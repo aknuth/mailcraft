@@ -338,6 +338,8 @@ pub struct UiState {
     web_pictures: HashMap<String, (Option<egui::TextureHandle>, u64)>,
     /// PROTOTYPE: the open HTML message laid out by Blitz, when that's on ([`reading::blitz`]).
     pub(crate) html_view: Option<reading::blitz::HtmlView>,
+    /// Its page asks for the reading lane's work (handed over after the frame).
+    pub(crate) html_pump: bool,
     pub(crate) blitz: bool,
     pub toast: Option<(String, bool, f64)>,
     seen_notices: usize,
@@ -522,6 +524,7 @@ impl MailApp {
                 bodies: app::Bodies::default(),
                 web_pictures: HashMap::new(),
                 html_view: None,
+                html_pump: false,
                 blitz: reading::blitz::wanted(),
                 toast: None,
                 seen_notices: seen,
