@@ -222,3 +222,22 @@ fn a_picture_in_an_inline_block_fits_its_column() {
     p.update().unwrap();
     assert!(p.height() <= 6.0, "4 pixels wide, so 4 tall: {}", p.height());
 }
+
+/// Heights as Chrome lays them out (each with a 10 pixel paragraph after it).
+#[test]
+fn table_cells_grow_and_read_spacing_and_padding() {
+    let button = r#"<a style="display:inline-block;padding:9px 24px;border:1px solid #00f;line-height:20px;font-size:14px;width:100%;box-sizing:border-box">X</a>"#;
+    let cases = [
+        // eBay's buttons: a cell 21 high around a 40 pixel button, 8 pixels between two.
+        (format!(r#"<div style="margin:0 0 8px 0;line-height:0"><table width="100%" cellpadding=0 cellspacing=0 style="display:inline-table"><tr><td height="21" style="line-height:1px;font-size:1px;padding:0">{button}</td></tr></table></div>"#), 58.0),
+        (r#"<table width="100%" cellpadding=0 cellspacing=0><tr><td height="21" style="padding:0"><div style="height:40px">x</div></td></tr></table>"#.to_string(), 50.0),
+        (r#"<table style="border-spacing:0" cellpadding="5"><tr><td><div style="height:40px">x</div></td></tr></table>"#.to_string(), 60.0),
+        (r#"<table cellspacing="5" cellpadding="0"><tr><td style="padding:0"><div style="height:40px">x</div></td></tr></table>"#.to_string(), 60.0),
+        // The mail's own rule outranks the attribute.
+        (r#"<style>td{padding:10px}</style><table cellspacing="0" cellpadding="0"><tr><td><div style="height:40px">x</div></td></tr></table>"#.to_string(), 70.0),
+    ];
+    for (html, want) in cases {
+        let p = Page::new(&format!("<body style=margin:0>{html}<p style='margin:0;height:10px'></p></body>"), 600, 1.0, false).unwrap();
+        assert_eq!(p.height(), want, "{html}");
+    }
+}
