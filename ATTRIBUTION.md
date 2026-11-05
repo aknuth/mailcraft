@@ -26,6 +26,7 @@ with a writer added, from [ZIDAN44/outlook-pst-rs](https://github.com/ZIDAN44/ou
 | `docs/images/reading.png` | MailCraft contributors | Screenshot of MailCraft's own sample mailbox | MIT OR Apache-2.0 |
 | `docs/images/search-dark.png` | MailCraft contributors | Screenshot of MailCraft's own sample mailbox | MIT OR Apache-2.0 |
 | `docs/images/compose.png` | MailCraft contributors | Screenshot of MailCraft's own sample mailbox | MIT OR Apache-2.0 |
+| `crates/html/src/tests/red.png` | MailCraft contributors | An 8×8 plain red test picture | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/128x128/apps/ai.storyteller.mailcraft.png` | MailCraft contributors | Rendered by `cargo xtask icons` (`xtask/src/icons.rs`) | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/16x16/apps/ai.storyteller.mailcraft.png` | MailCraft contributors | Rendered by `cargo xtask icons` (`xtask/src/icons.rs`) | MIT OR Apache-2.0 |
 | `assets/app-icon/hicolor/24x24/apps/ai.storyteller.mailcraft.png` | MailCraft contributors | Rendered by `cargo xtask icons` (`xtask/src/icons.rs`) | MIT OR Apache-2.0 |

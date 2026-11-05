@@ -39,7 +39,7 @@ fn pictures_are_asked_for_never_fetched() {
     let (_, _, px) = p.paint(0.0, 40.0).unwrap();
     let at = (10 * 600 + 10) * 4;
     assert_eq!(&px[at..at + 3], &[255, 0, 0], "the logo is drawn");
-    p.refuse("https://tracker.example/open.gif");
+    p.refuse("https://tracker.example/open.gif").unwrap();
     assert!(!p.wanted().iter().any(|w| w.contains("tracker")));
 }
 
@@ -101,4 +101,15 @@ fn links_far_down_after_painting() {
     let _ = p.paint(2560.0, 512.0).unwrap();
     assert_eq!(p.link_at(20.0, 3010.0).as_deref(), Some("https://shop.example/far"));
     assert_eq!(p.link_at(20.0, 10.0), None);
+}
+
+#[test]
+fn a_web_style_sheet_does_not_hold_it_up() {
+    // Blitz waits for the style sheets linked in `<head>`; a mail's are never loaded.
+    let html = r#"<html><head><link href="https://fonts.example/css2?family=Lato" rel="stylesheet">
+        <link rel="StyleSheet" href="https://shop.example/mail.css"></head>
+        <body><p style="margin:0;height:300px">Hello</p><img src="relative.png" width="10" height="10"></body></html>"#;
+    let p = Page::new(html, 600, 1.0, false).unwrap();
+    assert!(p.height() >= 300.0, "laid out: {}", p.height());
+    assert!(!p.wanted().iter().any(|w| w.contains(".example/")), "{:?}", p.wanted());
 }

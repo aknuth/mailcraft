@@ -72,12 +72,12 @@ pub(super) fn draw(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey,
                 }
                 Some(mailcraft_engine::Picture::Loading) => {}
                 // Only the pictures the message shows are fetched (not its style sheets).
-                _ => page.refuse(&url),
+                _ => changed |= page.refuse(&url).is_ok(),
             }
         } else {
             match mime::picture_attachment(p, &url).and_then(|i| s.attachment_bytes(i).ok()) {
                 Some(bytes) => changed |= page.give(&url, bytes).is_ok(),
-                None => page.refuse(&url),
+                None => changed |= page.refuse(&url).is_ok(),
             }
         }
     }
