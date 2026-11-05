@@ -131,3 +131,49 @@ fn a_cell_shown_another_way_is_still_drawn() {
     }
     assert!(tall("none") < 50.0, "a hidden cell stays hidden: {}", tall("none"));
 }
+
+const PROSE: &str = r#"<body style="margin:0;font-size:16px;line-height:20px">
+<p style="margin:0 0 20px">First paragraph here.</p>
+<p style="margin:0">Second one, with words.</p></body>"#;
+
+#[test]
+fn selects_by_dragging_across_blocks() {
+    let mut p = Page::new(PROSE, 600, 1.0, false).unwrap();
+    assert!(p.text_at(5.0, 10.0));
+    assert!(!p.text_at(5.0, 30.0), "the gap between the paragraphs");
+    let (_, _, plain) = p.paint(0.0, 60.0).unwrap();
+    p.select_from(1.0, 10.0);
+    assert!(!p.has_selection(), "a press alone selects nothing");
+    assert!(p.select_to(70.0, 50.0));
+    let got = p.selected_text().unwrap();
+    assert!(got.starts_with("First paragraph here."), "{got:?}");
+    assert!(got.contains("\nSecond"), "a block to a line: {got:?}");
+    let (_, _, shaded) = p.paint(0.0, 60.0).unwrap();
+    assert_ne!(plain, shaded, "the selection is painted");
+    // Past a line's end, in the margin: to the line's end.
+    p.select_from(1.0, 10.0);
+    assert!(p.select_to(590.0, 10.0));
+    assert_eq!(p.selected_text().as_deref(), Some("First paragraph here."));
+    // A press beside the text lets go; a drag then selects nothing.
+    p.select_from(1.0, 30.0);
+    assert!(!p.has_selection());
+    assert!(!p.select_to(70.0, 50.0));
+}
+
+#[test]
+fn selects_a_word_a_block_and_everything() {
+    let mut p = Page::new(PROSE, 600, 1.0, false).unwrap();
+    // "paragraph" begins after "First " (about 40 pixels in at 16px).
+    let x = (0..60).map(|i| i as f32 * 2.0).find(|x| {
+        p.select_around(*x, 10.0, false);
+        p.selected_text().as_deref() == Some("paragraph")
+    });
+    assert!(x.is_some(), "a word: {:?}", p.selected_text());
+    assert!(p.select_around(5.0, 50.0, true));
+    assert_eq!(p.selected_text().as_deref(), Some("Second one, with words."));
+    assert!(p.select_all());
+    assert_eq!(p.selected_text().as_deref(), Some("First paragraph here.\nSecond one, with words."));
+    assert!(p.clear_selection());
+    assert_eq!(p.selected_text(), None);
+    assert!(!p.select_around(5.0, 30.0, false), "no text there");
+}

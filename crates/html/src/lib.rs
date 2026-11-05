@@ -81,6 +81,8 @@ pub struct Page {
     scale: f32,
     dark: bool,
     height: f32,
+    /// A selection's start is placed (by a press on text, a word, the whole text).
+    anchored: bool,
 }
 
 fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, Refused> {
@@ -169,7 +171,7 @@ impl Page {
             return Err(Refused::TooDeep(d));
         }
         let sheets = guarded(|| style_sheets(&doc))?;
-        let mut page = Page { doc, asked, width, scale, dark, height: 0.0 };
+        let mut page = Page { doc, asked, width, scale, dark, height: 0.0, anchored: false };
         for url in sheets {
             page.answer(&url, bytes::Bytes::new())?;
         }
@@ -311,5 +313,6 @@ impl Page {
     }
 }
 
+mod selecting;
 #[cfg(test)]
 mod tests;
