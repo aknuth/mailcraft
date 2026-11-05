@@ -241,3 +241,45 @@ fn table_cells_grow_and_read_spacing_and_padding() {
         assert_eq!(p.height(), want, "{html}");
     }
 }
+
+/// Heights as Chrome lays them out.
+#[test]
+fn an_inline_element_holding_a_block_is_split_around_it() {
+    let cases = [
+        // A forwarded mail's header: the address read as an element that holds the whole mail.
+        (r#"<strong>From:</strong> "eBay" <ebay@ebay.com><br><strong>Date:</strong> Thu<br><div style="height:50px">block</div>"#, 90.0),
+        (r#"<strong>From:</strong> "eBay" <span>X<br><strong>Date:</strong> Thu<br><div style="height:50px">block</div></span>"#, 90.0),
+        (r#"Text <a href="https://shop.example/"><div style="height:50px">block</div></a>"#, 70.0),
+    ];
+    for (html, want) in cases {
+        let p = Page::new(&format!("<body style='margin:0;font-size:16px;line-height:20px'>{html}</body>"), 600, 1.0, false).unwrap();
+        assert_eq!(p.height(), want, "{html}");
+    }
+    // The block's piece of a link is a link too.
+    let p = Page::new(
+        r#"<body style="margin:0;line-height:20px">Text <a href="https://shop.example/"><div style="height:50px">block</div></a></body>"#,
+        600,
+        1.0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(p.link_at(5.0, 40.0).as_deref(), Some("https://shop.example/"));
+}
+
+#[test]
+fn a_row_of_percentages_leaves_its_other_cells_their_least() {
+    // Amazon's step tracker: a 50% bar, an 18 pixel dot, a 50% bar (Chrome: 141, 18, 141).
+    let html = r##"<body style="margin:0"><table width="300" cellpadding="0" cellspacing="0" border="0"><tr>
+        <td width="50%" height="18"><div style="height:4px;background:#1196AB"></div></td>
+        <td height="18"><table width="18" cellpadding="0" cellspacing="0" border="0"><tr><td width="18" height="18">
+          <div style="border-radius:18px;background:#1196AB;height:18px"></div></td></tr></table></td>
+        <td width="50%" height="18"><div style="height:4px;background:#E9E7E7"></div></td>
+      </tr></table></body>"##;
+    let mut p = Page::new(html, 600, 1.0, false).unwrap();
+    let (w, _, px) = p.paint(0.0, 18.0).unwrap();
+    let at = |x: usize, y: usize| &px[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 3];
+    // The left bar runs up to the dot, the dot sits at 141..159, the right bar runs on from it.
+    assert_eq!(at(139, 9), &[0x11, 0x96, 0xAB], "the left bar reaches the dot");
+    assert_eq!(at(150, 9), &[0x11, 0x96, 0xAB], "the dot");
+    assert_eq!(at(161, 9), &[0xE9, 0xE7, 0xE7], "the right bar starts at the dot");
+}

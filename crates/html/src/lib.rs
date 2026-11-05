@@ -110,6 +110,9 @@ fn depth(doc: &BaseDocument) -> usize {
 /// The style sheets it links to (resolved as Blitz asks for them). A mail's web style sheets
 /// are never loaded: Blitz waits for those in `<head>` before laying anything out, so they're
 /// answered empty at once.
+/// Passes of the fixes for what Blitz doesn't do yet, at most (each after laying out again).
+const ROUNDS: usize = 4;
+
 const BASE: &str = "mailcraft-message:/";
 
 fn style_sheets(doc: &BaseDocument) -> Vec<String> {
@@ -174,11 +177,17 @@ impl Page {
         let h = guarded(|| {
             doc.handle_messages();
             doc.resolve(0.0);
-            // These need the styles; any of them changes the page, laid out again then.
-            let wrapped = anonymous::wrap(doc);
-            let sized = replaced::fix(doc);
-            let grown = heights::fix(doc);
-            if shrink::fix(doc) | sized | grown | wrapped {
+            // What Blitz doesn't do yet, done to the page once its styles are known; a change
+            // gives new boxes (styled by the next pass) that may need it too.
+            for _ in 0..ROUNDS {
+                let split = split::split(doc);
+                let wrapped = anonymous::wrap(doc);
+                let sized = replaced::fix(doc);
+                let grown = heights::fix(doc);
+                let narrowed = columns::fix(doc);
+                if !(shrink::fix(doc) | sized | grown | narrowed | wrapped | split) {
+                    break;
+                }
                 doc.resolve(0.0);
             }
             doc.root_element().final_layout().size.height
@@ -319,10 +328,12 @@ impl Page {
 }
 
 mod anonymous;
+mod columns;
 mod heights;
 mod hints;
 mod replaced;
 mod selecting;
 mod shrink;
+mod split;
 #[cfg(test)]
 mod tests;
