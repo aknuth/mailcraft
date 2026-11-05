@@ -103,6 +103,28 @@ fn depth(doc: &BaseDocument) -> usize {
     most
 }
 
+/// The style sheets it links to (resolved as Blitz asks for them). A mail's web style sheets
+/// are never loaded: Blitz waits for those in `<head>` before laying anything out, so they're
+/// answered empty at once.
+const BASE: &str = "mailcraft-message:/";
+
+fn style_sheets(doc: &BaseDocument) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![doc.root_node().id];
+    while let Some(id) = stack.pop() {
+        let Some(n) = doc.get_node(id) else { continue };
+        stack.extend(n.children.iter().copied());
+        if n.data.is_element_with_tag_name(&local_name!("link"))
+            && n.attr(local_name!("rel")).is_some_and(|r| r.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet")))
+            && let Some(href) = n.attr(local_name!("href"))
+            && let Ok(url) = doc.base_url().join(href)
+        {
+            found.push(url.to_string());
+        }
+    }
+    found
+}
+
 fn viewport(width: u32, scale: f32, dark: bool) -> Viewport {
     let px = |v: f32| (v * scale).round().clamp(1.0, f32::from(u16::MAX)) as u32;
     Viewport::new(px(width as f32), px(1000.0), scale, if dark { ColorScheme::Dark } else { ColorScheme::Light })
@@ -118,6 +140,9 @@ impl Page {
         let config = DocumentConfig {
             viewport: Some(viewport(width, scale, dark)),
             net_provider: Some(Arc::new(Collector(asked.clone()))),
+            // A relative address has nothing to resolve against in a mail (Blitz fails on one
+            // without a base); this base makes it one nothing is ever given for.
+            base_url: Some(BASE.to_string()),
             ..Default::default()
         };
         let doc = guarded(|| HtmlDocument::from_html(html, config))?;
@@ -125,7 +150,11 @@ impl Page {
         if d > MAX_DEPTH {
             return Err(Refused::TooDeep(d));
         }
+        let sheets = guarded(|| style_sheets(&doc))?;
         let mut page = Page { doc, asked, width, scale, dark, height: 0.0 };
+        for url in sheets {
+            page.answer(&url, bytes::Bytes::new())?;
+        }
         page.lay_out()?;
         Ok(page)
     }
@@ -185,6 +214,22 @@ impl Page {
 
     /// Hand it what it asked for at `url` (a picture's bytes), and lay it out again.
     pub fn give(&mut self, url: &str, bytes: Vec<u8>) -> Result<(), Refused> {
+        if self.answer(url, bytes::Bytes::from(bytes))? {
+            self.lay_out()?;
+        }
+        Ok(())
+    }
+
+    /// Never to be given: answered empty, so nothing waits for it, and laid out again.
+    pub fn refuse(&mut self, url: &str) -> Result<(), Refused> {
+        if self.answer(url, bytes::Bytes::new())? {
+            self.lay_out()?;
+        }
+        Ok(())
+    }
+
+    /// Every open request for `url` answered with `data`; whether there was one.
+    fn answer(&mut self, url: &str, data: bytes::Bytes) -> Result<bool, Refused> {
         let handlers: Vec<Box<dyn NetHandler>> = match self.asked.lock() {
             Ok(mut a) => {
                 let (these, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut a.open).into_iter().partition(|(u, _)| u == url);
@@ -193,22 +238,12 @@ impl Page {
             }
             Err(_) => Vec::new(),
         };
-        if handlers.is_empty() {
-            return Ok(());
-        }
-        let data = bytes::Bytes::from(bytes);
+        let any = !handlers.is_empty();
         for h in handlers {
             let (u, d) = (url.to_string(), data.clone());
             guarded(move || h.bytes(u, d))?;
         }
-        self.lay_out()
-    }
-
-    /// Never to be given: forgotten.
-    pub fn refuse(&mut self, url: &str) {
-        if let Ok(mut a) = self.asked.lock() {
-            a.open.retain(|(u, _)| u != url);
-        }
+        Ok(any)
     }
 
     /// The part of the page from `top`, `height` CSS pixels tall, as RGBA pixels
