@@ -20,6 +20,8 @@ blitz-traits = "=0.3.0-beta.4"
 anyrender = "0.14"
 anyrender_vello_cpu = "0.18"
 bytes = "1"
+# Stylo itself, the version Blitz uses: the computed `display` the anonymous table boxes need.
+style = { package = "stylo", version = "=0.22.0", default-features = false }
 # The system's fonts through fontconfig loaded at run time, as egui loads it (the two share
 # fontconfig's bindings, which build one way or the other for both).
 fontique = { version = "0.12", default-features = false, features = ["fontconfig-dlopen"] }
