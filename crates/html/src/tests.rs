@@ -113,3 +113,21 @@ fn a_web_style_sheet_does_not_hold_it_up() {
     assert!(p.height() >= 300.0, "laid out: {}", p.height());
     assert!(!p.wanted().iter().any(|w| w.contains(".example/")), "{:?}", p.wanted());
 }
+
+#[test]
+fn a_cell_shown_another_way_is_still_drawn() {
+    // Mail templates stack their cells on phones with `display: inline-block` (or block);
+    // Blitz on its own leaves such a cell out with all it holds.
+    let tall = |display: &str| {
+        let html = format!(
+            r#"<body style="margin:0"><table width="300" cellpadding="0" cellspacing="0"><tr>
+            <td style="overflow: hidden; display:{display};"><div style="height:200px">Hi</div></td>
+            </tr></table></body>"#
+        );
+        Page::new(&html, 600, 1.0, false).unwrap().height()
+    };
+    for display in ["inline-block", " inline-block", "block", "BLOCK", "inline", "flex", "table-cell"] {
+        assert!(tall(display) >= 200.0, "display:{display} drawn {}", tall(display));
+    }
+    assert!(tall("none") < 50.0, "a hidden cell stays hidden: {}", tall("none"));
+}
