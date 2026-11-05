@@ -43,6 +43,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("mailcraft-store", 1),
     ("mailcraft-pst", 1),
     ("mailcraft-print", 1),
+    ("mailcraft-html", 1),
     ("mailcraft-smime", 1),
     ("mailcraft-jmap", 2),
     ("mailcraft-keys", 2),

@@ -1,0 +1,25 @@
+[package]
+name = "mailcraft-html"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MailCraft: HTML mail laid out and drawn by a browser's CSS engine (Blitz), into pixels (pure, wasm-safe)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Blitz: Stylo (Servo's CSS engine), Taffy (layout) and Parley (text), without a script engine
+# or a network client; pictures come only through `Page::give`. Stylo and its parsers are
+# MPL-2.0 (file by file); Blitz itself is MIT OR Apache-2.0.
+blitz-html = "=0.3.0-beta.4"
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "system-fonts", "complex-scripts", "text-transform-icu"] }
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
+blitz-traits = "=0.3.0-beta.4"
+anyrender = "0.14"
+anyrender_vello_cpu = "0.18"
+bytes = "1"
+# The system's fonts through fontconfig loaded at run time, as egui loads it (the two share
+# fontconfig's bindings, which build one way or the other for both).
+fontique = { version = "0.12", default-features = false, features = ["fontconfig-dlopen"] }

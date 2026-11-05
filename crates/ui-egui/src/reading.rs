@@ -14,6 +14,7 @@ use crate::theme::{self, Tokens};
 use crate::{Action, UiState, widgets};
 
 mod attachments;
+pub(crate) mod blitz;
 pub(crate) mod body;
 mod compose;
 mod long_text;

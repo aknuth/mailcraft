@@ -282,6 +282,10 @@ pub struct Parsed {
     /// The HTML body's columns, for mail laid out with tables (empty otherwise: `rich` flows).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layout: Vec<layout::Block>,
+    /// The HTML body as it came (at most [`HTML_MAX`] characters), for a renderer that lays it
+    /// out itself; `None` for mail without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
     /// Every picture the HTML body shows (`cid:` and web addresses).
     #[serde(default)]
     pub images: Vec<String>,
@@ -368,6 +372,8 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
     let copy = html.as_ref().map(|h| outlook_copy(capped(h, HTML_MAX)));
     // Its trackers as it's read: a pixel in Outlook's copy, drawn in VML, counts.
     let tracking = copy.as_ref().map(|c| trackers(&c.html)).unwrap_or_default();
+    // The HTML as it came, for a renderer of its own (Blitz) to lay out as a browser would.
+    let source_html = html.as_ref().map(|h| capped(h, HTML_MAX).to_string());
     let mut hidden = None;
     // Made ready: style sheet rules as inline styles, so cells keep their colours and titles
     // their size; what's hidden from Outlook hidden; and the HTML its text is read from. As it
@@ -436,6 +442,7 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
         had_html,
         rich,
         layout,
+        html: source_html,
         images,
         attachments,
         hidden_words: hidden.as_ref().map_or(0, |(_, n)| *n),
