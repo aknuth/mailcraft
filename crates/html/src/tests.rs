@@ -76,3 +76,29 @@ fn hostile_markup() {
         let _ = p.paint(0.0, p.height().min(500.0));
     }
 }
+
+/// Every part of a tall page is drawn, not only its top (the second tile came out empty).
+#[test]
+fn paints_every_part_of_a_tall_page() {
+    let html: String = (0..200).map(|i| format!("<p style='margin:0;line-height:20px'>Line {i}</p>")).collect();
+    for scale in [1.0, 1.5, 2.0] {
+        let mut p = Page::new(&html, 400, scale, false).unwrap();
+        assert!(p.height() > 3900.0, "{}", p.height());
+        for top in [0.0, 512.0, 1024.0, 3000.0] {
+            let (_, _, px) = p.paint(top, 512.0).unwrap();
+            let inked = px.chunks(4).filter(|c| c[3] > 0 && (c[0] < 128)).count();
+            assert!(inked > 100, "scale {scale}, from {top}: {inked} dark pixels");
+        }
+    }
+}
+
+/// A link far down is found where it is, after parts below the top were painted.
+#[test]
+fn links_far_down_after_painting() {
+    let mut html: String = (0..150).map(|i| format!("<p style='margin:0;line-height:20px'>Line {i}</p>")).collect();
+    html.push_str("<p style='margin:0;line-height:20px'><a href='https://shop.example/far'>Far link</a></p>");
+    let mut p = Page::new(&html, 400, 1.5, false).unwrap();
+    let _ = p.paint(2560.0, 512.0).unwrap();
+    assert_eq!(p.link_at(20.0, 3010.0).as_deref(), Some("https://shop.example/far"));
+    assert_eq!(p.link_at(20.0, 10.0), None);
+}
