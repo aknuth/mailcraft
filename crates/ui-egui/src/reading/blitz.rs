@@ -2,45 +2,62 @@
 //! of pixels, its links clickable. On with `MAILCRAFT_BLITZ=1`; a page Blitz refuses (nested
 //! too deep, a panic) is drawn the usual way.
 //!
+//! The page is laid out and painted on the reading lane ([`lane`]); the window shows what came
+//! back (a spinner until it's laid out, old tiles until new ones come) and hands on what's asked.
+//!
 //! Its text is selected as the other messages' is: a press starts a selection, a drag moves its
 //! end (scrolling at the view's edge), Shift+click too, a double-click takes a word and a
 //! triple-click a block; Ctrl+A, Escape and a copy are the text's while it has the keyboard
 //! (from a press in it until a press elsewhere), and its menu copies what's selected or all.
-//! Blitz paints the shading, so the tiles are painted again when it changes (the old ones shown
-//! until then).
+//! Blitz paints the shading, so the tiles are painted again when it changes.
 //!
-//! Not done yet: the reading lane (it lays out on the window's thread), dark mode (mail is drawn
-//! on white, as most mail expects).
+//! Not done yet: dark mode (mail is drawn on white, as most mail expects).
+
+mod lane;
 
 use super::*;
-use mailcraft_html::{Page, Refused};
-use std::collections::HashMap;
+use lane::{Shared, Step, lock};
+use mailcraft_html::Page;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Tiles are this many CSS pixels tall.
 const TILE: f32 = 512.0;
-/// New tiles painted in one frame, at most (the rest in the next ones).
-const TILES_PER_FRAME: usize = 2;
 
-/// The open message's page and its painted tiles.
+/// Pages made, counted (each message opened gets a new one).
+static PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// The open message's page (on the lane) and its tiles here.
 pub(crate) struct HtmlView {
     key: MessageKey,
-    page: Result<Page, Refused>,
-    /// Painted tiles, each with the version of the page it shows.
+    shared: Arc<Mutex<Shared>>,
+    /// Tiles uploaded, each with the page's version it shows.
     tiles: HashMap<usize, (egui::TextureHandle, u64)>,
-    /// The page's version: one more each time it's laid out again or its shading changes.
-    version: u64,
+    /// Tiles asked for, with the version they were asked at (not asked again meanwhile).
+    asked: HashMap<usize, u64>,
+    /// Pictures given or refused (not handed over again).
+    answered: HashSet<String>,
     /// Where it was drawn last, and the link under the pointer then.
     rect: Option<egui::Rect>,
     hovered: Option<String>,
+    /// The pointer's point last handed on.
+    pointer: Option<(f32, f32)>,
     /// The text has the keyboard: pressed into, until a press elsewhere.
     active: bool,
+}
+
+impl HtmlView {
+    fn shared(&self) -> Arc<Mutex<Shared>> {
+        self.shared.clone()
+    }
 }
 
 #[cfg(test)]
 impl HtmlView {
     /// Whether Blitz laid it out (and it's drawn as tiles).
     pub(crate) fn drawn(&self) -> bool {
-        self.page.is_ok() && !self.tiles.is_empty()
+        lock(&self.shared).made.refused.is_none() && !self.tiles.is_empty()
     }
 
     pub(crate) fn rect(&self) -> Option<egui::Rect> {
@@ -52,7 +69,7 @@ impl HtmlView {
     }
 
     pub(crate) fn selected(&self) -> Option<String> {
-        self.page.as_ref().ok().and_then(Page::selected_text)
+        lock(&self.shared).made.selected.clone()
     }
 
     pub(crate) fn active(&self) -> bool {
@@ -67,112 +84,111 @@ pub(crate) fn wanted() -> bool {
 
 /// Draw `html` with Blitz; `false` when it can't be (drawn the usual way then).
 pub(super) fn draw(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey, p: &mime::Parsed, html: &str, acts: &mut Vec<Action>) -> bool {
-    let width = ui.available_width().floor().max(1.0) as u32;
-    let scale = ui.ctx().pixels_per_point();
+    let size = (ui.available_width().floor().max(1.0) as u32, ui.ctx().pixels_per_point());
     if st.html_view.as_ref().is_none_or(|v| v.key != *key) {
-        let started = web_time::Instant::now();
-        let page = Page::new(html, width, scale, false);
-        log::info!("blitz: laid out in {:?}: {:?}", started.elapsed(), page.as_ref().map(Page::height).map_err(|e| e.to_string()));
-        st.html_view = Some(HtmlView { key: key.clone(), page, tiles: HashMap::new(), version: 0, rect: None, hovered: None, active: false });
+        let id = PAGES.fetch_add(1, Ordering::Relaxed);
+        st.html_view = Some(HtmlView {
+            key: key.clone(),
+            shared: Arc::new(Mutex::new(Shared::new(id, html, size))),
+            tiles: HashMap::new(),
+            asked: HashMap::new(),
+            answered: HashSet::new(),
+            rect: None,
+            hovered: None,
+            pointer: None,
+            active: false,
+        });
     }
     let Some(view) = st.html_view.as_mut() else { return false };
-    let Ok(page) = view.page.as_mut() else { return false };
-    let mut changed = matches!(page.set_size(width, scale), Ok(true));
-    // What it asks for: pictures sent with it, and web pictures once allowed.
-    let allowed = s.pictures_allowed();
-    for url in page.wanted() {
-        let lower = url.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
-            if !allowed {
-                continue; // asked again once the user allows them
+    let shared = view.shared.clone();
+    let mut sh = lock(&shared);
+    if sh.made.refused.is_some() {
+        return false;
+    }
+    if sh.size != size {
+        sh.size = size;
+        sh.asks.resize = true;
+    }
+    // Tiles painted since: uploaded.
+    for t in std::mem::take(&mut sh.made.tiles) {
+        let img = egui::ColorImage::from_rgba_premultiplied(t.size, &t.pixels);
+        match view.tiles.get_mut(&t.index) {
+            Some((tex, v)) => {
+                tex.set(img, egui::TextureOptions::LINEAR);
+                *v = t.version;
             }
-            match s.pictures.get(&url) {
-                Some(mailcraft_engine::Picture::Ready(bytes)) => {
-                    let _ = page.give(&url, bytes.to_vec());
-                }
-                Some(mailcraft_engine::Picture::Loading) => {}
-                // Only the pictures the message shows are fetched (not its style sheets).
-                _ => {
-                    let _ = page.refuse(&url);
-                }
-            }
-        } else {
-            match mime::picture_attachment(p, &url).and_then(|i| s.attachment_bytes(i).ok()) {
-                Some(bytes) => {
-                    let _ = page.give(&url, bytes);
-                }
-                None => {
-                    let _ = page.refuse(&url);
-                }
+            None => {
+                let tex = ui.ctx().load_texture(format!("blitz-{}", t.index), img, egui::TextureOptions::LINEAR);
+                view.tiles.insert(t.index, (tex, t.version));
             }
         }
     }
-    // Laid out again once for all given this frame.
-    changed |= matches!(page.update(), Ok(true));
-    let height = page.height().max(1.0);
+    answer(s, p, view, &mut sh);
+    if !sh.made.laid_out {
+        ui.add_space(8.0);
+        ui.spinner();
+        if sh.wants_pump() {
+            st.html_pump = true;
+        }
+        return true;
+    }
+    let (height, version) = (sh.made.height.max(1.0), sh.made.version);
     // A finger dragged over it scrolls (as over other text); a mouse's selects.
     let touch = ui.input(|i| i.has_touch_screen());
-    let (rect, response) = ui.allocate_exact_size(vec2(width as f32, height), if touch { Sense::click() } else { Sense::click_and_drag() });
+    let (rect, response) = ui.allocate_exact_size(vec2(size.0 as f32, height), if touch { Sense::click() } else { Sense::click_and_drag() });
     view.rect = Some(rect);
     view.hovered = None;
-    let before = page.selection();
-    select(ui, &response, rect, page, &mut view.active);
+    let local = |p: egui::Pos2| (p.x - rect.left(), p.y - rect.top());
+    select(ui, &response, rect, &mut sh.asks.steps, &mut view.active);
     if view.active {
-        keys(ui, page);
+        keys(ui, &mut sh);
         if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
             st.text_selection.keys = true;
         }
     }
-    menu(&response, page);
-    if changed || page.selection() != before {
-        view.version += 1;
-    }
+    menu(&response, sh.made.selected.clone(), &p.text);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::WHITE);
     let visible = rect.intersect(ui.clip_rect());
     if visible.height() > 0.0 {
         let first = ((visible.top() - rect.top()) / TILE).floor().max(0.0) as usize;
         let last = ((visible.bottom() - rect.top()) / TILE).floor().max(0.0) as usize;
-        let mut painted = 0;
         for i in first..=last {
             let top = i as f32 * TILE;
             if top >= height {
                 break;
             }
-            let h = TILE.min(height - top);
-            if view.tiles.get(&i).is_none_or(|(_, v)| *v != view.version) {
-                if painted >= TILES_PER_FRAME {
-                    ui.ctx().request_repaint();
-                } else {
-                    painted += 1;
-                    let Ok((w, ph, px)) = page.paint(top, h) else { return false };
-                    let img = egui::ColorImage::from_rgba_premultiplied([w as usize, ph as usize], &px);
-                    match view.tiles.get_mut(&i) {
-                        Some((tex, v)) => {
-                            tex.set(img, egui::TextureOptions::LINEAR);
-                            *v = view.version;
-                        }
-                        None => {
-                            let tex = ui.ctx().load_texture(format!("blitz-{i}"), img, egui::TextureOptions::LINEAR);
-                            view.tiles.insert(i, (tex, view.version));
-                        }
-                    }
-                }
+            let current = view.tiles.get(&i).is_some_and(|(_, v)| *v == version);
+            if !current && view.asked.get(&i) != Some(&version) {
+                view.asked.insert(i, version);
+                sh.asks.tiles.push(i);
             }
             if let Some((tex, _)) = view.tiles.get(&i) {
-                let at = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.top() + top), vec2(width as f32, h));
+                let at = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.top() + top), vec2(size.0 as f32, TILE.min(height - top)));
                 painter.image(tex.id(), at, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
             }
         }
         // Tiles far from view go.
         view.tiles.retain(|i, _| *i + 2 >= first && *i <= last + 2);
+        view.asked.retain(|i, _| *i + 2 >= first && *i <= last + 2);
     }
-    // Links: the hand, where it goes, and a click opens it; over text, the I-beam.
-    let over = response.hover_pos().map(|at| (at.x - rect.left(), at.y - rect.top()));
-    let link = over.and_then(|(x, y)| page.link_at(x, y));
-    if response.dragged() || (link.is_none() && over.is_some_and(|(x, y)| page.text_at(x, y))) {
+    // The pointer: handed on when it moves; the link and text under it come back.
+    let over = response.hover_pos().map(local);
+    if over.is_some() && over != view.pointer {
+        view.pointer = over;
+        sh.asks.hover = over;
+    }
+    let (link, text) = match (&sh.made.hover, over) {
+        (Some((at, link, text)), Some(o)) if *at == o => (link.clone(), *text),
+        _ => (None, false),
+    };
+    if response.dragged() || (link.is_none() && text) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
+    if sh.wants_pump() {
+        st.html_pump = true;
+    }
+    drop(sh);
     if let Some(link) = link {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         view.hovered = Some(link.clone());
@@ -186,8 +202,34 @@ pub(super) fn draw(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey,
     true
 }
 
+/// What the page asks for: pictures sent with it, and web pictures once allowed.
+fn answer(s: &Session, p: &mime::Parsed, view: &mut HtmlView, sh: &mut Shared) {
+    let allowed = s.pictures_allowed();
+    for url in sh.made.wanted.clone() {
+        if view.answered.contains(&url) {
+            continue;
+        }
+        let lower = url.to_ascii_lowercase();
+        let gift = if lower.starts_with("http://") || lower.starts_with("https://") {
+            if !allowed {
+                continue; // asked again once the user allows them
+            }
+            match s.pictures.get(&url) {
+                Some(mailcraft_engine::Picture::Ready(bytes)) => Some(bytes.to_vec()),
+                Some(mailcraft_engine::Picture::Loading) => continue,
+                // Only the pictures the message shows are fetched (not its style sheets).
+                _ => None,
+            }
+        } else {
+            mime::picture_attachment(p, &url).and_then(|i| s.attachment_bytes(i).ok())
+        };
+        view.answered.insert(url.clone());
+        sh.asks.gifts.push((url, gift));
+    }
+}
+
 /// The pointer on the page: a press, a double or triple click, Shift+click and a drag.
-fn select(ui: &mut Ui, response: &egui::Response, rect: egui::Rect, page: &mut Page, active: &mut bool) {
+fn select(ui: &mut Ui, response: &egui::Response, rect: egui::Rect, steps: &mut Vec<Step>, active: &mut bool) {
     let local = |p: egui::Pos2| (p.x - rect.left(), p.y - rect.top());
     let (pressed, shift, double, triple, dt) = ui.input(|i| {
         let b = egui::PointerButton::Primary;
@@ -197,20 +239,26 @@ fn select(ui: &mut Ui, response: &egui::Response, rect: egui::Rect, page: &mut P
         // A press elsewhere takes the keyboard from it; one in it gives it the keyboard.
         *active = response.hovered();
         if let Some((x, y)) = response.interact_pointer_pos().or(response.hover_pos()).filter(|_| *active).map(local) {
-            if triple {
-                page.select_around(x, y, true);
+            steps.push(if triple {
+                Step::Around(x, y, true)
             } else if double {
-                page.select_around(x, y, false);
-            } else if !(shift && page.select_to(x, y)) {
-                page.select_from(x, y);
-            }
+                Step::Around(x, y, false)
+            } else if shift {
+                Step::To(x, y)
+            } else {
+                Step::From(x, y)
+            });
         }
     }
     if response.dragged_by(egui::PointerButton::Primary)
         && let Some(at) = response.interact_pointer_pos()
     {
         let (x, y) = local(at);
-        page.select_to(x, y);
+        // Only the latest point of a drag matters.
+        if let Some(Step::To(..)) = steps.last() {
+            steps.pop();
+        }
+        steps.push(Step::To(x, y));
         // Held at or past the view's top or bottom: it scrolls, faster the farther out.
         let delta = text_selection::edge_delta(at.y, ui.clip_rect(), dt);
         if delta != 0.0 {
@@ -223,21 +271,22 @@ fn select(ui: &mut Ui, response: &egui::Response, rect: egui::Rect, page: &mut P
     }
 }
 
-/// The text's keys while it has the keyboard: Ctrl+A, Escape, and a copy.
-fn keys(ui: &mut Ui, page: &mut Page) {
+/// The text's keys while it has the keyboard: Ctrl+A, Escape, and a copy (of what's selected as
+/// the lane last said).
+fn keys(ui: &mut Ui, sh: &mut Shared) {
     let events = ui.input(|i| i.events.clone());
     let mut used = false;
     for e in &events {
         match e {
             egui::Event::Key { key: egui::Key::A, pressed: true, modifiers, .. } if modifiers.command && !modifiers.shift => {
-                page.select_all();
+                sh.asks.steps.push(Step::All);
                 used = true;
             }
             egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
-                page.clear_selection();
+                sh.asks.steps.push(Step::Clear);
             }
             egui::Event::Copy | egui::Event::Cut => {
-                if let Some(text) = page.selected_text() {
+                if let Some(text) = sh.made.selected.clone() {
                     ui.ctx().copy_text(text);
                     used = true;
                 }
@@ -257,16 +306,16 @@ fn keys(ui: &mut Ui, page: &mut Page) {
 }
 
 /// Its menu: copy what's selected, or the whole message.
-fn menu(response: &egui::Response, page: &Page) {
+fn menu(response: &egui::Response, selected: Option<String>, whole: &str) {
     response.context_menu(|ui| {
-        if let Some(text) = page.selected_text()
+        if let Some(text) = selected
             && ui.button(tl!("Copy")).clicked()
         {
             ui.ctx().copy_text(text);
             ui.close();
         }
         if ui.button(tl!("Copy the whole message")).clicked() {
-            ui.ctx().copy_text(page.text().trim().to_string());
+            ui.ctx().copy_text(whole.trim().to_string());
             ui.close();
         }
     });

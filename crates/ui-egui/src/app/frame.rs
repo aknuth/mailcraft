@@ -225,6 +225,7 @@ impl MailApp {
                 self.act(a);
             }
             self.send_body_work(&ctx);
+            self.send_html_work(&ctx);
             self.flush_jobs();
             self.tell_before_zooming(&ctx);
             return;
@@ -506,6 +507,7 @@ impl MailApp {
             ctx.request_repaint();
         }
         self.send_body_work(&ctx);
+        self.send_html_work(&ctx);
         self.flush_jobs();
         if std::mem::take(&mut self.ui.focus_main) {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);

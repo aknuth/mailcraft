@@ -32,6 +32,8 @@ fn an_html_message_is_drawn_as_tiles_with_its_links() {
     // Hovering "Your Orders" (at the header's right) shows where it goes.
     let area = view.rect().expect("drawn somewhere");
     let at = egui::pos2(area.right() - 30.0, area.top() + 20.0);
+    // The lane says what's under the pointer; the frame after shows it.
+    frame(&ctx, &mut a, vec![Event::PointerMoved(at)]);
     frame(&ctx, &mut a, vec![Event::PointerMoved(at)]);
     let link = a.ui.html_view.as_ref().and_then(|v| v.hovered_link());
     assert_eq!(link.as_deref(), Some("https://shop.example/orders"));
@@ -73,7 +75,9 @@ fn its_text_is_selected_by_a_drag_and_copied() {
     let got = copied(&ctx, &mut a, vec![Event::Copy]).expect("copied");
     assert!(got.contains("paragraph here.\nSecond"), "{got:?}");
     // Ctrl+A takes it all; Escape lets go.
-    let all = copied(&ctx, &mut a, vec![key(Key::A, Modifiers::COMMAND), Event::Copy]).expect("copied");
+    // Selected on the lane; copied the frame after.
+    frame(&ctx, &mut a, vec![key(Key::A, Modifiers::COMMAND)]);
+    let all = copied(&ctx, &mut a, vec![Event::Copy]).expect("copied");
     assert_eq!(all, "First paragraph here.\nSecond one, with words.");
     frame(&ctx, &mut a, vec![key(Key::Escape, Modifiers::NONE)]);
     assert_eq!(a.ui.html_view.as_ref().and_then(|v| v.selected()), None);
@@ -114,5 +118,70 @@ fn a_drag_past_the_bottom_scrolls_and_keeps_selecting() {
     frame(&ctx, &mut a, vec![button(below, false)]);
     let got = copied(&ctx, &mut a, vec![Event::Copy]).expect("copied");
     assert!(got.starts_with("Line 000") && got.contains("Line 040"), "{} lines", got.lines().count());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Services that keep the work handed to them, with its lane, for the test to run.
+struct Held(std::sync::Arc<std::sync::Mutex<Vec<(crate::Lane, crate::Work)>>>);
+
+impl crate::Services for Held {
+    fn clock(&self) -> (i64, i32) {
+        (NOW, 0)
+    }
+    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
+    fn background(&mut self, lane: crate::Lane, work: crate::Work) -> Result<(), crate::Work> {
+        self.0.lock().unwrap().push((lane, work));
+        Ok(())
+    }
+    fn has_background(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn the_page_is_laid_out_on_the_reading_lane_while_the_window_draws() {
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dir = std::env::temp_dir().join(format!("mailcraft-ui-blitz-lane-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::open(&dir).unwrap();
+    sample::seed_if_empty(&store, NOW).unwrap();
+    let s = Session::open(Some(store), Clock::new(NOW, 0));
+    let mut a = MailApp::new(s, Box::new(NullBackend), Box::new(Held(held.clone())));
+    a.ui.blitz = true;
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    let key = a.session.list.first().map(|m| m.key.clone()).unwrap();
+    a.session.open_message(&key);
+    a.session.apply(MailEvent::Body { key, raw: html_message(PROSE) });
+    frame(&ctx, &mut a, vec![]);
+    frame(&ctx, &mut a, vec![]);
+    // Handed to the reading lane, once (not again while it's at work); a spinner meanwhile.
+    let work: Vec<_> = held.lock().unwrap().drain(..).collect();
+    assert_eq!(work.len(), 1, "one pump handed over");
+    assert_eq!(work[0].0, crate::Lane::Reading);
+    assert!(a.ui.html_view.as_ref().is_some_and(|v| v.rect().is_none()), "not laid out yet");
+    // Each piece of work on a thread of its own (as a test's lanes do): the page is laid out
+    // again there from its HTML, and comes back.
+    let mut runs = work.into_iter().map(|(_, w)| w).collect::<Vec<_>>();
+    for _ in 0..10 {
+        for w in runs.drain(..) {
+            std::thread::spawn(w.run).join().unwrap();
+        }
+        frame(&ctx, &mut a, vec![]);
+        runs = held.lock().unwrap().drain(..).map(|(_, w)| w).collect();
+        if runs.is_empty() && a.ui.html_view.as_ref().is_some_and(|v| v.drawn()) {
+            break;
+        }
+    }
+    let view = a.ui.html_view.as_ref().unwrap();
+    assert!(view.drawn() && view.rect().is_some(), "laid out and painted on the lane");
     let _ = std::fs::remove_dir_all(dir);
 }

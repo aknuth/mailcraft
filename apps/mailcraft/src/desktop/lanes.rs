@@ -141,7 +141,13 @@ fn spawn(lane: Lane, shared: &Arc<Shared>, id: u64) -> std::io::Result<()> {
         Lane::Reading => "mail-reading",
     };
     let shared = shared.clone();
-    std::thread::Builder::new().name(name.into()).spawn(move || work_lane(&shared, id)).map(drop)
+    // The reading lane lays out HTML mail (Blitz's style and layout passes recurse into the
+    // page's nesting): far more stack than the 2 MiB a thread gets, which is only reserved.
+    let stack = match lane {
+        Lane::Pictures => 2 << 20,
+        Lane::Reading => 32 << 20,
+    };
+    std::thread::Builder::new().name(name.into()).stack_size(stack).spawn(move || work_lane(&shared, id)).map(drop)
 }
 
 /// A lane's thread: the work waiting, one at a time, until the lane closes or the thread is
