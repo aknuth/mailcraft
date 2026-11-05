@@ -171,9 +171,10 @@ impl Page {
         let h = guarded(|| {
             doc.handle_messages();
             doc.resolve(0.0);
-            // Both need the styles; either changes the page, laid out again then.
+            // These need the styles; any of them changes the page, laid out again then.
             let wrapped = anonymous::wrap(doc);
-            if replaced::fix(doc) | wrapped {
+            let sized = replaced::fix(doc);
+            if shrink::fix(doc) | sized | wrapped {
                 doc.resolve(0.0);
             }
             doc.root_element().final_layout().size.height
@@ -316,5 +317,6 @@ impl Page {
 mod anonymous;
 mod replaced;
 mod selecting;
+mod shrink;
 #[cfg(test)]
 mod tests;
