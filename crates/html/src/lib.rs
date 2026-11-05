@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyrender::render_to_buffer;
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{BaseDocument, DocumentConfig, local_name};
+use blitz_dom::{BaseDocument, DocumentConfig, UserAgentStylesheet, local_name};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
@@ -106,6 +106,23 @@ fn depth(doc: &BaseDocument) -> usize {
 /// The style sheets it links to (resolved as Blitz asks for them). A mail's web style sheets
 /// are never loaded: Blitz waits for those in `<head>` before laying anything out, so they're
 /// answered empty at once.
+/// What mail needs on top of Blitz's own sheet. Blitz leaves out a table cell whose `display`
+/// is not `table-cell` with all it holds (a browser wraps it in a cell of its own), and mail
+/// templates set `display: inline-block` or `block` on their cells to stack them on phones. A
+/// cell given one in its `style` attribute stays a cell (a user agent's `!important` outranks
+/// the mail's own); one hidden that way stays hidden.
+fn mail_sheet() -> String {
+    let mut cells = Vec::new();
+    for tag in ["td", "th"] {
+        for value in ["inline", "block", "flex", "grid", "list-item"] {
+            for gap in ["", " "] {
+                cells.push(format!("{tag}[style*=\"display:{gap}{value}\" i]"));
+            }
+        }
+    }
+    format!("{} {{ display: table-cell !important; }}", cells.join(", "))
+}
+
 const BASE: &str = "mailcraft-message:/";
 
 fn style_sheets(doc: &BaseDocument) -> Vec<String> {
@@ -143,6 +160,7 @@ impl Page {
             // A relative address has nothing to resolve against in a mail (Blitz fails on one
             // without a base); this base makes it one nothing is ever given for.
             base_url: Some(BASE.to_string()),
+            ua_stylesheets: vec![UserAgentStylesheet::default_sheet(), UserAgentStylesheet::parse(&mail_sheet())],
             ..Default::default()
         };
         let doc = guarded(|| HtmlDocument::from_html(html, config))?;
