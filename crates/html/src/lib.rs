@@ -152,7 +152,10 @@ impl Page {
             incremental: Some(false),
             ..Default::default()
         };
-        let doc = guarded(|| HtmlDocument::from_html(html, config))?;
+        let mut doc = guarded(|| HtmlDocument::from_html(html, config))?;
+        if let Some(sheet) = guarded(|| hints::sheet(&doc))? {
+            guarded(|| doc.add_user_agent_stylesheet(sheet))?;
+        }
         let d = guarded(|| depth(&doc))?;
         if d > MAX_DEPTH {
             return Err(Refused::TooDeep(d));
@@ -174,7 +177,8 @@ impl Page {
             // These need the styles; any of them changes the page, laid out again then.
             let wrapped = anonymous::wrap(doc);
             let sized = replaced::fix(doc);
-            if shrink::fix(doc) | sized | wrapped {
+            let grown = heights::fix(doc);
+            if shrink::fix(doc) | sized | grown | wrapped {
                 doc.resolve(0.0);
             }
             doc.root_element().final_layout().size.height
@@ -315,6 +319,8 @@ impl Page {
 }
 
 mod anonymous;
+mod heights;
+mod hints;
 mod replaced;
 mod selecting;
 mod shrink;
