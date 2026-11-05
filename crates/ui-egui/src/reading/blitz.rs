@@ -88,19 +88,27 @@ pub(super) fn draw(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey,
             }
             match s.pictures.get(&url) {
                 Some(mailcraft_engine::Picture::Ready(bytes)) => {
-                    changed |= page.give(&url, bytes.to_vec()).is_ok();
+                    let _ = page.give(&url, bytes.to_vec());
                 }
                 Some(mailcraft_engine::Picture::Loading) => {}
                 // Only the pictures the message shows are fetched (not its style sheets).
-                _ => changed |= page.refuse(&url).is_ok(),
+                _ => {
+                    let _ = page.refuse(&url);
+                }
             }
         } else {
             match mime::picture_attachment(p, &url).and_then(|i| s.attachment_bytes(i).ok()) {
-                Some(bytes) => changed |= page.give(&url, bytes).is_ok(),
-                None => changed |= page.refuse(&url).is_ok(),
+                Some(bytes) => {
+                    let _ = page.give(&url, bytes);
+                }
+                None => {
+                    let _ = page.refuse(&url);
+                }
             }
         }
     }
+    // Laid out again once for all given this frame.
+    changed |= matches!(page.update(), Ok(true));
     let height = page.height().max(1.0);
     // A finger dragged over it scrolls (as over other text); a mouse's selects.
     let touch = ui.input(|i| i.has_touch_screen());

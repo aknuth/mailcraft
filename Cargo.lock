@@ -4396,6 +4396,7 @@ dependencies = [
  "blitz-traits",
  "bytes",
  "fontique 0.12.0",
+ "stylo",
 ]
 
 [[package]]

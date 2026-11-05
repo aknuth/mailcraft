@@ -177,3 +177,36 @@ fn selects_a_word_a_block_and_everything() {
     assert_eq!(p.selected_text(), None);
     assert!(!p.select_around(5.0, 30.0, false), "no text there");
 }
+
+#[test]
+fn what_isnt_a_cell_in_a_table_gets_a_cell_of_its_own() {
+    // eBay's: a `display: table` box holding a cell (the picture) and a block (the details)
+    // side by side; Blitz on its own left the block out.
+    let html = r#"<body style="margin:0;font-size:16px;line-height:20px">
+        <div style="display:table;width:600px">
+          <div style="display:table-cell;width:200px"><div style="height:100px;background:#f00"></div></div>
+          <div style="display:none">gutter</div>
+          <div style="display:block;width:300px">Item ID: 1987</div>
+        </div>
+        <table width="600"><tr><td>A cell</td><div>moved out by the parser</div></tr></table>
+        <div style="display:table-row"><span>a row's text</span></div></body>"#;
+    let mut p = Page::new(html, 600, 1.0, false).unwrap();
+    // The details sit right of the picture, at its top.
+    assert!(p.text_at(210.0, 10.0), "the block beside the cell is drawn");
+    assert!(!p.text_at(10.0, 10.0), "the picture is at the left");
+    assert!(p.select_all());
+    let all = p.selected_text().unwrap_or_default();
+    assert!(all.contains("Item ID: 1987") && all.contains("a row's text"), "{all:?}");
+    assert!(!all.contains("gutter"), "hidden stays hidden: {all:?}");
+}
+
+#[test]
+fn a_picture_keeps_its_height_beside_a_min_width() {
+    // Shopify's spacer: as wide as the mail, no height.
+    let png: &[u8] = include_bytes!("tests/red.png");
+    let html = r#"<body style="margin:0"><img src="https://shop.example/spacer.png" height="1" style="min-width: 600px; height: 0;"><p style="margin:0;line-height:20px">after</p></body>"#;
+    let mut p = Page::new(html, 700, 1.0, false).unwrap();
+    p.give("https://shop.example/spacer.png", png.to_vec()).unwrap();
+    assert!(p.update().unwrap(), "laid out again");
+    assert!(p.height() < 40.0, "not 600 pixels tall: {}", p.height());
+}

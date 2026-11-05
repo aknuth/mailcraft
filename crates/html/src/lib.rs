@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyrender::render_to_buffer;
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{BaseDocument, DocumentConfig, UserAgentStylesheet, local_name};
+use blitz_dom::{BaseDocument, DocumentConfig, local_name};
 use blitz_html::HtmlDocument;
 use blitz_traits::net::{NetHandler, NetProvider, Request};
 use blitz_traits::shell::{ColorScheme, Viewport};
@@ -83,6 +83,8 @@ pub struct Page {
     height: f32,
     /// A selection's start is placed (by a press on text, a word, the whole text).
     anchored: bool,
+    /// Given or refused something since it was last laid out.
+    stale: bool,
 }
 
 fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, Refused> {
@@ -108,23 +110,6 @@ fn depth(doc: &BaseDocument) -> usize {
 /// The style sheets it links to (resolved as Blitz asks for them). A mail's web style sheets
 /// are never loaded: Blitz waits for those in `<head>` before laying anything out, so they're
 /// answered empty at once.
-/// What mail needs on top of Blitz's own sheet. Blitz leaves out a table cell whose `display`
-/// is not `table-cell` with all it holds (a browser wraps it in a cell of its own), and mail
-/// templates set `display: inline-block` or `block` on their cells to stack them on phones. A
-/// cell given one in its `style` attribute stays a cell (a user agent's `!important` outranks
-/// the mail's own); one hidden that way stays hidden.
-fn mail_sheet() -> String {
-    let mut cells = Vec::new();
-    for tag in ["td", "th"] {
-        for value in ["inline", "block", "flex", "grid", "list-item"] {
-            for gap in ["", " "] {
-                cells.push(format!("{tag}[style*=\"display:{gap}{value}\" i]"));
-            }
-        }
-    }
-    format!("{} {{ display: table-cell !important; }}", cells.join(", "))
-}
-
 const BASE: &str = "mailcraft-message:/";
 
 fn style_sheets(doc: &BaseDocument) -> Vec<String> {
@@ -162,7 +147,9 @@ impl Page {
             // A relative address has nothing to resolve against in a mail (Blitz fails on one
             // without a base); this base makes it one nothing is ever given for.
             base_url: Some(BASE.to_string()),
-            ua_stylesheets: vec![UserAgentStylesheet::default_sheet(), UserAgentStylesheet::parse(&mail_sheet())],
+            // Each layout builds every box again: the anonymous table boxes move children Blitz
+            // had left out (and so never built); a mail is laid out a few times, not each frame.
+            incremental: Some(false),
             ..Default::default()
         };
         let doc = guarded(|| HtmlDocument::from_html(html, config))?;
@@ -171,7 +158,7 @@ impl Page {
             return Err(Refused::TooDeep(d));
         }
         let sheets = guarded(|| style_sheets(&doc))?;
-        let mut page = Page { doc, asked, width, scale, dark, height: 0.0, anchored: false };
+        let mut page = Page { doc, asked, width, scale, dark, height: 0.0, anchored: false, stale: false };
         for url in sheets {
             page.answer(&url, bytes::Bytes::new())?;
         }
@@ -184,6 +171,11 @@ impl Page {
         let h = guarded(|| {
             doc.handle_messages();
             doc.resolve(0.0);
+            // Both need the styles; either changes the page, laid out again then.
+            let wrapped = anonymous::wrap(doc);
+            if replaced::fix(doc) | wrapped {
+                doc.resolve(0.0);
+            }
             doc.root_element().final_layout().size.height
         })?;
         self.height = if h.is_finite() { h.clamp(0.0, MAX_HEIGHT) } else { 0.0 };
@@ -232,20 +224,27 @@ impl Page {
         self.asked.lock().map(|a| a.seen.clone()).unwrap_or_default()
     }
 
-    /// Hand it what it asked for at `url` (a picture's bytes), and lay it out again.
+    /// Hand it what it asked for at `url` (a picture's bytes); laid out again by [`Page::update`]
+    /// (or the next paint), once for all given together.
     pub fn give(&mut self, url: &str, bytes: Vec<u8>) -> Result<(), Refused> {
-        if self.answer(url, bytes::Bytes::from(bytes))? {
-            self.lay_out()?;
-        }
+        self.stale |= self.answer(url, bytes::Bytes::from(bytes))?;
         Ok(())
     }
 
-    /// Never to be given: answered empty, so nothing waits for it, and laid out again.
+    /// Never to be given: answered empty, so nothing waits for it.
     pub fn refuse(&mut self, url: &str) -> Result<(), Refused> {
-        if self.answer(url, bytes::Bytes::new())? {
-            self.lay_out()?;
-        }
+        self.stale |= self.answer(url, bytes::Bytes::new())?;
         Ok(())
+    }
+
+    /// Laid out again if anything was given or refused since; `true` when it was.
+    pub fn update(&mut self) -> Result<bool, Refused> {
+        if !self.stale {
+            return Ok(false);
+        }
+        self.stale = false;
+        self.lay_out()?;
+        Ok(true)
     }
 
     /// Every open request for `url` answered with `data`; whether there was one.
@@ -269,6 +268,7 @@ impl Page {
     /// The part of the page from `top`, `height` CSS pixels tall, as RGBA pixels
     /// (`width × scale` by `height × scale`, rounded); with its size in pixels.
     pub fn paint(&mut self, top: f32, height: f32) -> Result<(u32, u32, Vec<u8>), Refused> {
+        self.update()?;
         let px = |v: f32| (v * self.scale).round().clamp(1.0, 16_384.0) as u32;
         let (w, h) = (px(self.width as f32), px(height.max(1.0)));
         let scale = f64::from(self.scale);
@@ -313,6 +313,8 @@ impl Page {
     }
 }
 
+mod anonymous;
+mod replaced;
 mod selecting;
 #[cfg(test)]
 mod tests;
