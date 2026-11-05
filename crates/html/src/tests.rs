@@ -210,3 +210,15 @@ fn a_picture_keeps_its_height_beside_a_min_width() {
     assert!(p.update().unwrap(), "laid out again");
     assert!(p.height() < 40.0, "not 600 pixels tall: {}", p.height());
 }
+
+#[test]
+fn a_picture_in_an_inline_block_fits_its_column() {
+    // eBay's product pictures: `width: 100%`, in a link that's an inline block, in a narrow
+    // column; Blitz drew them at their own size, over the next column.
+    let png: &[u8] = include_bytes!("tests/red.png"); // 8 by 8
+    let html = r#"<body style="margin:0"><div style="width:4px;font-size:0;line-height:0"><a href="https://shop.example/1" style="display:inline-block"><img src="https://shop.example/1.png" style="width:100%;display:block"></a></div></body>"#;
+    let mut p = Page::new(html, 600, 1.0, false).unwrap();
+    p.give("https://shop.example/1.png", png.to_vec()).unwrap();
+    p.update().unwrap();
+    assert!(p.height() <= 6.0, "4 pixels wide, so 4 tall: {}", p.height());
+}
