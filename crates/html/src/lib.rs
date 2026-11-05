@@ -216,10 +216,17 @@ impl Page {
     pub fn paint(&mut self, top: f32, height: f32) -> Result<(u32, u32, Vec<u8>), Refused> {
         let px = |v: f32| (v * self.scale).round().clamp(1.0, 16_384.0) as u32;
         let (w, h) = (px(self.width as f32), px(height.max(1.0)));
-        let y = (top.max(0.0) * self.scale).round() as u32;
         let scale = f64::from(self.scale);
         let doc = &mut self.doc;
-        let pixels = guarded(|| render_to_buffer::<VelloCpuImageRenderer, _>(|s| blitz_paint::paint_scene(s, doc, scale, w, h, 0, y), w, h))?;
+        // `paint_scene`'s offsets move the drawing down the picture; the document's own scroll
+        // is what brings a part further down into it. Put back afterwards: hit tests count from
+        // the page's top.
+        let pixels = guarded(|| {
+            doc.set_viewport_scroll(blitz_dom::Point { x: 0.0, y: f64::from(top.max(0.0)) });
+            let px = render_to_buffer::<VelloCpuImageRenderer, _>(|s| blitz_paint::paint_scene(s, doc, scale, w, h, 0, 0), w, h);
+            doc.set_viewport_scroll(blitz_dom::Point { x: 0.0, y: 0.0 });
+            px
+        })?;
         Ok((w, h, pixels))
     }
 
