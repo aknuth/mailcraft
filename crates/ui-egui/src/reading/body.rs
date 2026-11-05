@@ -155,6 +155,12 @@ pub(super) fn rich_body(s: &Session, st: &mut UiState, ui: &mut Ui, key: &Messag
     let allowed = s.pictures_allowed();
     let mut shown: Vec<String> = Vec::new();
     let width = ui.available_width();
+    if st.blitz
+        && let Some(html) = p.html.as_deref()
+        && blitz::draw(s, st, ui, key, p, html, acts)
+    {
+        return;
+    }
     let mut body = Body { s, key, p, allowed, shown: &mut shown, acts, cells: None };
     if long_text::many_lines(p) {
         // Thousands of lines: laid out by what's in view.

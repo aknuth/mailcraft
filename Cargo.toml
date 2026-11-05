@@ -18,6 +18,7 @@ mailcraft-mime = { path = "crates/mime" }
 mailcraft-store = { path = "crates/store" }
 mailcraft-jmap = { path = "crates/jmap" }
 mailcraft-print = { path = "crates/print" }
+mailcraft-html = { path = "crates/html" }
 mailcraft-smime = { path = "crates/smime" }
 mailcraft-pgp = { path = "crates/pgp" }
 mailcraft-keys = { path = "crates/keys" }

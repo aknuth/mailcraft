@@ -336,6 +336,9 @@ pub struct UiState {
     /// Decoded web pictures, by address, and the frame each was last shown in (the oldest go
     /// when there are too many).
     web_pictures: HashMap<String, (Option<egui::TextureHandle>, u64)>,
+    /// PROTOTYPE: the open HTML message laid out by Blitz, when that's on ([`reading::blitz`]).
+    pub(crate) html_view: Option<reading::blitz::HtmlView>,
+    pub(crate) blitz: bool,
     pub toast: Option<(String, bool, f64)>,
     seen_notices: usize,
     scroll_to_focus: bool,
@@ -518,6 +521,8 @@ impl MailApp {
                 pictures: reading::Pictures::default(),
                 bodies: app::Bodies::default(),
                 web_pictures: HashMap::new(),
+                html_view: None,
+                blitz: reading::blitz::wanted(),
                 toast: None,
                 seen_notices: seen,
                 scroll_to_focus: false,

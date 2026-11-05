@@ -267,6 +267,10 @@ pub struct Parsed {
     /// The HTML body's columns, for mail laid out with tables (empty otherwise: `rich` flows).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layout: Vec<layout::Block>,
+    /// The HTML body as it came (at most [`HTML_MAX`] characters), for a renderer that lays it
+    /// out itself; `None` for mail without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
     /// Every picture the HTML body shows (`cid:` and web addresses).
     #[serde(default)]
     pub images: Vec<String>,
@@ -348,6 +352,10 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
     };
     let html = m.body_html(0).filter(|_| real_html).or(tnef_html.map(std::borrow::Cow::Borrowed));
     let tracking = html.as_ref().map(|h| trackers(h)).unwrap_or_default();
+    let source_html = html.as_ref().map(|h| match h.char_indices().nth(HTML_MAX) {
+        Some((i, _)) => h.get(..i).unwrap_or(h).to_string(),
+        None => h.to_string(),
+    });
     let mut hidden = None;
     let (rich, images, layout) = match &html {
         Some(h) => {
@@ -397,6 +405,7 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
         had_html,
         rich,
         layout,
+        html: source_html,
         images,
         attachments,
         hidden_words: hidden.as_ref().map_or(0, |(_, n)| *n),
