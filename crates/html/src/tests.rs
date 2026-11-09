@@ -269,6 +269,18 @@ fn an_inline_element_holding_a_block_is_split_around_it() {
 }
 
 #[test]
+fn an_xhtml_doctype_is_still_html() {
+    // Intuit's mail: an XHTML DOCTYPE and `xmlns="https://…"` (not the XHTML namespace). Parsed
+    // as XML, the head's title and style sheets were drawn as text and the sheets didn't apply.
+    let html = r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="https://www.w3.org/1999/xhtml" lang="en"><head><meta charset="utf-8" /><title>Intuit</title>
+<style type="text/css">.box { height: 20px; margin: 0 }</style></head>
+<body style="margin:0"><div class="box">a&nbsp;b</div></body></html>"#;
+    let p = Page::new(html, 600, 1.0, false).unwrap();
+    assert_eq!(p.height(), 20.0);
+}
+
+#[test]
 fn a_row_of_percentages_leaves_its_other_cells_their_least() {
     // Amazon's step tracker: a 50% bar, an 18 pixel dot, a 50% bar (Chrome: 141, 18, 141).
     let html = r##"<body style="margin:0"><table width="300" cellpadding="0" cellspacing="0" border="0"><tr>

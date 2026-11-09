@@ -150,7 +150,9 @@ impl Page {
             incremental: Some(false),
             ..Default::default()
         };
-        let doc = guarded(|| HtmlDocument::from_html(html, config))?;
+        // A mail's HTML part is text/html: parsed as HTML whatever its DOCTYPE, as browsers do (an
+        // XHTML DOCTYPE would make Blitz's sniffing parse it as XML).
+        let doc = guarded(|| HtmlDocument::from_html_without_sniffing(html, config))?;
         let d = guarded(|| depth(&doc))?;
         if d > MAX_DEPTH {
             return Err(Refused::TooDeep(d));
