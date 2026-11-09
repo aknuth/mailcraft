@@ -4386,7 +4386,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-html"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
