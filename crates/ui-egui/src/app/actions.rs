@@ -376,9 +376,9 @@ impl MailApp {
             }
             Action::Print | Action::ExportPdf if self.services.downloads() => {
                 let name = format!("{}.pdf", self.message_file_name());
-                match self.session.message_pdf() {
+                match self.message_pdf() {
                     Ok(b) => self.services.download(&name, &b),
-                    Err(e) => self.session.notice(e.to_string(), true),
+                    Err(e) => self.session.notice(e, true),
                 }
             }
             Action::SaveMessage if self.services.downloads() => {
@@ -419,7 +419,7 @@ impl MailApp {
             Action::Print if self.services.can_print() => {
                 // The system's print dialog, handed the message as a PDF.
                 let title = self.message_file_name();
-                match self.session.message_pdf().map_err(|e| e.to_string()).and_then(|b| self.services.print_pdf(&title, &b)) {
+                match self.message_pdf().and_then(|b| self.services.print_pdf(&title, &b)) {
                     Ok(()) => {}
                     Err(e) => self.session.notice(e, true),
                 }
@@ -428,18 +428,25 @@ impl MailApp {
                 // No print dialog to hand it to: the message as a PDF, saved where asked, then
                 // opened to print from the viewer.
                 let Some(path) = self.services.save_path(&format!("{}.pdf", self.message_file_name())) else { return };
-                match self.session.run("message.exportPdf", &json!({"path": path.to_string_lossy()})) {
-                    Ok(_) => match self.services.open_path(&path) {
+                match self.message_pdf().and_then(|b| std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))) {
+                    Ok(()) => match self.services.open_path(&path) {
                         Ok(()) => self.session.notice(tl!("Opened as a PDF: print it from the viewer"), false),
                         Err(e) => self.session.notice(tf!("The PDF couldn't be opened: {error}", error = e), true),
                     },
                     Err(e) => self.session.notice(e.to_string(), true),
                 }
             }
-            Action::ExportPdf | Action::SaveMessage => {
-                let (ext, id) = if matches!(a, Action::ExportPdf) { ("pdf", "message.exportPdf") } else { ("eml", "message.saveAs") };
-                if let Some(path) = self.services.save_path(&format!("{}.{ext}", self.message_file_name())) {
-                    match self.session.run(id, &json!({"path": path.to_string_lossy()})) {
+            Action::ExportPdf => {
+                if let Some(path) = self.services.save_path(&format!("{}.pdf", self.message_file_name())) {
+                    match self.message_pdf().and_then(|b| std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))) {
+                        Ok(()) => self.session.notice(tf!("Saved {path}", path = path.display()), false),
+                        Err(e) => self.session.notice(e, true),
+                    }
+                }
+            }
+            Action::SaveMessage => {
+                if let Some(path) = self.services.save_path(&format!("{}.eml", self.message_file_name())) {
+                    match self.session.run("message.saveAs", &json!({"path": path.to_string_lossy()})) {
                         Ok(_) => self.session.notice(tf!("Saved {path}", path = path.display()), false),
                         Err(e) => self.session.notice(e.to_string(), true),
                     }
@@ -695,6 +702,15 @@ impl MailApp {
     }
 
     /// A file name for the open message (its subject, made safe).
+    /// The open message as a PDF: as Blitz draws it in the pane when it does (PROTOTYPE), else
+    /// its text.
+    pub(crate) fn message_pdf(&self) -> Result<Vec<u8>, String> {
+        if let Some(made) = crate::reading::blitz::message_pdf(&self.session, &self.ui) {
+            return made;
+        }
+        self.session.message_pdf().map_err(|e| e.to_string())
+    }
+
     pub(crate) fn message_file_name(&self) -> String {
         let subject = self.session.reading.as_ref().and_then(|r| r.parsed.as_ref()).map(|p| p.subject.clone()).unwrap_or_default();
         let name = mailcraft_engine::mime::sanitize_filename(if subject.trim().is_empty() { "message" } else { &subject });

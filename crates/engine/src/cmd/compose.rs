@@ -348,6 +348,14 @@ impl Session {
 
     /// The open message as a PDF: subject, header, text and the names of its attachments.
     pub fn message_pdf(&self) -> Result<Vec<u8>, CmdError> {
+        let doc = self.message_doc()?;
+        let fonts = self.print_fonts.as_ref().map(|(r, b)| mailcraft_print::Fonts { regular: r, bold: b.as_deref() });
+        mailcraft_print::pdf(&doc, fonts).map_err(CmdError::Failed)
+    }
+
+    /// What goes on the open message's pages: subject, header (with the names of its
+    /// attachments) and text.
+    pub fn message_doc(&self) -> Result<mailcraft_print::Doc, CmdError> {
         let r = self.reading.as_ref().ok_or_else(|| CmdError::Disabled("open a message first".into()))?;
         let m = r.parsed.as_ref().ok_or_else(|| CmdError::Disabled("the message is still downloading".into()))?;
         let mut header = vec![("From".to_string(), m.from.to_string())];
@@ -364,9 +372,7 @@ impl Session {
         if !files.is_empty() {
             header.push(("Attachments".into(), files.join(", ")));
         }
-        let doc = mailcraft_print::Doc { title: m.subject.clone(), header, body: m.text.clone() };
-        let fonts = self.print_fonts.as_ref().map(|(r, b)| mailcraft_print::Fonts { regular: r, bold: b.as_deref() });
-        mailcraft_print::pdf(&doc, fonts).map_err(CmdError::Failed)
+        Ok(mailcraft_print::Doc { title: m.subject.clone(), header, body: m.text.clone() })
     }
 }
 

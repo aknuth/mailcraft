@@ -22,6 +22,7 @@ use serde_json::Value;
 pub use mailcraft_mime as mime;
 pub use mailcraft_model as model;
 pub use mailcraft_pgp as pgp;
+pub use mailcraft_print as print;
 pub use mailcraft_smime as smime;
 pub use mailcraft_store as store;
 pub use session::{

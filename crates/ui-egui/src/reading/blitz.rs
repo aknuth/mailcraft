@@ -209,23 +209,87 @@ fn answer(s: &Session, p: &mime::Parsed, view: &mut HtmlView, sh: &mut Shared) {
         if view.answered.contains(&url) {
             continue;
         }
-        let lower = url.to_ascii_lowercase();
-        let gift = if lower.starts_with("http://") || lower.starts_with("https://") {
-            if !allowed {
-                continue; // asked again once the user allows them
-            }
-            match s.pictures.get(&url) {
-                Some(mailcraft_engine::Picture::Ready(bytes)) => Some(bytes.to_vec()),
-                Some(mailcraft_engine::Picture::Loading) => continue,
-                // Only the pictures the message shows are fetched (not its style sheets).
-                _ => None,
-            }
-        } else {
-            mime::picture_attachment(p, &url).and_then(|i| s.attachment_bytes(i).ok())
-        };
+        let Some(gift) = gift(s, p, &url, allowed) else { continue };
         view.answered.insert(url.clone());
         sh.asks.gifts.push((url, gift));
     }
+}
+
+/// What the page is handed for `url`: a picture sent with the message, or a web picture once
+/// allowed and downloaded (`Some(None)`: refused; `None`: not yet, asked again later).
+fn gift(s: &Session, p: &mime::Parsed, url: &str, allowed: bool) -> Option<Option<Vec<u8>>> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        if !allowed {
+            return None; // asked again once the user allows them
+        }
+        match s.pictures.get(url) {
+            Some(mailcraft_engine::Picture::Ready(bytes)) => Some(Some(bytes.to_vec())),
+            Some(mailcraft_engine::Picture::Loading) => None,
+            // Only the pictures the message shows are fetched (not its style sheets).
+            _ => Some(None),
+        }
+    } else {
+        Some(mime::picture_attachment(p, url).and_then(|i| s.attachment_bytes(i).ok()))
+    }
+}
+
+/// CSS pixels across the paper: about a browser's on A4 (it shrinks a wider page to fit).
+const PRINT_WIDTH: u32 = 720;
+/// Pixels per CSS pixel on paper (about 215 dots per inch).
+const PRINT_SCALE: f32 = 2.0;
+
+/// The open message as a PDF, its HTML drawn as Blitz draws it in the pane (its styles, and the
+/// pictures shown there), laid out again at the paper's width on a thread with room on its
+/// stack; `None` when the pane doesn't draw it with Blitz.
+pub(crate) fn message_pdf(s: &Session, st: &UiState) -> Option<Result<Vec<u8>, String>> {
+    let view = st.html_view.as_ref()?;
+    let r = s.reading.as_ref().filter(|r| r.key == view.key)?;
+    let p = r.parsed.as_ref()?;
+    let html = p.html.clone()?;
+    let urls: Vec<String> = {
+        let sh = lock(&view.shared);
+        if sh.made.refused.is_some() || !sh.made.laid_out {
+            return None;
+        }
+        view.answered.iter().chain(sh.made.wanted.iter()).cloned().collect()
+    };
+    let allowed = s.pictures_allowed();
+    let gifts: HashMap<String, Vec<u8>> = urls.into_iter().filter_map(|u| gift(s, p, &u, allowed).flatten().map(|b| (u, b))).collect();
+    let doc = match s.message_doc() {
+        Ok(d) => d,
+        Err(e) => return Some(Err(e.to_string())),
+    };
+    let fonts = s.print_fonts.clone();
+    let run = move || -> Result<Vec<u8>, String> {
+        let mut page = Page::new(&html, PRINT_WIDTH, PRINT_SCALE, false).map_err(|e| e.to_string())?;
+        // Pictures (and what they bring in) are handed over as asked for; the rest is refused.
+        for _ in 0..4 {
+            let wanted = page.wanted();
+            if wanted.is_empty() {
+                break;
+            }
+            for url in wanted {
+                let _ = match gifts.get(&url) {
+                    Some(b) => page.give(&url, b.clone()),
+                    None => page.refuse(&url),
+                };
+            }
+            page.update().map_err(|e| e.to_string())?;
+        }
+        let height = page.height();
+        let mut paint = |top: f32, h: f32| page.paint(top, h).ok();
+        let fonts = fonts.as_ref().map(|(r, b)| mailcraft_engine::print::Fonts { regular: r, bold: b.as_deref() });
+        let drawn = mailcraft_engine::print::Drawn { width: PRINT_WIDTH as f32, height, paint: &mut paint };
+        mailcraft_engine::print::pdf_with(&doc, fonts, Some(drawn))
+    };
+    let made = std::thread::Builder::new()
+        .name("print-page".into())
+        .stack_size(8 << 20)
+        .spawn(run)
+        .map_err(|e| e.to_string())
+        .and_then(|h| h.join().map_err(|_| "the message couldn't be drawn for printing".to_string()));
+    Some(made.and_then(|r| r))
 }
 
 /// The pointer on the page: a press, a double or triple click, Shift+click and a drag.

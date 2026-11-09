@@ -10,6 +10,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+mod drawn;
+pub use drawn::Drawn;
+
 /// What goes on the pages.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Doc {
@@ -214,6 +217,48 @@ fn wrap(face: &Face<'_>, text: &str, size: f32, width: f32) -> Vec<String> {
     out
 }
 
+/// The drawn body placed from `y` down, a page's room at a time (each strip painted then, and
+/// ended between lines where it can be); `true` when it didn't all fit in [`MAX_PAGES`].
+fn place_drawn(d: Drawn<'_>, width: f32, pages: &mut Vec<Vec<Placed>>, strips: &mut Vec<Vec<drawn::Strip>>, y: &mut f32) -> bool {
+    if !(d.width.is_finite() && d.height.is_finite()) || d.width < 1.0 || d.height <= 0.0 {
+        return false;
+    }
+    // Points per CSS pixel: the page's width across the text's.
+    let k = width / d.width;
+    let bottom = MARGIN + 20.0;
+    let mut top = 0.0f32;
+    while top < d.height - 0.5 {
+        let room = *y - bottom;
+        if room < 36.0 {
+            if pages.len() >= MAX_PAGES {
+                return true;
+            }
+            pages.push(Vec::new());
+            *y = PAGE_H - MARGIN;
+            continue;
+        }
+        let want = (room / k).min(d.height - top);
+        let Some((px_w, px_h, rgba)) = (d.paint)(top, want) else { return false };
+        if px_w == 0 || px_h == 0 {
+            return false;
+        }
+        let last = top + want >= d.height - 0.5;
+        let keep = if last { px_h } else { drawn::rows_to_keep(px_w, px_h, &rgba) }.max(1);
+        let used = want * keep as f32 / px_h as f32;
+        let h = used * k;
+        *y -= h;
+        strips.resize_with(pages.len(), Vec::new);
+        if let Some(on) = strips.last_mut() {
+            on.push(drawn::Strip { x: MARGIN, y: *y, w: width, h, px_w, px_h: keep, data: compress(&drawn::rgb_on_white(px_w, keep, &rgba)) });
+        }
+        top += used;
+        if !last {
+            *y = bottom; // the page is full: the next strip starts a new one
+        }
+    }
+    false
+}
+
 fn compress(data: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
 }
@@ -237,6 +282,12 @@ fn info_string(s: &str) -> String {
 
 /// The document as PDF bytes.
 pub fn pdf(doc: &Doc, fonts: Option<Fonts<'_>>) -> Result<Vec<u8>, String> {
+    pdf_with(doc, fonts, None)
+}
+
+/// The document as PDF bytes, its body drawn (an HTML message as a browser shows it) in place of
+/// its text when it's given.
+pub fn pdf_with(doc: &Doc, fonts: Option<Fonts<'_>>, drawn: Option<Drawn<'_>>) -> Result<Vec<u8>, String> {
     let mut faces: Vec<Face<'_>> = match fonts.and_then(|f| Face::parse(f.regular).map(|r| (r, f.bold))) {
         Some((regular, bold)) => {
             let bold = bold.and_then(Face::parse);
@@ -290,12 +341,19 @@ pub fn pdf(doc: &Doc, fonts: Option<Fonts<'_>>) -> Result<Vec<u8>, String> {
     let rule_page = pages.len() - 1;
     let rule_y = y;
     y -= 6.0;
-    for line in wrap(&faces[0], &doc.body, 11.0, width) {
-        if !place(&mut pages, &mut y, 0, 11.0, 14.5, MARGIN, line) {
-            truncated = true;
-            break;
+    let mut strips: Vec<Vec<drawn::Strip>> = Vec::new();
+    match drawn {
+        Some(d) => truncated = place_drawn(d, width, &mut pages, &mut strips, &mut y),
+        None => {
+            for line in wrap(&faces[0], &doc.body, 11.0, width) {
+                if !place(&mut pages, &mut y, 0, 11.0, 14.5, MARGIN, line) {
+                    truncated = true;
+                    break;
+                }
+            }
         }
     }
+    strips.resize_with(pages.len(), Vec::new);
     if truncated {
         place(&mut pages, &mut y, 1, 11.0, 18.0, MARGIN, "(The rest of the message didn't fit in this document.)".into());
     }
@@ -305,6 +363,9 @@ pub fn pdf(doc: &Doc, fonts: Option<Fonts<'_>>) -> Result<Vec<u8>, String> {
     let mut contents: Vec<String> = Vec::with_capacity(n);
     for (i, page) in pages.iter().enumerate() {
         let mut c = String::new();
+        for (j, st) in strips.get(i).into_iter().flatten().enumerate() {
+            let _ = writeln!(c, "q {:.2} 0 0 {:.2} {:.2} {:.2} cm /Im{} Do Q", st.w, st.h, st.x, st.y, j + 1);
+        }
         if i == rule_page {
             let _ = writeln!(c, "0.75 G 0.6 w {MARGIN:.2} {rule_y:.2} m {:.2} {rule_y:.2} l S 0 G", PAGE_W - MARGIN);
         }
@@ -402,14 +463,29 @@ pub fn pdf(doc: &Doc, fonts: Option<Fonts<'_>>) -> Result<Vec<u8>, String> {
     }
     let fonts_dict: String = font_refs.iter().enumerate().map(|(i, r)| format!("/F{} {r} 0 R", i + 1)).collect::<Vec<_>>().join(" ");
     let mut kids = Vec::new();
-    for c in &contents {
+    for (i, c) in contents.iter().enumerate() {
+        let mut pictures = String::new();
+        for (j, st) in strips.get_mut(i).into_iter().flatten().enumerate() {
+            let data = std::mem::take(&mut st.data);
+            let mut s = format!(
+                "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n",
+                st.px_w,
+                st.px_h,
+                data.len()
+            )
+            .into_bytes();
+            s.extend_from_slice(&data);
+            s.extend_from_slice(b"\nendstream");
+            let _ = write!(pictures, " /Im{} {} 0 R", j + 1, add(&mut objects, s));
+        }
+        let pictures = if pictures.is_empty() { String::new() } else { format!(" /XObject <<{pictures} >>") };
         let packed = compress(c.as_bytes());
         let mut s = format!("<< /Length {} /Filter /FlateDecode >>\nstream\n", packed.len()).into_bytes();
         s.extend_from_slice(&packed);
         s.extend_from_slice(b"\nendstream");
         let content_ref = add(&mut objects, s);
         let page = format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W:.2} {PAGE_H:.2}] /Resources << /Font << {fonts_dict} >> >> /Contents {content_ref} 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W:.2} {PAGE_H:.2}] /Resources << /Font << {fonts_dict} >>{pictures} >> /Contents {content_ref} 0 R >>"
         );
         kids.push(add(&mut objects, page.into_bytes()));
     }
@@ -481,6 +557,32 @@ mod tests {
         assert!(count >= 8, "{count} pages");
         assert!(text.contains("/Title (Storyboard \\(v2\\) review)"));
         objects_are_where_the_xref_says(&p);
+    }
+
+    /// A drawn body goes on as pictures, a page's worth each, the whole of it.
+    #[test]
+    fn a_drawn_body_fills_pages_with_pictures() {
+        let mut asked: Vec<(f32, f32)> = Vec::new();
+        let mut paint = |top: f32, height: f32| {
+            asked.push((top, height));
+            let (w, h) = (200u32, (height * 2.0).round() as u32);
+            // Ink, with a blank row every 40.
+            let px: Vec<u8> = (0..h).flat_map(|r| std::iter::repeat_n(if r % 40 == 39 { 255 } else { 0 }, (w * 4) as usize)).collect();
+            Some((w, h, px))
+        };
+        let p = pdf_with(&doc(""), None, Some(Drawn { width: 100.0, height: 3_000.0, paint: &mut paint })).unwrap();
+        let text = String::from_utf8_lossy(&p);
+        let count: usize = text.split("/Count ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok()).unwrap();
+        // 483 points across 100 CSS pixels: 3000 of them are about 14,500 points, 20 pages.
+        assert!((19..=22).contains(&count), "{count} pages");
+        assert_eq!(text.matches("/Subtype /Image").count(), asked.len());
+        assert!(text.contains("/XObject << /Im1"));
+        // One strip after the other, the whole height.
+        assert_eq!(asked.first().map(|a| a.0), Some(0.0));
+        objects_are_where_the_xref_says(&p);
+        // Nothing painted: the header only.
+        let p = pdf_with(&doc(""), None, Some(Drawn { width: 100.0, height: 500.0, paint: &mut |_, _| None })).unwrap();
+        assert!(!String::from_utf8_lossy(&p).contains("/Image"));
     }
 
     #[test]
