@@ -10,13 +10,14 @@ description = "MailCraft: HTML mail laid out and drawn by a browser's CSS engine
 workspace = true
 
 [dependencies]
-# Blitz: Stylo (Servo's CSS engine), Taffy (layout) and Parley (text), without a script engine
-# or a network client; pictures come only through `Page::give`. Stylo and its parsers are
-# MPL-2.0 (file by file); Blitz itself is MIT OR Apache-2.0.
-blitz-html = "=0.3.0-beta.4"
-blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "system-fonts", "complex-scripts", "text-transform-icu"] }
-blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
-blitz-traits = "=0.3.0-beta.4"
+# Blitz from MailCraft's branch of it (aknuth/blitz `mailcraft`: beta.4 and the fixes its
+# PATCHES.md lists), all at one revision. Blitz: Stylo (Servo's CSS engine), Taffy (layout) and
+# Parley (text), without a script engine or a network client; pictures come only through
+# `Page::give`. Stylo and its parsers are MPL-2.0 (file by file); Blitz is MIT OR Apache-2.0.
+blitz-html = { git = "https://github.com/aknuth/blitz", rev = "0a69da55407cc93280679dd0cbac8960fc6e2ac3" }
+blitz-dom = { git = "https://github.com/aknuth/blitz", rev = "0a69da55407cc93280679dd0cbac8960fc6e2ac3", default-features = false, features = ["svg", "system-fonts", "complex-scripts", "text-transform-icu"] }
+blitz-paint = { git = "https://github.com/aknuth/blitz", rev = "0a69da55407cc93280679dd0cbac8960fc6e2ac3", default-features = false, features = ["svg"] }
+blitz-traits = { git = "https://github.com/aknuth/blitz", rev = "0a69da55407cc93280679dd0cbac8960fc6e2ac3" }
 anyrender = "0.14"
 anyrender_vello_cpu = "0.18"
 bytes = "1"
