@@ -21,6 +21,7 @@ on GitHub.
 - A newsletter's buttons are drawn as buttons, with their round corners, and Outlook's at the size its copy gives them; columns that set no width are as wide as what they hold, as in a browser.
 
 ### Changed
+- On Linux, **Print** opens the desktop's print dialog (through its print portal), where the printer and its settings are chosen. Without a portal, and on Windows and macOS, the message still opens as a PDF to print from the viewer.
 - Outlook data files (`.pst`) are read and written by MailCraft's own code, written from Microsoft's published specification, in place of a third-party library. Files import as before, and those MailCraft makes or adds to open in Outlook.
 
 ### Fixed

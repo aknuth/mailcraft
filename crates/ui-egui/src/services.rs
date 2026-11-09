@@ -119,6 +119,15 @@ pub trait Services {
     fn save_path(&mut self, suggested: &str) -> Option<PathBuf>;
     /// Open a file with the system's default app.
     fn open_path(&mut self, path: &std::path::Path) -> Result<(), String>;
+    /// The system has a print dialog a PDF can be handed to (the desktop portal's on Linux).
+    /// Without one, Print saves the message as a PDF and opens it, to print from the viewer.
+    fn can_print(&mut self) -> bool {
+        false
+    }
+    /// Print a PDF with the system's print dialog (where [`Services::can_print`]).
+    fn print_pdf(&mut self, _title: &str, _pdf: &[u8]) -> Result<(), String> {
+        Err("this system has no print dialog MailCraft can use".into())
+    }
     /// Where a build that updates itself is with the next version. The default: nowhere.
     fn update_state(&mut self) -> UpdateState {
         UpdateState::None

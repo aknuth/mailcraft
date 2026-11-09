@@ -6,6 +6,7 @@ use super::*;
 
 pub(crate) mod boot;
 mod lanes;
+mod print;
 pub(crate) mod start;
 pub(crate) mod state_writer;
 pub(crate) mod window_frame;
@@ -46,6 +47,9 @@ pub(crate) struct Desktop {
     /// The folder of the last file picked or saved: the next file dialog opens there (attaching
     /// several files from one folder, saving attachments beside each other), as figcraft's do.
     pub(crate) last_dir: Option<PathBuf>,
+    /// The desktop has a print dialog MailCraft can hand a PDF to (asked once, when first
+    /// printing).
+    pub(crate) can_print: Option<bool>,
     /// The threads slow work runs on (decoding pictures).
     pub(crate) lanes: lanes::Lanes,
     /// The window draws its own title bar (Windows, issue #22), and what keeps it borderless.
@@ -127,6 +131,12 @@ impl Services for Desktop {
     }
     fn open_path(&mut self, path: &Path) -> Result<(), String> {
         shell_open(path.as_os_str())
+    }
+    fn can_print(&mut self) -> bool {
+        *self.can_print.get_or_insert_with(print::available)
+    }
+    fn print_pdf(&mut self, title: &str, pdf: &[u8]) -> Result<(), String> {
+        print::print(title, pdf)
     }
     fn update_state(&mut self) -> mailcraft_ui_egui::UpdateState {
         self.updater.as_ref().map(self_update::Updater::state).unwrap_or_default()
