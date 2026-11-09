@@ -1640,7 +1640,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.9",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -8059,8 +8059,7 @@ dependencies = [
 [[package]]
 name = "taffy"
 version = "0.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f7bd2d97198df05186f93a3a3c306845f40e8b3c22bf9279cdd7e5cf5fea7d"
+source = "git+https://github.com/aknuth/taffy.git?rev=ed5a6aabc8ca8d0252437dc80b766f4e98d20a68#ed5a6aabc8ca8d0252437dc80b766f4e98d20a68"
 dependencies = [
  "serde",
  "slotmap",

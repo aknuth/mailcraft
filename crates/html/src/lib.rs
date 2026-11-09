@@ -176,7 +176,7 @@ impl Page {
             for _ in 0..ROUNDS {
                 let split = split::split(doc);
                 let wrapped = anonymous::wrap(doc);
-                if !(shrink::fix(doc) | wrapped | split) {
+                if !(wrapped | split) {
                     break;
                 }
                 doc.resolve(0.0);
@@ -320,7 +320,6 @@ impl Page {
 
 mod anonymous;
 mod selecting;
-mod shrink;
 mod split;
 #[cfg(test)]
 mod tests;

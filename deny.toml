@@ -23,6 +23,7 @@ unknown-git = "deny"
 unknown-registry = "deny"
 allow-git = [
     "https://github.com/aknuth/blitz",
+    "https://github.com/aknuth/taffy",
     "https://github.com/storytold/craft-libs",
     "https://github.com/storytold/egui",
     "https://github.com/storytold/winit",
