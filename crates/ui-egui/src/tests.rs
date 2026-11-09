@@ -153,15 +153,26 @@ pub(crate) fn tour() {
             Dialog::OpenSharedCalendar { email: "ana@contoso.example".into(), error: Some("no access".into()) },
             Dialog::SubscribeCalendar { url: "webcal://holidays.example/de.ics".into(), name: String::new(), error: Some("HTTP 404".into()) },
             Dialog::AddSharedMailbox { account: "sample".into(), address: "sales@contoso.example".into(), error: Some("already open".into()) },
-            Dialog::Dav(crate::dialogs::DavForm {
+            Dialog::Dav(Box::new(crate::dialogs::DavForm {
                 account: "sample".into(),
+                email: "riley@studio.example".into(),
+                mail_user: "riley@studio.example".into(),
+                found_carddav: "https://dav.studio.example/addressbooks/riley/".into(),
                 caldav: "https://dav.example.com/calendars/riley/default".into(),
                 own: true,
                 username: "riley@studio.example".into(),
                 kept: Some("riley@studio.example".into()),
                 error: Some("no calendars were found".into()),
                 ..Default::default()
-            }),
+            })),
+            Dialog::Dav(Box::new(crate::dialogs::DavForm {
+                account: "sample".into(),
+                email: "riley@studio.example".into(),
+                mail_user: "riley".into(),
+                username: "riley".into(),
+                found_caldav: "https://dav.studio.example/calendars/riley/".into(),
+                ..Default::default()
+            })),
             Dialog::RemoveAccount { account: "sample".into(), email: "x".into() },
             Dialog::MailboxClosed {
                 account: "sample".into(),

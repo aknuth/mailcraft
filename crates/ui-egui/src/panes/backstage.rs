@@ -401,7 +401,7 @@ fn info(s: &Session, t: &Tokens, has_files: bool, ui: &mut Ui, b: &mut Backstage
             };
             setting_row(ui, t, false, name(t, tl!("Calendars and contacts")), Some(note(t, &about)), |ui| {
                 if ui.button(tl!("Calendar server…")).clicked() {
-                    acts.push(Action::Dialog(Dialog::Dav(crate::dialogs::DavForm::of(&a.config))));
+                    acts.push(Action::Dialog(Dialog::Dav(Box::new(crate::dialogs::DavForm::of(&a.config, s.pim.get(&id))))));
                 }
             });
         }

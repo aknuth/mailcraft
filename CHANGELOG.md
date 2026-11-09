@@ -21,6 +21,7 @@ on GitHub.
 - A newsletter's buttons are drawn as buttons, with their round corners, and Outlook's at the size its copy gives them; columns that set no width are as wide as what they hold, as in a browser.
 
 ### Changed
+- Calendars and contacts are also looked for on the mail domain's `dav.` server (`https://dav.example.com/.well-known/caldav`), as self-run servers often have them, and again each time MailCraft starts when none were found. **File › Info › Account settings › Calendar server…** shows where they were found and the address and user name they sign in with.
 - Outlook data files (`.pst`) are read and written by MailCraft's own code, written from Microsoft's published specification, in place of a third-party library. Files import as before, and those MailCraft makes or adds to open in Outlook.
 
 ### Fixed

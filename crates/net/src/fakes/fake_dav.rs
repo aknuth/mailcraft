@@ -256,7 +256,7 @@ mod tests {
     /// Found from the address, as an account with nothing given by hand. The tests' syncs never
     /// look for anything there, out on the network: their calendars and contacts are given, or
     /// were looked for already (`dav_checked`), the contacts none.
-    const AT: Where<'static> = Where { email: USER, username: "", imap_host: "imap.example", caldav: None, carddav: None };
+    const AT: Where<'static> = Where { email: USER, username: "", imap_host: "imap.example", caldav: None, carddav: None, look_again: false };
 
     fn event(uid: &str, summary: &str, start: i64) -> CalEvent {
         CalEvent { uid: uid.into(), summary: summary.into(), start, end: start + 3600, ..Default::default() }
@@ -430,6 +430,16 @@ mod tests {
         let out = sync(&dav, &Where { caldav: Some(&wrong), ..at }, &pim, 100, Zone::UTC).unwrap();
         assert!(out.caldav_home.is_none() && out.errors.iter().any(|e| e.contains("no calendars")), "{:?}", out.errors);
         assert!(matches!(sync(&Dav::new(USER, "nope"), &at, &pim, 100, Zone::UTC), Err(crate::NetError::Auth(_))));
+
+        // None found an hour ago: not looked for again until a day on, unless MailCraft has just
+        // started (a newer one may look in more places).
+        pim.caldav_home = Some(String::new());
+        pim.carddav_home = Some(String::new());
+        pim.dav_checked = Some(100);
+        let out = sync(&dav, &at, &pim, 3_700, Zone::UTC).unwrap();
+        assert!(out.caldav_home.is_none() && out.carddav_home.is_none());
+        let out = sync(&dav, &Where { look_again: true, ..at }, &pim, 3_700, Zone::UTC).unwrap();
+        assert_eq!((out.caldav_home.as_deref(), out.carddav_home.as_deref()), (Some(cal_home.as_str()), Some(book_home.as_str())));
     }
 
     /// From the review: nothing goes to a server other than the one the homes are on (items

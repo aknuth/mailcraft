@@ -145,7 +145,7 @@ pub enum Dialog {
         error: Option<String>,
     },
     /// Where an account's calendars and contacts are, given by hand (issue #7).
-    Dav(dav::DavForm),
+    Dav(Box<dav::DavForm>),
     /// The password of a certificate file being imported (S/MIME): from `path`, or `data` as the
     /// browser's picker gives it; neither, the one the browser keeps, unlocked.
     Certificate {

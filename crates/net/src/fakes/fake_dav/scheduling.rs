@@ -9,7 +9,7 @@ use mailcraft_model::zone::Zone;
 use super::*;
 use crate::dav::{Dav, Where, sync};
 
-const AT: Where<'static> = Where { email: USER, username: "", imap_host: "imap.example", caldav: None, carddav: None };
+const AT: Where<'static> = Where { email: USER, username: "", imap_host: "imap.example", caldav: None, carddav: None, look_again: false };
 
 fn person(email: &str, partstat: &str) -> Attendee {
     Attendee { email: email.into(), partstat: partstat.into(), ..Default::default() }

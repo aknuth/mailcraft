@@ -1210,6 +1210,7 @@ month	May	mai
 	Calendar server (CalDAV)	Serveur de calendrier (CalDAV)
 	Contacts server (CardDAV)	Serveur de contacts (CardDAV)
 	Calendars at {url}	Calendriers sur {url}
+	Contacts at {url}	Contacts sur {url}
 	Calendars come from a server of their own: give its address and sign-in	Les calendriers sont sur un serveur à part : indiquez son adresse et l’identification
 	Looked for when the account syncs	Recherché lors de la synchronisation du compte
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	MailCraft cherche vos calendriers et contacts sur le serveur de votre fournisseur de messagerie. S’il ne les trouve pas, indiquez les adresses données dans l’aide de votre fournisseur ; laissez un champ vide pour qu’il continue à les chercher.

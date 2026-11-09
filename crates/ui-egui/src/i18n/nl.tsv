@@ -1205,6 +1205,7 @@ month	May	mei
 	Calendar server (CalDAV)	Agendaserver (CalDAV)
 	Contacts server (CardDAV)	Contactenserver (CardDAV)
 	Calendars at {url}	Agenda's op {url}
+	Contacts at {url}	Contactpersonen op {url}
 	Calendars come from a server of their own: give its address and sign-in	De agenda's staan op een eigen server: geef het adres en de aanmelding op
 	Looked for when the account syncs	Wordt gezocht als het account synchroniseert
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	MailCraft zoekt uw agenda's en contactpersonen op de server van uw e-mailprovider. Als ze niet gevonden worden, geef dan de adressen uit de helppagina's van uw provider op; laat er een leeg om ernaar te blijven zoeken.

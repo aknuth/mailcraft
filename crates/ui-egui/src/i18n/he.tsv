@@ -1205,6 +1205,7 @@ month	May	מאי
 	Calendar server (CalDAV)	שרת לוח שנה (CalDAV)
 	Contacts server (CardDAV)	שרת אנשי קשר (CardDAV)
 	Calendars at {url}	לוחות שנה בכתובת {url}
+	Contacts at {url}	אנשי קשר בכתובת {url}
 	Calendars come from a server of their own: give its address and sign-in	לוחות השנה נמצאים בשרת נפרד: יש להזין את כתובתו ואת פרטי הכניסה
 	Looked for when the account syncs	יחופש כשהחשבון מסתנכרן
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	MailCraft מחפש את לוחות השנה ואנשי הקשר שלך בשרת של ספק הדואר. אם הם לא נמצאים, יש להזין את הכתובות מדפי העזרה של הספק; שדה שיישאר ריק ימשיך להיות מחופש.

@@ -1210,6 +1210,7 @@ month	May	Mayıs
 	Calendar server (CalDAV)	Takvim sunucusu (CalDAV)
 	Contacts server (CardDAV)	Kişi sunucusu (CardDAV)
 	Calendars at {url}	{url} adresindeki takvimler
+	Contacts at {url}	{url} adresindeki kişiler
 	Calendars come from a server of their own: give its address and sign-in	Takvimler kendi sunucularından gelir: adresini ve oturum açma bilgilerini girin
 	Looked for when the account syncs	Hesap eşitlenirken aranır
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	MailCraft, takvimlerinizi ve kişilerinizi posta sağlayıcınızın sunucusunda arar. Bulamazsa, sağlayıcınızın yardım sayfalarındaki adresleri girin; aramaya devam etmesi için birini boş bırakın.
