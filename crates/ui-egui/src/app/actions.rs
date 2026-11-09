@@ -416,8 +416,17 @@ impl MailApp {
             }
             Action::InsertPicture if self.services.pick_later("picture") => {}
             Action::AttachFiles if self.services.pick_later("attach") => {}
+            Action::Print if self.services.can_print() => {
+                // The system's print dialog, handed the message as a PDF.
+                let title = self.message_file_name();
+                match self.session.message_pdf().map_err(|e| e.to_string()).and_then(|b| self.services.print_pdf(&title, &b)) {
+                    Ok(()) => {}
+                    Err(e) => self.session.notice(e, true),
+                }
+            }
             Action::Print => {
-                // The message as a PDF, saved where asked, then opened to print from the viewer.
+                // No print dialog to hand it to: the message as a PDF, saved where asked, then
+                // opened to print from the viewer.
                 let Some(path) = self.services.save_path(&format!("{}.pdf", self.message_file_name())) else { return };
                 match self.session.run("message.exportPdf", &json!({"path": path.to_string_lossy()})) {
                     Ok(_) => match self.services.open_path(&path) {

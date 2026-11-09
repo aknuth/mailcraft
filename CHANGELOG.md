@@ -22,6 +22,7 @@ on GitHub.
 
 ### Changed
 - Calendars and contacts are also looked for on the mail domain's `dav.` server (`https://dav.example.com/.well-known/caldav`), as self-run servers often have them, and again each time MailCraft starts when none were found. **File › Info › Account settings › Calendar server…** shows where they were found and the address and user name they sign in with.
+- On Linux, **Print** opens the desktop's print dialog (through its print portal), where the printer and its settings are chosen. Without a portal, and on Windows and macOS, the message still opens as a PDF to print from the viewer.
 - Outlook data files (`.pst`) are read and written by MailCraft's own code, written from Microsoft's published specification, in place of a third-party library. Files import as before, and those MailCraft makes or adds to open in Outlook.
 
 ### Fixed
