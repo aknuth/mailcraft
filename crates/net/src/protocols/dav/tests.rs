@@ -153,3 +153,26 @@ fn calendars_owned_by_someone_else_are_told_apart() {
     let mut junk = multistatus(r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>%%%</d:href></d:response></d:multistatus>"#);
     mark_foreign(&mut junk, "not a url", "");
 }
+
+/// sabre/dav (Baikal, Nextcloud's base) puts a calendar shared with the user in their home with
+/// the user as its `owner`: whose it is, is the organizer of its sharing (`invite`), and it's
+/// `shared` (the user's own, shared with others, is `shared-owner`). Told apart, and named.
+#[test]
+fn a_calendar_shared_with_the_user_is_named_by_its_owner() {
+    let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">
+<d:response><d:href>/calendars/riley@example.com/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:owner><d:href>/principals/riley@example.com/</d:href></d:owner></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+<d:response><d:href>/calendars/riley@example.com/default/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><cal:calendar/><cs:shared-owner/></d:resourcetype><d:displayname>Calendar</d:displayname><d:owner><d:href>/principals/riley@example.com/</d:href></d:owner><cs:invite><cs:organizer><d:href>/principals/riley@example.com</d:href></cs:organizer></cs:invite></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+<d:response><d:href>/calendars/riley@example.com/31283b92/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><cal:calendar/><cs:shared/></d:resourcetype><d:displayname>Calendar</d:displayname><d:owner><d:href>/principals/riley@example.com/</d:href></d:owner><cs:invite><cs:organizer><d:href>/principals/accounting%40example.com</d:href></cs:organizer><cs:user><cs:invite-accepted/><cs:access><cs:read/></cs:access><d:href>mailto:riley@example.com</d:href><cs:common-name>riley</cs:common-name></cs:user></cs:invite></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>"#;
+    let at = "https://dav.example.com/calendars/riley@example.com/";
+    let mut items = multistatus(xml);
+    mark_foreign(&mut items, at, at);
+    assert_eq!(items.iter().map(|i| i.foreign).collect::<Vec<_>>(), [false, false, true]);
+    assert_eq!(items[2].owner.as_deref(), Some("accounting@example.com"));
+    assert_eq!(items[1].owner, None);
+    assert_eq!(syncing::calendar_name(&items[1]), "Calendar");
+    assert_eq!(syncing::calendar_name(&items[2]), "Calendar (accounting@example.com)");
+    // A name that says whose it is already isn't said twice.
+    items[2].props.insert("displayname".into(), "Accounting@example.com's calendar".into());
+    assert_eq!(syncing::calendar_name(&items[2]), "Accounting@example.com's calendar");
+}

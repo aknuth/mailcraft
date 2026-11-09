@@ -26,6 +26,7 @@ on GitHub.
 - Outlook data files (`.pst`) are read and written by MailCraft's own code, written from Microsoft's published specification, in place of a third-party library. Files import as before, and those MailCraft makes or adds to open in Outlook.
 
 ### Fixed
+- A calendar someone shares with you on a sabre/dav server (Baïkal and others) is shown as theirs, with their name after its own (`Calendar (accounting@example.com)`), and new events don't go there by themselves; it was taken for one of yours, and two calendars called Calendar couldn't be told apart.
 - On Windows, maximizing and restoring MailCraft are smooth: they animate as any window's do, the taskbar no longer blinks and the window no longer flashes a blurred picture of itself.
 - On Windows, all text in MailCraft is sharp again: the window's own title bar had the picture squeezed by one row of pixels, which softened every line from top to bottom. A stray black line along the top of the window is gone too.
 - Removing an account while its `.pst` import was still writing could leave a new account added with the same id writing into the removed account's kept data file. The two now never share a file.
