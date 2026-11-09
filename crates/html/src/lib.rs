@@ -113,8 +113,6 @@ fn depth(doc: &BaseDocument) -> usize {
 /// Passes of the fixes for what Blitz doesn't do yet, at most (each after laying out again).
 const ROUNDS: usize = 4;
 
-const BASE: &str = "mailcraft-message:/";
-
 fn style_sheets(doc: &BaseDocument) -> Vec<String> {
     let mut found = Vec::new();
     let mut stack = vec![doc.root_node().id];
@@ -147,18 +145,12 @@ impl Page {
         let config = DocumentConfig {
             viewport: Some(viewport(width, scale, dark)),
             net_provider: Some(Arc::new(Collector(asked.clone()))),
-            // A relative address has nothing to resolve against in a mail (Blitz fails on one
-            // without a base); this base makes it one nothing is ever given for.
-            base_url: Some(BASE.to_string()),
             // Each layout builds every box again: the anonymous table boxes move children Blitz
             // had left out (and so never built); a mail is laid out a few times, not each frame.
             incremental: Some(false),
             ..Default::default()
         };
-        let mut doc = guarded(|| HtmlDocument::from_html(html, config))?;
-        if let Some(sheet) = guarded(|| hints::sheet(&doc))? {
-            guarded(|| doc.add_user_agent_stylesheet(sheet))?;
-        }
+        let doc = guarded(|| HtmlDocument::from_html(html, config))?;
         let d = guarded(|| depth(&doc))?;
         if d > MAX_DEPTH {
             return Err(Refused::TooDeep(d));
@@ -330,7 +322,6 @@ impl Page {
 mod anonymous;
 mod columns;
 mod heights;
-mod hints;
 mod replaced;
 mod selecting;
 mod shrink;

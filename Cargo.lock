@@ -758,7 +758,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3#0a69da55407cc93280679dd0cbac8960fc6e2ac3"
+source = "git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef#30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -767,7 +767,7 @@ dependencies = [
  "color",
  "cssparser",
  "cursor-icon",
- "debug_timer 0.1.3 (git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3)",
+ "debug_timer 0.1.3 (git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef)",
  "euclid",
  "html-escape",
  "icu_casemap",
@@ -805,7 +805,7 @@ dependencies = [
 [[package]]
 name = "blitz-html"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3#0a69da55407cc93280679dd0cbac8960fc6e2ac3"
+source = "git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef#30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef"
 dependencies = [
  "blitz-dom",
  "blitz-traits",
@@ -816,7 +816,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3#0a69da55407cc93280679dd0cbac8960fc6e2ac3"
+source = "git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef#30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -838,7 +838,7 @@ dependencies = [
 [[package]]
 name = "blitz-traits"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3#0a69da55407cc93280679dd0cbac8960fc6e2ac3"
+source = "git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef#30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.2",
@@ -1794,7 +1794,7 @@ checksum = "da220af51a1a335e9a930beaaef53d261e41ea9eecfb3d973a3ddae1a7284b9c"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3#0a69da55407cc93280679dd0cbac8960fc6e2ac3"
+source = "git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef#30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef"
 
 [[package]]
 name = "der"
@@ -7934,7 +7934,7 @@ dependencies = [
 [[package]]
 name = "stylo_taffy"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=0a69da55407cc93280679dd0cbac8960fc6e2ac3#0a69da55407cc93280679dd0cbac8960fc6e2ac3"
+source = "git+https://github.com/aknuth/blitz?rev=30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef#30bcdd4f428218fe0847c8ec9f2bf401a6e3eaef"
 dependencies = [
  "bitflags 2.13.2",
  "stylo",

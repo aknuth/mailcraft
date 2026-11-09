@@ -107,11 +107,13 @@ fn links_far_down_after_painting() {
 fn a_web_style_sheet_does_not_hold_it_up() {
     // Blitz waits for the style sheets linked in `<head>`; a mail's are never loaded.
     let html = r#"<html><head><link href="https://fonts.example/css2?family=Lato" rel="stylesheet">
-        <link rel="StyleSheet" href="https://shop.example/mail.css"></head>
+        <link rel="StyleSheet" href="https://shop.example/mail.css"><link rel="stylesheet" href="local.css"></head>
         <body><p style="margin:0;height:300px">Hello</p><img src="relative.png" width="10" height="10"></body></html>"#;
     let p = Page::new(html, 600, 1.0, false).unwrap();
     assert!(p.height() >= 300.0, "laid out: {}", p.height());
     assert!(!p.wanted().iter().any(|w| w.contains(".example/")), "{:?}", p.wanted());
+    // A relative address has nothing to resolve against in a mail: skipped, never asked for.
+    assert!(!p.asked().iter().any(|w| w.contains("relative.png") || w.contains("local.css")), "{:?}", p.asked());
 }
 
 #[test]
