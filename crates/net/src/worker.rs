@@ -636,6 +636,8 @@ struct Worker {
     gone_meanwhile: Vec<String>,
     /// How many times its account had been removed as it started ([`Store::while_kept`]).
     removals: u64,
+    /// Its calendars and contacts were looked for since it started, found or not.
+    dav_looked: bool,
     /// Messages whose text the main connection gave first, shared with the second one: of those
     /// it brings only the whole (others it's handed were opened while the main one was busy).
     whole_only: Arc<std::sync::Mutex<std::collections::HashSet<mailcraft_model::MessageKey>>>,
@@ -706,6 +708,7 @@ impl Worker {
             counts_unsaid: Vec::new(),
             gone_meanwhile: Vec::new(),
             removals,
+            dav_looked: false,
             whole_only: Arc::default(),
             busy: Arc::default(),
             backoff: Duration::from_secs(5),

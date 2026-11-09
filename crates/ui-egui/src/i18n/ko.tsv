@@ -1209,6 +1209,7 @@ month	May	5월
 	Calendar server (CalDAV)	일정 서버 (CalDAV)
 	Contacts server (CardDAV)	연락처 서버 (CardDAV)
 	Calendars at {url}	일정 위치: {url}
+	Contacts at {url}	연락처 위치: {url}
 	Calendars come from a server of their own: give its address and sign-in	일정이 별도 서버에 있습니다: 주소와 로그인 정보를 입력하세요
 	Looked for when the account syncs	계정을 동기화할 때 찾습니다
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	MailCraft는 메일 제공업체의 서버에서 일정과 연락처를 찾습니다. 찾지 못하면 제공업체 도움말에 있는 주소를 입력하세요. 비워 둔 항목은 계속 자동으로 찾습니다.

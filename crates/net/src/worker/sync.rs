@@ -654,9 +654,13 @@ impl Worker {
             imap_host: host,
             caldav: Some(given.caldav.as_str()).filter(|c| !c.trim().is_empty()),
             carddav: Some(given.carddav.as_str()).filter(|c| !c.trim().is_empty()),
+            look_again: !self.dav_looked,
         };
         match crate::dav::sync(&dav, &at, &pim, now(), system_zone()) {
-            Ok(sync) => self.sink.emit(Event::DavSynced { account: self.id(), sync: Box::new(sync) }),
+            Ok(sync) => {
+                self.dav_looked = true;
+                self.sink.emit(Event::DavSynced { account: self.id(), sync: Box::new(sync) });
+            }
             Err(e) => {
                 log::info!("{}: calendars and contacts: {e}", self.acc.id);
                 if matches!(e, NetError::Auth(_)) {

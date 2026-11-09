@@ -82,6 +82,34 @@ fn an_srv_record_and_its_path_give_the_starts() {
 }
 
 #[test]
+fn the_mail_domain_gives_the_starts() {
+    let s = host_starts(Kind::Calendars, "example.com", "imap.example.com");
+    assert_eq!(
+        s,
+        [
+            "https://example.com/.well-known/caldav",
+            "https://caldav.example.com/.well-known/caldav",
+            "https://dav.example.com/.well-known/caldav",
+            "https://imap.example.com/.well-known/caldav",
+        ]
+    );
+    let s = host_starts(Kind::Contacts, "example.com", "imap.mail.example.net");
+    assert_eq!(
+        s,
+        [
+            "https://example.com/.well-known/carddav",
+            "https://carddav.example.com/.well-known/carddav",
+            "https://dav.example.com/.well-known/carddav",
+            "https://carddav.mail.example.net/.well-known/carddav",
+            "https://dav.mail.example.net/.well-known/carddav",
+            "https://imap.mail.example.net/.well-known/carddav",
+        ]
+    );
+    // No address to go by: the IMAP server's.
+    assert_eq!(host_starts(Kind::Calendars, "", "mail.example"), ["https://mail.example/.well-known/caldav"]);
+}
+
+#[test]
 fn addresses_typed_by_hand_read_as_https() {
     assert_eq!(given_url("posteo.de:8443").as_deref(), Some("https://posteo.de:8443/"));
     assert_eq!(given_url(" https://posteo.de:8443/calendars/me/default ").as_deref(), Some("https://posteo.de:8443/calendars/me/default"));

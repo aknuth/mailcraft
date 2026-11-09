@@ -8,6 +8,13 @@ use super::*;
 #[derive(Clone, Debug, Default)]
 pub struct DavForm {
     pub account: String,
+    /// The account's address and the mail server's user name, shown (not changed) beside the
+    /// sign-in the calendar server gets.
+    pub email: String,
+    pub mail_user: String,
+    /// Where the calendars and address books were found (empty: not yet, or none).
+    pub found_caldav: String,
+    pub found_carddav: String,
     pub caldav: String,
     pub carddav: String,
     /// Signs in with its own user name and password, not the mail server's.
@@ -21,14 +28,19 @@ pub struct DavForm {
 }
 
 impl DavForm {
-    pub fn of(c: &mailcraft_engine::model::AccountConfig) -> DavForm {
+    pub fn of(c: &mailcraft_engine::model::AccountConfig, pim: Option<&mailcraft_engine::model::pim::Pim>) -> DavForm {
         let d = c.dav.clone().unwrap_or_default();
+        let mail_user = if c.username.is_empty() { c.email.clone() } else { c.username.clone() };
         DavForm {
             account: c.id.clone(),
+            email: c.email.clone(),
+            found_caldav: pim.and_then(|p| p.caldav_home.clone()).unwrap_or_default(),
+            found_carddav: pim.and_then(|p| p.carddav_home.clone()).unwrap_or_default(),
             caldav: d.caldav,
             carddav: d.carddav,
             own: d.username.is_some(),
-            username: d.username.clone().unwrap_or_else(|| c.email.clone()),
+            username: d.username.clone().unwrap_or_else(|| mail_user.clone()),
+            mail_user,
             password: String::new(),
             kept: d.username.clone(),
             error: None,
@@ -58,15 +70,34 @@ pub(super) fn draw(ui: &mut Ui, f: &mut DavForm, t: &Tokens, acts: &mut Vec<Acti
     ui.add(egui::Label::new(RichText::new(about).color(t.dim)).wrap());
     ui.add_space(10.0);
     let w = ui.available_width();
+    let found = |ui: &mut Ui, url: &str, said: String| {
+        if !url.is_empty() {
+            ui.label(RichText::new(said).color(t.faint).small());
+        }
+    };
     ui.label(RichText::new(tl!("Calendar server (CalDAV)")).color(t.text));
-    ui.add(egui::TextEdit::singleline(&mut f.caldav).hint_text("https://dav.example.com/calendars/").desired_width(w));
+    ui.add(egui::TextEdit::singleline(&mut f.caldav).hint_text(hint(&f.found_caldav, "https://dav.example.com/")).desired_width(w));
+    found(ui, &f.found_caldav, tf!("Calendars at {url}", url = f.found_caldav));
     ui.add_space(6.0);
     ui.label(RichText::new(tl!("Contacts server (CardDAV)")).color(t.text));
-    ui.add(egui::TextEdit::singleline(&mut f.carddav).hint_text("https://dav.example.com/addressbooks/").desired_width(w));
-    ui.add_space(8.0);
+    ui.add(egui::TextEdit::singleline(&mut f.carddav).hint_text(hint(&f.found_carddav, "https://dav.example.com/")).desired_width(w));
+    found(ui, &f.found_carddav, tf!("Contacts at {url}", url = f.found_carddav));
+    ui.add_space(10.0);
+    // The sign-in the calendar server gets: the mail account's, shown greyed, unless it has its own.
+    ui.label(RichText::new(tl!("Email address")).color(t.text));
+    let mut email = f.email.clone();
+    ui.add_enabled(false, egui::TextEdit::singleline(&mut email).desired_width(w));
+    ui.add_space(6.0);
     ui.checkbox(&mut f.own, tl!("The calendar server has its own user name and password"));
+    ui.label(RichText::new(tl!("User name")).color(t.text));
     if f.own {
         ui.add(egui::TextEdit::singleline(&mut f.username).hint_text(tl!("User name")).desired_width(w));
+    } else {
+        let mut user = f.mail_user.clone();
+        ui.add_enabled(false, egui::TextEdit::singleline(&mut user).desired_width(w));
+    }
+    ui.label(RichText::new(tl!("Password")).color(t.text));
+    if f.own {
         let kept = f.kept.as_deref().is_some_and(|k| k == f.username.trim());
         let hint = if kept { tl!("Password (kept: type to change it)") } else { tl!("Password") };
         ui.add(egui::TextEdit::singleline(&mut f.password).password(true).hint_text(hint).desired_width(w));
@@ -75,6 +106,10 @@ pub(super) fn draw(ui: &mut Ui, f: &mut DavForm, t: &Tokens, acts: &mut Vec<Acti
                 .color(t.faint)
                 .small(),
         );
+    } else {
+        // The mail password, never shown: dots stand for it.
+        let mut dots = "••••••••".to_string();
+        ui.add_enabled(false, egui::TextEdit::singleline(&mut dots).desired_width(w));
     }
     if let Some(e) = &f.error {
         ui.add_space(4.0);
@@ -87,4 +122,9 @@ pub(super) fn draw(ui: &mut Ui, f: &mut DavForm, t: &Tokens, acts: &mut Vec<Acti
         acts.push(Action::Submit("account.dav", f.params()));
     }
     !cancel
+}
+
+/// The hint in an empty address field: where it was found, else an example.
+fn hint(found: &str, example: &str) -> String {
+    if found.is_empty() { example.to_string() } else { found.to_string() }
 }

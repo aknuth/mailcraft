@@ -213,6 +213,9 @@ pub struct Where<'a> {
     pub imap_host: &'a str,
     pub caldav: Option<&'a str>,
     pub carddav: Option<&'a str>,
+    /// Look for the homes again though none were found less than a day ago: the first sync
+    /// since MailCraft started (a newer MailCraft may look in more places).
+    pub look_again: bool,
 }
 
 impl Where<'_> {
@@ -330,13 +333,9 @@ impl Dav {
             crate::dns::srv(&name).map(|(host, port)| (host, port, crate::dns::txt_path(&name)))
         };
         let mut starts = srv_starts(kind, srv);
-        let service = if kind == Kind::Calendars { "caldav" } else { "carddav" };
-        for host in [domain.clone(), format!("{service}.{domain}"), imap_host.replacen("imap.", &format!("{service}."), 1), imap_host.to_string()] {
-            if !host.is_empty() && !host.contains(['/', ' ']) {
-                let u = format!("https://{host}{}", kind.well_known());
-                if !starts.contains(&u) {
-                    starts.push(u);
-                }
+        for u in host_starts(kind, &domain, imap_host) {
+            if !starts.contains(&u) {
+                starts.push(u);
             }
         }
         // A refused sign-in while looking (Google's servers want OAuth) means "not here".
@@ -624,6 +623,32 @@ fn srv_starts(kind: Kind, srv: Option<(String, u16, Option<String>)>) -> Vec<Str
         let u = format!("{base}{p}");
         if !starts.contains(&u) {
             starts.push(u);
+        }
+    }
+    starts
+}
+
+/// Where to look after the SRV record: the `/.well-known/` address on the mail domain, on its
+/// `caldav.` / `carddav.` and `dav.` hosts (`dav.<domain>` serves both on many self-run servers:
+/// sabre/dav, Radicale, Baïkal), the same beside the IMAP server, and on the IMAP server itself.
+fn host_starts(kind: Kind, domain: &str, imap_host: &str) -> Vec<String> {
+    let service = if kind == Kind::Calendars { "caldav" } else { "carddav" };
+    let on_domain = |sub: &str| if domain.is_empty() { String::new() } else { format!("{sub}.{domain}") };
+    let hosts = [
+        domain.to_string(),
+        on_domain(service),
+        on_domain("dav"),
+        imap_host.replacen("imap.", &format!("{service}."), 1),
+        imap_host.replacen("imap.", "dav.", 1),
+        imap_host.to_string(),
+    ];
+    let mut starts: Vec<String> = Vec::new();
+    for host in hosts {
+        if !host.is_empty() && !host.contains(['/', ' ']) {
+            let u = format!("https://{host}{}", kind.well_known());
+            if !starts.contains(&u) {
+                starts.push(u);
+            }
         }
     }
     starts
