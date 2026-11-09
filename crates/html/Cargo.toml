@@ -14,10 +14,10 @@ workspace = true
 # PATCHES.md lists), all at one revision. Blitz: Stylo (Servo's CSS engine), Taffy (layout) and
 # Parley (text), without a script engine or a network client; pictures come only through
 # `Page::give`. Stylo and its parsers are MPL-2.0 (file by file); Blitz is MIT OR Apache-2.0.
-blitz-html = { git = "https://github.com/aknuth/blitz", rev = "272ca49168c54652ec4b5bada016feaabe1bd390" }
-blitz-dom = { git = "https://github.com/aknuth/blitz", rev = "272ca49168c54652ec4b5bada016feaabe1bd390", default-features = false, features = ["svg", "system-fonts", "complex-scripts", "text-transform-icu"] }
-blitz-paint = { git = "https://github.com/aknuth/blitz", rev = "272ca49168c54652ec4b5bada016feaabe1bd390", default-features = false, features = ["svg"] }
-blitz-traits = { git = "https://github.com/aknuth/blitz", rev = "272ca49168c54652ec4b5bada016feaabe1bd390" }
+blitz-html = { git = "https://github.com/aknuth/blitz", rev = "113e70c52deb6f94385daee7606206b480b96518" }
+blitz-dom = { git = "https://github.com/aknuth/blitz", rev = "113e70c52deb6f94385daee7606206b480b96518", default-features = false, features = ["svg", "system-fonts", "complex-scripts", "text-transform-icu"] }
+blitz-paint = { git = "https://github.com/aknuth/blitz", rev = "113e70c52deb6f94385daee7606206b480b96518", default-features = false, features = ["svg"] }
+blitz-traits = { git = "https://github.com/aknuth/blitz", rev = "113e70c52deb6f94385daee7606206b480b96518" }
 anyrender = "0.14"
 anyrender_vello_cpu = "0.18"
 bytes = "1"

@@ -174,8 +174,7 @@ impl Page {
             for _ in 0..ROUNDS {
                 let split = split::split(doc);
                 let wrapped = anonymous::wrap(doc);
-                let narrowed = columns::fix(doc);
-                if !(shrink::fix(doc) | narrowed | wrapped | split) {
+                if !(shrink::fix(doc) | wrapped | split) {
                     break;
                 }
                 doc.resolve(0.0);
@@ -318,7 +317,6 @@ impl Page {
 }
 
 mod anonymous;
-mod columns;
 mod selecting;
 mod shrink;
 mod split;
