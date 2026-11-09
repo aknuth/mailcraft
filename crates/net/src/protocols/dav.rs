@@ -47,6 +47,9 @@ pub struct Item {
     /// Someone else's, listed in the user's home ([`Dav::collections`]: its `owner` isn't the
     /// user's).
     pub foreign: bool,
+    /// Whose it is, when it's someone else's: the end of their principal's address (sabre/dav
+    /// names them by address: `accounting@example.com`).
+    pub owner: Option<String>,
 }
 
 fn local(name: &str) -> String {
@@ -411,7 +414,7 @@ impl Dav {
     /// `owner` is known and is neither the home's owner nor the signed-in user is marked
     /// someone else's (SOGo lists the calendars subscribed to in the user's home, issue #30).
     pub fn collections(&self, kind: Kind, home: &str) -> Result<Vec<Item>> {
-        let props = "<d:resourcetype/><d:displayname/><cs:getctag/><d:sync-token/><a:calendar-color/><c:supported-calendar-component-set/><d:current-user-privilege-set/><d:owner/><d:current-user-principal/>";
+        let props = "<d:resourcetype/><d:displayname/><cs:getctag/><d:sync-token/><a:calendar-color/><c:supported-calendar-component-set/><d:current-user-privilege-set/><d:owner/><d:current-user-principal/><cs:invite/>";
         let (mut items, at) = self.propfind(home, "1", props)?;
         let want = if kind == Kind::Calendars { "calendar" } else { "addressbook" };
         mark_foreign(&mut items, &at, home);
@@ -597,8 +600,17 @@ fn mark_foreign(items: &mut [Item], at: &str, home: &str) {
     mine.extend(items.iter().filter(|i| path(&i.href) == home_path).flat_map(|i| i.hrefs.get("owner").into_iter().flatten()).map(|h| path(h)));
     mine.retain(|m| !m.is_empty());
     for i in items.iter_mut().filter(|i| path(&i.href) != home_path) {
-        let owner = i.hrefs.get("owner").and_then(|o| o.first()).map(|h| path(h)).filter(|o| !o.is_empty());
-        i.foreign = !mine.is_empty() && owner.is_some_and(|o| !mine.contains(&o));
+        // Shared with the user (sabre/dav): `owner` is the user, who has it in their home; whose
+        // it is, is the sharing's organizer (calendarserver.org's `invite`).
+        let shared = i.kinds.iter().any(|k| k == "shared");
+        let organizer = i.hrefs.get("organizer").and_then(|o| o.first()).map(|h| path(h)).filter(|o| !o.is_empty() && shared);
+        let owner = organizer.or_else(|| i.hrefs.get("owner").and_then(|o| o.first()).map(|h| path(h)).filter(|o| !o.is_empty()));
+        i.foreign = !mine.is_empty() && owner.as_ref().is_some_and(|o| !mine.contains(o));
+        i.owner = owner.filter(|_| i.foreign).and_then(|o| {
+            let last = o.rsplit('/').next().unwrap_or_default();
+            let name = mailcraft_model::mailto::percent_decode(last);
+            (!name.trim().is_empty()).then(|| name.trim().chars().take(100).collect())
+        });
     }
 }
 

@@ -299,7 +299,7 @@ pub fn sync(dav: &Dav, at: &Where, pim: &Pim, now: i64, local: mailcraft_model::
             let known = pim.calendars.iter().find(|k| k.id == c.href);
             let info = CalendarInfo {
                 id: c.href.clone(),
-                name: c.props.get("displayname").cloned().unwrap_or_else(|| "Calendar".into()),
+                name: calendar_name(&c),
                 color: known.map_or(u8::try_from(n % 8).unwrap_or(0), |k| k.color),
                 read_only: c.writable == Some(false),
                 ctag: ctag.clone(),
@@ -559,4 +559,14 @@ fn has_all_of(server: &CalEvent, mine: &CalEvent) -> bool {
         && server.recurrence_id == mine.recurrence_id
         && what(server) == what(mine)
         && mine.attendees.iter().all(|a| answer(server, &a.email) == Some(a.partstat.to_ascii_uppercase()))
+}
+
+/// A calendar's name: the server's, with whose it is when it's someone else's (two calendars
+/// both called "Calendar", the user's and a colleague's shared with them, told apart).
+pub(super) fn calendar_name(c: &Item) -> String {
+    let name = c.props.get("displayname").map(|n| n.trim()).filter(|n| !n.is_empty()).unwrap_or("Calendar");
+    match &c.owner {
+        Some(o) if !name.to_lowercase().contains(&o.to_lowercase()) => format!("{name} ({o})"),
+        _ => name.to_string(),
+    }
 }
