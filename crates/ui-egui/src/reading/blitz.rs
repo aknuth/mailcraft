@@ -1,5 +1,5 @@
 //! PROTOTYPE: an HTML message laid out and drawn by Blitz ([`mailcraft_html`]), shown as tiles
-//! of pixels, its links clickable. On with `MAILCRAFT_BLITZ=1`; a page Blitz refuses (nested
+//! of pixels, its links clickable. On unless `MAILCRAFT_BLITZ=0`; a page Blitz refuses (nested
 //! too deep, a panic) is drawn the usual way.
 //!
 //! The page is laid out and painted on the reading lane ([`lane`]); the window shows what came
@@ -77,9 +77,13 @@ impl HtmlView {
     }
 }
 
-/// Whether the prototype is on (`MAILCRAFT_BLITZ` set).
+/// Whether the prototype is on: unless `MAILCRAFT_BLITZ=0` (the tests' windows draw messages
+/// the usual way unless a test turns it on).
 pub(crate) fn wanted() -> bool {
-    std::env::var_os("MAILCRAFT_BLITZ").is_some()
+    match std::env::var_os("MAILCRAFT_BLITZ") {
+        Some(v) => v != "0",
+        None => !cfg!(test),
+    }
 }
 
 /// Draw `html` with Blitz; `false` when it can't be (drawn the usual way then).

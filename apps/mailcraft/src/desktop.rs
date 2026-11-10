@@ -138,6 +138,12 @@ impl Services for Desktop {
     fn print_pdf(&mut self, title: &str, pdf: &[u8]) -> Result<(), String> {
         print::print(title, pdf)
     }
+    fn printers(&mut self) -> Vec<String> {
+        print::printers()
+    }
+    fn print_pdf_on(&mut self, printer: &str, copies: u16, title: &str, pdf: &[u8]) -> Result<(), String> {
+        print::print_on(printer, copies, title, pdf)
+    }
     fn update_state(&mut self) -> mailcraft_ui_egui::UpdateState {
         self.updater.as_ref().map(self_update::Updater::state).unwrap_or_default()
     }

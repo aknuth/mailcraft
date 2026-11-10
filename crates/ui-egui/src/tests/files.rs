@@ -221,3 +221,63 @@ fn message_files_dropped_on_the_window_go_into_the_folder_open() {
     assert!(a.session.notices.last().is_some_and(|n| n.text.contains('2') && !n.error), "{:?}", a.session.notices.last());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Services that can print on two printers, as Windows does: what's printed is kept.
+#[derive(Default)]
+struct Printers(std::rc::Rc<std::cell::RefCell<Vec<(String, u16, String, usize)>>>);
+
+impl crate::Services for Printers {
+    fn clock(&self) -> (i64, i32) {
+        (NOW, 0)
+    }
+    fn pick_files(&mut self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    fn save_path(&mut self, _: &str) -> Option<PathBuf> {
+        None
+    }
+    fn open_path(&mut self, _: &Path) -> Result<(), String> {
+        Ok(())
+    }
+    fn notify(&mut self, _: &str, _: &str) {}
+    fn printers(&mut self) -> Vec<String> {
+        vec!["Office".into(), "Hallway".into()]
+    }
+    fn print_pdf_on(&mut self, printer: &str, copies: u16, title: &str, pdf: &[u8]) -> Result<(), String> {
+        self.0.borrow_mut().push((printer.into(), copies, title.into(), pdf.len()));
+        Ok(())
+    }
+}
+
+/// Where the system has printers but no print dialog (Windows), Print asks which printer and how
+/// many copies, then prints the message it was chosen for on it.
+#[test]
+fn print_asks_for_the_printer_where_the_system_has_no_dialog() {
+    let store = Store::memory();
+    sample::seed_if_empty(&store, NOW).unwrap();
+    let s = Session::open(Some(store), Clock::new(NOW, 0));
+    let printers = Printers::default();
+    let printed = printers.0.clone();
+    let mut a = MailApp::new(s, Box::new(NullBackend), Box::new(printers));
+    let ctx = egui::Context::default();
+    let frame = |ctx: &egui::Context, a: &mut MailApp| {
+        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
+        out.textures_delta.clear();
+    };
+    frame(&ctx, &mut a);
+    let key = a.session.list.first().map(|m| m.key.clone()).unwrap();
+    a.session.open_message(&key);
+    frame(&ctx, &mut a);
+    a.act(crate::Action::Print);
+    let Some(Dialog::Print(f)) = a.ui.dialog.as_mut() else { panic!("no print dialog: {:?}", a.ui.dialog.is_some()) };
+    assert_eq!(f.printers, ["Office", "Hallway"]);
+    assert!(f.pdf.starts_with(b"%PDF"), "the message is made into a PDF as Print is chosen");
+    f.printer = 1;
+    f.copies = 2;
+    let title = f.title.clone();
+    let pdf = std::mem::take(&mut f.pdf);
+    a.ui.dialog = None;
+    a.act(crate::Action::PrintOn { printer: "Hallway".into(), copies: 2, title: title.clone(), pdf: pdf.clone() });
+    assert_eq!(printed.borrow().as_slice(), [("Hallway".to_string(), 2, title, pdf.len())]);
+}

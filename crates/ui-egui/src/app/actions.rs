@@ -424,16 +424,32 @@ impl MailApp {
                     Err(e) => self.session.notice(e, true),
                 }
             }
+            Action::PrintOn { printer, copies, title, pdf } => match self.services.print_pdf_on(&printer, copies, &title, &pdf) {
+                Ok(()) => self.session.notice(tf!("Sent to {printer}", printer = printer), false),
+                Err(e) => self.session.notice(e, true),
+            },
             Action::Print => {
-                // No print dialog to hand it to: the message as a PDF, saved where asked, then
-                // opened to print from the viewer.
-                let Some(path) = self.services.save_path(&format!("{}.pdf", self.message_file_name())) else { return };
-                match self.message_pdf().and_then(|b| std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))) {
-                    Ok(()) => match self.services.open_path(&path) {
-                        Ok(()) => self.session.notice(tl!("Opened as a PDF: print it from the viewer"), false),
-                        Err(e) => self.session.notice(tf!("The PDF couldn't be opened: {error}", error = e), true),
-                    },
-                    Err(e) => self.session.notice(e.to_string(), true),
+                // MailCraft's own print dialog where the system can print a PDF but has no dialog
+                // to hand it to (asked each time: a printer may have been added since).
+                let printers = self.services.printers();
+                if !printers.is_empty() {
+                    match self.message_pdf() {
+                        Ok(pdf) => {
+                            let title = self.message_file_name();
+                            self.ui.dialog = Some(Dialog::Print(Box::new(dialogs::PrintForm { title, pdf, printers, printer: 0, copies: 1 })));
+                        }
+                        Err(e) => self.session.notice(e, true),
+                    }
+                } else if let Some(path) = self.services.save_path(&format!("{}.pdf", self.message_file_name())) {
+                    // No print dialog to hand it to: the message as a PDF, saved where asked,
+                    // then opened to print from the viewer.
+                    match self.message_pdf().and_then(|b| std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))) {
+                        Ok(()) => match self.services.open_path(&path) {
+                            Ok(()) => self.session.notice(tl!("Opened as a PDF: print it from the viewer"), false),
+                            Err(e) => self.session.notice(tf!("The PDF couldn't be opened: {error}", error = e), true),
+                        },
+                        Err(e) => self.session.notice(e.to_string(), true),
+                    }
                 }
             }
             Action::ExportPdf => {

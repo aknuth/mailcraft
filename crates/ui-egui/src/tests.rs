@@ -153,6 +153,13 @@ pub(crate) fn tour() {
             Dialog::OpenSharedCalendar { email: "ana@contoso.example".into(), error: Some("no access".into()) },
             Dialog::SubscribeCalendar { url: "webcal://holidays.example/de.ics".into(), name: String::new(), error: Some("HTTP 404".into()) },
             Dialog::AddSharedMailbox { account: "sample".into(), address: "sales@contoso.example".into(), error: Some("already open".into()) },
+            Dialog::Print(Box::new(crate::dialogs::PrintForm {
+                title: "Quarterly report".into(),
+                pdf: b"%PDF-1.7".to_vec(),
+                printers: vec!["Office printer".into(), "Microsoft Print to PDF".into()],
+                printer: 0,
+                copies: 2,
+            })),
             Dialog::Dav(Box::new(crate::dialogs::DavForm {
                 account: "sample".into(),
                 email: "riley@studio.example".into(),

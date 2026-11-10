@@ -19,8 +19,12 @@ use crate::{NetError, Result};
 mod download;
 pub use download::{Progress, content_range, download_installer, file_name, part_path, sha256_file};
 
-/// Where MailCraft is published.
-pub const REPO: &str = "ZIDAN44/mailcraft";
+/// Where MailCraft is published: ZIDAN44/mailcraft, or the GitHub repository a build names in
+/// `MAILCRAFT_UPDATE_REPO` (`owner/name`), so a fork's builds update from the fork's releases.
+pub const REPO: &str = match option_env!("MAILCRAFT_UPDATE_REPO") {
+    Some(r) => r,
+    None => "ZIDAN44/mailcraft",
+};
 
 /// Where releases are listed and their files come from: MailCraft's GitHub releases, or a copy of
 /// them served on this computer, for trying the updater out (debug builds only, see

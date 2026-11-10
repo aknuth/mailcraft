@@ -153,8 +153,16 @@ pub enum Action {
     /// Search every folder for this (shown in the box, with the Search tab).
     Search(String),
     SetDark(Option<bool>),
-    /// Print the open message (as a PDF opened in the system's viewer).
+    /// Print the open message: with the system's print dialog, MailCraft's own (choosing the
+    /// printer), or as a PDF opened in the system's viewer.
     Print,
+    /// Print a PDF on a printer chosen in MailCraft's print dialog.
+    PrintOn {
+        printer: String,
+        copies: u16,
+        title: String,
+        pdf: Vec<u8>,
+    },
     /// Save the open message as a PDF, or as its `.eml` source.
     ExportPdf,
     SaveMessage,

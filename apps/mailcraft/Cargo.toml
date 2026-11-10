@@ -55,6 +55,9 @@ uds_windows = "1.2"
 # safe wrappers over Win32, only the `advapi` feature (as PdfCraft has it).
 winit = { version = "0.30", default-features = false }
 winsafe = { version = "0.0.29", default-features = false, features = ["advapi", "dwm", "user"] }
+# Printing a PDF on a printer chosen in MailCraft's print dialog (`desktop/print.rs`): Windows'
+# own PDF renderer (`Windows.Data.Pdf`), not PDFium (the default feature, which downloads it).
+winprint = { version = "0.4", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Finder hands documents to an app through an `odoc` Apple event; winit 0.30 never sees it

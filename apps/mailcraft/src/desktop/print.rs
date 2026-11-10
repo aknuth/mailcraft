@@ -1,7 +1,9 @@
 //! Printing with the desktop's own print dialog on Linux and the BSDs: the message, as a PDF, is
 //! handed to the freedesktop portal (`org.freedesktop.portal.Print`), whose dialog chooses the
-//! printer and its settings and prints it. Without a portal (and on Windows and macOS) the
-//! message opens as a PDF, to print from the viewer.
+//! printer and its settings and prints it. On Windows MailCraft's own print dialog chooses the
+//! printer and the copies, and the PDF is printed by Windows' own PDF renderer
+//! (`Windows.Data.Pdf`, through `winprint`). Without either (and on macOS) the message opens as a
+//! PDF, to print from the viewer.
 
 /// Whether the desktop has a print portal (asked once, giving up after 2 s).
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -41,6 +43,79 @@ pub(crate) fn print(title: &str, pdf: &[u8]) -> Result<(), String> {
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 pub(crate) fn print(_: &str, _: &[u8]) -> Result<(), String> {
     Err("this system has no print dialog MailCraft can use".into())
+}
+
+/// The printers to choose from, the user's default first (Windows; elsewhere none).
+#[cfg(windows)]
+pub(crate) fn printers() -> Vec<String> {
+    use winprint::printer::PrinterDevice;
+    let mut names: Vec<String> = match PrinterDevice::all() {
+        Ok(all) => all.iter().map(|d| d.name().to_string()).collect(),
+        Err(e) => {
+            log::info!("print: the printers couldn't be listed ({e}): the PDF opens in the viewer");
+            return Vec::new();
+        }
+    };
+    let default = PrinterDevice::user_default().ok().flatten().map(|d| d.name().to_string());
+    if let Some(i) = default.and_then(|d| names.iter().position(|n| *n == d)) {
+        let name = names.remove(i);
+        names.insert(0, name);
+    }
+    names
+}
+
+#[cfg(not(windows))]
+pub(crate) fn printers() -> Vec<String> {
+    Vec::new()
+}
+
+/// Print a PDF on `printer`, `copies` times (Windows). The PDF is written to a folder of its own
+/// under the temporary folder, named by `title` (what the printer's queue shows), printed on a
+/// thread of its own so the window isn't held, and removed once it's printed.
+#[cfg(windows)]
+pub(crate) fn print_on(printer: &str, copies: u16, title: &str, pdf: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!("mailcraft-print-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let name: String =
+        title.chars().filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()).take(80).collect();
+    let name = if name.trim().is_empty() { "message".to_string() } else { name.trim().to_string() };
+    let path = dir.join(format!("{name}.pdf"));
+    std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, pdf)).map_err(|e| format!("the PDF couldn't be written for printing ({e})"))?;
+    let printer = printer.to_string();
+    std::thread::Builder::new()
+        .name("print".into())
+        .spawn(move || {
+            if let Err(e) = windows_print(&printer, copies, &path) {
+                log::info!("print: printing failed: {e}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .map(|_| ())
+        .map_err(|e| format!("the message couldn't be printed ({e})"))
+}
+
+#[cfg(windows)]
+fn windows_print(printer: &str, copies: u16, path: &std::path::Path) -> Result<(), String> {
+    use winprint::printer::{FilePrinter, PrinterDevice, TimedPrinter, WinPdfPrinter};
+    use winprint::ticket::{Copies, PrintTicketBuilder};
+    let device = PrinterDevice::all()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|d| d.name() == printer)
+        .ok_or_else(|| format!("the printer {printer} is gone"))?;
+    let mut ticket = PrintTicketBuilder::new(&device).map_err(|e| e.to_string())?;
+    ticket.merge(Copies(copies.max(1))).map_err(|e| e.to_string())?;
+    let ticket = ticket.build().map_err(|e| e.to_string())?;
+    let mut pdf = WinPdfPrinter::new(device);
+    // A driver that never answers would hold the thread (and the PDF's folder) for good.
+    pdf.set_timeout(Some(std::time::Duration::from_secs(300)));
+    pdf.print(path, ticket).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn print_on(_: &str, _: u16, _: &str, _: &[u8]) -> Result<(), String> {
+    Err("this system has no printers MailCraft can use".into())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

@@ -1206,6 +1206,9 @@ month	May	مايو
 	Contacts server (CardDAV)	خادم جهات الاتصال (CardDAV)
 	Calendars at {url}	التقويمات على {url}
 	Contacts at {url}	جهات الاتصال على {url}
+	Printer	الطابعة
+	Copies	النسخ
+	Sent to {printer}	أُرسلت إلى {printer}
 	Calendars come from a server of their own: give its address and sign-in	التقويمات على خادم خاص بها: أدخل عنوانه وبيانات تسجيل الدخول
 	Looked for when the account syncs	يُبحث عنها عند مزامنة الحساب
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	يبحث MailCraft عن تقويماتك وجهات اتصالك على خادم مزوّد بريدك. إن لم يجدها، فأدخل العناوين الواردة في صفحات المساعدة لدى مزوّدك؛ واترك أحدها فارغًا ليواصل البحث عنه.

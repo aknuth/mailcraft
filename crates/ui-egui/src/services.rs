@@ -128,6 +128,15 @@ pub trait Services {
     fn print_pdf(&mut self, _title: &str, _pdf: &[u8]) -> Result<(), String> {
         Err("this system has no print dialog MailCraft can use".into())
     }
+    /// The printers for MailCraft's own print dialog, the default one first, where the system
+    /// has no print dialog a PDF can be handed to but can print one (Windows). Empty: none.
+    fn printers(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Print a PDF on one of [`Services::printers`], `copies` times.
+    fn print_pdf_on(&mut self, _printer: &str, _copies: u16, _title: &str, _pdf: &[u8]) -> Result<(), String> {
+        Err("this system has no printers MailCraft can use".into())
+    }
     /// Where a build that updates itself is with the next version. The default: nowhere.
     fn update_state(&mut self) -> UpdateState {
         UpdateState::None

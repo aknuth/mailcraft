@@ -25,6 +25,18 @@ mod writing;
 
 pub use accounts::*;
 pub use dav::DavForm;
+
+/// The print dialog's choices, and the message it prints (made into a PDF as Print was chosen,
+/// so it's the message Print was chosen for, whichever window it was in).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrintForm {
+    pub title: String,
+    pub pdf: Vec<u8>,
+    /// The printers, the default one first.
+    pub printers: Vec<String>,
+    pub printer: usize,
+    pub copies: u16,
+}
 pub(crate) use importing::skip_line;
 pub use mailbox::*;
 pub use organize::*;
@@ -146,6 +158,9 @@ pub enum Dialog {
     },
     /// Where an account's calendars and contacts are, given by hand (issue #7).
     Dav(Box<dav::DavForm>),
+    /// MailCraft's own print dialog, where the system has none a PDF can be handed to (Windows):
+    /// the printer and how many copies.
+    Print(Box<PrintForm>),
     /// The password of a certificate file being imported (S/MIME): from `path`, or `data` as the
     /// browser's picker gives it; neither, the one the browser keeps, unlocked.
     Certificate {
@@ -634,7 +649,8 @@ fn body(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::reading::Pic
         | Dialog::SmartCard { .. }
         | Dialog::Event(..)
         | Dialog::Task(..)
-        | Dialog::Contact(..) => other::draw(ui, d, s, pics, t, acts),
+        | Dialog::Contact(..)
+        | Dialog::Print(..) => other::draw(ui, d, s, pics, t, acts),
     }
 }
 

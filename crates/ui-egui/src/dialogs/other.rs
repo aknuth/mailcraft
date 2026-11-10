@@ -4,6 +4,33 @@ use super::*;
 
 pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::reading::Pictures, t: &Tokens, acts: &mut Vec<Action>) -> bool {
     match d {
+        Dialog::Print(f) => {
+            ui.set_width(380.0);
+            title(ui, t, "Print");
+            ui.label(RichText::new(tl!("Printer")).color(t.dim));
+            let chosen = f.printers.get(f.printer).cloned().unwrap_or_default();
+            egui::ComboBox::from_id_salt("print-printer").width(340.0).selected_text(chosen).show_ui(ui, |ui| {
+                for (i, name) in f.printers.iter().enumerate() {
+                    ui.selectable_value(&mut f.printer, i, name.as_str());
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tl!("Copies")).color(t.dim));
+                ui.add(egui::DragValue::new(&mut f.copies).range(1..=99));
+            });
+            let (ok, cancel) = buttons(ui, t, "Print", f.printers.get(f.printer).is_some());
+            if ok && let Some(printer) = f.printers.get(f.printer) {
+                acts.push(Action::PrintOn {
+                    printer: printer.clone(),
+                    copies: f.copies.clamp(1, 99),
+                    title: std::mem::take(&mut f.title),
+                    pdf: std::mem::take(&mut f.pdf),
+                });
+                return false;
+            }
+            !cancel
+        }
         Dialog::ConfirmDeleteContact { uid, name } => {
             ui.set_width(380.0);
             if name.trim().is_empty() {

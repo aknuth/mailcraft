@@ -1210,6 +1210,9 @@ month	May	5月
 	Contacts server (CardDAV)	連絡人伺服器 (CardDAV)
 	Calendars at {url}	行事曆位於 {url}
 	Contacts at {url}	連絡人位於 {url}
+	Printer	印表機
+	Copies	份數
+	Sent to {printer}	已傳送到 {printer}
 	Calendars come from a server of their own: give its address and sign-in	行事曆位於另一個伺服器：請填寫其位址與登入資訊
 	Looked for when the account syncs	帳戶同步時尋找
 	MailCraft looks for your calendars and contacts on your mail provider's server. If it can't find them, give the addresses from your provider's help pages; leave one empty to keep looking for it.	MailCraft 會在郵件服務商的伺服器上尋找你的行事曆與連絡人。如果找不到，請填寫服務商說明頁面中的位址；留白的項目會繼續自動尋找。
