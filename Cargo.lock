@@ -322,7 +322,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
  "wl-clipboard-rs",
  "x11rb 0.13.2",
 ]
@@ -758,7 +758,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783#82e314e36162e5217854f9a9f38ebc970ab62783"
+source = "git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450#e509c1f15ac49a623e58153b2b569245e438a450"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -767,7 +767,7 @@ dependencies = [
  "color",
  "cssparser",
  "cursor-icon",
- "debug_timer 0.1.3 (git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783)",
+ "debug_timer 0.1.3 (git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450)",
  "euclid",
  "html-escape",
  "icu_casemap",
@@ -805,7 +805,7 @@ dependencies = [
 [[package]]
 name = "blitz-html"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783#82e314e36162e5217854f9a9f38ebc970ab62783"
+source = "git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450#e509c1f15ac49a623e58153b2b569245e438a450"
 dependencies = [
  "blitz-dom",
  "blitz-traits",
@@ -816,7 +816,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783#82e314e36162e5217854f9a9f38ebc970ab62783"
+source = "git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450#e509c1f15ac49a623e58153b2b569245e438a450"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -838,7 +838,7 @@ dependencies = [
 [[package]]
 name = "blitz-traits"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783#82e314e36162e5217854f9a9f38ebc970ab62783"
+source = "git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450#e509c1f15ac49a623e58153b2b569245e438a450"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.2",
@@ -1794,7 +1794,7 @@ checksum = "da220af51a1a335e9a930beaaef53d261e41ea9eecfb3d973a3ddae1a7284b9c"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783#82e314e36162e5217854f9a9f38ebc970ab62783"
+source = "git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450#e509c1f15ac49a623e58153b2b569245e438a450"
 
 [[package]]
 name = "der"
@@ -1965,7 +1965,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2492,7 +2492,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3696,7 +3696,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5041,7 +5041,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5523,7 +5523,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6997,7 +6997,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7664,7 +7664,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "287f59010008f0d7cf5e3b03196d666c1acc46c8d3e9cf34c28a1a7157601e72"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7960,7 +7960,7 @@ dependencies = [
 [[package]]
 name = "stylo_taffy"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/aknuth/blitz?rev=82e314e36162e5217854f9a9f38ebc970ab62783#82e314e36162e5217854f9a9f38ebc970ab62783"
+source = "git+https://github.com/aknuth/blitz?rev=e509c1f15ac49a623e58153b2b569245e438a450#e509c1f15ac49a623e58153b2b569245e438a450"
 dependencies = [
  "bitflags 2.13.2",
  "stylo",
@@ -8125,7 +8125,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9218,7 +9218,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
