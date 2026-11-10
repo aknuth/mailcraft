@@ -395,6 +395,8 @@
 	Mark messages as read when opened	메시지를 열면 읽음으로 표시
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	아직 보낸 사람이 없습니다.
+	Always load pictures from the web	웹의 사진을 항상 불러오기
+	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	보낸 사람에 관계없이 모든 메시지에서 불러옵니다. 보낸 사람은 언제 읽었는지 알 수 있습니다. 정크 메일과 암호화된 메일에서는 불러오지 않으며, 추적 사진은 절대 불러오지 않습니다.
 	Not available: the sample mailbox has no server.	사용할 수 없음: 예제 사서함에는 서버가 없습니다.
 	Not available: {error}	사용할 수 없음: {error}
 	On	켜짐

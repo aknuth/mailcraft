@@ -395,6 +395,8 @@
 	Mark messages as read when opened	開啟郵件時標示為已讀
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	還沒有寄件者。
+	Always load pictures from the web	一律載入網路圖片
+	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	在每封郵件中載入，不論寄件者是誰：寄件者可以知道你何時閱讀。垃圾郵件和加密郵件除外，追蹤圖片一律不載入。
 	Not available: the sample mailbox has no server.	無法使用: 範例信箱沒有伺服器。
 	Not available: {error}	無法使用: {error}
 	On	已開啟

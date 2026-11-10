@@ -396,6 +396,8 @@
 	Mark messages as read when opened	Nachrichten beim Öffnen als gelesen markieren
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Noch keine Absender.
+	Always load pictures from the web	Bilder aus dem Web immer laden
+	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	In jeder Nachricht, egal von wem: Der Absender kann sehen, wann Sie sie lesen. Nicht in Junk-E-Mail oder verschlüsselten Nachrichten und nie Tracking-Bilder.
 	Not available: the sample mailbox has no server.	Nicht verfügbar: Das Beispielpostfach hat keinen Server.
 	Not available: {error}	Nicht verfügbar: {error}
 	On	Aktiv

@@ -394,6 +394,21 @@ fn web_pictures_load_only_when_asked() {
     assert!(s.pictures_allowed());
     s.run("message.blockPictures", &json!({})).unwrap();
     assert!(!s.pictures_allowed());
+    // Always loading pictures: every sender's load, whatever was chosen for the message.
+    s.run("list.open", &json!({"key": key(2).to_id()})).unwrap();
+    s.run("message.blockPictures", &json!({})).unwrap();
+    assert!(!s.pictures_allowed());
+    s.pictures.clear();
+    s.take_jobs();
+    s.run("view.alwaysLoadPictures", &json!({"on": true})).unwrap();
+    assert!(s.pictures_allowed());
+    assert!(s.take_jobs().iter().any(|j| matches!(j, Job::FetchUrl { url } if url == "https://cdn.shop.example/2.png")));
+    // …but not in Junk, which still asks.
+    let junk = mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Junk, selectable: true, ..Default::default() };
+    s.apply(Event::Folders { account: id.clone(), folders: vec![junk] });
+    assert!(!s.pictures_allowed());
+    s.run("view.alwaysLoadPictures", &json!({"on": false})).unwrap();
+    assert!(!s.prefs.always_load_pictures);
     let _ = std::fs::remove_dir_all(store.root());
 }
 

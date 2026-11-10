@@ -395,6 +395,8 @@
 	Mark messages as read when opened	Отмечать письма прочитанными при открытии
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Отправителей пока нет.
+	Always load pictures from the web	Всегда загружать изображения из интернета
+	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	В каждом письме, от кого бы оно ни было: отправитель может видеть, когда вы его читаете. Кроме нежелательной и зашифрованной почты; изображения для отслеживания не загружаются никогда.
 	Not available: the sample mailbox has no server.	Недоступно: у примера почтового ящика нет сервера.
 	Not available: {error}	Недоступно: {error}
 	On	Включены
