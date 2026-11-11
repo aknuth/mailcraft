@@ -27,6 +27,25 @@ pub struct Data {
     pub overwrites: bool,
     /// Says it schedules meetings itself (`calendar-auto-schedule`, RFC 6638).
     pub schedules: bool,
+    /// Takes Digest sign-in only (RFC 7616, MD5 with `qop=auth`), as Baïkal does by default: its
+    /// nonce, which the test may change to make the one answered stale.
+    pub digest: Option<String>,
+    /// Requests refused for their sign-in.
+    pub refused: usize,
+    /// Collections the user may not read (403 to reading them), as a calendar shared for free /
+    /// busy only.
+    pub unreadable: Vec<String>,
+}
+
+/// Whether an `Authorization` value answers the fake's Digest challenge for this request.
+fn digest_ok(header: &str, method: &str, path: &str, nonce: &str) -> bool {
+    let Some((scheme, params)) = crate::dav::digest::challenges(header).into_iter().next() else { return false };
+    let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str()).unwrap_or_default();
+    let h = |s: &str| crate::dav::digest::hash(false, s);
+    let ha1 = h(&format!("{USER}:fake:{PASSWORD}"));
+    let ha2 = h(&format!("{method}:{path}"));
+    let want = h(&format!("{ha1}:{nonce}:{}:{}:auth:{ha2}", get("nc"), get("cnonce")));
+    scheme == "digest" && get("username") == USER && get("uri") == path && get("nonce") == nonce && get("response") == want
 }
 
 /// The uid an item's data names (its lines unfolded).
@@ -100,6 +119,7 @@ pub fn serve() -> Server {
                 continue;
             }
             let (mut len, mut authorized, mut if_match, mut if_none) = (0usize, false, None::<String>, false);
+            let mut given = String::new();
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -109,8 +129,9 @@ pub fn serve() -> Server {
                 if let Some(v) = lower.strip_prefix("content-length:") {
                     len = v.trim().parse().unwrap_or(0);
                 }
-                if line.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.trim() == auth) {
-                    authorized = true;
+                if let Some((_, v)) = line.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")) {
+                    authorized = v.trim() == auth;
+                    given = v.trim().to_string();
                 }
                 if let Some(v) = line.strip_prefix("If-Match:") {
                     if_match = Some(v.trim().to_string());
@@ -126,8 +147,31 @@ pub fn serve() -> Server {
             let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/").to_string());
             let mut d = shared.lock().unwrap();
             d.log.push(format!("{method} {path}"));
+            if let Some(nonce) = d.digest.clone() {
+                authorized = digest_ok(&given, &method, &path, &nonce);
+                if !authorized {
+                    // The right password with a nonce no longer current: stale, as RFC 7616 says.
+                    let old = crate::dav::digest::challenges(&given)
+                        .into_iter()
+                        .next()
+                        .and_then(|(_, p)| p.into_iter().find(|(k, _)| k == "nonce"))
+                        .map(|(_, v)| v);
+                    let stale = old.is_some_and(|o| o != nonce && digest_ok(&given, &method, &path, &o));
+                    let challenge = format!(
+                        "Basic realm=\"fake\", Digest realm=\"fake\", qop=\"auth\", nonce=\"{nonce}\"{}",
+                        if stale { ", stale=true" } else { "" }
+                    );
+                    d.refused += 1;
+                    respond(&mut s, "401 Unauthorized", &[("WWW-Authenticate", challenge)], "");
+                    continue;
+                }
+            }
             if !authorized {
                 respond(&mut s, "401 Unauthorized", &[], "");
+                continue;
+            }
+            if matches!(method.as_str(), "PROPFIND" | "REPORT") && d.unreadable.iter().any(|p| path.starts_with(p.as_str())) {
+                respond(&mut s, "403 Forbidden", &[], "");
                 continue;
             }
             match (method.as_str(), path.as_str()) {
@@ -256,7 +300,8 @@ mod tests {
     /// Found from the address, as an account with nothing given by hand. The tests' syncs never
     /// look for anything there, out on the network: their calendars and contacts are given, or
     /// were looked for already (`dav_checked`), the contacts none.
-    const AT: Where<'static> = Where { email: USER, username: "", imap_host: "imap.example", caldav: None, carddav: None, look_again: false };
+    const AT: Where<'static> =
+        Where { email: USER, username: "", imap_host: "imap.example", caldav: None, carddav: None, mails: true, look_again: false };
 
     fn event(uid: &str, summary: &str, start: i64) -> CalEvent {
         CalEvent { uid: uid.into(), summary: summary.into(), start, end: start + 3600, ..Default::default() }
@@ -388,6 +433,27 @@ mod tests {
             let on_server = d.items.values().any(|(_, v)| ical::parse(v, 0).events.iter().any(|e| e.uid == format!("{long}-{uid}")));
             assert!(on_server, "{uid} is on the server");
         }
+    }
+
+    /// A calendar or address book the user may not read (403: a calendar shared for free / busy
+    /// only) is neither the whole sync's failure nor a password refused, as it was (found through
+    /// a proxy in front of Baïkal, issue #61): the rest syncs, and it's kept as it is, and said.
+    #[test]
+    fn a_collection_the_user_may_not_read_is_kept_and_the_rest_synced() {
+        let server = serve();
+        {
+            let mut d = server.data.lock().unwrap();
+            d.put(&format!("{CAL}a.ics"), &ical::write(&[event("a", "Review", 1_800_000_000)], None, 0));
+            d.unreadable.push(BOOK.into());
+        }
+        let home = |k: &str| Some(format!("{}/dav/{k}/", server.base));
+        let mut pim = Pim { caldav_home: home("cal"), carddav_home: home("card"), dav_checked: Some(100), ..Default::default() };
+        pim.ensure_defaults();
+        let out = sync(&Dav::new(USER, PASSWORD), &AT, &pim, 100, Zone::UTC).unwrap();
+        assert_eq!(out.events.iter().map(|e| e.event.summary.as_str()).collect::<Vec<_>>(), ["Review"]);
+        let book = format!("{}{BOOK}", server.base);
+        assert_eq!((out.unchanged_books.clone(), out.synced_books.len()), (vec![book], 0));
+        assert!(out.errors.iter().any(|e| e.contains("couldn't be read") && e.contains("403")), "{:?}", out.errors);
     }
 
     /// Issue #7: an address given by hand, as a user copies it from the provider's help: the

@@ -4344,7 +4344,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -4380,7 +4380,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-cli"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "chrono",
  "iana-time-zone",
@@ -4391,7 +4391,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-engine"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "der 0.8.3",
  "log",
@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-html"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
@@ -4425,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-jmap"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "log",
  "mailcraft-mime",
@@ -4438,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-keys"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "core-foundation 0.10.1",
  "cryptoki",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-mime"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "encodify",
  "flate2",
@@ -4472,7 +4472,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-model"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4485,7 +4485,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-net"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "cfb",
  "craft-docpath",
@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-pgp"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "pgp",
  "rand_core 0.6.4",
@@ -4534,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-print"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "miniz_oxide 0.9.1",
  "skrifa 0.49.0",
@@ -4542,14 +4542,14 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-pst"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "mailcraft-smime"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -4578,7 +4578,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-store"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "craft-atomic",
  "dirs",
@@ -4595,7 +4595,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-ui-egui"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "accesskit_consumer",
  "egui",
@@ -4614,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-web"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "eframe",
  "egui",
@@ -9928,7 +9928,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "icu_normalizer",
  "png",

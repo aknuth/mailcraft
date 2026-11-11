@@ -4,7 +4,9 @@
 use super::*;
 
 mod measure;
-pub(crate) use measure::{Fit, measured};
+#[cfg(test)]
+pub(crate) use measure::measured;
+pub(crate) use measure::{Fit, PictureWidth, measured_with};
 
 impl Body<'_> {
     /// A table row: its cells side by side, or one under the other when there's no room.
@@ -62,6 +64,7 @@ impl Body<'_> {
                 });
                 let rect = framed.response.rect;
                 ui.painter().set(framed.inner, backdrop(rect, c.radius, fill, behind.as_ref()));
+                side_lines(ui, rect, &c.borders, page, &st.tokens);
                 // Boxes placed over it; the cell grows to hold any that reach past its end.
                 let mut bottom = rect.bottom();
                 for o in &c.overlays {
@@ -102,6 +105,26 @@ impl Body<'_> {
     }
 }
 
+/// A line's colour on `page`: its own where it can be told from the page, else one that can.
+pub(super) fn line_color(line: mime::layout::Line, page: [u8; 3], t: &theme::Tokens) -> Color32 {
+    theme::box_color(Some(line.color), page, t).map_or(t.faint, |c| Color32::from_rgb(c[0], c[1], c[2]))
+}
+
+/// The lines along the sides of `rect`: top, right, bottom, left, inside it.
+fn side_lines(ui: &Ui, rect: egui::Rect, lines: &[Option<mime::layout::Line>; 4], page: [u8; 3], t: &theme::Tokens) {
+    for (i, line) in lines.iter().enumerate() {
+        let Some(l) = line else { continue };
+        let w = f32::from(l.width);
+        let side = match i {
+            0 => egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + w)),
+            1 => egui::Rect::from_min_max(egui::pos2(rect.right() - w, rect.top()), rect.right_bottom()),
+            2 => egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - w), rect.right_bottom()),
+            _ => egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + w, rect.bottom())),
+        };
+        ui.painter().rect_filled(side, 0.0, line_color(*l, page, t));
+    }
+}
+
 /// A box's colour and the picture behind it, filling `rect` with corners `radius` round, at most
 /// half its shorter side (as CSS draws a radius too big for its box).
 pub(super) fn backdrop(rect: egui::Rect, radius: Option<u16>, fill: Color32, behind: Option<&egui::TextureHandle>) -> egui::Shape {
@@ -121,6 +144,11 @@ pub(crate) fn corner(radius: Option<u16>, rect: egui::Rect) -> egui::CornerRadiu
     let most = (rect.width().min(rect.height()) / 2.0).max(0.0);
     let r = radius.map_or(0.0, f32::from).min(most).min(f32::from(u8::MAX));
     egui::CornerRadius::same(r.round() as u8)
+}
+
+/// Where a table goes across its room: where it says, else where the cell's content goes.
+pub(super) fn table_place(own: mime::layout::Align, content: mime::layout::Align) -> mime::layout::Align {
+    if own == mime::layout::Align::Left { content } else { own }
 }
 
 /// Each cell's width in a row `width` wide, `spacing` between the cells, `columns` the widths the
@@ -150,6 +178,7 @@ pub(crate) fn cell_widths(
     // Widths: what cells (or their columns) ask for, the rest shared by the others; and what
     // each holds, from its columns' measures (those it spans, and the room between them).
     let mut col = 0usize;
+    let mut shares: Vec<bool> = Vec::with_capacity(row.len());
     let (asked, fits): (Vec<Option<f32>>, Vec<Option<Fit>>) = row
         .iter()
         .map(|c| {
@@ -159,6 +188,11 @@ pub(crate) fn cell_widths(
                 (parts.len() == span && parts.iter().all(Option::is_some)).then(|| parts.iter().flatten().map(|w| px(*w)).sum::<f32>())
             };
             let w = c.width.map(px).or_else(from_columns);
+            let share = match c.width {
+                Some(w) => matches!(w, Width::Percent(_)),
+                None => columns.get(col..col + span).is_some_and(|parts| parts.iter().any(|p| matches!(p, Some(Width::Percent(_))))),
+            };
+            shares.push(share);
             let gaps = spacing * span.saturating_sub(1) as f32;
             let fit = content.get(col..col.saturating_add(span)).filter(|parts| parts.len() == span).and_then(|parts| {
                 parts.iter().try_fold(Fit { min: gaps, max: gaps }, |a, p| p.map(|p| Fit { min: a.min + p.min, max: a.max + p.max }))
@@ -174,10 +208,25 @@ pub(crate) fn cell_widths(
     let auto = free > 0 && asked.iter().zip(&fits).all(|(a, f)| a.is_some() || f.is_some());
     let unasked = || asked.iter().zip(&fits).filter(|(a, _)| a.is_none()).filter_map(|(_, f)| *f);
     let least: f32 = if auto { unasked().map(|f| f.min).sum() } else { MIN_COLUMN * free as f32 };
-    let mut widths: Vec<f32> = if fixed > width || (free > 0 && room < least) {
+    // What the cells that don't ask for a share can't do without: their width, or their content.
+    let base = |a: &Option<f32>, f: &Option<Fit>| {
+        a.unwrap_or_else(|| match f {
+            Some(f) if auto || f.min > 0.0 => f.min.max(1.0),
+            _ => MIN_COLUMN,
+        })
+    };
+    let held: f32 = asked.iter().zip(&fits).zip(&shares).filter(|(_, s)| !**s).map(|((a, f), _)| base(a, f)).sum();
+    let shared: f32 = asked.iter().zip(&shares).filter(|(_, s)| **s).filter_map(|(a, _)| *a).sum();
+    let over = fixed > width || (free > 0 && room < least);
+    let mut widths: Vec<f32> = if over && shared > 0.0 && held < width {
+        // Shares of the row that come to more than is left: the other cells keep what they
+        // ask for or can't do without, and the shares split the rest, as browsers do (issue #47:
+        // a dot of 18 pixels between bars of 50% each was squeezed, and the row stacked; a logo
+        // beside a cell of 100% went above it).
+        asked.iter().zip(&fits).zip(&shares).map(|((a, f), s)| if *s { a.unwrap_or(0.0) / shared * (width - held) } else { base(a, f) }).collect()
+    } else if over {
         // Asked for more than there is: shared out in proportion (by what those that ask for
         // nothing can't do without, measured).
-        let base = |a: &Option<f32>, f: &Option<Fit>| a.unwrap_or_else(|| if auto { f.map_or(MIN_COLUMN, |f| f.min.max(1.0)) } else { MIN_COLUMN });
         let total: f32 = asked.iter().zip(&fits).map(|(a, f)| base(a, f)).sum::<f32>().max(1.0);
         asked.iter().zip(&fits).map(|(a, f)| base(a, f) / total * width).collect()
     } else if auto {
@@ -205,9 +254,9 @@ pub(crate) fn cell_widths(
     // browser shares it (three cells of 33% fill it equally); else the last cell's (a spacer next
     // to a wider cell asks for nothing more).
     let used: f32 = widths.iter().sum();
-    let shares: f32 = row.iter().zip(&widths).filter(|(c, _)| matches!(c.width, Some(Width::Percent(_)))).map(|(_, w)| *w).sum();
-    if used < width && shares > 0.0 {
-        let grow = (width - used) / shares;
+    let sharing: f32 = row.iter().zip(&widths).filter(|(c, _)| matches!(c.width, Some(Width::Percent(_)))).map(|(_, w)| *w).sum();
+    if used < width && sharing > 0.0 {
+        let grow = (width - used) / sharing;
         for (w, c) in widths.iter_mut().zip(row) {
             if matches!(c.width, Some(Width::Percent(_))) {
                 *w += *w * grow;
@@ -223,16 +272,23 @@ pub(crate) fn cell_widths(
     // one measured is squeezed when it can't hold its widest word, or when the row has less room
     // than an even share of it would need and it would take more.
     let even = if free > 0 { room / free as f32 } else { f32::INFINITY };
-    let squeezed = |w: f32, asked: Option<f32>, fit: Option<Fit>| {
+    let squeezed = |w: f32, asked: Option<f32>, fit: Option<Fit>, share: bool| {
         w < MIN_COLUMN
             && match (asked, fit) {
+                // A share is as much of the row as it can have: too little only for what it holds.
+                (Some(_), f) if share => f.is_some_and(|f| w + 0.5 < f.min),
                 (Some(a), _) => w + 0.5 < a,
                 (None, Some(f)) if auto => w + 0.5 < f.min || (even < MIN_COLUMN && w + 0.5 < f.max),
                 (None, _) => true,
             }
     };
-    let stack =
-        row.len() > 1 && widths.iter().zip(row).zip(asked.iter().zip(&fits)).any(|((w, c), (a, f))| squeezed(*w, *a, *f) && !c.blocks.is_empty());
+    let stack = row.len() > 1
+        && widths
+            .iter()
+            .zip(row)
+            .zip(asked.iter().zip(&fits))
+            .zip(&shares)
+            .any(|(((w, c), (a, f)), s)| squeezed(*w, *a, *f, *s) && !c.blocks.is_empty());
     (widths, stack)
 }
 

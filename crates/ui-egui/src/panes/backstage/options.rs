@@ -275,6 +275,29 @@ pub(super) fn options(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
         },
     );
 
+    // Issue #58: each account its own. Not in the browser, which waits on its server's own news.
+    let checked: Vec<&mailcraft_engine::model::AccountConfig> = s.accounts.iter().map(|a| &a.config).filter(|c| !c.is_local()).collect();
+    if !s.jmap_only && !checked.is_empty() {
+        let about = tl!(
+            "Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away."
+        );
+        group(ui, tl!("Checking for new mail"), Some(about), &mut |ui| {
+            for (i, c) in checked.iter().enumerate() {
+                setting(ui, i == 0, &c.email, None, &mut |ui| {
+                    let now = c.check_every.unwrap_or(0);
+                    let word = |m: u32| if m == 0 { tl!("Automatically").to_string() } else { tf!("Every {n} minutes", n = m) };
+                    egui::ComboBox::from_id_salt(("check-every", c.id.as_str())).width(170.0).selected_text(word(now)).show_ui(ui, |ui| {
+                        for m in [0u32, 5, 10, 15, 30, 60] {
+                            if ui.selectable_label(m == now, word(m)).clicked() && m != now {
+                                acts.push(Action::Run("account.checkEvery", json!({"account": c.id, "minutes": m})));
+                            }
+                        }
+                    });
+                });
+            }
+        });
+    }
+
     group(ui, tl!("Inbox and notifications"), None, &mut |ui| {
         setting(ui, true, tl!("Show a desktop notification when new mail arrives"), None, &mut |ui| {
             switch(ui, s.prefs.notify, tl!("Show a desktop notification when new mail arrives"), "view.notifications", acts);
@@ -425,6 +448,17 @@ pub(super) fn options(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
         setting(
             ui,
             false,
+            tl!("Show web pictures unless a message looks suspicious"),
+            Some(tl!(
+                "Pictures load as a message opens, when your mail server confirmed who sent it and it isn't in Junk. The server each picture is on can see your IP address and when you opened it. Tracking pictures stay blocked"
+            )),
+            &mut |ui| {
+                switch(ui, s.prefs.auto_pictures, tl!("Show web pictures unless a message looks suspicious"), "view.autoPictures", acts);
+            },
+        );
+        setting(
+            ui,
+            false,
             tl!("Check whether certificates were withdrawn"),
             Some(tl!(
                 "As signed mail is shown, its certificate's authority is asked whether it withdrew it. Its authority then learns whose mail you're reading"
@@ -487,7 +521,12 @@ pub(super) fn options(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
         );
     });
 
-    group(ui, tl!("Privacy"), Some(tl!("Pictures from the web load only when you ask. These senders' pictures always load:")), &mut |ui| {
+    let privacy = if s.prefs.auto_pictures {
+        tl!("These senders' pictures always load, even when a message looks suspicious:")
+    } else {
+        tl!("Pictures from the web load only when you ask. These senders' pictures always load:")
+    };
+    group(ui, tl!("Privacy"), Some(privacy), &mut |ui| {
         setting(
             ui,
             true,

@@ -311,17 +311,35 @@ pub fn sync(dav: &Dav, at: &Where, pim: &Pim, now: i64, local: mailcraft_model::
             } else {
                 let have: HashMap<&str, &str> =
                     pim.events.iter().filter(|e| e.calendar == c.href).map(|e| (e.href.as_str(), e.etag.as_str())).collect();
-                let listed = dav.etags(&c.href)?;
-                let fetch: Vec<String> =
-                    listed.iter().filter(|(h, t)| have.get(h.as_str()) != Some(&t.as_str()) || refetch.contains(h)).map(|(h, _)| h.clone()).collect();
-                // Unchanged: the engine keeps what it has.
-                out.kept.extend(listed.iter().filter(|(h, _)| !fetch.contains(h)).map(|(h, _)| h.clone()));
-                for (href, etag, data) in dav.multiget(Kind::Calendars, &c.href, &fetch)? {
-                    for event in ical::parse_in(&data, local).events {
-                        out.events.push(StoredEvent { calendar: c.href.clone(), href: href.clone(), etag: etag.clone(), event, dirty: false });
+                let read = || -> Result<(Vec<(String, String)>, Vec<(String, String, String)>)> {
+                    let listed = dav.etags(&c.href)?;
+                    let fetch: Vec<String> = listed
+                        .iter()
+                        .filter(|(h, t)| have.get(h.as_str()) != Some(&t.as_str()) || refetch.contains(h))
+                        .map(|(h, _)| h.clone())
+                        .collect();
+                    let got = dav.multiget(Kind::Calendars, &c.href, &fetch)?;
+                    Ok((listed.into_iter().filter(|(h, _)| !fetch.contains(h)).collect(), got))
+                };
+                match unreadable(read(), &info.name, &mut out.errors)? {
+                    Some((kept, got)) => {
+                        // Unchanged: the engine keeps what it has.
+                        out.kept.extend(kept.into_iter().map(|(h, _)| h));
+                        for (href, etag, data) in got {
+                            for event in ical::parse_in(&data, local).events {
+                                out.events.push(StoredEvent {
+                                    calendar: c.href.clone(),
+                                    href: href.clone(),
+                                    etag: etag.clone(),
+                                    event,
+                                    dirty: false,
+                                });
+                            }
+                        }
+                        out.synced_calendars.push(c.href.clone());
                     }
+                    None => out.unchanged_calendars.push(c.href.clone()),
                 }
-                out.synced_calendars.push(c.href.clone());
             }
             calendars.push(info);
         }
@@ -343,21 +361,45 @@ pub fn sync(dav: &Dav, at: &Where, pim: &Pim, now: i64, local: mailcraft_model::
                 out.unchanged_books.push(c.href.clone());
             } else {
                 let have: HashMap<&str, &str> = pim.cards.iter().filter(|x| x.book == c.href).map(|x| (x.href.as_str(), x.etag.as_str())).collect();
-                let listed = dav.etags(&c.href)?;
-                let fetch: Vec<String> = listed.iter().filter(|(h, t)| have.get(h.as_str()) != Some(&t.as_str())).map(|(h, _)| h.clone()).collect();
-                out.kept.extend(listed.iter().filter(|(h, _)| !fetch.contains(h)).map(|(h, _)| h.clone()));
-                for (href, etag, data) in dav.multiget(Kind::Contacts, &c.href, &fetch)? {
-                    for card in vcard::parse(&data) {
-                        out.cards.push(StoredCard { book: c.href.clone(), href: href.clone(), etag: etag.clone(), card, dirty: false });
+                let read = || -> Result<(Vec<(String, String)>, Vec<(String, String, String)>)> {
+                    let listed = dav.etags(&c.href)?;
+                    let fetch: Vec<String> =
+                        listed.iter().filter(|(h, t)| have.get(h.as_str()) != Some(&t.as_str())).map(|(h, _)| h.clone()).collect();
+                    let got = dav.multiget(Kind::Contacts, &c.href, &fetch)?;
+                    Ok((listed.into_iter().filter(|(h, _)| !fetch.contains(h)).collect(), got))
+                };
+                match unreadable(read(), &info.name, &mut out.errors)? {
+                    Some((kept, got)) => {
+                        out.kept.extend(kept.into_iter().map(|(h, _)| h));
+                        for (href, etag, data) in got {
+                            for card in vcard::parse(&data) {
+                                out.cards.push(StoredCard { book: c.href.clone(), href: href.clone(), etag: etag.clone(), card, dirty: false });
+                            }
+                        }
+                        out.synced_books.push(c.href.clone());
                     }
+                    None => out.unchanged_books.push(c.href.clone()),
                 }
-                out.synced_books.push(c.href.clone());
             }
             books.push(info);
         }
         out.books = Some(books);
     }
     Ok(out)
+}
+
+/// A calendar or address book read, or `None` when it couldn't be (one the user may not read,
+/// an error of the server's): said, and what's here of it kept as it is, while the others sync.
+/// A refused sign-in, or no connection, is the whole sync's.
+fn unreadable<T>(read: Result<T>, name: &str, errors: &mut Vec<String>) -> Result<Option<T>> {
+    match read {
+        Ok(t) => Ok(Some(t)),
+        Err(e @ (NetError::Auth(_) | NetError::Io(_) | NetError::Tls(_))) => Err(e),
+        Err(e) => {
+            errors.push(format!("{name} couldn't be read: {e}"));
+            Ok(None)
+        }
+    }
 }
 
 /// Who sends a meeting's invitations or answers, for the copy stored on the server.
@@ -380,7 +422,7 @@ impl Role {
     /// `none_found`: no copy of a new meeting was found on the server (one it put there itself).
     fn of(at: &Where, pim: &Pim, parts: &[&StoredEvent], schedules: bool, none_found: bool) -> Role {
         let Some(master) = parts.iter().find(|e| e.event.recurrence_id.is_none()).or_else(|| parts.first()) else { return Role::Plain };
-        if !schedules {
+        if !schedules || !at.mails {
             return Role::Plain;
         }
         let Some(organizer) = master.event.organizer.as_ref() else { return Role::AsItIs };

@@ -72,6 +72,25 @@ fn the_file_page_shows_accounts_replies_space_and_options() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Issue #61: calendars and contacts only, from a Nextcloud or Radicale address, with no email.
+#[test]
+fn the_account_form_adds_calendar_only_accounts() {
+    let (mut a, dir) = app("calendar-form");
+    let p = match calendar_form() {
+        Dialog::AddAccount(f) => f.calendar_params(),
+        _ => serde_json::Value::Null,
+    };
+    assert_eq!(
+        (p["dav"].clone(), p["email"].clone(), p["username"].clone()),
+        (json!("https://cloud.example.org/remote.php/dav"), json!("zoe@example.org"), json!(""))
+    );
+    a.act(crate::Action::Submit("account.add", p));
+    let added = a.session.accounts.iter().find(|x| x.config.email == "zoe@example.org").unwrap();
+    assert!(added.config.is_calendar_only());
+    assert_eq!(added.config.username, "zoe@example.org", "signs in with the address when no user name is given");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn the_account_form_adds_jmap_accounts() {
     let (mut a, dir) = app("jmap-form");
@@ -257,5 +276,25 @@ fn many_accounts_waiting_dont_cover_the_counts() {
     assert!(counts_end > 0.0, "{texts:?}");
     assert!(waiting.iter().any(|(s, ..)| s.starts_with('+')), "the rest as +N: {texts:?}");
     assert!(waiting.iter().all(|(_, l, _)| *l > counts_end), "nothing over the counts: {texts:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Issue #58: File › Options gives each account with a server a time of its own to look for mail.
+#[test]
+fn options_gives_each_account_its_time_to_look_for_mail() {
+    let (mut a, dir) = app("check-every");
+    let ctx = egui::Context::default();
+    a.act(crate::Action::Submit("account.add", json!({"email": "zoe@example.org", "password": "pw", "imapHost": "mail.example.org"})));
+    let id = a.session.accounts.iter().find(|x| x.config.email == "zoe@example.org").map(|x| x.config.id.clone()).unwrap();
+    a.act(crate::Action::Backstage(crate::backstage::Page::Options));
+    let tall = egui::vec2(1280.0, 3000.0);
+    let has = |texts: &[(String, egui::Rect, egui::Rect)], what: &str| texts.iter().any(|(t, ..)| t.contains(what));
+    crate::tests::rtl::drawn_text(&ctx, &mut a, tall);
+    let texts = crate::tests::rtl::drawn_text(&ctx, &mut a, tall);
+    assert!(has(&texts, "Checking for new mail") && has(&texts, "zoe@example.org") && has(&texts, "Automatically"), "{texts:?}");
+    a.act(crate::Action::Run("account.checkEvery", json!({"account": id, "minutes": 30})));
+    crate::tests::rtl::drawn_text(&ctx, &mut a, tall);
+    let texts = crate::tests::rtl::drawn_text(&ctx, &mut a, tall);
+    assert!(has(&texts, "Every 30 minutes"), "{texts:?}");
     let _ = std::fs::remove_dir_all(dir);
 }

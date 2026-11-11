@@ -57,7 +57,7 @@ pub use tnef::{
     Tnef, TnefBody, TnefFile, byte_code_page, decode_code_page, decompress_rtf, known_code_page, read_tnef, rtf_body, rtf_wraps_html,
     unsupported_code_page, utf16_code_page,
 };
-pub use trackers::{Trackers, clean_link, trackers, tracks_click};
+pub use trackers::{SenderCheck, Trackers, clean_link, trackers, tracks_click};
 
 /// `bytes` read in the character set `charset` names (`iso-8859-1`, `shift_jis`), when it's one
 /// known: for showing a source's text that isn't UTF-8 (View message source, issue #27).
@@ -242,6 +242,14 @@ pub(crate) fn importance(m: &Message<'_>) -> i8 {
 
 /// Mail sent in bulk: lists, newsletters, notifications (RFC 2369 `List-*`, RFC 2919 `List-Id`,
 /// RFC 3834 `Auto-Submitted`, the de-facto `Precedence: bulk|list|junk`, and no-reply senders).
+/// What the top `Authentication-Results` says of the one address in the From line.
+fn checked_sender(m: &Message<'_>) -> SenderCheck {
+    let Some(header) = header_raw(m.root(), "Authentication-Results") else { return SenderCheck::Unknown };
+    let Some(from) = m.from().filter(|f| f.iter().count() == 1 && !f.has_groups()) else { return SenderCheck::Unknown };
+    let address = from.first().and_then(|a| a.address()).unwrap_or_default();
+    trackers::sender_check(header, address.rsplit_once('@').map_or("", |(_, d)| d))
+}
+
 fn is_bulk(m: &Message<'_>) -> bool {
     let has = |name: &str| header_raw(m.root(), name).is_some_and(|v| !v.trim().is_empty());
     let precedence = header_raw(m.root(), "Precedence").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
@@ -305,6 +313,8 @@ pub struct Parsed {
     /// from this message's own header: whatever account it came through.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bulk: bool,
+    /// What the mail server that took it found out about who sent it.
+    pub sender_check: SenderCheck,
     /// A reaction to the message it answers (RFC 9078): its emoji, as [`Summary::reaction`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reaction: String,
@@ -341,6 +351,27 @@ pub struct Span {
     /// A picture's size as the message sets it (issue #10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_size: Option<ImageSize>,
+    /// How big it is, in pixels, as the message sets it (`font-size`, `<font size>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u16>,
+    /// Raised or lowered, smaller (`<sup>`, `<sub>`).
+    #[serde(default, skip_serializing_if = "Rise::is_normal")]
+    pub rise: Rise,
+}
+
+/// Text set above or below its line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Rise {
+    #[default]
+    Normal,
+    Sup,
+    Sub,
+}
+
+impl Rise {
+    fn is_normal(&self) -> bool {
+        *self == Rise::Normal
+    }
 }
 
 fn is_none(v: &usize) -> bool {
@@ -401,7 +432,9 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
                     images.push(src);
                 }
             }
-            (html::html_to_rich_within(h, WRITTEN_MAX, r.hidden), images, layout)
+            // Flowing text at the size it sets; a layout has its own ([`layout::Block`]).
+            let sized = if layout.is_empty() { layout::sized_html(h) } else { None };
+            (html::html_to_rich_within(sized.as_deref().unwrap_or(h), WRITTEN_MAX, r.hidden), images, layout)
         }
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
@@ -450,6 +483,7 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
         trackers: tracking,
         unsubscribe,
         bulk: is_bulk(&m),
+        sender_check: checked_sender(&m),
         reaction: reaction_of(&m),
     })
 }

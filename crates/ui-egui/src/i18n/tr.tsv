@@ -1632,3 +1632,20 @@ month	May	Mayıs
 	it can't be decrypted with your OpenPGP key	OpenPGP anahtarınızla şifresi çözülemiyor
 	your OpenPGP keys are used by the MailCraft desktop app, not in the browser	OpenPGP anahtarlarınızı tarayıcı değil, MailCraft masaüstü uygulaması kullanır
 	Not sent yet: this is a draft.	Henüz gönderilmedi: bu bir taslak.
+	Show web pictures unless a message looks suspicious	İleti şüpheli görünmedikçe web resimlerini göster
+	Pictures load as a message opens, when your mail server confirmed who sent it and it isn't in Junk. The server each picture is on can see your IP address and when you opened it. Tracking pictures stay blocked	Posta sunucunuz göndereni doğruladıysa ve ileti Gereksiz klasöründe değilse resimler ileti açılırken yüklenir. Her resmin sunucusu IP adresinizi ve iletiyi ne zaman açtığınızı görebilir. İzleme resimleri engelli kalır
+	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	Bu ileti şüpheli görünüyor veya göndereni doğrulanamadı, bu yüzden resimleri gizli kalıyor.
+	These senders' pictures always load, even when a message looks suspicious:	Bu gönderenlerin resimleri, ileti şüpheli görünse bile her zaman yüklenir:
+	Open a mail file	Bir posta dosyası aç
+	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	Kaydedilmiş bir iletiyi (.eml veya Outlook .msg) bir klasöre eklemeden düz metin olarak görün. Resimleri yüklenmez ve içindeki hiçbir şey çalışmaz.
+	Nothing is kept: closing it leaves no trace in your mail.	Hiçbir şey saklanmaz: kapattığınızda postanızda iz kalmaz.
+	and {n} more	ve {n} tane daha
+	Checking for new mail	Yeni posta denetimi
+	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Otomatik: sunucu bildirebiliyorsa yeni posta bildirildiği anda gelir, aksi halde iki dakikada bir bakılır. Belirli bir süre seçildiğinde hesap yalnızca o zaman bakar. Gönderdikleriniz hemen gider, Gönder/Al ise hemen bakar.
+	Automatically	Otomatik
+	Every {n} minutes	Her {n} dakikada
+	Calendars and contacts only, with no email (CalDAV and CardDAV)	Yalnızca takvimler ve kişiler, e-posta olmadan (CalDAV ve CardDAV)
+	Calendar and contacts server	Takvim ve kişi sunucusu
+	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Nextcloud, Baïkal, SOGo veya Radicale gibi, takvimlerinizi ve kişilerinizi e-posta olmadan tutan her CalDAV ve CardDAV sunucusu için. Parolanız bu bilgisayarın anahtarlığında tutulur ve yalnızca o sunucuya gönderilir.
+	Server: {url} (CalDAV and CardDAV)	Sunucu: {url} (CalDAV ve CardDAV)
+	Not available: this account has no mail server.	Kullanılamıyor: bu hesabın posta sunucusu yok.

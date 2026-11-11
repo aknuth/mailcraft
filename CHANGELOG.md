@@ -8,7 +8,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 version is a milestone, named in italics under its heading. Numbers like (#11) are tester issues
 on GitHub.
 
-## 0.34.0
+## 0.35.0
+
+*Mail built from templates reads as it was designed, a mail file opens from inside MailCraft, calendars and contacts sync with no email account, and each account checks for mail as often as you choose.*
+
+### Fixed
+
+- Mail built from templates is no longer said to hide its text: a preview line's invisible padding isn't words, and `font-size: 0` on a column hides nothing when the text inside sets its own size (#47).
+- A heading written in boxes of its own no longer shows `##` before its text, and a price no longer shows `^{$}`: raised and lowered text (`<sup>`, `<sub>`) sits above and below its line (#47).
+- Newsletters and notifications built with MJML and similar templates are laid out however deeply their tables nest, with no more text tables of box-drawing lines in a monospace font; lines around cells and tables, dividers and spacers are drawn, and heading cells are bold and centred (#47).
+- A row's shares no longer push out what's beside them: a progress step's dot stays between its bars and a logo beside a cell of 100% stays beside it. A picture held back keeps the size it says, so an icon's description no longer runs a letter to a line (#47).
+- A box drawn around text or a picture keeps its colour, corners and lines, whatever its width: a progress step's round dot, or a note in a coloured card (#47).
+- Text in a message is drawn at the size its sender set, so fine print is small and a price or title large (#47).
+- On a POP account, a message you send shows in Sent Items at once, and a saved draft in Drafts, instead of after MailCraft starts again (#57).
+- A message you send just before starting another no longer stays "still being sent" for good, and closing MailCraft no longer warns about it.
+- New contacts and events have somewhere to go when the calendar server has only address books or calendars you can't change (a Nextcloud user who never opened its web page): they stay on this computer instead of being refused (#61).
+- Calendars and contacts sync with a server that takes Digest sign-in only, as Baïkal does unless set otherwise: every request was refused as if the password were wrong (#61).
+- A calendar or address book you may not read no longer keeps the others from syncing, nor asks for your password again: it's kept as it is, and named (#61).
+- On FreeBSD, a new account isn't started from a data file another account has open, as elsewhere: it was copied while it was being written.
+
+### Added
+
+- File › Options › Safety can show web pictures as a message opens, unless it looks suspicious: in Junk, from a blocked sender, or from a sender your mail server couldn't confirm. Off at first; a picture's server can see your IP address and when you opened the message.
+- File › Open & Export opens a saved `.eml` or Outlook `.msg` file to look at as plain text, without adding it to a folder (#56). Opening one shows who else it went to, what's attached and where a link really goes.
+- File › Options sets how often each account looks for new mail: automatically, as before, or every 5, 10, 15, 30 or 60 minutes (#58).
+- Add account can add calendars and contacts only, with no email, from any CalDAV and CardDAV server (Nextcloud, Baïkal, SOGo, Radicale and others): give its address, your user name and an app password, and they sync both ways. A server that schedules meetings sends their invitations (#61).
+
+## 0.34.0 - 2026-11-08
 
 *One coloured title bar on Windows, dates written your way, and drafts never lost on their way to the server.*
 

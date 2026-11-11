@@ -1628,3 +1628,20 @@ month	May	5月
 	it can't be decrypted with your OpenPGP key	无法用你的 OpenPGP 密钥解密
 	your OpenPGP keys are used by the MailCraft desktop app, not in the browser	你的 OpenPGP 密钥由 MailCraft 桌面应用使用，而不在浏览器中使用
 	Not sent yet: this is a draft.	尚未发送：这是草稿。
+	Show web pictures unless a message looks suspicious	除非邮件看起来可疑，否则显示网络图片
+	Pictures load as a message opens, when your mail server confirmed who sent it and it isn't in Junk. The server each picture is on can see your IP address and when you opened it. Tracking pictures stay blocked	如果邮件服务器已确认发件人且邮件不在垃圾邮件中，打开邮件时会加载图片。每张图片所在的服务器都能看到你的 IP 地址和打开时间。跟踪图片仍被阻止
+	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	此邮件看起来可疑或无法确认发件人，因此其图片保持隐藏。
+	These senders' pictures always load, even when a message looks suspicious:	这些发件人的图片始终加载，即使邮件看起来可疑：
+	Open a mail file	打开邮件文件
+	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	以纯文本查看已保存的邮件（.eml 或 Outlook 的 .msg），不会将其添加到文件夹。不会加载其中的图片，其中的任何内容也不会运行。
+	Nothing is kept: closing it leaves no trace in your mail.	不会保留任何内容：关闭后不会在邮件中留下痕迹。
+	and {n} more	另外 {n} 个
+	Checking for new mail	检查新邮件
+	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	自动：服务器能通知时，新邮件一到就收取，否则每两分钟检查一次。设置时间后，帐户只在那时检查。发送的邮件会立即发出，“发送/接收”会马上检查。
+	Automatically	自动
+	Every {n} minutes	每 {n} 分钟
+	Calendars and contacts only, with no email (CalDAV and CardDAV)	仅日历和联系人，无邮件 (CalDAV 和 CardDAV)
+	Calendar and contacts server	日历和联系人服务器
+	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	用于任何保存日历和联系人但不含邮件的 CalDAV 和 CardDAV 服务器，例如 Nextcloud、Baïkal、SOGo 或 Radicale。密码保存在这台电脑的钥匙串中，只会发送到该服务器。
+	Server: {url} (CalDAV and CardDAV)	服务器: {url} (CalDAV 和 CardDAV)
+	Not available: this account has no mail server.	不可用：此帐户没有邮件服务器。

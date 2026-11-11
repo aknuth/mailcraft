@@ -1631,3 +1631,20 @@ month	May	Май
 	it can't be decrypted with your OpenPGP key	его нельзя расшифровать вашим ключом OpenPGP
 	your OpenPGP keys are used by the MailCraft desktop app, not in the browser	ваши ключи OpenPGP используются настольным приложением MailCraft, а не в браузере
 	Not sent yet: this is a draft.	Ещё не отправлено: это черновик.
+	Show web pictures unless a message looks suspicious	Показывать картинки из интернета, если письмо не выглядит подозрительным
+	Pictures load as a message opens, when your mail server confirmed who sent it and it isn't in Junk. The server each picture is on can see your IP address and when you opened it. Tracking pictures stay blocked	Картинки загружаются при открытии письма, если почтовый сервер подтвердил отправителя и письмо не в папке «Нежелательная почта». Сервер каждой картинки увидит ваш IP-адрес и время открытия. Картинки слежения остаются заблокированными
+	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	Это письмо выглядит подозрительным или его отправителя не удалось подтвердить, поэтому картинки скрыты.
+	These senders' pictures always load, even when a message looks suspicious:	Картинки от этих отправителей загружаются всегда, даже если письмо выглядит подозрительным:
+	Open a mail file	Открыть файл письма
+	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	Посмотреть сохранённое письмо (.eml или .msg из Outlook) как обычный текст, не добавляя его в папку. Картинки не загружаются, и ничего из письма не запускается.
+	Nothing is kept: closing it leaves no trace in your mail.	Ничего не сохраняется: после закрытия в вашей почте не останется следов.
+	and {n} more	и ещё {n}
+	Checking for new mail	Проверка новой почты
+	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Автоматически: новая почта приходит, как только сервер сообщит о ней, если он это умеет, иначе проверка идёт каждые две минуты. С заданным временем учётная запись проверяет почту только тогда. Отправленное уходит сразу, а «Отправить/получить» проверяет немедленно.
+	Automatically	Автоматически
+	Every {n} minutes	Каждые {n} мин.
+	Calendars and contacts only, with no email (CalDAV and CardDAV)	Только календари и контакты, без почты (CalDAV и CardDAV)
+	Calendar and contacts server	Сервер календарей и контактов
+	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Для любого сервера CalDAV и CardDAV с вашими календарями и контактами, например Nextcloud, Baïkal, SOGo или Radicale, без почты. Пароль хранится в связке ключей этого компьютера и отправляется только на этот сервер.
+	Server: {url} (CalDAV and CardDAV)	Сервер: {url} (CalDAV и CardDAV)
+	Not available: this account has no mail server.	Недоступно: у этой учётной записи нет почтового сервера.

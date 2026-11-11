@@ -1632,3 +1632,20 @@ month	May	Mai
 	it can't be decrypted with your OpenPGP key	sie lässt sich mit Ihrem OpenPGP-Schlüssel nicht entschlüsseln
 	your OpenPGP keys are used by the MailCraft desktop app, not in the browser	Ihre OpenPGP-Schlüssel werden von der MailCraft-Desktop-App verwendet, nicht im Browser
 	Not sent yet: this is a draft.	Noch nicht gesendet: Dies ist ein Entwurf.
+	Show web pictures unless a message looks suspicious	Webbilder anzeigen, außer wenn eine Nachricht verdächtig wirkt
+	Pictures load as a message opens, when your mail server confirmed who sent it and it isn't in Junk. The server each picture is on can see your IP address and when you opened it. Tracking pictures stay blocked	Bilder werden beim Öffnen geladen, wenn Ihr Mailserver den Absender bestätigt hat und die Nachricht nicht in „Junk-E-Mail“ liegt. Der Server des Bildes sieht Ihre IP-Adresse und wann Sie die Nachricht geöffnet haben. Tracking-Bilder bleiben blockiert
+	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	Diese Nachricht wirkt verdächtig oder ihr Absender konnte nicht bestätigt werden, daher bleiben ihre Bilder ausgeblendet.
+	These senders' pictures always load, even when a message looks suspicious:	Bilder dieser Absender werden immer geladen, auch wenn eine Nachricht verdächtig wirkt:
+	Open a mail file	Eine E-Mail-Datei öffnen
+	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	Eine gespeicherte Nachricht (.eml oder .msg von Outlook) als reinen Text ansehen, ohne sie einem Ordner hinzuzufügen. Ihre Bilder werden nicht geladen, und nichts darin wird ausgeführt.
+	Nothing is kept: closing it leaves no trace in your mail.	Nichts wird behalten: Nach dem Schließen bleibt keine Spur in Ihren E-Mails.
+	and {n} more	und {n} weitere
+	Checking for new mail	Nach neuen E-Mails suchen
+	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Automatisch holt neue E-Mails, sobald der Server sie meldet, wo ein Server das kann, und sucht sonst alle zwei Minuten. Mit einer festen Zeit sucht ein Konto nur dann. Was Sie senden, geht sofort hinaus, und Senden/Empfangen sucht sofort.
+	Automatically	Automatisch
+	Every {n} minutes	Alle {n} Minuten
+	Calendars and contacts only, with no email (CalDAV and CardDAV)	Nur Kalender und Kontakte, ohne E-Mail (CalDAV und CardDAV)
+	Calendar and contacts server	Server für Kalender und Kontakte
+	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Für jeden CalDAV- und CardDAV-Server mit Ihren Kalendern und Kontakten, etwa Nextcloud, Baïkal, SOGo oder Radicale, ohne E-Mail. Ihr Kennwort wird im Schlüsselbund dieses Computers gespeichert und nur an diesen Server gesendet.
+	Server: {url} (CalDAV and CardDAV)	Server: {url} (CalDAV und CardDAV)
+	Not available: this account has no mail server.	Nicht verfügbar: Dieses Konto hat keinen Mailserver.

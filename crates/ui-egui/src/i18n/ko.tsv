@@ -1631,3 +1631,20 @@ month	May	5월
 	it can't be decrypted with your OpenPGP key	내 OpenPGP 키로 해독할 수 없습니다
 	your OpenPGP keys are used by the MailCraft desktop app, not in the browser	OpenPGP 키는 브라우저가 아니라 MailCraft 데스크톱 앱에서 사용됩니다
 	Not sent yet: this is a draft.	아직 보내지 않음: 임시 보관 메시지입니다.
+	Show web pictures unless a message looks suspicious	메시지가 의심스럽지 않으면 웹 그림 표시
+	Pictures load as a message opens, when your mail server confirmed who sent it and it isn't in Junk. The server each picture is on can see your IP address and when you opened it. Tracking pictures stay blocked	메일 서버가 보낸 사람을 확인했고 정크 메일에 있지 않으면 메시지를 열 때 그림을 불러옵니다. 각 그림의 서버는 IP 주소와 메시지를 연 시각을 볼 수 있습니다. 추적 그림은 계속 차단됩니다
+	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	이 메시지는 의심스럽거나 보낸 사람을 확인할 수 없어 그림을 숨겨 둡니다.
+	These senders' pictures always load, even when a message looks suspicious:	이 보낸 사람의 그림은 메시지가 의심스러워 보여도 항상 불러옵니다:
+	Open a mail file	메일 파일 열기
+	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	저장된 메시지(.eml 또는 Outlook .msg)를 폴더에 추가하지 않고 일반 텍스트로 봅니다. 그림은 불러오지 않으며 그 안의 어떤 것도 실행되지 않습니다.
+	Nothing is kept: closing it leaves no trace in your mail.	아무것도 보관되지 않습니다. 닫으면 메일에 아무 흔적도 남지 않습니다.
+	and {n} more	외 {n}개
+	Checking for new mail	새 메일 확인
+	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	자동은 서버가 알려 줄 수 있으면 새 메일을 바로 받고, 그렇지 않으면 2분마다 확인합니다. 시간을 정하면 계정은 그때만 확인합니다. 보내는 메일은 바로 전송되며 보내기/받기는 즉시 확인합니다.
+	Automatically	자동
+	Every {n} minutes	{n}분마다
+	Calendars and contacts only, with no email (CalDAV and CardDAV)	일정과 연락처만, 메일 없음 (CalDAV 및 CardDAV)
+	Calendar and contacts server	일정 및 연락처 서버
+	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Nextcloud, Baïkal, SOGo, Radicale처럼 메일 없이 일정과 연락처를 보관하는 모든 CalDAV 및 CardDAV 서버용입니다. 암호는 이 컴퓨터의 키체인에 보관되며 그 서버로만 전송됩니다.
+	Server: {url} (CalDAV and CardDAV)	서버: {url} (CalDAV 및 CardDAV)
+	Not available: this account has no mail server.	사용할 수 없음: 이 계정에는 메일 서버가 없습니다.

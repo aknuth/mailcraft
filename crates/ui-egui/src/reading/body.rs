@@ -61,7 +61,13 @@ pub(super) fn html_bar(s: &Session, t: &Tokens, ui: &mut Ui, key: &MessageKey, p
                 ui.horizontal_wrapped(|ui| {
                     let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                     icons::paint(ui.painter(), ir, Icon::Image, t.dim);
-                    ui.label(RichText::new(tl!("Pictures from the web are hidden to protect your privacy.")).color(t.dim));
+                    // Shown by themselves elsewhere: why not on this one.
+                    let why = if s.prefs.auto_pictures {
+                        tl!("This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.")
+                    } else {
+                        tl!("Pictures from the web are hidden to protect your privacy.")
+                    };
+                    ui.label(RichText::new(why).color(t.dim));
                     if ui.link(tl!("Show pictures")).clicked() {
                         acts.push(Action::Run("message.showPictures", json!({})));
                     }
@@ -210,19 +216,32 @@ pub(super) trait CellEdit {
 pub(super) const MIN_COLUMN: f32 = 140.0;
 
 pub(super) fn span_font(sp: &mime::Span) -> egui::FontId {
+    let font = span_font_at_full_size(sp);
+    match sp.rise {
+        mime::Rise::Normal => font,
+        _ => egui::FontId::new(font.size * SCRIPT_SIZE, font.family),
+    }
+}
+
+/// How much smaller raised and lowered text is drawn.
+const SCRIPT_SIZE: f32 = 0.72;
+
+fn span_font_at_full_size(sp: &mime::Span) -> egui::FontId {
+    // The size the message sets, one of its pixels a point here, as its layout is.
+    let size = |unset: f32| sp.size.map_or(unset, f32::from);
     if sp.heading > 0 {
-        theme::bold(match sp.heading {
+        theme::bold(size(match sp.heading {
             1 => 22.0,
             2 => 19.0,
             3 => 17.0,
             _ => 15.5,
-        })
+        }))
     } else if sp.code {
-        egui::FontId::monospace(13.5)
+        egui::FontId::monospace(size(13.5))
     } else if sp.bold {
-        theme::bold(14.5)
+        theme::bold(size(14.5))
     } else {
-        theme::regular(14.5)
+        theme::regular(size(14.5))
     }
 }
 
@@ -250,6 +269,7 @@ impl Body<'_> {
                         italics: sp.italic,
                         strikethrough: if sp.strike { egui::Stroke::new(1.0, fg) } else { egui::Stroke::NONE },
                         underline: if sp.link.is_some() { egui::Stroke::new(1.0, fg) } else { egui::Stroke::NONE },
+                        valign: if sp.rise == mime::Rise::Sup { Align::TOP } else { Align::BOTTOM },
                         ..Default::default()
                     };
                     job.append(&sp.text, 0.0, format);
@@ -307,12 +327,31 @@ impl Body<'_> {
         if let Some(src) = &sp.image {
             self.shown.push(src.clone());
             if !picture(self.s, st, ui, self.key, self.p, src, self.allowed, width, sp.image_size) {
-                let alt = if sp.text.trim().is_empty() { "picture" } else { sp.text.trim() };
-                ui.add(egui::Label::new(RichText::new(format!("[{alt}]")).color(t.faint)).selectable(false));
+                let alt = held_back_words(&sp.text);
+                match held_back_box(sp.image_size, width) {
+                    Some(size) => {
+                        // The room it will take, with its description if that fits.
+                        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                        let galley = ui.painter().layout_no_wrap(alt, theme::regular(12.0), t.faint);
+                        if galley.size().x <= rect.width() && galley.size().y <= rect.height() {
+                            ui.painter().galley(rect.center() - galley.size() / 2.0, galley, t.faint);
+                        }
+                        if size.x > 3.0 && size.y > 3.0 {
+                            ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.0, t.faint.gamma_multiply(0.4)), egui::StrokeKind::Inside);
+                        }
+                    }
+                    None => {
+                        ui.add(egui::Label::new(RichText::new(alt).color(t.faint)).selectable(false));
+                    }
+                }
             }
             return;
         }
         let mut rt = RichText::new(&sp.text).font(span_font(sp));
+        // Raised: as tall as the line, so that it sits at the top of it beside the text.
+        if sp.rise == mime::Rise::Sup {
+            rt = rt.line_height(Some(ui.fonts_mut(|f| f.row_height(&span_font_at_full_size(sp))))).raised();
+        }
         if sp.italic {
             rt = rt.italics();
         }
@@ -371,7 +410,18 @@ impl Body<'_> {
                 Block::Table(table) if depth < 16 => {
                     // What its columns hold (measured once): their widths, and its own when it
                     // sets none and is as wide as what it holds (a `<table>`, a button).
-                    let measures = table::measured(ui, self.key, table);
+                    let (s, key, p, allowed) = (self.s, self.key, self.p, self.allowed);
+                    let ctx = ui.ctx().clone();
+                    let measures = table::measured_with(ui, key, table, allowed, &mut |sp| {
+                        let Some(src) = &sp.image else { return table::PictureWidth::Alt };
+                        match picture_texture(s, st, &ctx, key, p, src, allowed) {
+                            Pic::Ready(tex) => {
+                                table::PictureWidth::Is(shown_size(tex.size_vec2(), sp.image_size, f32::MAX / 2.0).map_or(0.0, |z| z.x))
+                            }
+                            Pic::Loading => table::PictureWidth::Coming,
+                            Pic::Missing => table::PictureWidth::Alt,
+                        }
+                    });
                     let tw = match table.width {
                         Some(Width::Px(px)) => (px as f32).min(width),
                         Some(Width::Percent(pc)) => width * f32::from(pc) / 100.0,
@@ -379,8 +429,9 @@ impl Body<'_> {
                         None => width,
                     }
                     .max(1.0);
-                    // In a centred cell (`<td align="center">`), a table is centred too, as browsers do.
-                    let at = if table.align == A::Left && align == A::Center { A::Center } else { table.align };
+                    // In a centred or right-aligned cell (`<td align="center">`), a table is
+                    // too, as browsers do.
+                    let at = table::table_place(table.align, align);
                     let indent = match at {
                         A::Center => (width - tw) / 2.0,
                         A::Right => width - tw,
@@ -411,6 +462,10 @@ impl Body<'_> {
                                 slot
                             });
                             ui.painter().set(framed.inner, table::backdrop(framed.response.rect, table.radius, fill, behind.as_ref()));
+                            if let Some(l) = table.border {
+                                let stroke = egui::Stroke::new(f32::from(l.width), table::line_color(l, page, &st.tokens));
+                                ui.painter().rect_stroke(framed.response.rect, 0.0, stroke, egui::StrokeKind::Inside);
+                            }
                         });
                     });
                 }
@@ -498,6 +553,37 @@ pub(super) fn picture(
         ui.add(egui::Image::new(&tex).fit_to_exact_size(at).maintain_aspect_ratio(false));
     }
     true
+}
+
+/// The room a picture that can't be shown (held back, or lost) takes: the size it says, no wider
+/// than the room, when it says its width in pixels (its height, or square when small, as an
+/// icon is); `None` to write its description instead. (A description of 18 pixels' width came
+/// out a letter to a line, and everything around it moved: issue #47.)
+pub(super) fn held_back_box(size: Option<mime::ImageSize>, width: f32) -> Option<egui::Vec2> {
+    use mime::layout::Width;
+    const SMALL: f32 = 64.0;
+    let z = size?;
+    let Some(Width::Px(w)) = z.width else { return None };
+    let w = w as f32;
+    let h = match z.height {
+        Some(h) => h as f32,
+        None if w <= SMALL => w,
+        None => return None,
+    };
+    let shrink = (width / w).min(1.0);
+    (w >= 0.5 && h >= 0.5).then(|| egui::vec2(w * shrink, (h * shrink).min(2000.0)))
+}
+
+/// What's written for a picture that can't be shown: its description in brackets, cut short (a
+/// shop's is often the item's whole name).
+pub(super) fn held_back_words(alt: &str) -> String {
+    const LONGEST: usize = 48;
+    let alt = alt.trim();
+    let alt = if alt.is_empty() { "picture" } else { alt };
+    match alt.char_indices().nth(LONGEST) {
+        Some((i, _)) => format!("[{}…]", alt.get(..i).unwrap_or(alt).trim_end()),
+        None => format!("[{alt}]"),
+    }
 }
 
 /// How big a picture of its own size `own` shows in room `width` wide: at the size the message

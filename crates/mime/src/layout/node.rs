@@ -3,6 +3,31 @@
 
 use super::*;
 
+/// The colour of a table's lines when `border="1"` is all that's said.
+const TABLE_LINE: [u8; 3] = [128, 128, 128];
+
+/// One word of a `border` shorthand: its width, its style or its colour.
+fn read_line_word(word: &str, width: &mut Option<u32>, kind: &mut Option<String>, colour: &mut Option<[u8; 3]>) {
+    if matches!(word, "none" | "hidden" | "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset") {
+        *kind = Some(word.to_string());
+    } else if let Some(w) = line_width(word) {
+        *width = Some(w);
+    } else if let Some(c) = color(word) {
+        *colour = Some(c);
+    }
+}
+
+/// A line's width in pixels (`1px`, `thin`), `0` read as such.
+fn line_width(v: &str) -> Option<u32> {
+    match v.trim() {
+        "thin" => Some(1),
+        "medium" => Some(3),
+        "thick" => Some(5),
+        "0" => Some(0),
+        v => length_px(v).filter(|_| v.ends_with(|c: char| c.is_ascii_alphabetic())).map(|n| n.round().clamp(0.0, 64.0) as u32),
+    }
+}
+
 impl Node {
     pub(super) fn attr(&self, name: &str) -> Option<&str> {
         self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
@@ -125,11 +150,17 @@ impl Node {
     }
 
     pub(super) fn align(&self) -> Align {
-        let v = self.attr("align").map(str::to_ascii_lowercase).or_else(|| self.style("text-align")).unwrap_or_default();
+        self.own_align().unwrap_or_default()
+    }
+
+    /// How what's in it lines up, when it says (`align`, `text-align`).
+    pub(super) fn own_align(&self) -> Option<Align> {
+        let v = self.attr("align").map(str::to_ascii_lowercase).or_else(|| self.style("text-align"))?;
         match v.trim() {
-            "center" | "middle" => Align::Center,
-            "right" | "end" => Align::Right,
-            _ => Align::Left,
+            "center" | "middle" => Some(Align::Center),
+            "right" | "end" => Some(Align::Right),
+            "left" | "start" => Some(Align::Left),
+            _ => None,
         }
     }
 
@@ -181,6 +212,96 @@ impl Node {
             }
         }
         out
+    }
+
+    /// The line along one side of it (`top`, `right`, `bottom`, `left`) its style sets: from
+    /// `border-top` or `border`, `border-top-width` and the like over them. None when its style is
+    /// `none`, or says none, as CSS has it.
+    pub(super) fn line(&self, side: &str) -> Option<Line> {
+        let short = self.style(&format!("border-{side}")).or_else(|| self.style("border"));
+        let (mut width, mut kind, mut colour): (Option<u32>, Option<String>, Option<[u8; 3]>) = (None, None, None);
+        for word in short.as_deref().unwrap_or("").split_whitespace() {
+            read_line_word(word, &mut width, &mut kind, &mut colour);
+        }
+        let one = |prop: &str, all: &str| self.style(prop).or_else(|| self.style(all)).filter(|v| v.split_whitespace().count() == 1);
+        if let Some(v) = one(&format!("border-{side}-width"), "border-width") {
+            width = line_width(&v);
+        }
+        if let Some(v) = one(&format!("border-{side}-style"), "border-style") {
+            kind = Some(v);
+        }
+        if let Some(v) = one(&format!("border-{side}-color"), "border-color") {
+            colour = color(&v).or(colour);
+        }
+        let shown = kind.is_some_and(|k| !matches!(k.as_str(), "none" | "hidden"));
+        let width = width.unwrap_or(3).min(MAX_LINE) as u8;
+        (shown && width > 0).then(|| Line { width, color: colour.unwrap_or([0, 0, 0]) })
+    }
+
+    /// The lines along its sides: top, right, bottom, left.
+    pub(super) fn lines(&self) -> [Option<Line>; 4] {
+        ["top", "right", "bottom", "left"].map(|side| self.line(side))
+    }
+
+    /// The line around a table (`border`, or the attribute `border="1"`).
+    pub(super) fn table_line(&self) -> Option<Line> {
+        self.line("top").or_else(|| {
+            let n = self.attr("border")?.trim().parse::<u32>().ok().filter(|n| *n > 0)?;
+            Some(Line { width: n.min(MAX_LINE) as u8, color: TABLE_LINE })
+        })
+    }
+
+    /// A cell's lines: its own, its row's, and the one its table's `border="1"` gives every cell.
+    pub(super) fn cell_lines(&self, tr: &Node, table: &Node) -> [Option<Line>; 4] {
+        let all = table.attr("border").and_then(|b| b.trim().parse::<u32>().ok()).filter(|n| *n > 0).map(|_| Line { width: 1, color: TABLE_LINE });
+        let mut lines = self.lines();
+        for (i, side) in ["top", "right", "bottom", "left"].into_iter().enumerate() {
+            if let Some(l) = lines.get_mut(i)
+                && l.is_none()
+            {
+                *l = tr.line(side).or(all);
+            }
+        }
+        lines
+    }
+
+    /// Whether there's nothing in it to see: no picture, and no text but spaces.
+    pub(super) fn blank(&self) -> bool {
+        !self.has_visible_text(0) && !self.has_picture(0)
+    }
+
+    fn has_visible_text(&self, depth: usize) -> bool {
+        depth < MAX_DEPTH * 4
+            && self.kids.iter().any(|k| match k {
+                Kid::Text(t) => t.chars().any(|c| !c.is_whitespace() && !matches!(c, '\u{200a}' | '\u{200b}' | '\u{200c}' | '\u{feff}' | '\u{a0}')),
+                Kid::El(n) => n.has_visible_text(depth + 1),
+            })
+    }
+
+    /// Whether it's a box that draws something around what it holds: a colour other than the one
+    /// it's on, or a line. Not a table, and not a picture behind it (those have their own ways).
+    pub(super) fn draws_a_box(&self, on: Option<[u8; 3]>) -> bool {
+        matches!(self.tag.as_str(), "div" | "section" | "article" | "aside" | "header" | "footer" | "main")
+            && self.background_image().is_none()
+            && (self.background().is_some_and(|c| Some(c) != on) || self.lines().iter().any(Option::is_some))
+    }
+
+    /// The line a box with nothing in it draws (`<p style="border-top: …">`, a one-cell table of
+    /// that, or `<hr>` drawn so): a divider.
+    pub(super) fn rule(&self) -> Option<Line> {
+        if !matches!(self.tag.as_str(), "p" | "div" | "table") {
+            return None;
+        }
+        let line = self.line("top").or_else(|| self.line("bottom")).filter(|_| self.line("left").is_none())?;
+        let cells: usize = if self.tag == "table" { self.rows().iter().map(|(_, c)| c.len()).sum() } else { 0 };
+        (cells <= 1 && self.background().is_none() && self.background_image().is_none() && self.blank()).then_some(line)
+    }
+
+    /// The height of a box with nothing in it that's there to part what's around it
+    /// (`<div style="height:20px">&#8202;</div>`, as MJML writes a spacer), or to be a bar of colour.
+    pub(super) fn spacer(&self) -> Option<u16> {
+        let height = self.min_height().filter(|_| matches!(self.tag.as_str(), "div" | "p"))?;
+        (self.background_image().is_none() && self.blank()).then_some(height)
     }
 
     /// The radius of its corners its style sets (`border-radius`: its first length, every corner
@@ -366,7 +487,8 @@ impl Node {
         self.kids.iter().all(|k| match k {
             Kid::Text(_) => true,
             Kid::El(e) if !block_tag(&e.tag) => !e.has_block_inside(0),
-            Kid::El(e) => e.tag.len() == 2 && e.tag.starts_with('h') && e.tag != "hr" && !e.has_block_inside(0),
+            // A title may hold a box of its own (`<h2><div>`, as a template writes one).
+            Kid::El(e) => e.tag.len() == 2 && e.tag.starts_with('h') && e.tag != "hr" && !e.has_table(0),
         })
     }
 
@@ -382,6 +504,22 @@ impl Node {
     }
 
     /// Its size in pixels, when its style or `<font size>` sets one.
+    /// The size of the text in it, in pixels, given the size of what's around it (`0`: not
+    /// known). A size of nothing (`font-size: 0`, on a template's columns) is passed over.
+    pub(super) fn text_size(&self, around: u16) -> u16 {
+        let base = if around == 0 { 16.0 } else { f32::from(around) };
+        let number = |v: &str, unit: &str| v.strip_suffix(unit).and_then(|n| n.trim().parse::<f32>().ok());
+        let px = match self.style("font-size").as_deref().map(str::trim) {
+            Some("smaller") => Some(base * 0.83),
+            Some("larger") => Some(base * 1.2),
+            // What's relative is to what's around it (the rest are the same anywhere).
+            Some(v) if v.ends_with('%') => number(v, "%").map(|n| base * n / 100.0),
+            Some(v) if v.ends_with("em") && !v.ends_with("rem") => number(v, "em").map(|n| base * n),
+            _ => self.font_size(),
+        };
+        px.filter(|p| p.is_finite() && *p >= 1.0).map_or(around, |p| p.round().min(f32::from(u16::MAX)) as u16)
+    }
+
     pub(super) fn font_size(&self) -> Option<f32> {
         self.style("font-size")
             .as_deref()

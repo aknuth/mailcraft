@@ -2,13 +2,27 @@
 
 use super::*;
 
+mod calendars;
+
 /// How often a full sync says the counts of the folders it has synced, at most.
 const COUNTS_EVERY: Duration = Duration::from_secs(1);
+/// A minute of an account's own time between looks for new mail (short in tests, to see some pass).
+const MINUTE: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(60) };
+/// Every folder is read at most this often when an account looks at set times, however often it
+/// looks at the Inbox: as often as an account left to itself reads them.
+const FULL_SYNC_MINUTES: u32 = 15;
+/// How long an IMAP connection stays quiet between looks. A server may drop one after 30 minutes
+/// of nothing (RFC 3501 5.4), which would come back as an error on the next thing asked of it.
+const QUIET_MINUTES: u32 = 10;
 
 impl Worker {
     /// Wait for new mail: IDLE on the Inbox when the server supports it, else poll.
     pub(super) fn wait_for_mail(&mut self, rx: &Receiver<Job>) {
         self.working(false);
+        if let Some(every) = self.check_every() {
+            self.wait_for_set_time(rx, every);
+            return;
+        }
         let inbox = self.inbox();
         if matches!(self.conn, Some(Conn::Jmap(_))) && !self.no_push && inbox.is_some() && self.wait_for_push(rx) {
             return;
@@ -21,16 +35,7 @@ impl Worker {
             match got {
                 Ok(j) => push_job(&mut self.queue, j),
                 Err(RecvTimeoutError::Disconnected) => self.closed = true,
-                Err(RecvTimeoutError::Timeout) if next_soon.is_some_and(|at| at <= Instant::now()) => {
-                    let now = Instant::now();
-                    let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.soon).into_iter().partition(|(at, _)| *at <= now);
-                    self.soon = later;
-                    let mut folders: Vec<String> = due.into_iter().map(|(_, f)| f).collect();
-                    folders.dedup();
-                    for f in folders {
-                        self.sync_one(&f);
-                    }
-                }
+                Err(RecvTimeoutError::Timeout) if next_soon.is_some_and(|at| at <= Instant::now()) => self.sync_soon_folders(),
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(f) = inbox {
                         self.sync_one(&f);
@@ -76,6 +81,81 @@ impl Worker {
             Ok(false) => {}
             Err(e) => self.failed(e),
         }
+    }
+
+    /// How often the account was asked to look for new mail (issue #58); `None`: left to itself.
+    pub(super) fn check_every(&self) -> Option<Duration> {
+        self.acc.check_every.filter(|m| *m > 0).map(|m| MINUTE.saturating_mul(m.min(mailcraft_model::MAX_CHECK_MINUTES)))
+    }
+
+    /// How long between reading every folder: an account looking less often than that reads them
+    /// when it looks, and nothing in between.
+    pub(super) fn full_sync_every(&self) -> Duration {
+        self.check_every().map_or(FULL_SYNC_EVERY, |every| every.max(MINUTE.saturating_mul(FULL_SYNC_MINUTES)))
+    }
+
+    /// Folders that were to be read again by now ([`Worker::soon`]).
+    fn sync_soon_folders(&mut self) {
+        let now = Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.soon).into_iter().partition(|(at, _)| *at <= now);
+        self.soon = later;
+        let mut folders: Vec<String> = due.into_iter().map(|(_, f)| f).collect();
+        folders.dedup();
+        for f in folders {
+            self.sync_one(&f);
+        }
+    }
+
+    /// Wait for the account's next set time (issue #58), with no IDLE or push: not being told is
+    /// what was asked for. Jobs are done as they come, and don't put the time off: it counts from
+    /// when the Inbox was last looked at, or an account in use would never get to it.
+    fn wait_for_set_time(&mut self, rx: &Receiver<Job>, every: Duration) {
+        let now = Instant::now();
+        let due = self.looked.unwrap_or(now).checked_add(every).unwrap_or(now);
+        let full = self.last_full.and_then(|t| t.checked_add(self.full_sync_every())).unwrap_or(now);
+        let soon = self.soon.iter().map(|(at, _)| *at).min().unwrap_or(due);
+        let wait = due.min(full).min(soon).saturating_duration_since(now).min(MINUTE.saturating_mul(QUIET_MINUTES));
+        let Some(got) = self.recv_unless_set_aside(rx, wait) else { return };
+        match got {
+            Ok(j) => {
+                // What it was asked to do finds the connection good, or makes one.
+                if now.elapsed() >= MINUTE {
+                    self.dropped_while_quiet(due);
+                }
+                push_job(&mut self.queue, j);
+            }
+            Err(RecvTimeoutError::Disconnected) => self.closed = true,
+            Err(RecvTimeoutError::Timeout) => {
+                self.sync_soon_folders();
+                // Every folder's turn: the Inbox with them, in the loop that called this.
+                if self.last_full.is_none_or(|t| t.elapsed() >= self.full_sync_every()) {
+                    return;
+                }
+                if Instant::now() < due {
+                    self.dropped_while_quiet(due);
+                    return;
+                }
+                if self.dropped_while_quiet(Instant::now()) {
+                    return;
+                }
+                if let Some(f) = self.inbox() {
+                    self.sync_one(&f);
+                }
+                self.looked = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Whether the server dropped an IMAP connection left quiet between looks, as servers do, some
+    /// within a minute. Found out here it's nothing to report: the connection is let go, to be made
+    /// again at `back_at` or by whatever needs it first, instead of failing what's asked of it next.
+    pub(super) fn dropped_while_quiet(&mut self, back_at: Instant) -> bool {
+        let Some(Conn::Imap(c)) = self.conn.as_mut() else { return false };
+        let Err(e) = c.noop() else { return false };
+        log::info!("{}: the server let a quiet connection go: {e}", self.acc.id);
+        self.conn = None;
+        self.next_attempt = back_at;
+        true
     }
 
     /// A job, waiting for one up to `wait` ([`Receiver::recv_timeout`]); `None` sooner, once
@@ -281,6 +361,7 @@ impl Worker {
             self.report_quota();
             self.prune_jmap_numbers();
             self.last_full = Some(Instant::now());
+            self.looked = self.last_full;
             // Anything left from a failed attempt gets another try every full sync.
             self.flush_outbox();
             log::info!("{}: synced {} folders in {:.1} s", self.acc.id, self.folders.len(), began.elapsed().as_secs_f32());
@@ -525,6 +606,16 @@ impl Worker {
         self.sink.emit(answer(Vec::new(), error, true));
     }
 
+    /// [`Self::sync_one`] for a folder a message was just filed in. A POP account's folders other
+    /// than its Inbox are only on this computer, so reading one finds nothing new: said here, or
+    /// the list on screen went without it until MailCraft started again (issue #57).
+    pub(super) fn sync_filed(&mut self, path: &str) {
+        if matches!(self.conn, Some(Conn::Pop)) {
+            self.sink.emit(Event::FolderChanged { account: self.id(), folder: path.to_string() });
+        }
+        self.sync_one(path);
+    }
+
     pub(super) fn sync_one(&mut self, path: &str) {
         if self.sync_counted(path) {
             self.counts_unsaid.push(path.to_string());
@@ -611,65 +702,6 @@ impl Worker {
         }
     }
 
-    /// Sync calendars and address books with the account's CalDAV / CardDAV server (password
-    /// accounts: OAuth tokens are for mail only).
-    pub(super) fn sync_dav(&mut self) {
-        // Exchange Online: its calendars and contacts through Graph.
-        if let Some(Conn::Graph(c)) = &self.conn {
-            let pim: mailcraft_model::pim::Pim = self.store.load_account_doc(&self.acc.id, mailcraft_model::pim::PIM_DOC).unwrap_or_default();
-            match crate::graph_pim::sync(c, &pim, now()) {
-                Ok(sync) => self.sink.emit(Event::DavSynced { account: self.id(), sync: Box::new(sync) }),
-                Err(e) => log::info!("{}: calendars and contacts: {e}", self.acc.id),
-            }
-            return;
-        }
-        // On-premises Exchange: its calendar and contacts through EWS.
-        if let Some(Conn::Ews(c)) = &self.conn {
-            let pim: mailcraft_model::pim::Pim = self.store.load_account_doc(&self.acc.id, mailcraft_model::pim::PIM_DOC).unwrap_or_default();
-            match crate::ews_pim::sync(c, &pim, now()) {
-                Ok(sync) => self.sink.emit(Event::DavSynced { account: self.id(), sync: Box::new(sync) }),
-                Err(e) => log::info!("{}: calendars and contacts: {e}", self.acc.id),
-            }
-            return;
-        }
-        // Calendars and contacts given by hand (issue #7), with their own sign-in or the mail's.
-        let given = self.acc.dav.clone().unwrap_or_default();
-        // OAuth tokens are for mail only: such an account's calendars need a sign-in of their own.
-        if (self.acc.oauth.is_some() || self.acc.ews.is_some()) && given.username.is_none() {
-            return;
-        }
-        let pim: mailcraft_model::pim::Pim = self.store.load_account_doc(&self.acc.id, mailcraft_model::pim::PIM_DOC).unwrap_or_default();
-        let (user, password) = match &given.username {
-            Some(u) => (u.clone(), self.creds.as_ref().and_then(|c| c.get_secret(&self.acc, DAV_SECRET)).unwrap_or_default()),
-            None => (
-                if self.acc.username.is_empty() { self.acc.email.clone() } else { self.acc.username.clone() },
-                self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner).secret.clone(),
-            ),
-        };
-        let dav = crate::dav::Dav::new(&user, &password);
-        let host = self.acc.pop.as_ref().map_or(self.acc.imap.host.as_str(), |p| p.host.as_str());
-        let at = crate::dav::Where {
-            email: &self.acc.email,
-            username: &self.acc.username,
-            imap_host: host,
-            caldav: Some(given.caldav.as_str()).filter(|c| !c.trim().is_empty()),
-            carddav: Some(given.carddav.as_str()).filter(|c| !c.trim().is_empty()),
-            look_again: !self.dav_looked,
-        };
-        match crate::dav::sync(&dav, &at, &pim, now(), system_zone()) {
-            Ok(sync) => {
-                self.dav_looked = true;
-                self.sink.emit(Event::DavSynced { account: self.id(), sync: Box::new(sync) });
-            }
-            Err(e) => {
-                log::info!("{}: calendars and contacts: {e}", self.acc.id);
-                if matches!(e, NetError::Auth(_)) {
-                    self.notice(format!("calendars and contacts: {e}"));
-                }
-            }
-        }
-    }
-
     /// Report the space used on the server (when it publishes a quota).
     pub(super) fn report_quota(&mut self) {
         let q = match self.conn.as_mut() {
@@ -685,9 +717,4 @@ impl Worker {
             Err(e) => log::info!("{}: quota: {e}", self.acc.id),
         }
     }
-}
-
-/// The system's time zone, for calendar times written without one (`UTC` when it can't say).
-fn system_zone() -> mailcraft_model::zone::Zone {
-    iana_time_zone::get_timezone().ok().and_then(|z| mailcraft_model::zone::Zone::named(&z)).unwrap_or_default()
 }
