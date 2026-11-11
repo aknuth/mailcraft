@@ -322,12 +322,6 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             Ok(json!({"trusted": s.prefs.trusted_senders.iter().collect::<Vec<_>>()}))
         })
         .params(r#"{"address": string, "on"?: bool}"#),
-        CommandSpec::new("view.alwaysLoadPictures", "Always load pictures from the web", "File › Options › Privacy", |s, v| {
-            s.prefs.always_load_pictures = p::bool(v, "on").unwrap_or(!s.prefs.always_load_pictures);
-            s.request_pictures();
-            Ok(json!({"on": s.prefs.always_load_pictures}))
-        })
-        .params(r#"{"on"?: bool (none: switched)}"#),
     ]
 }
 

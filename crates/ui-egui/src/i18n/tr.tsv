@@ -396,8 +396,6 @@
 	Mark messages as read when opened	Açılan iletileri okundu olarak işaretle
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Henüz gönderici yok.
-	Always load pictures from the web	Web’deki resimleri her zaman yükle
-	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	Gönderen kim olursa olsun her iletide: gönderen, iletiyi ne zaman okuduğunuzu görebilir. Gereksiz e-postada ve şifreli postada değil; izleme resimleri hiçbir zaman yüklenmez.
 	Not available: the sample mailbox has no server.	Kullanılamıyor: örnek posta kutusunun sunucusu yok.
 	Not available: {error}	Kullanılamıyor: {error}
 	On	Açık

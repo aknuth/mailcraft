@@ -527,27 +527,13 @@ pub(super) fn options(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
         tl!("Pictures from the web load only when you ask. These senders' pictures always load:")
     };
     group(ui, tl!("Privacy"), Some(privacy), &mut |ui| {
-        setting(
-            ui,
-            true,
-            tl!("Always load pictures from the web"),
-            Some(tl!(
-                "In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures."
-            )),
-            &mut |ui| {
-                let mut v = s.prefs.always_load_pictures;
-                if widgets::switch(ui, &t, &mut v, tl!("Always load pictures from the web")).changed() {
-                    acts.push(Action::Run("view.alwaysLoadPictures", json!({"on": v})));
-                }
-            },
-        );
         if s.prefs.trusted_senders.is_empty() {
             ui.add_space(4.0);
             ui.label(RichText::new(tl!("No senders yet.")).color(t.faint).small());
             ui.add_space(8.0);
         }
-        for who in &s.prefs.trusted_senders {
-            setting(ui, false, who, None, &mut |ui| {
+        for (i, who) in s.prefs.trusted_senders.iter().enumerate() {
+            setting(ui, i == 0, who, None, &mut |ui| {
                 if ui.button(tl!("Remove")).clicked() {
                     acts.push(Action::Run("view.trustSender", json!({"address": who, "on": false})));
                 }

@@ -395,8 +395,6 @@
 	Mark messages as read when opened	Segna i messaggi come letti quando si aprono
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Ancora nessun mittente.
-	Always load pictures from the web	Carica sempre le immagini dal web
-	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	In ogni messaggio, chiunque lo abbia inviato: il mittente può vedere quando lo leggi. Non nella posta indesiderata o crittografata, e mai le immagini di tracciamento.
 	Not available: the sample mailbox has no server.	Non disponibile: la casella di esempio non ha un server.
 	Not available: {error}	Non disponibile: {error}
 	On	Attive

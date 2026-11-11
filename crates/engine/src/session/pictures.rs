@@ -26,14 +26,11 @@ impl Session {
     }
 
     /// Whether the open message's web pictures may load: the user asked, for this message, for
-    /// everything from its sender, for every message that doesn't look suspicious, or for all
-    /// mail (but mail in Junk still asks).
+    /// everything from its sender, or for every message that doesn't look suspicious.
     pub fn pictures_allowed(&self) -> bool {
         let Some(r) = &self.reading else { return false };
         let sender = r.parsed.as_ref().map(|p| p.from.email.trim().to_ascii_lowercase()).unwrap_or_default();
-        let in_junk = self.folder(&r.key.account, &r.key.folder).is_some_and(|f| f.role == FolderRole::Junk);
         self.pictures_for.contains(&r.key)
-            || (self.prefs.always_load_pictures && !in_junk)
             || (!sender.is_empty() && (self.prefs.trusted_senders.contains(&sender) || self.sender_safe(&sender)))
             || (self.prefs.auto_pictures && self.pictures_load_alone())
     }
@@ -49,7 +46,7 @@ impl Session {
     }
 
     /// Ask the network layer for the open message's pictures, when allowed.
-    pub(crate) fn request_pictures(&mut self) {
+    pub(super) fn request_pictures(&mut self) {
         if !self.pictures_allowed() {
             return;
         }

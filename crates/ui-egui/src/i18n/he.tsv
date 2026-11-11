@@ -395,8 +395,6 @@
 	Mark messages as read when opened	סמן הודעות כנקראו כשהן נפתחות
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	אין עדיין שולחים.
-	Always load pictures from the web	תמיד לטעון תמונות מהאינטרנט
-	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	בכל הודעה, לא משנה מי שלח אותה: השולח יכול לדעת מתי קראת אותה. לא בדואר זבל או בדואר מוצפן, ולעולם לא תמונות מעקב.
 	Not available: the sample mailbox has no server.	לא זמין: לתיבת הדואר לדוגמה אין שרת.
 	Not available: {error}	לא זמין: {error}
 	On	פועל

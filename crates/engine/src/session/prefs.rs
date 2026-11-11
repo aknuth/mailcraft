@@ -103,9 +103,6 @@ pub struct Prefs {
     pub show_html: bool,
     /// Senders whose pictures from the web load without asking (lower-case addresses).
     pub trusted_senders: BTreeSet<String>,
-    /// Pictures from the web load without asking, whoever sent the mail (Outlook's "download
-    /// pictures automatically"): not in Junk, not in encrypted mail, never tracking pictures.
-    pub always_load_pictures: bool,
     /// Junk Email: senders (a lower-case address, or `@domain`) whose mail goes to Junk as it
     /// arrives ([`junk`]).
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
@@ -294,7 +291,6 @@ impl Default for Prefs {
             focus_overrides: std::collections::BTreeMap::new(),
             show_html: true,
             trusted_senders: BTreeSet::new(),
-            always_load_pictures: false,
             blocked_senders: BTreeSet::new(),
             safe_senders: BTreeSet::new(),
             new_mail_window: true,

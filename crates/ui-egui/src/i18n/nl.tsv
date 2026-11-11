@@ -395,8 +395,6 @@
 	Mark messages as read when opened	Berichten als gelezen markeren bij openen
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Nog geen afzenders.
-	Always load pictures from the web	Afbeeldingen van het web altijd laden
-	In every message, whoever sent it: the sender can see when you read it. Not in Junk or encrypted mail, and never tracking pictures.	In elk bericht, wie het ook stuurde: de afzender kan zien wanneer u het leest. Niet in ongewenste of versleutelde e-mail, en nooit trackingafbeeldingen.
 	Not available: the sample mailbox has no server.	Niet beschikbaar: het voorbeeldpostvak heeft geen server.
 	Not available: {error}	Niet beschikbaar: {error}
 	On	Aan
