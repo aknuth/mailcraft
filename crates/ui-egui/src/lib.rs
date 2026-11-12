@@ -130,6 +130,8 @@ pub enum Action {
     /// Closing, with the update asked about: installed as MailCraft closes (true), or kept for
     /// later (false).
     UpdateOnClose(bool),
+    /// The update said to be ready put off (that version): the bar above the panes goes too.
+    UpdateLater(String),
     /// Closing, with a data file to compact: that account's compacted first, MailCraft closing
     /// once it's done (`Some`), or closed now (`None`). The account rides in the action: the
     /// dialog that asked is gone by the time it runs.

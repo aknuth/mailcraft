@@ -1,6 +1,7 @@
 //! Dialogs: what closing MailCraft would leave behind (messages being written, what online-only
 //! accounts hold in memory, a data file being imported, an update about to be installed or
-//! still downloading), and a data file compacted, as MailCraft closes or otherwise.
+//! still downloading), an update ready to restart into, and a data file compacted, as MailCraft
+//! closes or otherwise.
 
 use mailcraft_engine::model::job::{CompactPhase, DataFileHealth};
 
@@ -169,6 +170,33 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
             // Nothing on its way any more (the download failed): nothing to ask.
             UpdateState::None => false,
         },
+        // Said once as it's ready; put away, the bar above the panes still offers it.
+        Dialog::UpdateReady(state) => {
+            let UpdateState::Ready { version, asks } = state else { return false };
+            ui.set_width(440.0);
+            title(ui, t, &tf!("MailCraft {version} is ready", version = version));
+            let mut about =
+                tl!("The update is downloaded and checked. Restart MailCraft now to install it, or it installs when you close MailCraft.")
+                    .to_string();
+            if let Some(asked) = asks.say() {
+                about.push(' ');
+                about.push_str(asked);
+            }
+            ui.add(egui::Label::new(RichText::new(about).color(t.dim)).wrap());
+            ui.add_space(10.0);
+            let mut keep = true;
+            button_row(ui, |ui| {
+                if ui.button(tl!("Later")).on_hover_text(tl!("It installs when you close MailCraft.")).clicked() {
+                    acts.push(Action::UpdateLater(version.clone()));
+                    keep = false;
+                }
+                if widgets::accent_button(ui, Icon::Sync, "Restart now", t, true).clicked() {
+                    acts.push(Action::RestartToUpdate);
+                    keep = false;
+                }
+            });
+            keep
+        }
         // A data file being compacted; it ends by itself (nothing left to show).
         Dialog::Compacting { account, closing, since } => {
             let Some(c) = s.compaction.running.get(account.as_str()) else { return false };

@@ -1,6 +1,7 @@
 //! A newer MailCraft on its way, in a build that updates itself (`apps/mailcraft/src/self_update.rs`):
-//! the status bar says how far its download is; once it's downloaded and checked, a bar above the
-//! panes (and the system's notification, if MailCraft isn't in front) offers to restart into it;
+//! the status bar says how far its download is; once it's downloaded and checked, a question (when
+//! no other is on screen), a bar above the panes and the system's notification (if MailCraft isn't
+//! in front) offer to restart into it;
 //! and closing asks first, so it never installs an update, or pauses a download, without a word.
 
 use crate::*;
@@ -17,10 +18,22 @@ impl MailApp {
             // The question follows the download (finished while asked: it's about installing).
             asked.clone_from(&state);
         }
+        if let Some(Dialog::UpdateReady(asked)) = &self.ui.dialog
+            && asked.ready() != state.ready()
+        {
+            // Nothing ready any more, or another version: the question is out of date.
+            self.ui.dialog = None;
+        }
         if let UpdateState::Ready { version, .. } = &state
             && self.ui.update_told.as_deref() != Some(version.as_str())
         {
             self.ui.update_told = Some(version.clone());
+            // Asked once, unless something else is being asked or the File page is open: then the
+            // bar says it.
+            if self.ui.dialog.is_none() && self.ui.backstage.is_none() && self.ui.update_later.as_deref() != Some(version.as_str()) {
+                self.ui.dialog = Some(Dialog::UpdateReady(state.clone()));
+                self.ui.dialog_for = None;
+            }
             if !ctx.input(|i| i.focused) {
                 let title = tf!("MailCraft {version} is ready", version = version);
                 self.services.notify(&title, tl!("Restart MailCraft to install it now, or it installs when you close MailCraft."));
