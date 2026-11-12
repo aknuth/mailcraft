@@ -18,6 +18,7 @@ on GitHub.
 - **A mail server on this computer with a certificate of its own can be trusted**: a program that connects a mail service to mail apps (a bridge) makes its own certificate, which MailCraft refused. Now it asks, showing the certificate's fingerprint, and **Trust this certificate** keeps it for that account, for receiving and sending. Only for a server on this computer; MailCraft asks again if the certificate changes, and a server anywhere else is checked as before (#77).
 - **To-Do Bar** beside the mail (View › To-Do Bar), as Outlook's: a month to go to a day from, what's coming up in your calendars in the next week, and your tasks with the mail flagged in any folder, under when they're due. Type a new task into it, mark one complete, click a flagged message to open it, click a day to open the calendar on it. Each part is shown or closed on its own, and the parts and the bar's width are remembered (#79).
 - The Calendar's small months show the days with something on them in bold.
+- **An update ready to install asks** whether to restart into it now (**Restart now**, or **Later**: it installs when you close MailCraft), as soon as it's downloaded and checked, unless another question is open; the bar above the mail still offers it.
 
 ### Fixed
 

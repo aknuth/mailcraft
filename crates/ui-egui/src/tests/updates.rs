@@ -83,7 +83,9 @@ pub(crate) fn tour(a: &mut MailApp, ctx: &egui::Context) {
     for state in [UpdateState::Downloading { version: "0.25.0".into(), done: 3 << 20, total: 30 << 20 }, ready(true), ready(false)] {
         asked.borrow_mut().state = state.clone();
         frame(ctx, a, vec![]);
-        a.ui.dialog = Some(Dialog::UpdateOnClose(state));
+        a.ui.dialog = Some(Dialog::UpdateOnClose(state.clone()));
+        frame(ctx, a, vec![]);
+        a.ui.dialog = Some(Dialog::UpdateReady(state));
         frame(ctx, a, vec![]);
         a.ui.dialog = None;
         a.act(Action::Backstage(crate::backstage::Page::About));
@@ -115,17 +117,22 @@ fn a_ready_update_is_said_once() {
     out.textures_delta.clear();
     frame(&ctx, &mut a, vec![]);
     assert_eq!(asked.borrow().notified, ["MailCraft 0.25.0-test.22 is ready"], "told once");
+    assert!(matches!(&a.ui.dialog, Some(Dialog::UpdateReady(s)) if s.ready() == Some("0.25.0-test.22")), "asked: {:?}", a.ui.dialog);
     assert!(a.update_bar_wanted());
-    a.ui.update_later = Some("0.25.0-test.22".into());
+    // Later (as its button does): the question and the bar go, and neither comes back.
+    a.ui.dialog = None;
+    a.act(Action::UpdateLater("0.25.0-test.22".into()));
     frame(&ctx, &mut a, vec![]);
-    assert!(!a.update_bar_wanted(), "Later puts it away");
+    assert!(!a.update_bar_wanted() && a.ui.dialog.is_none(), "Later puts it away");
     // A newer one ready: said again.
     asked.borrow_mut().state = UpdateState::Ready { version: "0.25.0-test.23".into(), asks: crate::InstallAsks::Nothing };
     frame(&ctx, &mut a, vec![]);
     assert!(a.update_bar_wanted());
-    assert_eq!(asked.borrow().notified.len(), 1, "in front: the bar says it");
+    assert!(matches!(&a.ui.dialog, Some(Dialog::UpdateReady(s)) if s.ready() == Some("0.25.0-test.23")), "asked again");
+    assert_eq!(asked.borrow().notified.len(), 1, "in front: the window says it");
     // Restart now: closing asks nothing more, and the restart holds once the window closes.
     a.act(Action::RestartToUpdate);
+    assert!(a.ui.dialog.is_none(), "the question goes with it");
     assert!(a.ui.close_now && a.ui.update_answered && !asked.borrow().restart, "not before the close goes ahead");
     frame(&ctx, &mut a, vec![]);
     close(&ctx, &mut a);
@@ -326,5 +333,24 @@ fn closing_the_window_keeps_mailcraft_running_when_asked_to() {
     // Where the app can't keep running at all, a close is a close.
     asked.borrow_mut().tray = None;
     assert!(!closed(&mut a).contains(&egui::ViewportCommand::CancelClose));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Ready while something else is asked: that question stays, and the bar says it instead.
+#[test]
+fn a_ready_update_waits_its_turn() {
+    let (mut a, dir) = app("update-ready-busy");
+    let asked = updating(&mut a);
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    a.ui.dialog = Some(Dialog::ConfirmDelete { count: 1 });
+    asked.borrow_mut().state = ready(true);
+    frame(&ctx, &mut a, vec![]);
+    assert!(matches!(a.ui.dialog, Some(Dialog::ConfirmDelete { .. })), "{:?}", a.ui.dialog);
+    assert!(a.update_bar_wanted());
+    // Put away, it isn't asked after all: said once.
+    a.ui.dialog = None;
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.dialog.is_none() && a.update_bar_wanted());
     let _ = std::fs::remove_dir_all(dir);
 }

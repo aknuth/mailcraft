@@ -58,6 +58,9 @@ pub enum Dialog {
     },
     /// Closing with an update about to be installed, or still downloading: what becomes of it.
     UpdateOnClose(crate::UpdateState),
+    /// A newer MailCraft downloaded and checked, said once as it's ready: restart into it now,
+    /// or later (it installs when MailCraft closes).
+    UpdateReady(crate::UpdateState),
     /// Closing while a data file is imported (`permille`: how far, when that's known): it goes
     /// on the next time MailCraft opens.
     ImportOnClose {
@@ -621,6 +624,7 @@ fn body(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::reading::Pic
         Dialog::LostOnClose { .. }
         | Dialog::SaveOnClose(..)
         | Dialog::UpdateOnClose(..)
+        | Dialog::UpdateReady(..)
         | Dialog::ImportOnClose { .. }
         | Dialog::Compacting { .. }
         | Dialog::CompactOnClose { .. } => closing::draw(ui, d, s, t, acts),

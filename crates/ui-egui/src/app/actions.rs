@@ -103,12 +103,16 @@ impl MailApp {
             // still be kept, and Cancel there leaves MailCraft as it was.
             Action::RestartToUpdate => {
                 if self.ui.update.ready().is_some() {
+                    if matches!(self.ui.dialog, Some(Dialog::UpdateReady(_))) {
+                        self.ui.dialog = None;
+                    }
                     self.ui.restart_wanted = true;
                     self.ui.update_answered = true;
                     self.ui.close_now = true;
                 }
             }
             Action::CompactOnClose(account) => self.compact_on_close(account),
+            Action::UpdateLater(version) => self.ui.update_later = Some(version),
             Action::UpdateOnClose(install) => {
                 if !install {
                     self.services.keep_update_for_later();
