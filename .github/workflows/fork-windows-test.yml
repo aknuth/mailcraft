@@ -32,6 +32,8 @@ env:
   UNSIGNED_BUILD: "1"
   MAILCRAFT_UPDATE_CHANNEL: test
   MAILCRAFT_UPDATE_REPO: ${{ github.repository }}
+  # Sign in with Microsoft: the fork owner's Entra app (public client, no secret; not secret).
+  MAILCRAFT_MICROSOFT_CLIENT_ID: cb70b375-2c2a-410e-a006-af0ec424f969
 
 jobs:
   version:
