@@ -1,10 +1,11 @@
-# FORK ONLY (aknuth/mailcraft, proto/blitz-reading): a Windows x64 test build for trying the
-# Blitz prototype out, published as a pre-release of this repository. Started by pushing a tag
+# FORK ONLY (aknuth/mailcraft, proto/blitz-reading): a Windows x64 and Linux x86_64 (AppImage,
+# deb, rpm, tar.gz) test build for trying the Blitz prototype out, published as a pre-release of
+# this repository. Started by pushing a tag
 # `wintest-<n>` on the commit to build (a workflow on another branch than the default one can't be
 # run from the Actions page), or there once it's on the default branch. Its builds update
 # themselves from this repository's releases (MAILCRAFT_UPDATE_REPO), never from ZIDAN44's.
-# The Windows job and the publishing are release-wip.yml's, cut down to one platform.
-name: Windows test build (fork)
+# The jobs and the publishing are release.yml's, cut down to two platforms.
+name: Test build (fork)
 
 on:
   push:
@@ -100,9 +101,54 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
 
+  linux:
+    name: Linux x86_64
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BUILD_DATE: ${{ needs.version.outputs.date }}
+      BUILD_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: storytold/craft-common-actions/actions/checkout-craft-fonts@main
+        with:
+          ref: ${{ env.CRAFT_FONTS_REF }}
+      - uses: storytold/craft-common-actions/actions/install-linux-deps@main
+        with:
+          deb-arch: amd64
+          nfpm-version: "2.47.0"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fork-linux-x86_64
+      - name: Apply version override
+        if: inputs.version != '' && inputs.version != null
+        run: cargo xtask version set "$VERSION"
+      - name: Build and package (AppImage, deb, rpm, tar.gz)
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/linux/package.sh
+      - name: Check the packages
+        run: |
+          dpkg-deb --info dist/release/*.deb
+          for appimage in dist/release/*.AppImage; do
+            chmod +x "$appimage"
+            APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-linux-x86_64
+          path: dist/release/*
+          if-no-files-found: error
+
   release:
     name: Publish the test build
-    needs: [version, windows]
+    needs: [version, windows, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -126,16 +172,16 @@ jobs:
           RUN: ${{ github.run_number }}
         run: |
           cat >../notes.md <<EOF
-          **Windows test build** of MailCraft $VERSION (\`${GITHUB_SHA::9}\`, \`$GITHUB_REF_NAME\`), with HTML mail drawn by Blitz and printing.
+          **Test build** (Windows x64, Linux x86_64) of MailCraft $VERSION (\`${GITHUB_SHA::9}\`, \`$GITHUB_REF_NAME\`), with HTML mail drawn by Blitz and printing.
 
           Not code-signed: SmartScreen may say "Windows protected your PC": choose *More info › Run anyway*.
 
-          Files: the \`.msi\` installer, or the \`-portable.zip\`. Check a download against \`SHA256SUMS.txt\`.
+          Files: Windows, the \`.msi\` installer or the \`-portable.zip\`; Linux, the \`.AppImage\`, \`.deb\`, \`.rpm\` or \`.tar.gz\`. Check a download against \`SHA256SUMS.txt\`.
 
           It updates itself to the next test build published here.
           EOF
           gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
-            --title "MailCraft $VERSION (Windows test build $RUN)" \
+            --title "MailCraft $VERSION (test build $RUN)" \
             --notes-file ../notes.md -- *
           {
             echo "Published **$TAG**:"
