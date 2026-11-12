@@ -1204,6 +1204,7 @@ month	May	Mai
 	Restart MailCraft to install it now, or it installs when you close MailCraft.	Starten Sie MailCraft neu, um es jetzt zu installieren, oder es wird installiert, wenn Sie MailCraft schließen.
 	Restart now	Jetzt neu starten
 	The update is downloaded and checked. It installs now, as MailCraft closes, which takes a moment; open MailCraft again when it's done.	Das Update ist heruntergeladen und geprüft. Es wird jetzt beim Schließen von MailCraft installiert, was einen Moment dauert; öffnen Sie MailCraft danach wieder.
+	The update is downloaded and checked. Restart MailCraft now to install it, or it installs when you close MailCraft.	Das Update ist heruntergeladen und geprüft. Starten Sie MailCraft jetzt neu, um es zu installieren, oder es wird installiert, wenn Sie MailCraft schließen.
 	Update and close	Aktualisieren und schließen
 	Windows asks for an administrator's permission.	Windows fragt nach der Erlaubnis eines Administrators.
 	The system asks for your password to install it.	Das System fragt nach Ihrem Passwort, um es zu installieren.
@@ -1660,3 +1661,9 @@ month	May	Mai
 	Not available: this account has no mail server.	Nicht verfügbar: Dieses Konto hat keinen Mailserver.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Ihre E-Mails wurden aus dem früheren Flatpak von MailCraft übernommen, das noch installiert ist. Zum Entfernen ausführen: flatpak uninstall --delete-data {id}
 	Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.	Geöffnet aus {file}. Sie liegt in keinem Ordner, ihre Bilder aus dem Web werden nicht geladen, und nach dem Schließen bleibt keine Spur.
+	To-Do Bar	Aufgabenleiste
+	Appointments	Termine
+	Type a new task	Neue Aufgabe eingeben
+	Nothing to do	Nichts zu erledigen
+	Nothing in the next 7 days	Nichts in den nächsten 7 Tagen
+	Show the calendar, what's coming up and your tasks beside the mail	Kalender, anstehende Termine und Aufgaben neben den E-Mails anzeigen

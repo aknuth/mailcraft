@@ -16,6 +16,9 @@ on GitHub.
 
 - **Keep MailCraft running when its window is closed** (File › Options › General, off unless you turn it on): closing the window puts it away, and MailCraft goes on checking for mail and announcing it. On Windows, and on Linux desktops with a notification area, the window is hidden and MailCraft's icon there opens it again; under Wayland, without a notification area, and on a Mac, the window is minimized instead. Starting MailCraft again brings it back too. **Exit** (the icon's, or the File page's) and a Mac's **Quit** end it (#67).
 - **A mail server on this computer with a certificate of its own can be trusted**: a program that connects a mail service to mail apps (a bridge) makes its own certificate, which MailCraft refused. Now it asks, showing the certificate's fingerprint, and **Trust this certificate** keeps it for that account, for receiving and sending. Only for a server on this computer; MailCraft asks again if the certificate changes, and a server anywhere else is checked as before (#77).
+- **To-Do Bar** beside the mail (View › To-Do Bar), as Outlook's: a month to go to a day from, what's coming up in your calendars in the next week, and your tasks with the mail flagged in any folder, under when they're due. Type a new task into it, mark one complete, click a flagged message to open it, click a day to open the calendar on it. Each part is shown or closed on its own, and the parts and the bar's width are remembered (#79).
+- The Calendar's small months show the days with something on them in bold.
+- **An update ready to install asks** whether to restart into it now (**Restart now**, or **Later**: it installs when you close MailCraft), as soon as it's downloaded and checked, unless another question is open; the bar above the mail still offers it.
 
 ### Fixed
 
@@ -68,6 +71,8 @@ on GitHub.
 - An Outlook data file import that was paused or cut off isn't continued on a file that has changed since, even when the change left the file's size and date as they were: MailCraft goes by what the file holds.
 - In Arabic and Hebrew what you type in the search box starts at its right edge, and in a narrow window the box is laid out from the right as the rest of the window is.
 - In Arabic and Hebrew the People pane is mirrored: pictures and names on the right, the A–Z index on the left, and the list view's columns from the right.
+- A new account's calendar and contacts are read as soon as its Inbox is in. They waited for every mail folder, so a big mailbox's calendar stayed empty for as long as its first sync took (#80).
+- An Exchange calendar or contacts folder the server won't give says so, with why, and appointments the server fails on are counted: nothing was said, and the calendar just stayed empty (#80).
 
 ## 0.36.0 - 2026-11-11
 

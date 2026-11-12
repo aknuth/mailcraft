@@ -1203,6 +1203,7 @@ month	May	maggio
 	Restart MailCraft to install it now, or it installs when you close MailCraft.	Riavvia MailCraft per installarlo ora, oppure verrà installato alla chiusura di MailCraft.
 	Restart now	Riavvia ora
 	The update is downloaded and checked. It installs now, as MailCraft closes, which takes a moment; open MailCraft again when it's done.	L'aggiornamento è scaricato e verificato. Viene installato ora, alla chiusura di MailCraft, e richiede un momento; riapri MailCraft quando ha finito.
+	The update is downloaded and checked. Restart MailCraft now to install it, or it installs when you close MailCraft.	L'aggiornamento è scaricato e verificato. Riavvia MailCraft ora per installarlo, oppure verrà installato alla chiusura di MailCraft.
 	Update and close	Aggiorna e chiudi
 	Windows asks for an administrator's permission.	Windows chiede l'autorizzazione di un amministratore.
 	The system asks for your password to install it.	Il sistema chiede la tua password per installarlo.
@@ -1659,3 +1660,9 @@ month	May	maggio
 	Not available: this account has no mail server.	Non disponibile: questo account non ha un server di posta.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	La posta è stata trasferita dal precedente Flatpak di MailCraft, che è ancora installato. Per rimuoverlo, esegui: flatpak uninstall --delete-data {id}
 	Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.	Aperto da {file}. Non è in nessuna cartella, le immagini dal web non vengono caricate e, una volta chiuso, non resta traccia.
+	To-Do Bar	Barra delle attività
+	Appointments	Appuntamenti
+	Type a new task	Digita una nuova attività
+	Nothing to do	Niente da fare
+	Nothing in the next 7 days	Niente nei prossimi 7 giorni
+	Show the calendar, what's coming up and your tasks beside the mail	Mostra il calendario, i prossimi impegni e le attività accanto alla posta
