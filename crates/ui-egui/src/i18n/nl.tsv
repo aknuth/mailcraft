@@ -117,6 +117,7 @@
 	24-hour	24-uurs
 	12-hour	12-uurs
 	Whole date and time in the list	Volledige datum en tijd in de lijst
+	Earlier this month	Eerder deze maand
 	Last month	Vorige maand
 	Last week	Vorige week
 	Later	Later
@@ -264,6 +265,10 @@
 	Servers: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})	Servers: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})
 	Settings found: {source}	Instellingen gevonden: {source}
 	Show a desktop notification when new mail arrives	Een bureaubladmelding tonen wanneer er nieuwe mail binnenkomt
+	Keep MailCraft running when its window is closed	MailCraft actief houden wanneer het venster wordt gesloten
+	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Het blijft in het systeemvak, controleert op e-mail en meldt die. ‘Afsluiten’ op de pagina Bestand, of in het menu van het pictogram, sluit het.
+	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Het venster wordt geminimaliseerd en MailCraft blijft op e-mail controleren en die melden. ‘Afsluiten’ op de pagina Bestand sluit het.
+	Open MailCraft	MailCraft openen
 	Show as plain text	Als platte tekst weergeven
 	Show formatted	Met opmaak weergeven
 	Show in Favorites	In Favorieten weergeven
@@ -367,7 +372,7 @@
 	About MailCraft	Over MailCraft
 	Account information	Accountgegevens
 	Account settings	Accountinstellingen
-	An ArtCraft app · MIT OR Apache-2.0	Een ArtCraft-app · MIT OR Apache-2.0
+	Free and open source · MIT OR Apache-2.0	Gratis en open source · MIT OR Apache-2.0
 	Automatic replies	Automatische antwoorden
 	Back	Terug
 	Built in the open from the email standards: no code, icons or assets from other mail apps.	Openlijk gebouwd op basis van de e-mailstandaarden: geen code, pictogrammen of materiaal van andere mail-apps.
@@ -774,6 +779,12 @@ month	May	mei
 	Sign in with Microsoft	Aanmelden met Microsoft
 	Sign in with Microsoft…	Aanmelden met Microsoft…
 	Mailbox won't open	Postvak gaat niet open
+	Trust this computer's mail server?	De mailserver op deze computer vertrouwen?
+	{host} is on this computer and shows a certificate it made itself, which no authority vouches for. A program that connects a mail service to mail apps does this. Trust it only if you set that program up.	{host} staat op deze computer en toont een certificaat dat het zelf heeft gemaakt en waar geen instantie voor instaat. Dat doet een programma dat een maildienst met mailprogramma’s verbindt. Vertrouw het alleen als u dat programma zelf hebt ingesteld.
+	Certificate fingerprint (SHA-256)	Vingerafdruk van het certificaat (SHA-256)
+	MailCraft asks again if the server shows another certificate.	MailCraft vraagt het opnieuw als de server een ander certificaat toont.
+	Trust this certificate	Dit certificaat vertrouwen
+	Certificate not trusted yet	Certificaat nog niet vertrouwd
 	The mailbox won't open	Het postvak gaat niet open
 	Microsoft Graph reaches the mailbox without IMAP, and brings its calendar and contacts too. The account starts again through it: its mail comes down from the server.	Microsoft Graph bereikt het postvak zonder IMAP en brengt ook de agenda en contactpersonen mee. Het account begint daarmee opnieuw: de e-mail wordt van de server opgehaald.
 	Turned IMAP on, or picked another account in the browser? Sign in again	IMAP aangezet, of in de browser een ander account gekozen? Opnieuw aanmelden
@@ -1630,7 +1641,7 @@ month	May	mei
 	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	Dit bericht lijkt verdacht of de afzender kon niet worden bevestigd, dus de afbeeldingen blijven verborgen.
 	These senders' pictures always load, even when a message looks suspicious:	Afbeeldingen van deze afzenders worden altijd geladen, ook als een bericht verdacht lijkt:
 	Open a mail file	Een e-mailbestand openen
-	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	Bekijk een opgeslagen bericht (.eml of .msg van Outlook) als platte tekst, zonder het aan een map toe te voegen. De afbeeldingen worden niet geladen en niets erin wordt uitgevoerd.
+	See a saved message (.eml or Outlook's .msg) in a window of its own, without adding it to a folder. Its pictures from the web aren't loaded and nothing in it runs.	Bekijk een opgeslagen bericht (.eml of .msg van Outlook) in een eigen venster, zonder het aan een map toe te voegen. De afbeeldingen van het web worden niet geladen en niets erin wordt uitgevoerd.
 	Nothing is kept: closing it leaves no trace in your mail.	Er wordt niets bewaard: na het sluiten blijft er geen spoor achter in je e-mail.
 	and {n} more	en nog {n}
 	Checking for new mail	Controleren op nieuwe e-mail
@@ -1642,3 +1653,5 @@ month	May	mei
 	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Voor elke CalDAV- en CardDAV-server die je agenda's en contactpersonen bewaart, zoals Nextcloud, Baïkal, SOGo of Radicale, zonder e-mail. Je wachtwoord wordt in de sleutelhanger van deze computer bewaard en alleen naar die server verzonden.
 	Server: {url} (CalDAV and CardDAV)	Server: {url} (CalDAV en CardDAV)
 	Not available: this account has no mail server.	Niet beschikbaar: dit account heeft geen mailserver.
+	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Je e-mail is overgenomen uit de eerdere Flatpak van MailCraft, die nog geïnstalleerd is. Verwijder die met: flatpak uninstall --delete-data {id}
+	Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.	Geopend uit {file}. Het staat in geen enkele map, de afbeeldingen van het web worden niet geladen en na het sluiten blijft er geen spoor achter.

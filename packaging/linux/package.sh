@@ -17,7 +17,7 @@ set -euo pipefail
 # shellcheck source=../common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../common.sh"
 HERE="$ROOT/packaging/linux"
-APP_ID=ai.storyteller.mailcraft
+APP_ID=io.github.zidan44.MailCraft
 
 SKIP_BUILD=0
 FORMATS="appimage deb rpm tar"
@@ -37,7 +37,7 @@ case "$ARCH" in
   aarch64 | arm64) ARCH=aarch64; DEB_ARCH=arm64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-export MAILCRAFT_MAINTAINER="${MAILCRAFT_MAINTAINER:-MailCraft maintainers <mailcraft@storyteller.ai>}"
+export MAILCRAFT_MAINTAINER="${MAILCRAFT_MAINTAINER:-Zinadin Zidan <zidan.roking@gmail.com>}"
 BASENAME="mailcraft-$VERSION-linux-$ARCH"
 
 echo "==> MailCraft $VERSION for Linux $ARCH ($FORMATS)"

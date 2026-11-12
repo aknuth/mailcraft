@@ -55,7 +55,7 @@ pub use dialogs::Dialog;
 
 /// MailCraft's id: the Linux app id (its `.desktop` file and icon are named so), the macOS bundle
 /// id and the Windows notifications' app id.
-pub const APP_ID: &str = "ai.storyteller.mailcraft";
+pub const APP_ID: &str = "io.github.zidan44.MailCraft";
 
 /// A window of MailCraft's own beyond the main one (a message being written, one popped out, a
 /// message's source), carrying [`APP_ID`]: without it a Wayland dock shows no icon for it and a
@@ -64,7 +64,7 @@ pub(crate) fn os_window() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default().with_app_id(APP_ID)
 }
 use icons::Icon;
-pub use services::{Backend, InstallAsks, Lane, NullBackend, NullServices, Services, UpdateState, Work};
+pub use services::{Backend, InstallAsks, KeptOnClose, Lane, NullBackend, NullServices, Services, UpdateState, Work};
 use theme::Tokens;
 
 /// Whether the message being written shows in the reading pane: when it isn't popped out, or
@@ -277,6 +277,9 @@ pub struct UiState {
     /// The ready version whose bar was put away (Later), and the one the system was told of.
     pub(crate) update_later: Option<String>,
     pub(crate) update_told: Option<String>,
+    /// MailCraft's earlier Flatpak this start brought the mail over from, still installed: a bar
+    /// says how to remove it until it's dismissed.
+    pub(crate) old_flatpak: Option<&'static str>,
     /// What to do with the update as MailCraft closes was answered: closing asks no more.
     pub(crate) update_answered: bool,
     /// Restart now was chosen: the new version opens once installed, if the close goes ahead.
@@ -290,6 +293,14 @@ pub struct UiState {
     pub tokens: Tokens,
     /// The platform has files (temporary ones for other apps): not in the browser.
     pub has_files: bool,
+    /// Whether MailCraft can keep running with its window closed (the desktop app), and what
+    /// becomes of the window then; looked up at every frame.
+    pub keeps_running: Option<KeptOnClose>,
+    /// The window was closed to the notification area and is hidden.
+    pub(crate) in_tray: bool,
+    /// Exit was chosen (the File page's, the tray icon's): the window's close ends MailCraft
+    /// rather than hiding it.
+    pub(crate) quit_wanted: bool,
     /// Where the data is kept and whether it can be moved; where it moves at the next start.
     pub data_folder: Option<(PathBuf, bool)>,
     pub pending_move: Option<PathBuf>,
@@ -473,7 +484,9 @@ impl MailApp {
     pub fn new(session: Session, backend: Box<dyn Backend>, mut services: Box<dyn Services>) -> MailApp {
         let seen = session.notices.len();
         let has_files = !services.downloads();
+        let keeps_running = services.keeps_running();
         let (data_folder, pending_move) = (services.data_folder(), services.pending_data_move());
+        let old_flatpak = services.carried_over_from();
         let mut session = session;
         session.set_zone(services.zone().as_deref());
         // The window's network side keeps each account's search index up, and the window steps
@@ -504,12 +517,16 @@ impl MailApp {
                 update: UpdateState::None,
                 update_later: None,
                 update_told: None,
+                old_flatpak,
                 update_answered: false,
                 restart_wanted: false,
                 close_asked: false,
                 compact: Default::default(),
                 reminders: reminders::State::default(),
                 has_files,
+                keeps_running,
+                in_tray: false,
+                quit_wanted: false,
                 data_folder,
                 pending_move,
                 dark: None,
@@ -680,6 +697,9 @@ impl MailApp {
                 self.ui.dialog_for = self.session.compose.as_ref().filter(|c| c.window).map(|c| c.id);
                 self.ui.dialog = Some(Dialog::SendCheck(found));
             }
+            // A message opened by a command (a script's, a conversation's row in the reading
+            // pane) is brought into view in the list: it could be opened out of sight.
+            Ok(_) if id == "list.open" => self.ui.scroll_to_focus = true,
             Ok(_) => {}
             // Not from an account that can't send: said over the message, as why it didn't go.
             Err(CmdError::Disabled(_))
@@ -729,6 +749,8 @@ impl MailApp {
                     }
                     // An Outlook message file: shown once it's read (`pump`).
                     Some("reading") => {}
+                    // A message file: in a message window of its own, as one double-clicked is.
+                    Some("message") if v.get("key").is_some() => {}
                     _ => self.ui.dialog = Some(Dialog::preview(&v, &self.session.clock)),
                 }
             }

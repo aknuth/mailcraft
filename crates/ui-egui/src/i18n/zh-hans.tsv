@@ -117,6 +117,7 @@
 	24-hour	24 小时制
 	12-hour	12 小时制
 	Whole date and time in the list	在列表中显示完整日期和时间
+	Earlier this month	本月早些时候
 	Last month	上个月
 	Last week	上周
 	Later	稍后
@@ -264,6 +265,10 @@
 	Servers: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})	服务器: {imap} (IMAP {imap_port})，{smtp} (SMTP {smtp_port})
 	Settings found: {source}	已找到设置: {source}
 	Show a desktop notification when new mail arrives	收到新邮件时显示桌面通知
+	Keep MailCraft running when its window is closed	关闭窗口后让 MailCraft 继续运行
+	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	它会留在通知区域，检查邮件并在有新邮件时通知。在“文件”页或其图标菜单中选择“退出”可将其关闭。
+	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	窗口会最小化，MailCraft 会继续检查邮件并在有新邮件时通知。在“文件”页选择“退出”可将其关闭。
+	Open MailCraft	打开 MailCraft
 	Show as plain text	以纯文本显示
 	Show formatted	显示格式
 	Show in Favorites	在收藏夹中显示
@@ -367,7 +372,7 @@
 	About MailCraft	关于 MailCraft
 	Account information	帐户信息
 	Account settings	帐户设置
-	An ArtCraft app · MIT OR Apache-2.0	ArtCraft 应用 · MIT OR Apache-2.0
+	Free and open source · MIT OR Apache-2.0	免费开源 · MIT OR Apache-2.0
 	Automatic replies	自动答复
 	Back	返回
 	Built in the open from the email standards: no code, icons or assets from other mail apps.	依据电子邮件标准公开构建: 不含其他邮件应用的代码、图标或素材。
@@ -775,6 +780,12 @@ month	May	5月
 	Sign in with Microsoft	使用 Microsoft 登录
 	Sign in with Microsoft…	使用 Microsoft 登录…
 	Mailbox won't open	邮箱无法打开
+	Trust this computer's mail server?	信任此电脑上的邮件服务器吗？
+	{host} is on this computer and shows a certificate it made itself, which no authority vouches for. A program that connects a mail service to mail apps does this. Trust it only if you set that program up.	{host} 位于此电脑上，出示的是它自己生成的证书，没有任何机构为其担保。把邮件服务连接到邮件应用的程序就是这样做的。只有当该程序是您自己设置的时，才信任它。
+	Certificate fingerprint (SHA-256)	证书指纹 (SHA-256)
+	MailCraft asks again if the server shows another certificate.	如果服务器出示其他证书，MailCraft 会再次询问。
+	Trust this certificate	信任此证书
+	Certificate not trusted yet	证书尚未受信任
 	The mailbox won't open	邮箱无法打开
 	Microsoft Graph reaches the mailbox without IMAP, and brings its calendar and contacts too. The account starts again through it: its mail comes down from the server.	Microsoft Graph 不经 IMAP 即可访问邮箱，还会同步日历和联系人。账户将通过它重新开始：邮件会从服务器下载。
 	Turned IMAP on, or picked another account in the browser? Sign in again	已开启 IMAP，或在浏览器中选了别的账户？重新登录
@@ -1631,7 +1642,7 @@ month	May	5月
 	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	此邮件看起来可疑或无法确认发件人，因此其图片保持隐藏。
 	These senders' pictures always load, even when a message looks suspicious:	这些发件人的图片始终加载，即使邮件看起来可疑：
 	Open a mail file	打开邮件文件
-	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	以纯文本查看已保存的邮件（.eml 或 Outlook 的 .msg），不会将其添加到文件夹。不会加载其中的图片，其中的任何内容也不会运行。
+	See a saved message (.eml or Outlook's .msg) in a window of its own, without adding it to a folder. Its pictures from the web aren't loaded and nothing in it runs.	在单独的窗口中查看已保存的邮件（.eml 或 Outlook 的 .msg），不会将其添加到文件夹。不会加载其中来自网络的图片，其中的任何内容也不会运行。
 	Nothing is kept: closing it leaves no trace in your mail.	不会保留任何内容：关闭后不会在邮件中留下痕迹。
 	and {n} more	另外 {n} 个
 	Checking for new mail	检查新邮件
@@ -1643,3 +1654,5 @@ month	May	5月
 	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	用于任何保存日历和联系人但不含邮件的 CalDAV 和 CardDAV 服务器，例如 Nextcloud、Baïkal、SOGo 或 Radicale。密码保存在这台电脑的钥匙串中，只会发送到该服务器。
 	Server: {url} (CalDAV and CardDAV)	服务器: {url} (CalDAV 和 CardDAV)
 	Not available: this account has no mail server.	不可用：此帐户没有邮件服务器。
+	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	邮件已从 MailCraft 之前的 Flatpak 迁移过来，旧版仍已安装。要删除它，请运行：flatpak uninstall --delete-data {id}
+	Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.	从 {file} 打开。它不在任何文件夹中，不会加载其中来自网络的图片，关闭后不会留下痕迹。

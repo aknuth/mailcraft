@@ -3,8 +3,7 @@
 This page lists what MailCraft still lacks against the everyday Outlook mail workflow, most-hit
 first. Each item says who it affects, what to do meanwhile and why it happens.
 
-The scope is [storytold/artcraft#2177](https://github.com/storytold/artcraft/issues/2177). See
-[what comes next](../ROADMAP.md) and [what each version added](../CHANGELOG.md); a gap that gets
+See [what comes next](../ROADMAP.md) and [what each version added](../CHANGELOG.md); a gap that gets
 fixed moves to the changelog.
 
 ## Open
@@ -50,9 +49,14 @@ Test builds update themselves ([how test builds update](updates.md)). These part
   - On a standard (non-administrator) macOS account, a copy in `/Applications` isn't replaced.
   - Every tester gets a new build within the hour. There is no staged rollout.
   - Each update downloads the whole installer. There are no delta downloads.
-- **Workaround:** On a standard macOS account, keep MailCraft in `~/Applications`.
+  - On macOS, after each update the system asks once whether MailCraft may read its passwords
+    from the keychain.
+- **Workaround:** On a standard macOS account, keep MailCraft in `~/Applications`. On macOS,
+  choose **Always Allow** when asked (it lasts until the next update).
 - **Cause:** An Ed25519 signature on updates and releases needs a signing key that only the
-  owner can create.
+  owner can create. The keychain ties an app's passwords to its Apple developer team, and a
+  build signed without an Apple certificate has none, so each build is a new app to it; a
+  designated requirement by bundle id doesn't change that.
 
 ### 5. OpenPGP: what isn't done yet
 

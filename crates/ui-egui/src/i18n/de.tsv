@@ -117,6 +117,7 @@
 	24-hour	24 Stunden
 	12-hour	12 Stunden
 	Whole date and time in the list	Vollständiges Datum mit Uhrzeit in der Liste
+	Earlier this month	Früher in diesem Monat
 	Last month	Letzter Monat
 	Last week	Letzte Woche
 	Later	Später
@@ -264,6 +265,10 @@
 	Servers: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})	Server: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})
 	Settings found: {source}	Einstellungen gefunden: {source}
 	Show a desktop notification when new mail arrives	Bei neuen E-Mails eine Desktopbenachrichtigung anzeigen
+	Keep MailCraft running when its window is closed	MailCraft weiter ausführen, wenn das Fenster geschlossen wird
+	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Es bleibt im Infobereich, ruft E-Mails ab und meldet neue. „Beenden“ auf der Seite „Datei“ oder im Menü des Symbols schließt es.
+	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Das Fenster wird minimiert, und MailCraft ruft weiter E-Mails ab und meldet neue. „Beenden“ auf der Seite „Datei“ schließt es.
+	Open MailCraft	MailCraft öffnen
 	Show as plain text	Als Nur-Text anzeigen
 	Show formatted	Formatiert anzeigen
 	Show in Favorites	In Favoriten anzeigen
@@ -368,7 +373,7 @@
 	About MailCraft	Über MailCraft
 	Account information	Kontoinformationen
 	Account settings	Kontoeinstellungen
-	An ArtCraft app · MIT OR Apache-2.0	Eine ArtCraft-App · MIT OR Apache-2.0
+	Free and open source · MIT OR Apache-2.0	Kostenlos und quelloffen · MIT OR Apache-2.0
 	Automatic replies	Automatische Antworten
 	Back	Zurück
 	Built in the open from the email standards: no code, icons or assets from other mail apps.	Offen auf Grundlage der E-Mail-Standards entwickelt: kein Code, keine Symbole und keine Ressourcen anderer Mail-Apps.
@@ -773,6 +778,12 @@
 	Sign in with Microsoft	Mit Microsoft anmelden
 	Sign in with Microsoft…	Mit Microsoft anmelden…
 	Mailbox won't open	Postfach öffnet sich nicht
+	Trust this computer's mail server?	Dem Mailserver auf diesem Computer vertrauen?
+	{host} is on this computer and shows a certificate it made itself, which no authority vouches for. A program that connects a mail service to mail apps does this. Trust it only if you set that program up.	{host} läuft auf diesem Computer und zeigt ein selbst erstelltes Zertifikat, für das keine Zertifizierungsstelle bürgt. So verhält sich ein Programm, das einen Maildienst mit Mailprogrammen verbindet. Vertrauen Sie ihm nur, wenn Sie dieses Programm selbst eingerichtet haben.
+	Certificate fingerprint (SHA-256)	Fingerabdruck des Zertifikats (SHA-256)
+	MailCraft asks again if the server shows another certificate.	MailCraft fragt erneut, wenn der Server ein anderes Zertifikat zeigt.
+	Trust this certificate	Diesem Zertifikat vertrauen
+	Certificate not trusted yet	Zertifikat noch nicht vertrauenswürdig
 	The mailbox won't open	Das Postfach öffnet sich nicht
 	Microsoft Graph reaches the mailbox without IMAP, and brings its calendar and contacts too. The account starts again through it: its mail comes down from the server.	Microsoft Graph erreicht das Postfach ohne IMAP und bringt auch Kalender und Kontakte mit. Das Konto beginnt darüber neu: Die E-Mails werden vom Server geladen.
 	Turned IMAP on, or picked another account in the browser? Sign in again	IMAP eingeschaltet oder im Browser ein anderes Konto gewählt? Erneut anmelden
@@ -1635,7 +1646,7 @@ month	May	Mai
 	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	Diese Nachricht wirkt verdächtig oder ihr Absender konnte nicht bestätigt werden, daher bleiben ihre Bilder ausgeblendet.
 	These senders' pictures always load, even when a message looks suspicious:	Bilder dieser Absender werden immer geladen, auch wenn eine Nachricht verdächtig wirkt:
 	Open a mail file	Eine E-Mail-Datei öffnen
-	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	Eine gespeicherte Nachricht (.eml oder .msg von Outlook) als reinen Text ansehen, ohne sie einem Ordner hinzuzufügen. Ihre Bilder werden nicht geladen, und nichts darin wird ausgeführt.
+	See a saved message (.eml or Outlook's .msg) in a window of its own, without adding it to a folder. Its pictures from the web aren't loaded and nothing in it runs.	Eine gespeicherte Nachricht (.eml oder .msg von Outlook) in einem eigenen Fenster ansehen, ohne sie einem Ordner hinzuzufügen. Ihre Bilder aus dem Web werden nicht geladen, und nichts darin wird ausgeführt.
 	Nothing is kept: closing it leaves no trace in your mail.	Nichts wird behalten: Nach dem Schließen bleibt keine Spur in Ihren E-Mails.
 	and {n} more	und {n} weitere
 	Checking for new mail	Nach neuen E-Mails suchen
@@ -1647,3 +1658,5 @@ month	May	Mai
 	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Für jeden CalDAV- und CardDAV-Server mit Ihren Kalendern und Kontakten, etwa Nextcloud, Baïkal, SOGo oder Radicale, ohne E-Mail. Ihr Kennwort wird im Schlüsselbund dieses Computers gespeichert und nur an diesen Server gesendet.
 	Server: {url} (CalDAV and CardDAV)	Server: {url} (CalDAV und CardDAV)
 	Not available: this account has no mail server.	Nicht verfügbar: Dieses Konto hat keinen Mailserver.
+	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Ihre E-Mails wurden aus dem früheren Flatpak von MailCraft übernommen, das noch installiert ist. Zum Entfernen ausführen: flatpak uninstall --delete-data {id}
+	Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.	Geöffnet aus {file}. Sie liegt in keinem Ordner, ihre Bilder aus dem Web werden nicht geladen, und nach dem Schließen bleibt keine Spur.

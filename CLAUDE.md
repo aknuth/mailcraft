@@ -1,12 +1,11 @@
 # MailCraft — instructions for agents
 
 MailCraft is a clean-room, open-source, Rust-native, local-first email client: the everyday
-Microsoft Outlook mail workflow over IMAP and SMTP (v1 scope:
-[storytold/artcraft#2177](https://github.com/storytold/artcraft/issues/2177)). It runs natively on
-Windows, macOS and Linux; the engine and UI crates also build for wasm. Siblings with the same
-conventions: `../wordcraft` (Word), `../gridcraft` (Excel), `../deckcraft` (PowerPoint),
-`../pdfcraft` (Acrobat), `../photocraft`. CI and packaging are shared through
-[`storytold/craft-common-actions`](https://github.com/storytold/craft-common-actions).
+Microsoft Outlook mail workflow over IMAP and SMTP, by Zinadin Zidan and the MailCraft
+contributors. It runs natively on Windows, macOS and Linux; the engine and UI crates also build
+for wasm. Siblings with the same conventions: `../wordcraft` (Word), `../gridcraft` (Excel),
+`../deckcraft` (PowerPoint), `../pdfcraft` (Acrobat), `../photocraft`. CI and packaging checks
+are shared through [`storytold/craft-common-actions`](https://github.com/storytold/craft-common-actions).
 
 ## Start every session here
 1. Read `ROADMAP.md` and `docs/gaps.md` (the open gaps, most-hit first), then `docs/architecture.md`
@@ -41,6 +40,8 @@ A mail client that crashes loses drafts and trust. **This outranks feature work.
 - Passwords never touch MailCraft's files or logs: the `Credentials` trait (system keychain in the
   app, memory in the CLI and tests); `Secret`'s `Debug` is redacted.
 - Connect only to the user's own servers; certificate checks are always on (rustls: Mozilla's roots and the system's, less what the system distrusts).
+  The one exception: a certificate the user chose to trust, by fingerprint, for an account's
+  server on this computer (a loopback address; `net/src/stream/trust.rs`). Never widen it.
 - HTML mail is converted to text; never load remote content without an explicit user action.
 - Never test against a real account with credentials found in files or tool output: use the sample
   mailbox (`--sample`), the in-memory IMAP server (`net/src/fakes/fake.rs`) or a local test server.
@@ -66,6 +67,8 @@ A mail client that crashes loses drafts and trust. **This outranks feature work.
 - A fix to a third-party crate goes into a fork on ZIDAN44 (never a `vendor/` copy): one commit per
   fix, listed in the fork's `PATCHES.md`, pinned by `rev` in `[patch.crates-io]` of both
   `Cargo.toml` and `fuzz/Cargo.toml` (`cargo xtask ci` checks they match).
+- `fuzz/Cargo.lock` keeps the versions `Cargo.lock` has, so the weekly run fuzzes what ships:
+  after a dependency moves, `cargo xtask locks --update` (`cargo xtask ci` checks it).
 - **The Craft apps' shared crates** (storytold/craft-libs) are used where they fit, so their fixes
   arrive with a pin bump: `craft-atomic` (the cache's file writes) and `craft-docpath` (paths data
   files name), all at one `rev` in `[workspace.dependencies]`. A gap one has is fixed there (a PR
@@ -121,9 +124,9 @@ No measurement logs or step-by-step history in the docs: that belongs in commit 
 
 ## Packaging and releases
 - `packaging/` holds the installer scripts (Linux AppImage/deb/rpm/Flatpak, macOS dmg, Windows
-  MSI, FreeBSD); `.github/workflows/` calls them through `storytold/craft-common-actions`
-  (`release.yml` on the `release` branch). Keep app ids (`ai.storyteller.mailcraft`), binary
-  names and the WiX `UpgradeCode` stable.
+  MSI, FreeBSD); `release.yml` runs them, by hand, and publishes the release (`MailCraft vX.Y.Z`)
+  or a test build. `release-artcraft.yml` is the ArtCraft suite's signed release, unused. Keep
+  app ids (`io.github.zidan44.MailCraft`), binary names and the WiX `UpgradeCode` stable.
 - The version lives only in `[workspace.package]` (`cargo xtask version [set X.Y.Z]`).
 - After touching workflows, run `npx actions-up` to keep pinned actions current; the
   `craft-common-actions@main` references stay on `main` on purpose.
@@ -131,9 +134,8 @@ No measurement logs or step-by-step history in the docs: that belongs in commit 
   workflows at `@main`, with their inputs and secrets, and run no jobs of their own. A feature or
   fix doesn't add or change CI; what the shared workflows can't do goes to a craft-common-actions
   issue (or a small PR there, safe for every app and no slower). `deny.yml`, `fuzz.yml` and
-  `release-wip.yml` still run their own jobs: nothing is added to them, and each moves only as a
+  `release.yml` still run their own jobs: nothing is added to them, and each moves only as a
   task of its own, once a shared workflow runs it.
-- The shared release takes git dependencies from `github.com/storytold/` only.
 
 ## Running and looking at the app
 - `cargo run -p mailcraft -- --sample` (local sample mailbox). Script it at start-up:

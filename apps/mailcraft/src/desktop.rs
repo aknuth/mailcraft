@@ -9,6 +9,7 @@ mod lanes;
 mod print;
 pub(crate) mod start;
 pub(crate) mod state_writer;
+pub(crate) mod tray;
 pub(crate) mod window_frame;
 
 pub(crate) struct PoolBackend(pub(crate) Pool);
@@ -164,6 +165,9 @@ impl Services for Desktop {
     fn pending_data_move(&self) -> Option<PathBuf> {
         self.base.as_deref().and_then(location::pending_move)
     }
+    fn carried_over_from(&self) -> Option<&'static str> {
+        crate::self_update::renamed::carried_over().then_some(crate::self_update::renamed::OLD_ID)
+    }
     fn move_data_folder(&mut self, to: Option<&Path>) -> Result<Option<PathBuf>, String> {
         let base = self.base.as_deref().ok_or("the data folder was chosen when MailCraft started")?;
         match to {
@@ -276,6 +280,12 @@ impl Services for Desktop {
             ]
         };
         candidates.iter().find_map(|p| std::fs::read(p).ok())
+    }
+    fn keeps_running(&self) -> Option<mailcraft_ui_egui::KeptOnClose> {
+        tray::offered()
+    }
+    fn kept_on_close(&self) -> Option<mailcraft_ui_egui::KeptOnClose> {
+        tray::kept_on_close()
     }
     fn can_drag_out(&self) -> bool {
         // Elsewhere, under X11 only: a Wayland window isn't an X window.

@@ -313,13 +313,13 @@ pub(super) fn close_compose(s: &mut Session, v: &Value) -> CmdResult {
         }
         s.let_go_saved();
     } else {
-        s.compose = None;
+        s.let_go_compose();
     }
     Ok(json!({"closed": c.id, "saved": saved}))
 }
 
 pub(super) fn discard(s: &mut Session, _: &Value) -> CmdResult {
-    let c = s.compose.take();
+    let c = s.let_go_compose();
     Ok(json!({"discarded": c.map(|c| c.id)}))
 }
 
@@ -338,15 +338,11 @@ impl Session {
     /// The open message's source (`.eml`).
     pub fn message_source(&self) -> Result<Vec<u8>, CmdError> {
         let r = self.reading.as_ref().ok_or_else(|| CmdError::Disabled("open a message first".into()))?;
-        if r.key.folder == crate::session::OUTBOX {
-            self.outbox_entry(&r.key).and_then(|(a, i)| self.store.as_ref().and_then(|st| st.outbox_raw(&a, i.id)))
-        } else {
-            self.store.as_ref().and_then(|st| st.read_body(&r.key))
-        }
-        .ok_or_else(|| CmdError::Failed("the message isn't downloaded".into()))
+        self.body_raw(&r.key).ok_or_else(|| CmdError::Failed("the message isn't downloaded".into()))
     }
 
-    /// The open message as a PDF: subject, header, text and the names of its attachments.
+    /// The open message as a PDF: subject, header, its text as it's formatted (bold, italic,
+    /// headings, sizes, colours, links underlined) and the names of its attachments.
     pub fn message_pdf(&self) -> Result<Vec<u8>, CmdError> {
         let doc = self.message_doc()?;
         let fonts = self.print_fonts.as_ref().map(|(r, b)| mailcraft_print::Fonts { regular: r, bold: b.as_deref() });
@@ -372,8 +368,43 @@ impl Session {
         if !files.is_empty() {
             header.push(("Attachments".into(), files.join(", ")));
         }
-        Ok(mailcraft_print::Doc { title: m.subject.clone(), header, body: m.text.clone() })
+        Ok(mailcraft_print::Doc { title: m.subject.clone(), header, body: m.text.clone(), rich: printed_runs(&m.rich) })
     }
+}
+
+/// A formatted message's lines as the PDF prints them (issue #72: it printed the plain text,
+/// its formatting gone). A picture is its description; a message without formatting has none.
+fn printed_runs(rich: &mailcraft_mime::RichText) -> Vec<Vec<mailcraft_print::Run>> {
+    const LINK: [u8; 3] = [0x0B, 0x57, 0xD0];
+    rich.iter()
+        .map(|line| {
+            line.iter()
+                .filter(|s| s.image.is_none() || !s.text.trim().is_empty())
+                .map(|s| {
+                    let heading = match s.heading {
+                        0 => None,
+                        1 => Some(20.0),
+                        2 => Some(17.0),
+                        3 => Some(14.5),
+                        _ => Some(12.5),
+                    };
+                    mailcraft_print::Run {
+                        // Struck-through text comes with a stroke over each letter for where no
+                        // line can be drawn: here one is.
+                        text: if s.image.is_some() { format!("[{}]", s.text.trim()) } else { s.text.replace('\u{336}', "") },
+                        bold: s.bold || heading.is_some(),
+                        italic: s.italic,
+                        underline: s.link.is_some(),
+                        strike: s.strike,
+                        // CSS pixels to points.
+                        size: heading.or(s.size.map(|px| f32::from(px) * 0.75)),
+                        color: s.color.or(s.link.as_ref().map(|_| LINK)),
+                        background: s.background,
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 pub(super) fn save_attachment(s: &mut Session, v: &Value) -> CmdResult {

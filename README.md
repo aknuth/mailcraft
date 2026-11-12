@@ -2,12 +2,16 @@
 
 <p align="center">
   <b>Local-first email: an open-source, clean-room alternative to Microsoft Outlook, written in Rust.</b><br>
-  <i>By the ArtCraft team. Tracked in <a href="https://github.com/storytold/artcraft/issues/2177">storytold/artcraft#2177</a>.</i>
+  <i>By Zinadin Zidan and the MailCraft contributors.</i>
 </p>
 
 <p align="center">
   <a href="https://github.com/ZIDAN44/mailcraft/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ZIDAN44/mailcraft/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-0e7c86?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="https://mailcraft.dev">mailcraft.dev</a> · <a href="https://mailcraft.dev/#download">Download</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="ROADMAP.md">Roadmap</a>
 </p>
 
 <p align="center">
@@ -39,7 +43,7 @@ of your mail on your computer, so it works offline.
 
 ## Install
 
-Download an installer from the [Releases](https://github.com/ZIDAN44/mailcraft/releases) page:
+Download an installer from [mailcraft.dev](https://mailcraft.dev/#download), which offers the file for your system, or from the [Releases](https://github.com/ZIDAN44/mailcraft/releases) page:
 
 - **Windows:** `.msi`, or a portable zip.
 - **macOS:** `.dmg`.
@@ -62,6 +66,10 @@ cd apps/mailcraft-web && trunk serve           # browser: http://127.0.0.1:8774/
 
 ## Documentation
 
+- [Setting up your email account](https://mailcraft.dev/setup)
+- [Switching from Outlook](https://mailcraft.dev/switch-from-outlook)
+- [Opening a `.pst` file without Outlook](https://mailcraft.dev/open-pst-without-outlook)
+- [Running MailCraft from a USB stick](https://mailcraft.dev/portable)
 - [What each version added](CHANGELOG.md)
 - [What comes next](ROADMAP.md)
 - [What's still missing](docs/gaps.md)
@@ -77,7 +85,7 @@ cd apps/mailcraft-web && trunk serve           # browser: http://127.0.0.1:8774/
 - Follow the project rules in [CLAUDE.md](CLAUDE.md): no crashes, no Microsoft assets, clean room.
 - Run `cargo xtask ci` before every commit.
 - To fuzz the parsers, see [fuzzing](fuzz/README.md).
-- The installer scripts live in [`packaging/`](packaging). [`storytold/craft-common-actions`](https://github.com/storytold/craft-common-actions) runs them, and `release.yml` runs on the `release` branch.
+- The installer scripts live in [`packaging/`](packaging). The `Release` workflow (`release.yml`) runs them and publishes a release.
 
 ## License and credits
 

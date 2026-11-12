@@ -51,6 +51,8 @@ impl MailApp {
         if self.ui.close_asked && !asking && !self.ui.close_now && !self.ui.closing_anyway {
             self.ui.close_asked = false;
             self.ui.restart_wanted = false;
+            // An Exit answered with Cancel: the next close of the window hides it again.
+            self.ui.quit_wanted = false;
             self.ui.update_answered = false;
             self.ui.compact.answered = false;
             self.ui.compact.dont_wait = false;
@@ -86,6 +88,24 @@ impl MailApp {
                 if ui.button(tl!("Later")).on_hover_text(tl!("It installs when you close MailCraft.")).clicked() {
                     self.ui.update_later = Some(version.clone());
                 }
+            }
+        });
+    }
+
+    /// The bar saying the mail came over from MailCraft's earlier Flatpak (its id before 0.36),
+    /// and how to remove that one, which MailCraft can't from inside its sandbox (Dismiss).
+    pub(crate) fn old_flatpak_bar(&mut self, ui: &mut Ui) {
+        let Some(old) = self.ui.old_flatpak else { return };
+        let t = self.ui.tokens;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+            icons::paint(ui.painter(), r, Icon::Info, t.accent);
+            let text =
+                tf!("Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}", id = old);
+            ui.add(egui::Label::new(RichText::new(text).color(t.text)).selectable(true));
+            if ui.button(tl!("Dismiss")).clicked() {
+                self.ui.old_flatpak = None;
             }
         });
     }

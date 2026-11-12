@@ -14,6 +14,8 @@ struct Asked {
     notified: Vec<String>,
     later: bool,
     restart: bool,
+    /// What a close does when MailCraft is kept running.
+    tray: Option<crate::KeptOnClose>,
 }
 
 struct Updating(Rc<RefCell<Asked>>);
@@ -41,6 +43,12 @@ impl crate::Services for Updating {
     }
     fn keep_update_for_later(&mut self) {
         self.0.borrow_mut().later = true;
+    }
+    fn keeps_running(&self) -> Option<crate::KeptOnClose> {
+        Some(crate::KeptOnClose::Hidden)
+    }
+    fn kept_on_close(&self) -> Option<crate::KeptOnClose> {
+        self.0.borrow().tray
     }
     fn notify(&mut self, title: &str, _body: &str) {
         self.0.borrow_mut().notified.push(title.to_string());
@@ -202,4 +210,121 @@ fn closing_says_what_becomes_of_the_update() {
     assert!(!asked.borrow().later && a.ui.close_now && a.ui.update_answered);
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(dir2);
+}
+
+/// A start that brought the mail over from MailCraft's Flatpak under its id before 0.36.
+struct CarriedOver;
+
+impl crate::Services for CarriedOver {
+    fn clock(&self) -> (i64, i32) {
+        (NOW, 0)
+    }
+    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
+        Err("no".into())
+    }
+    fn carried_over_from(&self) -> Option<&'static str> {
+        Some("ai.storyteller.mailcraft")
+    }
+}
+
+/// The texts drawn in a frame (AccessKit on) and where each is: `(label, centre)`.
+fn drawn(ctx: &egui::Context, a: &mut MailApp, events: Vec<egui::Event>) -> Vec<(String, egui::Pos2)> {
+    let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), events, ..Default::default() };
+    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
+    out.textures_delta.clear();
+    let tree = out.platform_output.accesskit_update.expect("AccessKit is on");
+    tree.nodes
+        .iter()
+        .filter_map(|(_, n)| {
+            let b = n.bounds()?;
+            let label = n.label().or(n.value())?.to_string();
+            Some((label, egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)))
+        })
+        .collect()
+}
+
+/// A bar says the mail came over from the old Flatpak and how to remove that one, until it's
+/// dismissed; a start that brought nothing over has no bar.
+#[test]
+fn the_old_flatpak_is_named_once_its_mail_came_over() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut a = MailApp::new(Session::open(None, Clock::new(NOW, 0)), Box::new(NullBackend), Box::new(CarriedOver));
+    drawn(&ctx, &mut a, vec![]);
+    let texts = drawn(&ctx, &mut a, vec![]);
+    assert!(texts.iter().any(|(t, _)| t.contains("flatpak uninstall --delete-data ai.storyteller.mailcraft")), "the bar says how to remove it");
+    let at = texts.iter().find(|(t, _)| t == "Dismiss").map(|(_, p)| *p).expect("a Dismiss button");
+    let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    drawn(&ctx, &mut a, vec![egui::Event::PointerMoved(at), press(true)]);
+    drawn(&ctx, &mut a, vec![press(false)]);
+    let texts = drawn(&ctx, &mut a, vec![]);
+    assert_eq!(a.ui.old_flatpak, None);
+    assert!(!texts.iter().any(|(t, _)| t.contains("flatpak uninstall")));
+    let b = MailApp::new(Session::open(None, Clock::new(NOW, 0)), Box::new(NullBackend), Box::new(NullServices(NOW)));
+    assert_eq!(b.ui.old_flatpak, None);
+}
+
+/// Issue #67: with "Keep MailCraft running when its window is closed" on, and its icon in the
+/// notification area, closing the window hides it and ends nothing; Exit closes it, and asks
+/// what a close asks. Off, or with no icon to come back from, a close is a close.
+#[test]
+fn closing_the_window_keeps_mailcraft_running_when_asked_to() {
+    let (mut a, dir) = app("keep-running");
+    let asked = updating(&mut a);
+    asked.borrow_mut().tray = Some(crate::KeptOnClose::Hidden);
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    // The window asked to close: what it's told to do then.
+    let closed = |a: &mut MailApp| {
+        let input = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
+        out.textures_delta.clear();
+        out.viewport_output.remove(&egui::ViewportId::ROOT).map(|v| v.commands).unwrap_or_default()
+    };
+    let hides = |commands: &[egui::ViewportCommand]| {
+        commands.contains(&egui::ViewportCommand::CancelClose) && commands.contains(&egui::ViewportCommand::Visible(false))
+    };
+    assert!(!hides(&closed(&mut a)) && !a.ui.in_tray, "off: the window closes");
+    a.run("view.closeToTray", json!({"on": true}));
+    assert!(hides(&closed(&mut a)) && a.ui.in_tray, "on: hidden, still running");
+    a.show_window(&ctx);
+    assert!(!a.ui.in_tray);
+    // A message being written doesn't stop the window hiding: nothing is lost by it.
+    a.run("mail.new", json!({}));
+    a.run("compose.update", json!({"to": "ann@x.example", "subject": "Later", "body": "Not sent yet."}));
+    assert!(hides(&closed(&mut a)) && a.ui.dialog.is_none());
+    // Exit asks about it, as a close does, with the window back; cancelled, the window hides again.
+    a.exit(&ctx);
+    let commands = closed(&mut a);
+    assert!(!hides(&commands) && matches!(&a.ui.dialog, Some(Dialog::SaveOnClose(1))), "{commands:?}");
+    assert!(commands.contains(&egui::ViewportCommand::Visible(true)) && !a.ui.in_tray, "the question is shown: {commands:?}");
+    a.ui.dialog = None;
+    frame(&ctx, &mut a, vec![]);
+    assert!(hides(&closed(&mut a)), "cancelled: closing hides again");
+    // Where a hidden window couldn't be brought back (Wayland, no notification area), it's
+    // minimized: the taskbar is the way back.
+    a.show_window(&ctx);
+    a.run("compose.discard", json!({}));
+    asked.borrow_mut().tray = Some(crate::KeptOnClose::Minimized);
+    let commands = closed(&mut a);
+    assert!(commands.contains(&egui::ViewportCommand::CancelClose) && commands.contains(&egui::ViewportCommand::Minimized(true)), "{commands:?}");
+    assert!(!hides(&commands) && !a.ui.in_tray);
+    // Where the app can't keep running at all, a close is a close.
+    asked.borrow_mut().tray = None;
+    assert!(!closed(&mut a).contains(&egui::ViewportCommand::CancelClose));
+    let _ = std::fs::remove_dir_all(dir);
 }

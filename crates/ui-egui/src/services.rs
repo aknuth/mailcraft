@@ -97,6 +97,16 @@ pub struct Work {
 }
 
 /// Platform services the UI needs.
+/// What becomes of the window when it's closed and MailCraft is kept running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptOnClose {
+    /// Hidden: MailCraft's icon in the system's notification area brings it back.
+    Hidden,
+    /// Minimized: where a hidden window couldn't be brought back (Wayland, no notification
+    /// area), the taskbar does.
+    Minimized,
+}
+
 pub trait Services {
     /// Unix seconds and the local UTC offset in seconds.
     fn clock(&self) -> (i64, i32);
@@ -239,6 +249,11 @@ pub trait Services {
     fn pending_data_move(&self) -> Option<PathBuf> {
         None
     }
+    /// The id of MailCraft's earlier Flatpak when this start brought its mail over (it stays
+    /// installed until it's removed).
+    fn carried_over_from(&self) -> Option<&'static str> {
+        None
+    }
     /// Ask for the data to move into `to` when MailCraft next starts (`None` forgets the move);
     /// the folder it will be in.
     fn move_data_folder(&mut self, _to: Option<&std::path::Path>) -> Result<Option<PathBuf>, String> {
@@ -258,6 +273,15 @@ pub trait Services {
     /// which is when a lane caught on cancelled work is given a new thread.
     fn has_background(&self) -> bool {
         false
+    }
+    /// Whether this app can keep running with its window closed, and what becomes of the window
+    /// then: what the option says of itself (none: it isn't offered), and what a close does now
+    /// (none: it closes).
+    fn keeps_running(&self) -> Option<KeptOnClose> {
+        None
+    }
+    fn kept_on_close(&self) -> Option<KeptOnClose> {
+        None
     }
     /// Whether files can be dragged out of the window to other apps (see
     /// [`MailApp::take_drag_out`]).

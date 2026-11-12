@@ -117,6 +117,7 @@
 	24-hour	24 saat
 	12-hour	12 saat
 	Whole date and time in the list	Listede tam tarih ve saat
+	Earlier this month	Bu ayın başlarında
 	Last month	Geçen ay
 	Last week	Geçen hafta
 	Later	Daha sonra
@@ -264,6 +265,10 @@
 	Servers: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})	Sunucular: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})
 	Settings found: {source}	Ayarlar bulundu: {source}
 	Show a desktop notification when new mail arrives	Yeni posta geldiğinde masaüstü bildirimi göster
+	Keep MailCraft running when its window is closed	Penceresi kapatıldığında MailCraft çalışmaya devam etsin
+	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Bildirim alanında kalır, postayı denetler ve yeni postayı bildirir. Dosya sayfasındaki veya simgesinin menüsündeki “Çıkış” onu kapatır.
+	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Penceresi simge durumuna küçültülür ve MailCraft postayı denetlemeyi ve yeni postayı bildirmeyi sürdürür. Dosya sayfasındaki “Çıkış” onu kapatır.
+	Open MailCraft	MailCraft’ı aç
 	Show as plain text	Düz metin olarak göster
 	Show formatted	Biçimli göster
 	Show in Favorites	Sık Kullanılanlarda göster
@@ -368,7 +373,7 @@
 	About MailCraft	MailCraft hakkında
 	Account information	Hesap bilgileri
 	Account settings	Hesap ayarları
-	An ArtCraft app · MIT OR Apache-2.0	Bir ArtCraft uygulaması · MIT OR Apache-2.0
+	Free and open source · MIT OR Apache-2.0	Ücretsiz ve açık kaynak · MIT OR Apache-2.0
 	Automatic replies	Otomatik yanıtlar
 	Back	Geri
 	Built in the open from the email standards: no code, icons or assets from other mail apps.	E-posta standartlarından yola çıkılarak açık olarak geliştirildi: başka posta uygulamalarından kod, simge veya varlık yok.
@@ -773,6 +778,12 @@
 	Sign in with Microsoft	Microsoft ile oturum aç
 	Sign in with Microsoft…	Microsoft ile oturum aç…
 	Mailbox won't open	Posta kutusu açılmıyor
+	Trust this computer's mail server?	Bu bilgisayardaki posta sunucusuna güvenilsin mi?
+	{host} is on this computer and shows a certificate it made itself, which no authority vouches for. A program that connects a mail service to mail apps does this. Trust it only if you set that program up.	{host} bu bilgisayarda ve kendi oluşturduğu, hiçbir yetkilinin kefil olmadığı bir sertifika gösteriyor. Bir posta hizmetini posta uygulamalarına bağlayan bir program böyle yapar. Yalnızca o programı siz kurduysanız güvenin.
+	Certificate fingerprint (SHA-256)	Sertifika parmak izi (SHA-256)
+	MailCraft asks again if the server shows another certificate.	Sunucu başka bir sertifika gösterirse MailCraft yeniden sorar.
+	Trust this certificate	Bu sertifikaya güven
+	Certificate not trusted yet	Sertifikaya henüz güvenilmiyor
 	The mailbox won't open	Posta kutusu açılmıyor
 	Microsoft Graph reaches the mailbox without IMAP, and brings its calendar and contacts too. The account starts again through it: its mail comes down from the server.	Microsoft Graph, posta kutusuna IMAP olmadan erişir; takvimini ve kişilerini de getirir. Hesap onun üzerinden yeniden başlar: postaları sunucudan indirilir.
 	Turned IMAP on, or picked another account in the browser? Sign in again	IMAP'i açtınız mı ya da tarayıcıda başka bir hesap mı seçtiniz? Yeniden oturum açın
@@ -1635,7 +1646,7 @@ month	May	Mayıs
 	This message looks suspicious or its sender couldn't be confirmed, so its pictures stay hidden.	Bu ileti şüpheli görünüyor veya göndereni doğrulanamadı, bu yüzden resimleri gizli kalıyor.
 	These senders' pictures always load, even when a message looks suspicious:	Bu gönderenlerin resimleri, ileti şüpheli görünse bile her zaman yüklenir:
 	Open a mail file	Bir posta dosyası aç
-	See a saved message (.eml or Outlook's .msg) as plain text, without adding it to a folder. Its pictures aren't loaded and nothing in it runs.	Kaydedilmiş bir iletiyi (.eml veya Outlook .msg) bir klasöre eklemeden düz metin olarak görün. Resimleri yüklenmez ve içindeki hiçbir şey çalışmaz.
+	See a saved message (.eml or Outlook's .msg) in a window of its own, without adding it to a folder. Its pictures from the web aren't loaded and nothing in it runs.	Kaydedilmiş bir iletiyi (.eml veya Outlook .msg) bir klasöre eklemeden kendi penceresinde görün. Web'deki resimleri yüklenmez ve içindeki hiçbir şey çalışmaz.
 	Nothing is kept: closing it leaves no trace in your mail.	Hiçbir şey saklanmaz: kapattığınızda postanızda iz kalmaz.
 	and {n} more	ve {n} tane daha
 	Checking for new mail	Yeni posta denetimi
@@ -1647,3 +1658,5 @@ month	May	Mayıs
 	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Nextcloud, Baïkal, SOGo veya Radicale gibi, takvimlerinizi ve kişilerinizi e-posta olmadan tutan her CalDAV ve CardDAV sunucusu için. Parolanız bu bilgisayarın anahtarlığında tutulur ve yalnızca o sunucuya gönderilir.
 	Server: {url} (CalDAV and CardDAV)	Sunucu: {url} (CalDAV ve CardDAV)
 	Not available: this account has no mail server.	Kullanılamıyor: bu hesabın posta sunucusu yok.
+	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Postanız MailCraft'ın önceki Flatpak'ından taşındı; o hâlâ yüklü. Kaldırmak için şunu çalıştırın: flatpak uninstall --delete-data {id}
+	Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.	{file} dosyasından açıldı. Hiçbir klasörde değil, web'deki resimleri yüklenmez ve kapattığınızda iz kalmaz.

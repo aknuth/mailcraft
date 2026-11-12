@@ -80,7 +80,13 @@ pub fn window(s: &mut Session, st: &mut UiState, ui: &mut Ui, w: mailcraft_engin
     let mut mine = Vec::new();
     message(s, st, ui, &mut mine, true);
     s.reading = saved;
-    if !mine.is_empty() {
+    if mine.is_empty() {
+        return;
+    }
+    // An opened file is in no list to open it from: it stands in as the open message instead.
+    if s.opened_file_name(&key).is_some() {
+        acts.extend(mine.into_iter().map(|a| Action::InWindow(key.clone(), Box::new(a))));
+    } else {
         acts.push(Action::Open(key));
         acts.extend(mine);
     }
@@ -137,7 +143,7 @@ fn message(s: &mut Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action
                     None if getting_ready => {
                         if let Some(m) = &summary {
                             let subject = if m.subject.is_empty() { tl!("(no subject)") } else { m.subject.as_str() };
-                            crate::bidi::label(ui, subject, theme::bold(21.0), t.text);
+                            subject_heading(ui, subject, &t);
                             ui.add_space(8.0);
                         }
                         ui.spinner();
@@ -167,7 +173,7 @@ fn message(s: &mut Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action
                     // Subject.
                     ui.horizontal_wrapped(|ui| {
                         let subject = if p.subject.is_empty() { tl!("(no subject)") } else { p.subject.as_str() };
-                        crate::bidi::label(ui, subject, theme::bold(21.0), t.text);
+                        subject_heading(ui, subject, &t);
                         if summary.as_ref().is_some_and(|m| m.flags.flagged) {
                             let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                             icons::paint(ui.painter(), ir, Icon::Flag, t.flag);
@@ -220,8 +226,14 @@ fn message(s: &mut Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action
                         // The date to the right, with room kept for it (the address ran under it in a
                         // narrow pane); under the sender when the pane is too narrow for both.
                         let when = summary.as_ref().map_or(p.date, |m| if p.date > 0 { p.date } else { m.date });
-                        let date = egui::WidgetText::from(RichText::new(crate::i18n::date(&dates::full_time(when, &s.clock))).color(t.dim).small())
-                            .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Small);
+                        // None at all (a message file without one): no date, rather than 1970's.
+                        let when = if when > 0 { crate::i18n::date(&dates::full_time(when, &s.clock)) } else { String::new() };
+                        let date = egui::WidgetText::from(RichText::new(when).color(t.dim).small()).into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            egui::TextStyle::Small,
+                        );
                         let rest = ui.available_width() - date.size().x - 16.0;
                         let beside = rest >= 200.0;
                         let room = if beside { rest } else { ui.available_width() };
@@ -323,6 +335,9 @@ fn message(s: &mut Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action
                     }
                     if let Some(sec) = &r.security {
                         security::security_bar(s, &t, ui, sec);
+                    }
+                    if let Some(name) = s.opened_file_name(&r.key) {
+                        opened_file_bar(&t, ui, name);
                     }
                     if let Some((_, item)) = s.outbox_entry(&r.key) {
                         egui::Frame::new().fill(t.warn.gamma_multiply(0.12)).corner_radius(6).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
@@ -536,6 +551,31 @@ pub(crate) fn external_tag(ui: &mut Ui, t: &Tokens) -> egui::Response {
         .on_hover_text(tl!("This sender is outside your organisation."))
 }
 
+/// A message file opened to be looked at (issue #56): where it's from, and what it's spared.
+fn opened_file_bar(t: &Tokens, ui: &mut Ui, name: &str) {
+    egui::Frame::new().fill(t.chrome).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(6).inner_margin(Margin::symmetric(10, 6)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                icons::paint(ui.painter(), ir, Icon::File, t.dim);
+                // Wrapped in a narrow window (on one line it widened the whole message past it).
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(tf!(
+                            "Opened from {file}. It isn't in any folder, its pictures from the web aren't loaded, and closing it leaves no trace.",
+                            file = name
+                        ))
+                        .color(t.dim),
+                    );
+                });
+            });
+        },
+    );
+    ui.add_space(8.0);
+}
+
 /// Who the message says it's from doesn't add up: said plainly, above everything it asks for.
 pub(crate) fn sender_warning(t: &Tokens, ui: &mut Ui, w: &mailcraft_engine::model::lookalike::SenderWarning) {
     use mailcraft_engine::model::lookalike::SenderWarning;
@@ -697,21 +737,18 @@ fn thread_list(s: &Session, t: &Tokens, ui: &mut Ui, thread: &[MessageKey], open
                 }
                 let font = if !m.flags.seen { theme::bold(13.0) } else { theme::regular(13.0) };
                 let p = ui.painter_at(rect);
-                p.text(rect.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, m.from.display(), font, t.text);
-                p.text(
-                    rect.left_center() + vec2(170.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    widgets::shorten(&m.preview, 70),
-                    theme::regular(12.5),
-                    t.dim,
-                );
-                p.text(
-                    rect.right_center() - vec2(8.0, 0.0),
-                    egui::Align2::RIGHT_CENTER,
-                    crate::i18n::date(&dates::list_time(m.when(), &s.clock)),
-                    theme::regular(12.0),
-                    t.dim,
-                );
+                // Who, the first words and when, each in its own room: the words ran on under
+                // the time in a narrow pane, and a long name under the words.
+                let when = p.layout_no_wrap(crate::i18n::date(&dates::list_time(m.when(), &s.clock)), theme::regular(12.0), t.dim);
+                let who = widgets::one_line(ui, m.from.display(), font, t.text, 154.0);
+                let mid = |g: &egui::Galley| rect.center().y - g.size().y / 2.0;
+                let room = rect.width() - 170.0 - when.size().x - 20.0;
+                p.galley(egui::pos2(rect.left() + 8.0, mid(&who)), who, t.text);
+                if room > 24.0 {
+                    let words = widgets::one_line(ui, &m.preview, theme::regular(12.5), t.dim, room);
+                    p.galley(egui::pos2(rect.left() + 170.0, mid(&words)), words, t.dim);
+                }
+                p.galley(egui::pos2(rect.right() - 8.0 - when.size().x, mid(&when)), when, t.dim);
                 if resp.clicked() && !current {
                     acts.push(Action::Open(k.clone()));
                 }
