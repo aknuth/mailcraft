@@ -23,9 +23,11 @@ macro_rules! tf {
 
 mod a11y;
 mod app;
+mod backup;
 mod dialogs;
 pub mod i18n;
 mod keytips;
+mod lists;
 mod look;
 mod panes;
 mod reading;
@@ -180,6 +182,17 @@ pub enum Action {
     /// The category list to a file, or categories from one.
     ExportCategories,
     ImportCategories,
+    /// Save a backup of what the browser keeps (issue #83), locked with the password when
+    /// there's one, with the downloaded mail when asked; pick one to bring back; bring it back.
+    Backup {
+        password: String,
+        mail: bool,
+    },
+    PickBackup,
+    Restore {
+        data: std::sync::Arc<Vec<u8>>,
+        password: String,
+    },
     /// Pick a `.p12` / `.pfx` file for an account's certificate, then ask its password.
     ImportCertificate(String),
     /// The browser: open the account's certificate it keeps, with its password, for this page.
@@ -384,6 +397,8 @@ pub struct UiState {
     fonts_ready: bool,
     /// The messages being written that have been shown, to focus a new one's first field once.
     pub(crate) compose_shown: std::collections::HashSet<u64>,
+    /// Where the message being written beside the list was drawn, and in which pass.
+    pub(crate) compose_area: Option<(u64, egui::Rect)>,
     /// The editors of the messages being written other than the one acting now (`editor`).
     pub(crate) editors: HashMap<u64, rich_edit::Editor>,
     /// The message whose window a dialog for messages belongs to (Save changes, Address Book).
@@ -574,6 +589,7 @@ impl MailApp {
                 source_headers: Default::default(),
                 fonts_ready: false,
                 compose_shown: Default::default(),
+                compose_area: None,
                 editors: HashMap::new(),
                 dialog_for: None,
                 editor: None,
@@ -799,6 +815,12 @@ impl MailApp {
         for (purpose, name, data) in self.services.take_picked() {
             if let Some(account) = purpose.strip_prefix("certificate:") {
                 self.ui.dialog = Some(Dialog::Certificate { account: account.to_string(), path: name, data: Some(data), password: String::new() });
+            } else if purpose == "backup" {
+                self.backup_picked(name, data);
+            } else if purpose == "rules" {
+                self.rules_picked(&data);
+            } else if purpose == "categories" {
+                self.categories_picked(&data);
             } else if purpose == "picture" {
                 let size = rich_edit::own_size(&data);
                 let (width, line) = (rich_edit::fitted_width(size), rich_edit::own_line(size));

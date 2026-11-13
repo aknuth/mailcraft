@@ -163,6 +163,14 @@ pub(crate) fn tour() {
                 printer: 0,
                 copies: 2,
             })),
+            Dialog::Address(crate::dialogs::AddressForm {
+                account: "sample".into(),
+                address: "shop@studio.example".into(),
+                name: "The Shop".into(),
+                reply_to: "help@studio.example".into(),
+                error: Some("that's the account's own address".into()),
+                ..Default::default()
+            }),
             Dialog::Dav(Box::new(crate::dialogs::DavForm {
                 account: "sample".into(),
                 email: "riley@studio.example".into(),
@@ -196,6 +204,8 @@ pub(crate) fn tour() {
             Dialog::Password { account: "sample".into(), email: "x".into(), password: String::new() },
             Dialog::Certificate { account: "sample".into(), path: "riley.p12".into(), data: None, password: String::new() },
             Dialog::Certificate { account: "sample".into(), path: String::new(), data: None, password: String::new() },
+            Dialog::Backup(Default::default()),
+            Dialog::Restore(crate::dialogs::RestoreForm { name: "MailCraft backup 2026-11-13.mailcraft-backup".into(), ..Default::default() }),
             Dialog::PgpKey { account: "sample".into(), path: "ana-secret.asc".into(), passphrase: String::new() },
             Dialog::SmartCard { account: "sample".into(), module: "/usr/lib/opensc-pkcs11.so".into(), pin: "1234".into(), system: false },
             Dialog::SmartCard { account: "sample".into(), module: String::new(), pin: String::new(), system: true },
@@ -487,6 +497,8 @@ struct WebLike {
     downloads: std::rc::Rc<std::cell::RefCell<Vec<(String, usize)>>>,
     picked: Vec<(String, String, Vec<u8>)>,
     asked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    /// The file the picker gives next (else a note).
+    hands: std::rc::Rc<std::cell::RefCell<Option<Vec<u8>>>>,
 }
 
 impl crate::Services for WebLike {
@@ -510,7 +522,8 @@ impl crate::Services for WebLike {
     }
     fn pick_later(&mut self, purpose: &str) -> bool {
         self.asked.borrow_mut().push(purpose.to_string());
-        self.picked.push((purpose.to_string(), "notes.txt".into(), b"remember".to_vec()));
+        let file = self.hands.borrow_mut().take().unwrap_or_else(|| b"remember".to_vec());
+        self.picked.push((purpose.to_string(), "notes.txt".into(), file));
         true
     }
     fn take_picked(&mut self) -> Vec<(String, String, Vec<u8>)> {

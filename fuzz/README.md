@@ -60,6 +60,7 @@ The fuzzer keeps what it finds in `corpus/` and `artifacts/`. Git ignores both f
 | `html` | An HTML body: text, layout, CSS, links, pictures, trackers, read as Outlook reads it (conditional comments, VML) |
 | `ical` | iCalendar, written and read back; WebDAV `multistatus` replies |
 | `vcard` | vCard, written and read back |
+| `backup` | A backup file of what the browser keeps: read, written and read back |
 | `http` | HTTP answers, whole and streamed; `Content-Range`; release data and `SHA256SUMS.txt` |
 | `imap` | A whole IMAP session, including a folder sync |
 | `jmap` | JMAP sign-in, sync, push events and URLs |
@@ -68,6 +69,7 @@ The fuzzer keeps what it finds in `corpus/` and `artifacts/`. Git ignores both f
 | `data_folder` | A damaged data folder's own files |
 | `search_index` | A damaged search index |
 | `photo` | A JPEG or PNG with its location removed |
+| `pdf` | A message printed: a picture read from any bytes and embedded, tables laid out on pages |
 | `smime` | BER, signatures, encrypted mail, certificates, `.p12` files |
 | `pgp` | OpenPGP keys, encrypted and signed messages, detached and cleartext signatures; PGP/MIME, inline PGP, Autocrypt headers and attached keys |
 | `pst` | A `.pst` file (Outlook data file), patched or whole |

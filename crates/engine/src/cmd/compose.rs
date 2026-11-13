@@ -19,7 +19,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             Ok(json!({ "kept": kept }))
         }),
         CommandSpec::new("compose.update", "Edit message", "Message", compose_update)
-            .params(r#"{"to"?: string, "cc"?: string, "bcc"?: string, "subject"?: string, "body"?: string, "marks"?: bool (the body uses **bold**, *italic*, - lists…), "account"?: string, "importance"?: "high"|"normal"|"low", "readReceipt"?: bool, "replyTo"?: string (where replies go), "sendAfter"?: number (Unix seconds: held in the Outbox until then; 0 sends at once)}"#)
+            .params(r#"{"to"?: string, "cc"?: string, "bcc"?: string, "subject"?: string, "body"?: string, "marks"?: bool (the body uses **bold**, *italic*, - lists…), "account"?: string, "from"?: string (one of the account's addresses; "" for its own), "importance"?: "high"|"normal"|"low", "readReceipt"?: bool, "replyTo"?: string (where replies go), "sendAfter"?: number (Unix seconds: held in the Outbox until then; 0 sends at once)}"#)
             .when(has_compose),
         CommandSpec::new("compose.attach", "Attach file", "Message › Insert", attach).params(r#"{"path": string} | {"name": string, "data": [bytes]}"#).when(has_compose),
         CommandSpec::new("compose.insertPicture", "Insert picture", "Message › Insert", insert_picture)
@@ -90,6 +90,19 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
     {
         return Err(CmdError::Params(format!("no account `{a}`")));
     }
+    // Which of the account's addresses it's from (issue #81): the account's own is none.
+    let from = match p::str(v, "from") {
+        Some(address) => {
+            let of = account.clone().or_else(|| s.compose.as_ref().map(|c| c.account.clone())).unwrap_or_default();
+            let config = s.account(&of).map(|a| &a.config).ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+            match config.identity(address) {
+                Some(i) => Some(i.email.clone()),
+                None if address.trim().is_empty() || config.email.eq_ignore_ascii_case(address.trim()) => Some(String::new()),
+                None => return Err(CmdError::Params(format!("`{}` isn't one of this account's addresses", address.trim()))),
+            }
+        }
+        None => None,
+    };
     let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
     if c.sending {
         return Err(CmdError::Disabled("the message is being sent".into()));
@@ -130,10 +143,21 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
         c.send_after = (at > 0).then_some(at);
     }
     let id = c.id;
-    // The signature follows the account it's sent from (issue #11).
-    if let Some(a) = account {
-        let was = std::mem::replace(&mut c.account, a);
-        s.follow_from(&was);
+    // The signature follows the account it's sent from (issue #11), and the address.
+    if account.is_some() || from.is_some() {
+        let (was, was_from) = (c.account.clone(), c.from.clone());
+        if let Some(a) = account {
+            // Another account's addresses aren't this one's: its own, unless one is picked.
+            if a != c.account {
+                c.from.clear();
+            }
+            c.account = a;
+        }
+        if let Some(f) = from {
+            c.from = f;
+        }
+        s.follow_from(&was, &was_from);
+        s.signing_follows_from(&was, &was_from);
     }
     Ok(json!({"compose": id}))
 }
@@ -340,71 +364,6 @@ impl Session {
         let r = self.reading.as_ref().ok_or_else(|| CmdError::Disabled("open a message first".into()))?;
         self.body_raw(&r.key).ok_or_else(|| CmdError::Failed("the message isn't downloaded".into()))
     }
-
-    /// The open message as a PDF: subject, header, its text as it's formatted (bold, italic,
-    /// headings, sizes, colours, links underlined) and the names of its attachments.
-    pub fn message_pdf(&self) -> Result<Vec<u8>, CmdError> {
-        let doc = self.message_doc()?;
-        let fonts = self.print_fonts.as_ref().map(|(r, b)| mailcraft_print::Fonts { regular: r, bold: b.as_deref() });
-        mailcraft_print::pdf(&doc, fonts).map_err(CmdError::Failed)
-    }
-
-    /// What goes on the open message's pages: subject, header (with the names of its
-    /// attachments) and text.
-    pub fn message_doc(&self) -> Result<mailcraft_print::Doc, CmdError> {
-        let r = self.reading.as_ref().ok_or_else(|| CmdError::Disabled("open a message first".into()))?;
-        let m = r.parsed.as_ref().ok_or_else(|| CmdError::Disabled("the message is still downloading".into()))?;
-        let mut header = vec![("From".to_string(), m.from.to_string())];
-        if !m.to.is_empty() {
-            header.push(("To".into(), mailcraft_model::addr::format_list(&m.to)));
-        }
-        if !m.cc.is_empty() {
-            header.push(("Cc".into(), mailcraft_model::addr::format_list(&m.cc)));
-        }
-        if m.date > 0 {
-            header.push(("Date".into(), mailcraft_model::dates::full_time(m.date, &self.clock)));
-        }
-        let files: Vec<String> = m.attachments.iter().filter(|a| !a.inline).map(|a| a.name.clone()).collect();
-        if !files.is_empty() {
-            header.push(("Attachments".into(), files.join(", ")));
-        }
-        Ok(mailcraft_print::Doc { title: m.subject.clone(), header, body: m.text.clone(), rich: printed_runs(&m.rich) })
-    }
-}
-
-/// A formatted message's lines as the PDF prints them (issue #72: it printed the plain text,
-/// its formatting gone). A picture is its description; a message without formatting has none.
-fn printed_runs(rich: &mailcraft_mime::RichText) -> Vec<Vec<mailcraft_print::Run>> {
-    const LINK: [u8; 3] = [0x0B, 0x57, 0xD0];
-    rich.iter()
-        .map(|line| {
-            line.iter()
-                .filter(|s| s.image.is_none() || !s.text.trim().is_empty())
-                .map(|s| {
-                    let heading = match s.heading {
-                        0 => None,
-                        1 => Some(20.0),
-                        2 => Some(17.0),
-                        3 => Some(14.5),
-                        _ => Some(12.5),
-                    };
-                    mailcraft_print::Run {
-                        // Struck-through text comes with a stroke over each letter for where no
-                        // line can be drawn: here one is.
-                        text: if s.image.is_some() { format!("[{}]", s.text.trim()) } else { s.text.replace('\u{336}', "") },
-                        bold: s.bold || heading.is_some(),
-                        italic: s.italic,
-                        underline: s.link.is_some(),
-                        strike: s.strike,
-                        // CSS pixels to points.
-                        size: heading.or(s.size.map(|px| f32::from(px) * 0.75)),
-                        color: s.color.or(s.link.as_ref().map(|_| LINK)),
-                        background: s.background,
-                    }
-                })
-                .collect()
-        })
-        .collect()
 }
 
 pub(super) fn save_attachment(s: &mut Session, v: &Value) -> CmdResult {
