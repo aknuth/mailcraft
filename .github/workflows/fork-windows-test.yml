@@ -63,7 +63,9 @@ jobs:
   windows:
     name: Windows x64
     needs: version
-    runs-on: windows-latest
+    # The fork owner's own Windows PC (a self-hosted runner, label `mailcraft`): GitHub's hosted
+    # runners are kept for the Linux job.
+    runs-on: [self-hosted, windows, mailcraft]
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.version.outputs.version }}
