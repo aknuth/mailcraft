@@ -58,6 +58,8 @@ pub enum Dialog {
     Password {
         account: String,
         email: String,
+        /// The user name it signs in with, when that isn't its address; else empty.
+        user: String,
         password: String,
     },
     ConfirmDelete {
@@ -282,7 +284,7 @@ impl Dialog {
     }
 
     /// The address book for the message being written; a double-click adds to `field`.
-    pub fn select_names(c: &mailcraft_engine::Compose, field: &'static str) -> Dialog {
+    pub fn select_names(c: &mailcraft_engine::Compose, field: Recipients) -> Dialog {
         Dialog::SelectNames(Box::new(NamesForm {
             target: field,
             to: c.to.clone(),
@@ -293,7 +295,6 @@ impl Dialog {
         }))
     }
 
-    /// Dialogs that belong to the message being written (shown in its window when it has one).
     /// A question that must be answered before going on, or a warning: read as an alert.
     pub fn is_alert(&self) -> bool {
         self.about_closing()
@@ -326,6 +327,7 @@ impl Dialog {
         )
     }
 
+    /// Dialogs that belong to the message being written (shown in its window when it has one).
     pub fn for_compose(&self) -> bool {
         matches!(self, Dialog::SelectNames(_) | Dialog::SaveChanges | Dialog::EmptySubject | Dialog::SendCheck(_) | Dialog::WordCount(..))
             || matches!(self, Dialog::Signature(f) if f.insert)
@@ -463,17 +465,24 @@ impl Dialog {
             exchange,
             split: v.external.is_some(),
             external: v.external.clone().unwrap_or_default(),
-            outside: if v.outside.is_empty() { "all".into() } else { v.outside.clone() },
+            outside: Outside::from_code(&v.outside),
             error: None,
         }))
     }
 
     pub fn password(a: &AccountConfig) -> Dialog {
-        Dialog::Password { account: a.id.clone(), email: a.email.clone(), password: String::new() }
+        // The user name it signs in with, when that isn't its address (issue #88).
+        let user = if a.username.trim().is_empty() || a.username.trim().eq_ignore_ascii_case(a.email.trim()) {
+            String::new()
+        } else {
+            a.username.trim().to_string()
+        };
+        Dialog::Password { account: a.id.clone(), email: a.email.clone(), user, password: String::new() }
     }
 
-    /// Set the error shown in the add-account form.
-    pub fn set_error(&mut self, e: String) {
+    /// Show a refused submit's error on the dialog's own error line. False when it has none
+    /// (Select Names, a question): the caller says it some other way.
+    pub fn set_error(&mut self, e: String) -> bool {
         match self {
             Dialog::AddAccount(f) => f.error = Some(e),
             Dialog::FolderName { error, .. }
@@ -493,12 +502,13 @@ impl Dialog {
             Dialog::OpenSharedCalendar { error, .. } | Dialog::SubscribeCalendar { error, .. } | Dialog::AddSharedMailbox { error, .. } => {
                 *error = Some(e)
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     /// A new rule for mail like this (from its sender, into Archive).
-    pub fn rule_from(sender: &str, _subject: &str) -> Dialog {
+    pub fn rule_from(sender: &str) -> Dialog {
         Dialog::EditRule(Box::new(RuleForm {
             index: None,
             name: tf!("Mail from {sender}", sender = sender),
@@ -510,6 +520,7 @@ impl Dialog {
             stop: false,
             run_now: true,
             error: None,
+            original: None,
         }))
     }
 

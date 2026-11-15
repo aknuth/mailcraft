@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use mailcraft_model::job::progress::Work;
 use redb::ReadableDatabase;
 
-use super::commits::child;
+use super::measure::{ms, percentile};
 use super::*;
+use crate::lock;
+use crate::packed::Tables;
 use crate::packed::compact::{Account, Step, Target};
-use crate::packed::{Packs, Tables};
 
 /// What a data file from before holds: path → bytes as kept.
 pub(super) type Kept = Vec<(String, Vec<u8>)>;
@@ -39,16 +40,6 @@ pub(super) fn old_store(t: &std::path::Path, kept: &Kept) -> Store {
     let s = Store::open_packed(&app, &files).unwrap();
     s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
     s
-}
-
-pub(super) fn packs(s: &Store) -> &Packs {
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
-    packs
-}
-
-/// Mail text of about `n` bytes (compresses well).
-fn text(n: usize, seed: u64) -> Vec<u8> {
-    format!("Subject: note {seed}\r\n\r\n").bytes().chain(b"the figures for the quarter are in ".iter().copied().cycle().take(n)).collect()
 }
 
 /// Every file of `a1` as it reads back (`None`: it doesn't).
@@ -179,13 +170,11 @@ fn an_old_data_file_is_compressed_again_and_reads_back_the_same() {
     let t2 = temp("recompress-new");
     let s = Store::open_packed(t2.join("app"), t2.join("Files")).unwrap();
     s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
-    s.write_body(&super::commits::inbox(1), &base64(&noise(50_000, 1))).unwrap();
+    s.write_body(&inbox(1), &base64(&noise(50_000, 1))).unwrap();
     let r = s.recompress_data_file("a1", &stop, &mut |_| {}).unwrap().unwrap();
     assert!(r.finished && r.files == 0);
     assert_eq!(s.recompress_data_file("nobody", &stop, &mut |_| {}).unwrap(), None);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
-    let _ = std::fs::remove_dir_all(&t2);
 }
 
 /// A run whose first batch has files written again (whole and in pieces), and one removed,
@@ -254,7 +243,6 @@ fn a_file_written_while_it_is_compressed_is_left_as_written() {
     assert!(!kept_compressed(&s, "A/2.eml"), "the file as written meanwhile");
     assert!(kept_compressed(&s, "A/4.eml") && kept_compressed(&s, "B/1/39.eml"));
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A run whose account is removed between reading a batch and writing it back (`Removing`), or
@@ -319,8 +307,6 @@ fn a_recompress_never_brings_back_the_data_file_of_an_account_removed() {
     assert_eq!(data_files(&t2), ["old.mailcraft"]);
     assert_eq!(packs(&s).file("a1"), None);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
-    let _ = std::fs::remove_dir_all(&t2);
 }
 
 /// A run whose first batch is read, then files kept raw that it hasn't reached are moved behind
@@ -360,14 +346,14 @@ fn a_file_moved_behind_a_recompress_is_compressed_too() {
     let mut before = read_back(&s);
     let p = packs(&s);
     // As a batch is written: a run under way (as `Packs::recompress` says it is).
-    Packs::lock(&p.recompressing).insert("a1".into());
+    lock(&p.recompressing).insert("a1".into());
     let target = Moving {
         inner: Account { packs: p, account: "a1", reopened: p.reopened("a1"), kept: &always },
         moves: moves.to_vec(),
         done: AtomicBool::new(false),
     };
     let r = super::super::compact::recompress(&target, &AtomicBool::new(false), &mut |_| {}).unwrap();
-    Packs::lock(&p.recompressing).remove("a1");
+    lock(&p.recompressing).remove("a1");
     eprintln!("{r:?}");
     assert!(r.finished);
     for (from, to) in moves {
@@ -408,8 +394,6 @@ fn a_file_moved_behind_a_recompress_is_compressed_too() {
     assert_eq!(read_back(&s), before);
     assert!(s.data_file_health("a1").unwrap().unwrap().recompressed);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
-    let _ = std::fs::remove_dir_all(&t2);
 }
 
 /// A run stopped after its first batch says so (the file's health shows it, and offers to go on),
@@ -457,7 +441,6 @@ fn a_stopped_recompress_goes_on_from_where_it_stopped() {
     let health = s.data_file_health("a1").unwrap().unwrap();
     assert!(health.recompressed && !health.recompress_stopped);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Killed part way through (after a different batch each time, its write not yet on the disk):
@@ -486,7 +469,6 @@ fn a_recompress_killed_part_way_loses_nothing() {
         assert_eq!(read_back(&s), before, "{batches}: once finished");
         assert!(b64.iter().all(|k| kept_compressed(&s, k)), "{batches}");
         drop(s);
-        let _ = std::fs::remove_dir_all(&t);
     }
 }
 
@@ -515,8 +497,6 @@ fn killed_during_recompress() {
 #[test]
 #[ignore = "a measurement: run alone with --ignored --nocapture"]
 fn a_write_from_the_window_waits_little_for_a_recompress() {
-    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    let at = |v: &[f64], q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
     for big in [false, true] {
         let t = temp(&format!("recompress-latency-{big}"));
         let mut kept: Kept = (0..600u32).map(|i| (format!("INBOX/1/{i}.eml"), base64(&noise(90_000, u64::from(i) + 1)))).collect();
@@ -527,7 +507,7 @@ fn a_write_from_the_window_waits_little_for_a_recompress() {
         let files = kept.len() as u64;
         let s = old_store(&t, &kept);
         drop(kept);
-        s.write_body(&super::commits::inbox(1), b"Subject: x\r\n\r\nx").unwrap();
+        s.write_body(&inbox(1), b"Subject: x\r\n\r\nx").unwrap();
         let running = {
             let s = s.clone();
             std::thread::spawn(move || {
@@ -541,22 +521,23 @@ fn a_write_from_the_window_waits_little_for_a_recompress() {
         let mut took = Vec::new();
         while !running.is_finished() || took.len() < 10 {
             let t0 = Instant::now();
-            s.write_body(&super::commits::inbox(1), format!("Subject: x\r\n\r\nread {}", took.len()).as_bytes()).unwrap();
+            s.write_body(&inbox(1), format!("Subject: x\r\n\r\nread {}", took.len()).as_bytes()).unwrap();
             took.push(ms(t0.elapsed()));
             std::thread::sleep(Duration::from_millis(3));
         }
         let (r, run) = running.join().unwrap();
         let mut waits: Vec<f64> = p.seals.waits.lock().unwrap().drain(..).map(ms).collect();
-        waits.sort_by(f64::total_cmp);
-        took.sort_by(f64::total_cmp);
-        let (p50, p99, max) = (at(&took, 0.5), at(&took, 0.99), took.last().copied().unwrap_or(0.0));
+        // Sorted by the percentiles, so the last is the most.
+        let wait99 = percentile(&mut waits, 0.99);
+        let (p50, p99) = (percentile(&mut took, 0.5), percentile(&mut took, 0.99));
+        let max = took.last().copied().unwrap_or(0.0);
         eprintln!(
             "{}: recompressed {} files in {run:?}; {} writes from the window took p50 {p50:.1} ms, p99 {p99:.1} ms, \
              at most {max:.1} ms; their wait for the writer p99 {:.1} ms, at most {:.1} ms",
             if big { "with big attachments" } else { "mail alone" },
             r.files,
             took.len(),
-            at(&waits, 0.99),
+            wait99,
             waits.last().copied().unwrap_or(0.0),
         );
         assert!(r.finished && r.files == files);
@@ -564,7 +545,6 @@ fn a_write_from_the_window_waits_little_for_a_recompress() {
         // not held to the mark (a 60 MiB file's write is about 0.1 s, at most a few times a run).
         assert!(big || p99 <= 60.0, "a write from the window took {p99:.1} ms beside the recompress (p99)");
         drop(s);
-        let _ = std::fs::remove_dir_all(&t);
     }
 }
 
@@ -608,13 +588,11 @@ fn the_fuzz_targets_data_files_read_back_the_same() {
     assert!(crate::fuzz_data_file(&seed));
     let written = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/data_file/kinds");
     assert_eq!(std::fs::read(&written).ok().as_deref(), Some(seed.as_slice()), "fuzz/seeds/data_file/kinds is the seed made here");
-    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut rng = crate::tests::random::Rng(0x2545_f491_4f6c_dd1d);
     for round in 0..300 {
         let mut input = seed.clone();
         for _ in 0..1 + round % 8 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
+            let x = rng.next_u64();
             let at = (x >> 8) as usize % input.len();
             input[at] = (x >> 40) as u8;
         }

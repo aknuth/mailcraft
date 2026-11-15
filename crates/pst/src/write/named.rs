@@ -1,9 +1,10 @@
 //! Named properties: each one given is looked up in the file's name-to-ID map, and added to it
 //! when it isn't there (MS-PST 2.4.7).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
+use super::FIRST_SUBNODE;
 use super::edit::Editor;
 use super::heap::build_props;
 use super::types::*;
@@ -107,19 +108,23 @@ fn collect<'a>(messages: &mut Vec<&'a NewMessage<'a>>, attachments: &'a [NewAtta
 impl Editor {
     /// The ID of each named property `batch` gives; those the map lacks are added to it.
     pub(crate) fn resolve_named(&mut self, batch: &[BatchMessage<'_>]) -> io::Result<NamedIds> {
+        // In the order first given, which is the order those the map lacks are added in.
         let mut wanted: Vec<NameKey> = Vec::new();
+        let mut seen: HashSet<NameKey> = HashSet::new();
         for input in batch {
             let mut messages = vec![&input.message];
             collect(&mut messages, input.attachments);
             for p in messages.iter().flat_map(|m| m.properties) {
                 if let PropertyKey::Named(set, name) = p.key {
                     let key = NameKey::of(&set, name);
-                    if !wanted.contains(&key) {
+                    if !seen.contains(&key) {
+                        seen.insert(key.clone());
                         wanted.push(key);
                     }
                 }
             }
         }
+        let strings_wanted = wanted.iter().any(|k| matches!(k, NameKey::String(..)));
         let mut named = NamedIds::default();
         if wanted.is_empty() {
             return Ok(named);
@@ -157,13 +162,15 @@ impl Editor {
             };
             let key = if guid & 1 == 0 {
                 NameKey::Id(set, id)
+            } else if !strings_wanted {
+                continue;
             } else {
                 match string_at(&strings, id) {
                     Some(n) => NameKey::String(set, n),
                     None => continue,
                 }
             };
-            if index <= MAX_PROP_INDEX && wanted.contains(&key) {
+            if index <= MAX_PROP_INDEX && seen.contains(&key) {
                 named.ids.entry(key).or_insert(0x8000 + index);
             }
         }
@@ -222,24 +229,20 @@ impl Editor {
     pub(crate) fn rewrite_props(&mut self, nid: u32, props: Vec<(u16, PropertyValue)>) -> io::Result<()> {
         let entry = self.node(nid)?;
         let old = self.pst.subnodes(entry.sub)?;
-        let built = build_props(self.format(), props, 0x80)?;
+        let built = build_props(self.format(), props, FIRST_SUBNODE)?;
         let mut subs = SubNodes::new();
-        for (node, bytes) in built.external {
-            let bid = self.write_tree(&bytes)?;
-            subs.insert(node, (bid, 0));
-        }
+        let data = self.write_props_into(built, &mut subs)?;
         // Any other subnodes the node has stay.
-        for (node, (data, sub)) in old.iter() {
-            if subs.contains_key(node) || *node & crate::ndb::NID_TYPE_MASK == super::heap::NID_TYPE_INTERNAL {
+        for (node, (kept_data, kept_sub)) in old.iter() {
+            if subs.contains_key(node) || *node & crate::ndb::NID_TYPE_MASK == crate::ndb::NID_TYPE_INTERNAL {
                 continue;
             }
-            self.add_ref(*data);
-            if *sub != 0 {
-                self.add_ref(*sub);
+            self.add_ref(*kept_data);
+            if *kept_sub != 0 {
+                self.add_ref(*kept_sub);
             }
-            subs.insert(*node, (*data, *sub));
+            subs.insert(*node, (*kept_data, *kept_sub));
         }
-        let data = self.write_leaves(&built.blocks)?;
         let sub = self.write_subnodes(&subs)?;
         self.release_node_data(entry.data, entry.sub)?;
         self.set_node(nid, data, sub, entry.parent);

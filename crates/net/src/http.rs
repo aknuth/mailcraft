@@ -11,12 +11,13 @@ use std::io::{Read, Write};
 use crate::stream::{self, Stream};
 use crate::{NetError, Result};
 
+mod body;
 mod streamed;
 pub use streamed::{exchange_into, get_into};
 
 /// Longest header block accepted.
 const MAX_HEAD: usize = 64 << 10;
-const MAX_REDIRECTS: usize = 5;
+pub(crate) const MAX_REDIRECTS: usize = 5;
 
 /// A parsed `http(s)://host[:port]/path?query` URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,12 +70,7 @@ impl Url {
         } else {
             tail.to_string()
         };
-        // Spaces and controls are percent-encoded rather than sent raw.
-        let path: String = path
-            .chars()
-            .flat_map(|c| if c == ' ' || c.is_control() { format!("%{:02X}", u32::from(c) & 0xff).chars().collect::<Vec<_>>() } else { vec![c] })
-            .collect();
-        Ok(Url { https, host: host.to_ascii_lowercase(), port, path })
+        Ok(Url { https, host: host.to_ascii_lowercase(), port, path: spaces_escaped(path) })
     }
 
     /// `Location` resolved against this URL.
@@ -99,6 +95,32 @@ impl Url {
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
         if self.port == default_port(self.https) { format!("{scheme}://{host}") } else { format!("{scheme}://{host}:{}", self.port) }
     }
+}
+
+/// A path with its spaces and controls percent-encoded rather than sent raw (each of their UTF-8
+/// bytes: `U+0085` is `%C2%85`); the path itself, untouched, when it has none.
+fn spaces_escaped(path: String) -> String {
+    let raw = |c: char| c == ' ' || c.is_control();
+    if !path.contains(raw) {
+        return path;
+    }
+    let mut out = String::with_capacity(path.len() + 16);
+    let mut utf8 = [0u8; 4];
+    for c in path.chars() {
+        if raw(c) {
+            // Neither is unreserved: every byte comes out as `%XX`.
+            out.push_str(&pct(c.encode_utf8(&mut utf8)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether a [`Url`]'s host is this computer (`localhost`, `127.0.0.1`, `::1`: an IPv6 host is
+/// kept without its brackets): the one place plain http is let through, to a test server.
+pub fn is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn default_port(https: bool) -> u16 {
@@ -238,38 +260,53 @@ fn secret_header(name: &str) -> bool {
     ["authorization", "cookie", "proxy-authorization"].iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
-fn send_to(req: &Request, public_only: bool) -> Result<Response> {
+/// Where a redirect sends a request, if `resp` is one.
+fn redirect(resp: &Response) -> Option<&str> {
+    resp.header("Location").filter(|_| matches!(resp.status, 301 | 302 | 303 | 307 | 308))
+}
+
+/// Where the redirect `resp` (an answer from `url`) leads: `None` when it isn't one. Never from
+/// HTTPS down to plain HTTP.
+pub(crate) fn next_hop(url: &Url, resp: &Response) -> Result<Option<Url>> {
+    let Some(loc) = redirect(resp) else { return Ok(None) };
+    let next = url.join(loc)?;
+    if url.https && !next.https {
+        return Err(NetError::Tls("redirected from https to http".into()));
+    }
+    Ok(Some(next))
+}
+
+/// `req` sent by `once` (a connection of its own each time), then, for a GET or HEAD, on to
+/// where up to [`MAX_REDIRECTS`] redirects lead, without its sign-in once that's another site.
+fn follow(req: &Request, mut once: impl FnMut(&Request, &Url) -> Result<Response>) -> Result<Response> {
     let mut url = Url::parse(&req.url)?;
     let mut bare: Option<Request> = None;
+    let follows = req.method == "GET" || req.method == "HEAD";
     for _ in 0..=MAX_REDIRECTS {
-        let resp = once(bare.as_ref().unwrap_or(req), &url, public_only)?;
-        let follow = matches!(resp.status, 301 | 302 | 303 | 307 | 308) && (req.method == "GET" || req.method == "HEAD");
-        match resp.header("Location").filter(|_| follow) {
-            Some(loc) => {
-                let next = url.join(loc)?;
-                // Never from HTTPS down to plain HTTP.
-                if url.https && !next.https {
-                    return Err(NetError::Tls("redirected from https to http".into()));
-                }
-                if let Some(without) = redirected(bare.as_ref().unwrap_or(req), &url, &next) {
-                    bare = Some(without);
-                }
-                url = next;
-            }
-            None => return Ok(resp),
+        let now = bare.as_ref().unwrap_or(req);
+        let resp = once(now, &url)?;
+        let Some(next) = (if follows { next_hop(&url, &resp)? } else { None }) else { return Ok(resp) };
+        if let Some(without) = redirected(now, &url, &next) {
+            bare = Some(without);
         }
+        url = next;
     }
     Err(NetError::Protocol("too many redirects".into()))
+}
+
+fn send_to(req: &Request, public_only: bool) -> Result<Response> {
+    follow(req, |req, url| exchange(&mut connect(url, public_only)?, req, url))
 }
 
 pub fn get(url: &str, max: usize) -> Result<Response> {
     send(&Request::get(url, max))
 }
 
-fn once(req: &Request, url: &Url, public_only: bool) -> Result<Response> {
+/// A connection to `url`'s server: to the internet only when `public_only`
+/// ([`stream::tcp_public`]), and through TLS for `https`.
+fn connect(url: &Url, public_only: bool) -> Result<Stream> {
     let sock = if public_only { stream::tcp_public(&url.host, url.port)? } else { stream::tcp(&url.host, url.port)? };
-    let mut s = if url.https { stream::tls(sock, &url.host)? } else { Stream::Plain(sock) };
-    exchange(&mut s, req, url)
+    if url.https { stream::tls(sock, &url.host) } else { Ok(Stream::Plain(sock)) }
 }
 
 /// Write the request and read the response on an open connection.
@@ -289,14 +326,16 @@ pub struct Conn {
 impl Conn {
     pub fn open(url: &str) -> Result<Conn> {
         let url = Url::parse(url)?;
-        let sock = stream::tcp(&url.host, url.port)?;
-        let s = if url.https { stream::tls(sock, &url.host)? } else { Stream::Plain(sock) };
-        Ok(Conn { s, url, closing: false })
+        Ok(Conn { s: connect(&url, false)?, url, closing: false })
     }
 
     /// Whether this connection reaches `url`'s server.
     pub fn reaches(&self, url: &str) -> bool {
-        Url::parse(url).is_ok_and(|u| u.https == self.url.https && u.host.eq_ignore_ascii_case(&self.url.host) && u.port == self.url.port)
+        Url::parse(url).is_ok_and(|u| self.reaches_url(&u))
+    }
+
+    fn reaches_url(&self, u: &Url) -> bool {
+        u.https == self.url.https && u.host.eq_ignore_ascii_case(&self.url.host) && u.port == self.url.port
     }
 
     /// Whether another request can go on it.
@@ -310,15 +349,16 @@ impl Conn {
             return Err(NetError::Closed("the server closed the connection".into()));
         }
         let url = Url::parse(&req.url)?;
-        if !self.reaches(&req.url) {
+        if !self.reaches_url(&url) {
             return Err(NetError::Protocol("a request for another server".into()));
         }
         // Assume the worst until a full response has been read: after an error mid-exchange the
         // stream position is unknown.
         self.closing = true;
         write_request(&mut self.s, req, &url, true)?;
-        let resp = read_response(&mut self.s, req.max, req.method == "HEAD")?;
-        self.closing = resp.header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("close"))
+        let (resp, cut) = read_answer(&mut self.s, req.max, req.method == "HEAD")?;
+        self.closing = cut
+            || resp.header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("close"))
             || (resp.header("Content-Length").is_none() && resp.header("Transfer-Encoding").is_none() && resp.status != 204 && resp.status != 304);
         Ok(resp)
     }
@@ -369,7 +409,7 @@ fn read_head<S: Read>(s: &mut S) -> Result<(u16, Vec<(String, String)>, Vec<u8>)
         buf.extend_from_slice(tmp.get(..n).unwrap_or_default());
     };
     let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or_default()).to_string();
-    let mut rest: Vec<u8> = buf.get(head_end + 4..).map(<[u8]>::to_vec).unwrap_or_default();
+    let rest: Vec<u8> = buf.get(head_end + 4..).map(<[u8]>::to_vec).unwrap_or_default();
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let mut parts = status_line.split_whitespace();
@@ -384,83 +424,28 @@ fn read_head<S: Read>(s: &mut S) -> Result<(u16, Vec<(String, String)>, Vec<u8>)
     }
     let headers: Vec<(String, String)> =
         lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).take(200).collect();
-    Ok((status, headers, std::mem::take(&mut rest)))
+    Ok((status, headers, rest))
 }
 
+/// The answer and its body (at most `max` bytes), read whole: as a download is
+/// ([`body::copy_body`]), into memory.
 fn read_response<S: Read>(s: &mut S, max: usize, head_only: bool) -> Result<Response> {
-    let mut tmp = [0u8; 16 << 10];
-    let (status, headers, mut rest) = read_head(s)?;
-    let resp = |body| Response { status, headers: headers.clone(), body };
-    let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.to_ascii_lowercase());
+    read_answer(s, max, head_only).map(|(resp, _)| resp)
+}
+
+/// [`read_response`], and whether the connection can carry no other answer though this one's
+/// body came whole ([`body::Ahead::cut`]).
+fn read_answer<S: Read>(s: &mut S, max: usize, head_only: bool) -> Result<(Response, bool)> {
+    let (status, headers, rest) = read_head(s)?;
+    let mut resp = Response { status, headers, body: Vec::new() };
     if head_only || status == 204 || status == 304 || (100..200).contains(&status) {
-        return Ok(resp(Vec::new()));
+        return Ok((resp, false));
     }
-    let too_big = || NetError::Protocol(format!("the response is larger than {} KB", max / 1024));
-    let mut fill = |rest: &mut Vec<u8>, want: usize| -> Result<bool> {
-        while rest.len() < want {
-            let n = s.read(&mut tmp)?;
-            if n == 0 {
-                return Ok(false);
-            }
-            rest.extend_from_slice(tmp.get(..n).unwrap_or_default());
-            if rest.len() > max.saturating_add(MAX_HEAD) {
-                return Err(too_big());
-            }
-        }
-        Ok(true)
-    };
-    if get("transfer-encoding").is_some_and(|t| t.contains("chunked")) {
-        let mut body = Vec::new();
-        let mut pos = 0usize;
-        loop {
-            // A size line.
-            let line_end = loop {
-                if let Some(p) = rest.get(pos..).and_then(|r| r.windows(2).position(|w| w == b"\r\n")) {
-                    break pos + p;
-                }
-                if rest.len() - pos > 1024 {
-                    return Err(NetError::Protocol("bad chunk size line".into()));
-                }
-                let want = rest.len() + 1;
-                if !fill(&mut rest, want)? {
-                    return Err(NetError::Closed("the response ended early".into()));
-                }
-            };
-            let size_text = String::from_utf8_lossy(rest.get(pos..line_end).unwrap_or_default()).to_string();
-            let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-                .map_err(|_| NetError::Protocol("bad chunk size".into()))?;
-            pos = line_end + 2;
-            if size == 0 {
-                return Ok(resp(body));
-            }
-            if body.len().saturating_add(size) > max {
-                return Err(too_big());
-            }
-            let want = pos.saturating_add(size).saturating_add(2);
-            if !fill(&mut rest, want)? {
-                return Err(NetError::Closed("the response ended early".into()));
-            }
-            body.extend_from_slice(rest.get(pos..pos + size).unwrap_or_default());
-            pos += size + 2;
-        }
-    }
-    if let Some(len) = get("content-length") {
-        let len: usize = len.trim().parse().map_err(|_| NetError::Protocol("bad Content-Length".into()))?;
-        if len > max {
-            return Err(too_big());
-        }
-        if !fill(&mut rest, len)? {
-            return Err(NetError::Closed("the response ended early".into()));
-        }
-        rest.truncate(len);
-        return Ok(resp(rest));
-    }
-    // No length: the body runs to the end of the connection.
-    fill(&mut rest, usize::MAX)?;
-    if rest.len() > max {
-        return Err(too_big());
-    }
-    Ok(resp(rest))
+    let mut body = Vec::new();
+    let mut ahead = body::Ahead::new(s, rest);
+    body::copy_body(&mut ahead, &resp, u64::try_from(max).unwrap_or(u64::MAX), &mut body, "response")?;
+    resp.body = body;
+    Ok((resp, ahead.cut()))
 }
 
 /// Longest event accepted from an event stream.
@@ -490,8 +475,7 @@ pub struct EventStream<S> {
 /// Open an event stream: a GET that must answer 200 with `text/event-stream`.
 pub fn open_events(url: &str, headers: &[(&str, &str)]) -> Result<EventStream<Stream>> {
     let u = Url::parse(url)?;
-    let sock = stream::tcp(&u.host, u.port)?;
-    let mut s = if u.https { stream::tls(sock, &u.host)? } else { Stream::Plain(sock) };
+    let mut s = connect(&u, false)?;
     let mut req = Request::get(url, MAX_EVENT).header("Accept", "text/event-stream").header("Cache-Control", "no-cache");
     for (k, v) in headers {
         req = req.header(k, v);
@@ -508,7 +492,7 @@ pub fn open_events(url: &str, headers: &[(&str, &str)]) -> Result<EventStream<St
         return Err(NetError::Protocol("not an event stream".into()));
     }
     let chunked = get("transfer-encoding").is_some_and(|t| t.contains("chunked"));
-    Ok(EventStream { s, raw: rest, text: Vec::new(), chunked, left: 0, crlf: false })
+    Ok(EventStream { raw: rest, ..EventStream::new(s, chunked) })
 }
 
 impl<S: Read + stream::Timeouts> EventStream<S> {
@@ -558,28 +542,23 @@ impl<S: Read + stream::Timeouts> EventStream<S> {
                 continue;
             }
             if self.crlf {
-                if self.raw.len() < 2 {
-                    return Ok(());
+                match self.raw.get(..2) {
+                    None => return Ok(()),
+                    Some(b"\r\n") => {}
+                    Some(_) => return Err(NetError::Protocol("bad chunk end".into())),
                 }
                 self.raw.drain(..2);
                 self.crlf = false;
             }
-            let Some(end) = self.raw.windows(2).position(|w| w == b"\r\n") else {
-                if self.raw.len() > 1024 {
-                    return Err(NetError::Protocol("bad chunk size line".into()));
-                }
-                return Ok(());
-            };
-            let line = String::from_utf8_lossy(self.raw.get(..end).unwrap_or_default()).to_string();
-            let size =
-                usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).map_err(|_| NetError::Protocol("bad chunk size".into()))?;
+            let Some(end) = body::line_end(&self.raw)? else { return Ok(()) };
+            let size = body::chunk_size(self.raw.get(..end).unwrap_or_default())?;
             self.raw.drain(..end + 2);
             if size == 0 {
                 return Err(NetError::Closed("the event stream ended".into()));
             }
-            if size > MAX_EVENT {
+            let Some(size) = usize::try_from(size).ok().filter(|s| *s <= MAX_EVENT) else {
                 return Err(NetError::Protocol("an event is too long".into()));
-            }
+            };
             self.left = size;
         }
     }
@@ -613,193 +592,7 @@ pub fn form(pairs: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// Percent-encode everything but the unreserved characters (RFC 3986 §2.3).
-pub fn pct(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
+pub use mailcraft_jmap::pct;
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use std::io::{BufRead, BufReader};
-    use std::net::TcpListener;
-
-    use super::*;
-
-    /// Found in review: a redirect to another site took the request's sign-in along (the
-    /// password of a JMAP account, a Microsoft token). It stays with the site it was for.
-    #[test]
-    fn a_sign_in_doesnt_follow_a_redirect_to_another_site() {
-        for (a, b, same) in [
-            ("example.com", "EXAMPLE.com.", true),
-            ("example.com", "api.example.com", true),
-            ("api.example.com", "www.example.com", true),
-            ("a.b.example.com", "c.example.com", false),
-            ("example.com", "example.net", false),
-            ("example.com", "evilexample.com", false),
-            ("a.co.uk", "b.co.uk", false),
-            ("mail.a.co.uk", "dav.a.co.uk", true),
-            ("127.0.0.1", "127.0.0.1", true),
-            ("127.0.0.1", "127.0.0.2", false),
-            ("localhost", "example.com", false),
-            ("example.com", "com", false),
-            ("a.github.io", "b.github.io", false),
-            ("x.a.github.io", "a.github.io", true),
-            ("mail.example.co.uk", "co.uk", false),
-        ] {
-            assert_eq!(same_site(a, b), same, "{a} / {b}");
-        }
-        let req =
-            Request::get("https://example.com/.well-known/jmap", 1000).header("Authorization", "Basic c2VjcmV0").header("Accept", "application/json");
-        let at = |u: &str| Url::parse(u).unwrap();
-        // Another site: the rest of the request goes on, without it.
-        let bare = redirected(&req, &at("https://example.com/a"), &at("https://elsewhere.example/b")).unwrap();
-        assert_eq!(bare.headers, [("Accept".to_string(), "application/json".to_string())]);
-        // The same site, or nothing secret in it: as it is.
-        assert!(redirected(&req, &at("https://example.com/a"), &at("https://api.example.com/b")).is_none());
-        assert!(redirected(&bare, &at("https://example.com/a"), &at("https://elsewhere.example/b")).is_none());
-    }
-
-    /// Serve `responses` (one per connection, in order) on localhost; returns the base URL and
-    /// the requests received.
-    pub(crate) fn serve(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
-        let h = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for r in responses {
-                let (mut s, _) = l.accept().unwrap();
-                let mut reader = BufReader::new(s.try_clone().unwrap());
-                let mut req = String::new();
-                let mut len = 0usize;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        len = v.trim().parse().unwrap_or(0);
-                    }
-                    req.push_str(&line);
-                }
-                let mut body = vec![0u8; len];
-                reader.read_exact(&mut body).unwrap();
-                req.push_str(&String::from_utf8_lossy(&body));
-                seen.push(req);
-                s.write_all(&r).unwrap();
-            }
-            seen
-        });
-        (base, h)
-    }
-
-    #[test]
-    fn urls() {
-        let u = Url::parse("HTTPS://Mail.Example.com/a/b?x=1#frag").unwrap();
-        assert_eq!((u.https, u.host.as_str(), u.port, u.path.as_str()), (true, "mail.example.com", 443, "/a/b?x=1"));
-        assert_eq!(Url::parse("http://h:8080").unwrap().path, "/");
-        assert_eq!(Url::parse("http://[::1]:99/x").unwrap().host, "::1");
-        assert_eq!(Url::parse("http://h/a b").unwrap().path, "/a%20b");
-        for bad in ["ftp://h/", "http://", "http://user@h/", "http://h:0/", "http://h:x/", "javascript:alert(1)", "http://h h/"] {
-            assert!(Url::parse(bad).is_err(), "{bad}");
-        }
-        let u = Url::parse("https://h.example/a/b/c?q").unwrap();
-        assert_eq!(u.join("/x").unwrap().path, "/x");
-        assert_eq!(u.join("d").unwrap().path, "/a/b/d");
-        assert_eq!(u.join("//other.example/p").unwrap().host, "other.example");
-        assert!(!u.join("http://x.example/").unwrap().https);
-        assert_eq!(pct("a b&c=é"), "a%20b%26c%3D%C3%A9");
-        assert_eq!(form(&[("a", "1 2"), ("b", "/")]), b"a=1%202&b=%2F".to_vec());
-    }
-
-    #[test]
-    fn lengths_chunks_redirects_and_limits() {
-        let (base, h) = serve(vec![
-            b"HTTP/1.1 302 Found\r\nLocation: /two\r\n\r\n".to_vec(),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello".to_vec(),
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\n\r\n".to_vec(),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\nxx".to_vec(),
-            b"HTTP/1.0 200 OK\r\n\r\nuntil the end".to_vec(),
-            b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok".to_vec(),
-            b"garbage\r\n\r\n".to_vec(),
-        ]);
-        let r = get(&format!("{base}/one"), 1000).unwrap();
-        assert_eq!((r.status, r.body.as_slice(), r.header("content-type")), (200, &b"hello"[..], Some("text/plain")));
-        assert_eq!(get(&base, 1000).unwrap().body, b"Wikipedia");
-        assert!(matches!(get(&base, 1000), Err(NetError::Protocol(m)) if m.contains("larger")));
-        assert_eq!(get(&base, 1000).unwrap().body, b"until the end");
-        let r = send(
-            &Request::post(&format!("{base}/token"), "application/x-www-form-urlencoded", form(&[("code", "x y")]), 100)
-                .header("Authorization", "Bearer t"),
-        )
-        .unwrap();
-        assert!(r.ok() && r.body == b"ok");
-        assert!(get(&base, 1000).is_err());
-        let seen = h.join().unwrap();
-        assert!(seen[0].starts_with("GET /one HTTP/1.1\r\nHost: 127.0.0.1:"), "{}", seen[0]);
-        assert!(seen[1].starts_with("GET /two "), "redirect followed: {}", seen[1]);
-        assert!(seen[5].starts_with("POST /token ") && seen[5].contains("Authorization: Bearer t") && seen[5].ends_with("code=x%20y"), "{}", seen[5]);
-        // Header injection is refused before anything is sent.
-        assert!(send(&Request::get(&base, 10).header("X", "a\r\nEvil: 1")).is_err());
-    }
-
-    /// Hands out bytes a few at a time, then "times out".
-    struct Drip(Vec<u8>, usize);
-
-    impl Read for Drip {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.0.is_empty() {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "nothing yet"));
-            }
-            let n = self.1.min(self.0.len()).min(buf.len());
-            buf[..n].copy_from_slice(&self.0[..n]);
-            self.0.drain(..n);
-            Ok(n)
-        }
-    }
-
-    impl crate::stream::Timeouts for Drip {
-        fn set_read_timeout(&mut self, _: Option<std::time::Duration>) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn event_streams() {
-        let body = ": hello\n\nevent: state\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\ndata: plain\n\n";
-        // Chunked, split at awkward places.
-        let mut chunked = Vec::new();
-        for part in [&body[..5], &body[5..23], &body[23..]] {
-            chunked.extend(format!("{:x};ext=1\r\n{part}\r\n", part.len()).as_bytes());
-        }
-        for step in [1, 3, 64] {
-            let mut es = EventStream::new(Drip(chunked.clone(), step), true);
-            let mut got = Vec::new();
-            for _ in 0..200 {
-                if let Some(e) = es.next(std::time::Duration::from_millis(1)).unwrap() {
-                    got.push(e);
-                }
-            }
-            assert_eq!(
-                got,
-                vec![Sse { event: "state".into(), data: "{\"a\":\n1}".into() }, Sse { event: "message".into(), data: "plain".into() }],
-                "step {step}"
-            );
-        }
-        let mut es = EventStream::new(Drip(body.as_bytes().to_vec(), 7), false);
-        let first = (0..50).find_map(|_| es.next(std::time::Duration::from_millis(1)).unwrap());
-        assert_eq!(first.map(|e| e.event), Some("state".into()), "plain (not chunked) too");
-        // The end of the stream, and hostile input.
-        assert!(matches!(EventStream::new(Drip(b"0\r\n\r\n".to_vec(), 9), true).next(std::time::Duration::ZERO), Err(NetError::Closed(_))));
-        assert!(EventStream::new(Drip(b"zz\r\n".to_vec(), 9), true).next(std::time::Duration::ZERO).is_err());
-        let endless = vec![b'x'; MAX_EVENT + 10];
-        let mut es = EventStream::new(Drip(endless, 1 << 16), false);
-        assert!((0..100).any(|_| es.next(std::time::Duration::ZERO).is_err()), "an event without an end is refused");
-    }
-}
+pub(crate) mod tests;

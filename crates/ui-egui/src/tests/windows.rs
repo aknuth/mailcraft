@@ -6,7 +6,7 @@ pub(super) mod layout;
 
 #[test]
 fn in_the_browser_a_popped_out_message_opens_in_a_window_of_its_own() {
-    let (a, dir) = app("tabs");
+    let (a, _) = app("tabs");
     let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let mut a = MailApp::new(a.session, Box::new(NullBackend), Box::new(PageServices(opened.clone())));
     let ctx = egui::Context::default();
@@ -25,12 +25,34 @@ fn in_the_browser_a_popped_out_message_opens_in_a_window_of_its_own() {
     tab.act(crate::Action::Run("message.closeWindow", json!({"key": k.to_id()})));
     frame(&ctx, &mut tab, vec![]);
     assert_eq!(opened.borrow().last().map(String::as_str), Some("closed"));
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A reply written in a message's own page (the browser) has the address book as the main
+/// window has: Select Names lists the people mail was exchanged with (it listed no one there,
+/// the page's frame never filling it in).
+#[test]
+fn a_message_page_s_reply_has_the_address_book() {
+    let (a, _) = app("page-names");
+    let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut tab = MailApp::new(a.session, Box::new(NullBackend), Box::new(PageServices(opened)));
+    let ctx = egui::Context::default();
+    let k = tab.session.list[0].key.clone();
+    tab.show_message_page(&k.to_id());
+    frame(&ctx, &mut tab, vec![]);
+    tab.run("list.open", json!({"key": k.to_id()}));
+    tab.run("mail.reply", json!({}));
+    frame(&ctx, &mut tab, vec![]);
+    let c = tab.session.compose.clone().unwrap();
+    tab.ui.dialog = Some(Dialog::select_names(&c, crate::dialogs::Recipients::To));
+    frame(&ctx, &mut tab, vec![]);
+    assert_eq!(tab.ui.page_message.as_ref(), Some(&k), "still the page");
+    let Some(Dialog::SelectNames(f)) = &tab.ui.dialog else { panic!("no dialog") };
+    assert!(f.list.iter().any(|x| x.email == "zoe@studio.example"), "everyone mail was exchanged with: {:?}", f.list);
 }
 
 #[test]
 fn double_clicked_mail_opens_in_its_own_window() {
-    let (mut a, dir) = app("windows");
+    let (mut a, _) = app("windows");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = a.session.list[0].key.clone();
@@ -51,14 +73,13 @@ fn double_clicked_mail_opens_in_its_own_window() {
     frame(&ctx, &mut a, vec![key(Key::Escape, Modifiers::NONE)]);
     frame(&ctx, &mut a, vec![]);
     assert!(a.session.windows.is_empty(), "Escape closes the window");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A message's own window: its attachment buttons work on its message, not the one in the
 /// reading pane (they used to act on the reading pane's, and fail).
 #[test]
 fn a_message_windows_attachments_are_its_own() {
-    let (mut a, dir) = app("window-attachments");
+    let (mut a, _) = app("window-attachments");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.services = Box::new(Recorder(Default::default()));
@@ -77,7 +98,35 @@ fn a_message_windows_attachments_are_its_own() {
     let name = w.parsed.as_ref().and_then(|p| p.attachments.first()).map(|x| x.name.clone()).unwrap();
     assert!(path.is_file() && path.file_name().is_some_and(|n| n.to_string_lossy() == name), "{path:?}");
     assert_eq!(a.session.reading.as_ref().map(|r| r.key.clone()), Some(plain), "the reading pane is as it was");
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Save all in the browser says which attachment couldn't be downloaded, rather than leaving it
+/// out unseen (the others came, and it looked like all of them).
+#[test]
+fn in_the_browser_save_all_says_what_it_couldnt_download() {
+    let store = Store::memory();
+    sample::seed_if_empty(&store, NOW).unwrap();
+    let s = Session::open(Some(store), Clock::new(NOW, 0));
+    let web = WebLike::default();
+    let downloads = web.downloads.clone();
+    let mut a = MailApp::new(s, Box::new(NullBackend), Box::new(web));
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    let key = a.session.list.iter().find(|m| m.has_attachments).map(|m| m.key.clone()).unwrap();
+    a.session.open_message(&key);
+    frame(&ctx, &mut a, vec![]);
+    // One more the message doesn't have: its bytes can't be had.
+    let r = a.session.reading.as_mut().unwrap();
+    let mut parsed = (**r.parsed.as_ref().unwrap()).clone();
+    let mut gone = parsed.attachments.iter().find(|x| !x.inline).cloned().unwrap();
+    (gone.index, gone.name) = (999, "Missing.pdf".into());
+    parsed.attachments.push(gone);
+    let real = parsed.attachments.iter().filter(|x| !x.inline).count() - 1;
+    r.parsed = Some(std::sync::Arc::new(parsed));
+    a.act(crate::Action::SaveAll);
+    assert_eq!(downloads.borrow().len(), real, "the others came");
+    let said: Vec<&str> = a.session.notices.iter().filter(|n| n.error).map(|n| n.text.as_str()).collect();
+    assert!(said.iter().any(|t| t.starts_with("Missing.pdf couldn't be downloaded: ")), "{said:?}");
 }
 
 #[test]
@@ -106,15 +155,16 @@ fn in_the_browser_files_download_and_attachments_come_from_the_picker() {
     a.session.jmap_only = true;
     a.ui.dialog = Some(Dialog::add_account_with("zoe@fastmail.example", false));
     frame(&ctx, &mut a, vec![]);
-    assert!(matches!(&a.ui.dialog, Some(Dialog::AddAccount(f)) if f.jmap && f.advanced));
+    assert!(matches!(&a.ui.dialog, Some(Dialog::AddAccount(f)) if f.kind == crate::dialogs::AccountKind::Jmap && f.advanced));
     a.ui.dialog = None;
     assert!(a.session.run("account.add", &json!({"email": "zoe@example.com", "password": "pw", "imapHost": "imap.example.com"})).is_err());
 
     a.run("mail.new", json!({}));
     a.act(crate::Action::AttachFiles);
     frame(&ctx, &mut a, vec![]);
-    assert_eq!(asked.borrow().as_slice(), ["attach"]);
-    assert!(a.session.compose.as_ref().is_some_and(|c| c.attachments.iter().any(|x| x.name == "notes.txt")));
+    assert_eq!(asked.borrow().as_slice(), [crate::Picked::Attach]);
+    // Its bytes handed over as they are.
+    assert!(a.session.compose.as_ref().is_some_and(|c| c.attachments.iter().any(|x| x.name == "notes.txt" && x.data == b"remember")));
     a.run("compose.discard", json!({}));
 
     // Rules and categories go to a file as downloads, and come back from the picker.
@@ -142,7 +192,7 @@ fn in_the_browser_files_download_and_attachments_come_from_the_picker() {
     a.act(crate::Action::ImportCategories);
     frame(&ctx, &mut a, vec![]);
     assert_eq!(a.session.prefs.categories.len(), categories);
-    assert_eq!(asked.borrow().get(1..), Some(&["rules".to_string(), "categories".to_string()][..]));
+    assert_eq!(asked.borrow().get(1..), Some(&[crate::Picked::Rules, crate::Picked::Categories][..]));
     // A file that isn't one is said so, and nothing changes.
     a.act(crate::Action::ImportRules);
     frame(&ctx, &mut a, vec![]);
@@ -153,8 +203,8 @@ fn in_the_browser_files_download_and_attachments_come_from_the_picker() {
     let size = egui::vec2(1280.0, 800.0);
     let page = |a: &mut MailApp| -> Vec<String> {
         a.act(crate::Action::Backstage(crate::backstage::Page::Open));
-        super::rtl::drawn_text(&ctx, a, size);
-        super::rtl::drawn_text(&ctx, a, size).into_iter().map(|(text, ..)| text).collect()
+        drawn_text(&ctx, a, size);
+        drawn_strings(&ctx, a, size)
     };
     let there = page(&mut a);
     for card in ["Backup", "Rules"] {
@@ -172,7 +222,7 @@ fn in_the_browser_files_download_and_attachments_come_from_the_picker() {
 
 #[test]
 fn new_mail_writes_in_its_own_window_and_replies_pop_out() {
-    let (mut a, dir) = app("compose-window");
+    let (mut a, _) = app("compose-window");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.run("mail.new", json!({}));
@@ -198,7 +248,6 @@ fn new_mail_writes_in_its_own_window_and_replies_pop_out() {
     frame(&ctx, &mut a, vec![]);
     let c = a.session.compose.as_ref().unwrap();
     assert!(!c.window && c.body.contains("\nSent: "));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Fonts built in from craft-fonts (`CRAFT_FONTS_DIR`) are the last fallbacks, with their
@@ -241,11 +290,48 @@ fn a_window_whose_monitor_went_comes_back_on_screen() {
     use crate::WindowPlace;
     let saved = WindowPlace { x: 2100.0, y: 50.0, w: 1200.0, h: 800.0, maximized: false, monitor: Some([1920.0, 1080.0]) };
     let info = |monitor: egui::Vec2| egui::ViewportInfo { monitor_size: Some(monitor), ..Default::default() };
-    assert_eq!(saved.rescue(&info(egui::vec2(1600.0, 900.0))), Some(egui::pos2(200.0, 50.0)));
-    assert_eq!(saved.rescue(&info(egui::vec2(1920.0, 1080.0))), None, "the same monitor");
-    assert_eq!(saved.rescue(&egui::ViewportInfo::default()), None, "not known yet");
-    assert_eq!(WindowPlace { maximized: true, ..saved }.rescue(&info(egui::vec2(1600.0, 900.0))), None);
-    assert_eq!(WindowPlace { monitor: None, ..saved }.rescue(&info(egui::vec2(1600.0, 900.0))), None, "saved before monitors were kept");
+    assert_eq!(saved.rescue(&info(egui::vec2(1600.0, 900.0)), None), Some(egui::pos2(200.0, 50.0)));
+    assert_eq!(saved.rescue(&info(egui::vec2(1920.0, 1080.0)), None), None, "the same monitor");
+    assert_eq!(saved.rescue(&egui::ViewportInfo::default(), None), None, "not known yet");
+    assert_eq!(WindowPlace { maximized: true, ..saved }.rescue(&info(egui::vec2(1600.0, 900.0)), None), None);
+    assert_eq!(WindowPlace { monitor: None, ..saved }.rescue(&info(egui::vec2(1600.0, 900.0)), None), None, "saved before monitors were kept");
+}
+
+/// A window restored where no monitor is any more, though one of the same size took the place of
+/// its own (two alike, one unplugged), comes back on screen: the system's monitors say so, not
+/// their sizes. Centred on the primary monitor, wherever that is; one that can be dragged back by
+/// its top edge stays where it is (WordCraft's fix).
+#[test]
+fn a_window_on_no_monitor_comes_back_though_the_sizes_match() {
+    use crate::{Monitors, WindowPlace};
+    let left = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+    let right = egui::Rect::from_min_size(egui::pos2(1920.0, 0.0), egui::vec2(1920.0, 1080.0));
+    let saved = WindowPlace { x: 2100.0, y: 50.0, w: 1200.0, h: 800.0, maximized: false, monitor: Some([1920.0, 1080.0]) };
+    let at = |x: f32, y: f32| egui::ViewportInfo {
+        monitor_size: Some(egui::vec2(1920.0, 1080.0)),
+        outer_rect: Some(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1200.0, 830.0))),
+        native_pixels_per_point: Some(1.0),
+        ..Default::default()
+    };
+    let one = Monitors { all: vec![left], primary: Some(left) };
+    let both = Monitors { all: vec![left, right], primary: Some(left) };
+    assert_eq!(saved.rescue(&at(2100.0, 50.0), Some(&one)), Some(egui::pos2(360.0, 140.0)), "its monitor went");
+    assert_eq!(saved.rescue(&at(2100.0, 50.0), Some(&both)), None, "still there");
+    assert_eq!(saved.rescue(&at(2100.0, 50.0), None), None, "the system lists none: sizes only");
+    assert_eq!(saved.rescue(&at(1920.0 - 96.0, 50.0), Some(&one)), None, "enough of its top edge to drag by");
+    assert_eq!(saved.rescue(&at(1920.0 - 95.0, 50.0), Some(&one)), Some(egui::pos2(360.0, 140.0)));
+    assert_eq!(saved.rescue(&at(100.0, -900.0), Some(&one)), Some(egui::pos2(360.0, 140.0)), "its top edge above every monitor");
+    assert_eq!(WindowPlace { monitor: None, ..saved }.rescue(&at(2100.0, 50.0), Some(&one)), Some(egui::pos2(360.0, 140.0)));
+    assert_eq!(WindowPlace { maximized: true, ..saved }.rescue(&at(2100.0, 50.0), Some(&one)), None);
+    // The primary monitor left of the origin, and at twice the pixels: in points, centred on it.
+    let primary = egui::Rect::from_min_size(egui::pos2(-2560.0, 240.0), egui::vec2(2560.0, 1440.0));
+    let hidpi = egui::ViewportInfo {
+        native_pixels_per_point: Some(2.0),
+        outer_rect: Some(egui::Rect::from_min_size(egui::pos2(5000.0, 50.0), egui::vec2(1200.0, 830.0))),
+        ..at(0.0, 0.0)
+    };
+    let far = Monitors { all: vec![primary], primary: Some(primary) };
+    assert_eq!(saved.rescue(&hidpi, Some(&far)), Some(egui::pos2(-1280.0 + 40.0, 120.0)));
 }
 
 /// A window too big for its screen, frame included, shrinks to fit and is centred; one that fits
@@ -299,17 +385,16 @@ fn a_damaged_system_font_doesnt_stop_the_window() {
     }
     let ctx = egui::Context::default();
     ctx.set_fonts(defs);
-    let (mut a, dir) = app("bad-fonts");
+    let (mut a, _) = app("bad-fonts");
     frame(&ctx, &mut a, vec![]);
     frame(&ctx, &mut a, vec![]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Ctrl+Q is Mark as read (Outlook's): it marked the message read and then closed MailCraft,
 /// egui's own quit shortcut being Ctrl+Q too. Now the window stays (a Mac keeps Cmd+Q to quit).
 #[test]
 fn ctrl_q_marks_read_and_keeps_the_window() {
-    let (mut a, dir) = app("ctrl-q");
+    let (mut a, _) = app("ctrl-q");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = a.session.list.iter().find(|m| !m.flags.seen).map(|m| m.key.clone()).unwrap();
@@ -329,7 +414,6 @@ fn ctrl_q_marks_read_and_keeps_the_window() {
     } else {
         assert!(!closes, "the window stays");
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Every window of MailCraft's own carries its app id, as the main one does: a Wayland dock
@@ -366,15 +450,7 @@ impl OwnTitleBar {
 }
 
 impl crate::Services for OwnTitleBar {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
+    stub_services!(clock, pick_files, save_path);
     fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
         Err("not available".into())
     }
@@ -391,7 +467,7 @@ impl crate::Services for OwnTitleBar {
 /// note is gone after the frame.
 #[test]
 fn the_window_is_told_before_its_own_title_bar_zooms_it() {
-    let (a, dir) = app("told-before-maximize");
+    let (a, _) = app("told-before-maximize");
     let told = OwnTitleBar::new();
     let count = std::rc::Rc::clone(&told.0);
     let mut a = MailApp::new(a.session, Box::new(NullBackend), Box::new(told));
@@ -419,16 +495,8 @@ fn the_window_is_told_before_its_own_title_bar_zooms_it() {
         run(&mut a, vec![], false);
     }
     let out = run(&mut a, vec![], false);
-    let tree = out.platform_output.accesskit_update.as_ref().expect("AccessKit is on");
-    let at = |label: &str| {
-        tree.nodes
-            .iter()
-            .find_map(|(_, n)| {
-                let b = n.bounds()?;
-                (n.label()? == label).then(|| egui::pos2((b.x0 + b.x1) as f32 / 2.0, (b.y0 + b.y1) as f32 / 2.0))
-            })
-            .unwrap_or_else(|| panic!("{label}"))
-    };
+    let nodes = named_in(&out);
+    let at = |label: &str| nodes.iter().filter(|n| n.label.as_deref() == Some(label)).find_map(Named::centre).unwrap_or_else(|| panic!("{label}"));
     let (max, min) = (at("Maximize"), at("Minimize"));
     let free = egui::pos2(at("Send / Receive all folders (F9)").x - 20.0, 20.0);
     run(&mut a, click(min), false);
@@ -447,7 +515,6 @@ fn the_window_is_told_before_its_own_title_bar_zooms_it() {
     run(&mut a, click(max), true);
     run(&mut a, vec![], true);
     assert_eq!(count.get(), 3, "so does Restore");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Issue #22: on Windows the top bar is the window's title bar, in MailCraft's colour as
@@ -456,7 +523,7 @@ fn the_window_is_told_before_its_own_title_bar_zooms_it() {
 /// window's edges resizing it, and the File page keeping the bar. Without it, none of that.
 #[test]
 fn the_top_bar_is_the_window_title_bar_when_it_has_none_of_the_systems() {
-    let (a, dir) = app("own-title-bar");
+    let (a, _) = app("own-title-bar");
     let mut a = MailApp::new(a.session, Box::new(NullBackend), Box::new(OwnTitleBar::new()));
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
@@ -471,16 +538,8 @@ fn the_top_bar_is_the_window_title_bar_when_it_has_none_of_the_systems() {
         out.textures_delta.clear();
         out
     };
-    let named = |out: &egui::FullOutput| -> Vec<(String, egui::Rect)> {
-        let tree = out.platform_output.accesskit_update.as_ref().expect("AccessKit is on");
-        tree.nodes
-            .iter()
-            .filter_map(|(_, n)| {
-                let b = n.bounds()?;
-                Some((n.label()?.to_string(), egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))))
-            })
-            .collect()
-    };
+    let named =
+        |out: &egui::FullOutput| -> Vec<(String, egui::Rect)> { named_in(out).into_iter().filter_map(|n| Some((n.label?, n.rect?))).collect() };
     let sent = |out: &egui::FullOutput| out.viewport_output.values().flat_map(|v| v.commands.clone()).collect::<Vec<_>>();
     let click = |at: egui::Pos2| {
         vec![
@@ -587,15 +646,13 @@ fn the_top_bar_is_the_window_title_bar_when_it_has_none_of_the_systems() {
     let out = run(&mut a, vec![]);
     assert!(named(&out).iter().any(|(l, _)| l == "Close"), "the File page's title bar");
     // With the system's title bar, MailCraft draws none of it.
-    let (b, dir2) = app("system-title-bar");
+    let (b, _) = app("system-title-bar");
     let mut b = b;
     for _ in 0..3 {
         run(&mut b, vec![]);
     }
     let out = run(&mut b, vec![]);
     assert!(!named(&out).iter().any(|(l, _)| l == "Minimize"));
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(dir2);
 }
 
 /// The title bar laid over a dialog stays off a dialog that reaches into the bar (a short window,
@@ -605,7 +662,7 @@ fn the_top_bar_is_the_window_title_bar_when_it_has_none_of_the_systems() {
 /// drawn over Close).
 #[test]
 fn the_title_bar_keeps_off_a_dialog_in_it_and_its_buttons_off_the_mark() {
-    let (a, dir) = app("own-title-bar-short");
+    let (a, _) = app("own-title-bar-short");
     let mut a = MailApp::new(a.session, Box::new(NullBackend), Box::new(OwnTitleBar::new()));
     let ctx = egui::Context::default();
     let time = std::cell::Cell::new(0.0f64);
@@ -678,5 +735,45 @@ fn the_title_bar_keeps_off_a_dialog_in_it_and_its_buttons_off_the_mark() {
     assert!(!tiles.is_empty(), "the mark drawn");
     assert!(tiles.iter().all(|r| r.right() <= size.x - crate::app::caption::CAPTIONS_W), "clear of the buttons: {tiles:?}");
     crate::i18n::set_current(crate::i18n::Lang::EN);
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Audit #473: a ribbon button asks whether the ribbon is the classic one without copying what
+/// was noted of every button before it. A ribbon of 120 buttons in groups of 6, both kinds. Run
+/// in release: `cargo test --release -p mailcraft-ui-egui --lib ribbon_buttons_measure --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn ribbon_buttons_measure() {
+    let t = crate::theme::Tokens::light();
+    for classic in [false, true] {
+        let ctx = egui::Context::default();
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 200.0)));
+        let ribbon = |ctx: &egui::Context| {
+            let mut out = ctx.run_ui(RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+                let id = crate::widgets::ribbon_fit_id();
+                let start = crate::widgets::RibbonFit { active: true, classic, icons_from: usize::MAX, ..Default::default() };
+                ui.ctx().data_mut(|d| d.insert_temp(id, start));
+                ui.horizontal(|ui| {
+                    for g in 0..20 {
+                        for _ in 0..6 {
+                            let _ = crate::widgets::tool_button(ui, crate::icons::Icon::Reply, "Reply", &t, true);
+                        }
+                        crate::widgets::group(ui, &t, "Respond", g == 19);
+                    }
+                });
+                ui.ctx().data_mut(|d| std::mem::take(d.get_temp_mut_or_default::<crate::widgets::RibbonFit>(id)));
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..20 {
+            ribbon(&ctx);
+        }
+        const ROUNDS: u32 = 1000;
+        let at = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            ribbon(&ctx);
+        }
+        let kind = if classic { "classic" } else { "simplified" };
+        println!("MEASURE a {kind} ribbon of 120 buttons: {:.1} µs a frame", at.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS));
+    }
 }

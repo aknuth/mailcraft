@@ -29,18 +29,61 @@ impl Store {
 
     fn list_load(&self, account: &str, folder: &str) -> Result<FolderLoad> {
         let dir = self.folder_dir(account, folder);
-        let file: StateFile = self.read_json(&dir.join("state.json"))?;
-        let st = FolderState {
-            validity: file.validity,
-            uid_next: file.uid_next,
-            highest_modseq: file.highest_modseq,
-            messages: file.messages,
-            window: file.window,
-        };
+        let mut head: StateFile = self.read_json(&dir.join(HEAD))?;
         // A list in pages: the flags marked since its pages were written, put on them at the end.
-        let marks: Vec<(u32, Flags)> = if file.pages.is_empty() { Vec::new() } else { self.read_json(&dir.join(MARKS))? };
-        Ok(FolderLoad { account: account.to_string(), folder: folder.to_string(), dir, st, pages: file.pages.len(), next: 0, marks })
+        let marks: Vec<(u32, Flags)> = if head.pages.is_empty() { Vec::new() } else { self.read_json(&dir.join(MARKS))? };
+        Ok(FolderLoad::from_head(account, folder, dir, &mut head, marks))
     }
+
+    /// [`Store::list_from_disk`] from its head read already (`head`, in `dir`: its messages taken
+    /// from it), with `marks` put on its pages: only the pages are read.
+    pub(crate) fn list_from_head(
+        &self,
+        account: &str,
+        folder: &str,
+        dir: PathBuf,
+        head: &mut StateFile,
+        marks: Vec<(u32, Flags)>,
+    ) -> Result<FolderState> {
+        let mut load = FolderLoad::from_head(account, folder, dir, head, marks);
+        while !load.step(self)? {}
+        Ok(load.finish())
+    }
+
+    /// The numbers of a folder's messages, the rest of each one's summary not read: the numbers
+    /// still in use, all that forgetting the others needs (a folder's whole list read for its
+    /// numbers alone took four times as long, measured on 100,000 messages). In no order.
+    pub fn folder_uids(&self, account: &str, folder: &str) -> Result<Vec<u32>> {
+        let dir = self.folder_dir(account, folder);
+        let head: UidsFile = self.read_json(&dir.join(HEAD))?;
+        let mut uids: Vec<u32> = head.messages.iter().map(|m| m.key.uid).collect();
+        for i in 0..head.pages.len() {
+            let page: Vec<UidOnly> = self.read_json(&page_path(&dir, i))?;
+            uids.extend(page.iter().map(|m| m.key.uid));
+        }
+        Ok(uids)
+    }
+}
+
+/// A folder's list file ([`StateFile`]) read for its messages' numbers and its pages alone.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct UidsFile {
+    messages: Vec<UidOnly>,
+    pages: Vec<u64>,
+}
+
+/// A message's summary read for its number alone.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct UidOnly {
+    key: UidOfKey,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct UidOfKey {
+    uid: u32,
 }
 
 /// Beside a list kept in pages: the flags of the messages marked since its pages were written
@@ -48,6 +91,15 @@ impl Store {
 /// (about 2 MB, and 24 to 90 ms of the window's frame in a folder of 10,941). The next save of
 /// the whole list puts them into the pages and empties it.
 pub(crate) const MARKS: &str = "state-marks.json";
+
+/// A folder's list's head ([`StateFile`]): its sync state, and its messages or the pages they're
+/// kept in.
+pub(crate) const HEAD: &str = "state.json";
+
+/// Page `i` of a list kept in pages, in its folder's directory `dir`.
+pub(crate) fn page_path(dir: &Path, i: usize) -> PathBuf {
+    dir.join(format!("state-{i}.json"))
+}
 
 /// The most messages kept marked beside a list's pages (about 50 KB): one more puts them into
 /// their pages.
@@ -70,12 +122,25 @@ pub struct FolderLoad {
 }
 
 impl FolderLoad {
+    /// A list's reading from its `head` (in `dir`; its messages taken from it), with `marks` to put
+    /// on its pages.
+    fn from_head(account: &str, folder: &str, dir: PathBuf, head: &mut StateFile, marks: Vec<(u32, Flags)>) -> FolderLoad {
+        let st = FolderState {
+            validity: head.validity,
+            uid_next: head.uid_next,
+            highest_modseq: head.highest_modseq,
+            messages: std::mem::take(&mut head.messages),
+            window: head.window,
+        };
+        FolderLoad { account: account.to_string(), folder: folder.to_string(), dir, st, pages: head.pages.len(), next: 0, marks }
+    }
+
     /// Read the next page of the list; `true` once there is none left.
     pub fn step(&mut self, store: &Store) -> Result<bool> {
         if self.next >= self.pages {
             return Ok(true);
         }
-        let page: Vec<Summary> = store.read_json(&self.dir.join(format!("state-{}.json", self.next)))?;
+        let page: Vec<Summary> = store.read_json(&page_path(&self.dir, self.next))?;
         self.st.messages.extend(page.into_iter().map(SharedSummary::new));
         self.next += 1;
         Ok(self.next >= self.pages)
@@ -86,8 +151,9 @@ impl FolderLoad {
         self.next >= self.pages
     }
 
-    /// Pages read so far, the head counted.
-    pub fn pages_read(&self) -> usize {
+    /// Pages read so far, the head counted (tests).
+    #[cfg(test)]
+    pub(crate) fn pages_read(&self) -> usize {
         self.next.saturating_add(1)
     }
 
@@ -175,13 +241,25 @@ impl Store {
         state: &FolderState,
         changed: Option<&std::collections::HashSet<u32>>,
     ) -> Result<(Vec<(PathBuf, Vec<u8>)>, Vec<PathBuf>)> {
+        // Missing or damaged reads as none; a failed read is an error, not a list without pages
+        // (which wrote every page again, and left the stale ones).
+        let old: StateFile = self.read_json(&self.folder_dir(account, folder).join(HEAD))?;
+        self.list_writes_over(account, folder, state, changed, &old, None)
+    }
+
+    /// [`Store::list_writes`] over the head read already from the disk (`old`), and the marks beside
+    /// its pages when they were read too (`kept`; `None`: read when they're needed).
+    pub(crate) fn list_writes_over(
+        &self,
+        account: &str,
+        folder: &str,
+        state: &FolderState,
+        changed: Option<&std::collections::HashSet<u32>>,
+        old: &StateFile,
+        kept: Option<&[(u32, Flags)]>,
+    ) -> Result<(Vec<(PathBuf, Vec<u8>)>, Vec<PathBuf>)> {
         let dir = self.folder_dir(account, folder);
-        let head = dir.join("state.json");
-        let json_err = |p: &Path| {
-            let p = p.display().to_string();
-            move |source| StoreError::Json { path: p, source }
-        };
-        let old: StateFile = self.read_json(&head).unwrap_or_default();
+        let head = dir.join(HEAD);
         let mut file = StateFile {
             validity: state.validity,
             uid_next: state.uid_next,
@@ -202,14 +280,21 @@ impl Store {
             // Few marked since the pages were written: those kept beside them, nothing else.
             let mut folded: Option<std::collections::HashSet<u32>> = None;
             if let Some(changed) = same {
-                let kept: Vec<(u32, Flags)> = self.read_json(&marks_path)?;
+                let read: Vec<(u32, Flags)>;
+                let kept = match kept {
+                    Some(kept) => kept,
+                    None => {
+                        read = self.read_json(&marks_path)?;
+                        &read
+                    }
+                };
                 let mut marks: BTreeMap<u32, &Flags> = kept.iter().map(|(uid, f)| (*uid, f)).collect();
                 for m in state.messages.iter().filter(|m| changed.contains(&m.key.uid)) {
                     marks.insert(m.key.uid, &m.flags);
                 }
                 if marks.len() <= MARKS_MAX {
                     let list: Vec<(u32, &Flags)> = marks.into_iter().collect();
-                    let bytes = serde_json::to_vec(&list).map_err(json_err(&marks_path))?;
+                    let bytes = to_json(&marks_path, &list)?;
                     let mut writes = vec![(marks_path, bytes)];
                     // A head that says more than the one on disk (a newer modseq) written too,
                     // naming the same pages.
@@ -218,7 +303,8 @@ impl Store {
                     {
                         file.pages.clone_from(&old.pages);
                         file.count = old.count;
-                        writes.push((head.clone(), serde_json::to_vec(&file).map_err(json_err(&head))?));
+                        let bytes = to_json(&head, &file)?;
+                        writes.push((head, bytes));
                     }
                     return Ok((writes, Vec::new()));
                 }
@@ -238,8 +324,8 @@ impl Store {
                     file.pages.push(hash);
                     continue;
                 }
-                let path = dir.join(format!("state-{i}.json"));
-                let bytes = serde_json::to_vec(page).map_err(json_err(&path))?;
+                let path = page_path(&dir, i);
+                let bytes = to_json(&path, page)?;
                 let hash = page_hash(&bytes);
                 if old.pages.get(i) != Some(&hash) || !self.files.is_file(&path) {
                     writes.push((path, bytes));
@@ -247,13 +333,23 @@ impl Store {
                 file.pages.push(hash);
             }
         }
-        // The pages have every flag now: the marks beside them emptied, with them.
-        if self.has_marks(&marks_path) {
-            writes.push((marks_path, b"[]".to_vec()));
-        }
-        writes.push((head.clone(), serde_json::to_vec(&file).map_err(json_err(&head))?));
-        let stale = (file.pages.len()..old.pages.len()).map(|i| dir.join(format!("state-{i}.json"))).collect();
+        let stale = self.head_writes(&dir, &file, old, &mut writes)?;
         Ok((writes, stale))
+    }
+
+    /// `file` written as the head of the list in `dir` after its pages (in `writes`), with the
+    /// lock held: the marks beside the pages emptied first when they have any (the pages have
+    /// every flag now), then the head. The pages `old` (the head it replaces) named and `file`
+    /// doesn't, to go once these are written.
+    pub(crate) fn head_writes(&self, dir: &Path, file: &StateFile, old: &StateFile, writes: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<PathBuf>> {
+        let marks = dir.join(MARKS);
+        if self.has_marks(&marks) {
+            writes.push((marks, b"[]".to_vec()));
+        }
+        let head = dir.join(HEAD);
+        let bytes = to_json(&head, file)?;
+        writes.push((head, bytes));
+        Ok((file.pages.len()..old.pages.len()).map(|i| page_path(dir, i)).collect())
     }
 
     /// Put right whether these messages carry files (what an index pass found their summaries
@@ -287,7 +383,7 @@ impl Store {
         };
         let _held = self.hold_changes();
         let dir = self.folder_dir(account, folder);
-        let head = dir.join("state.json");
+        let head = dir.join(HEAD);
         let mut file: StateFile = self.read_json(&head)?;
         if file.validity != found.validity {
             return Ok(0);
@@ -303,7 +399,7 @@ impl Store {
             if seen >= wanted {
                 break;
             }
-            let path = dir.join(format!("state-{i}.json"));
+            let path = page_path(&dir, i);
             let mut page: Vec<Summary> = self.read_json(&path)?;
             let mut here = 0usize;
             for m in &mut page {
@@ -314,8 +410,7 @@ impl Store {
             if here == 0 {
                 continue;
             }
-            let p = path.display().to_string();
-            let bytes = serde_json::to_vec(&page).map_err(|source| StoreError::Json { path: p, source })?;
+            let bytes = to_json(&path, &page)?;
             *hash = page_hash(&bytes);
             writes.push((path, bytes));
             changed += here;
@@ -323,8 +418,8 @@ impl Store {
         if changed == 0 {
             return Ok(0);
         }
-        let p = head.display().to_string();
-        writes.push((head, serde_json::to_vec(&file).map_err(|source| StoreError::Json { path: p, source })?));
+        let bytes = to_json(&head, &file)?;
+        writes.push((head, bytes));
         self.write_files(writes)?;
         Ok(changed)
     }
@@ -406,6 +501,8 @@ impl Store {
         for folder in &folders {
             let mut st = self.load_folder(account, folder)?;
             let mut sources_gone: Vec<&MessageKey> = Vec::new();
+            // Only these messages' flags changed: a big list's other pages aren't made again.
+            let mut flags_of: Option<HashSet<u32>> = None;
             let in_folder = |k: &MessageKey| k.account == account && &k.folder == folder && k.validity == st.validity;
             match op {
                 Op::SetFlag { keys, flag, on } => {
@@ -414,6 +511,7 @@ impl Store {
                     for m in st.messages.iter_mut().filter(|m| uids.contains(&m.key.uid)) {
                         flag.set(&mut SharedSummary::make_mut(m).flags, *on);
                     }
+                    flags_of = Some(uids);
                 }
                 Op::SetKeyword { keys, keyword, on } => {
                     // A set: every message of a folder may change at once (looked up in a list, that was quadratic).
@@ -421,6 +519,7 @@ impl Store {
                     for m in st.messages.iter_mut().filter(|m| uids.contains(&m.key.uid)) {
                         SharedSummary::make_mut(m).flags.set_keyword(keyword, *on);
                     }
+                    flags_of = Some(uids);
                 }
                 Op::Move { keys, to } => {
                     if to == folder {
@@ -437,7 +536,10 @@ impl Store {
                 }
                 Op::CreateFolder { .. } | Op::RenameFolder { .. } | Op::DeleteFolder { .. } | Op::EmptyFolder { .. } => {}
             }
-            self.save_folder(account, folder, &st)?;
+            match &flags_of {
+                Some(changed) => self.save_folder_changed(account, folder, &st, changed)?,
+                None => self.save_folder(account, folder, &st)?,
+            }
             // Once the list no longer has them: one that can't be saved keeps their sources.
             for k in sources_gone {
                 self.remove_body(k);
@@ -491,6 +593,8 @@ impl Store {
                 for g in &gone {
                     self.clear_folder(account, g)?;
                 }
+                // A set: a folder with thousands of subfolders (an import's) was gone × folders.
+                let gone: HashSet<String> = gone.into_iter().collect();
                 list.retain(|f| !gone.contains(&f.path));
                 Vec::new()
             }
@@ -552,12 +656,20 @@ impl Store {
 /// whether any count changed.
 pub(crate) fn set_counts(list: &mut [Folder], counts: &[(String, u32, u32)]) -> (usize, bool) {
     let (mut found, mut changed) = (0, false);
-    for (path, unread, total) in counts {
-        if let Some(f) = list.iter_mut().find(|f| f.path == *path) {
+    // Each path's first folder (a damaged list may name one twice), looked up once each: a search
+    // of the list for each count was counts × folders (41 ms for an import's 5,000).
+    let mut at: HashMap<&str, usize> = HashMap::with_capacity(list.len());
+    for (i, f) in list.iter().enumerate() {
+        at.entry(f.path.as_str()).or_insert(i);
+    }
+    let found_at: Vec<(usize, u32, u32)> =
+        counts.iter().filter_map(|(path, unread, total)| Some((*at.get(path.as_str())?, *unread, *total))).collect();
+    for (i, unread, total) in found_at {
+        if let Some(f) = list.get_mut(i) {
             found += 1;
-            changed |= f.unread != *unread || f.total != *total;
-            f.unread = *unread;
-            f.total = *total;
+            changed |= f.unread != unread || f.total != total;
+            f.unread = unread;
+            f.total = total;
         }
     }
     (found, changed)

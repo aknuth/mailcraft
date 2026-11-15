@@ -10,48 +10,22 @@
 //! It prints the three counts (numbers only) and fails when they differ.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use serde_json::json;
 
 use crate::Session;
 use crate::model::dates::Clock;
-use crate::store::Store;
 
 #[test]
-#[ignore]
+#[ignore = "needs a big mailbox in MC_DATA or MC_CACHE"]
 fn files_agree() {
-    let (store, account) = if let Ok(data) = std::env::var("MC_DATA") {
-        let data = PathBuf::from(data);
-        let store = Store::open_packed(data.clone(), data.join("MailCraft Files")).unwrap();
-        store.open_data_files().unwrap();
-        let account = store.load_accounts().unwrap().first().map(|a| a.id.clone()).expect("an account in MC_DATA");
-        (store, account)
-    } else if let Ok(cache) = std::env::var("MC_CACHE") {
-        let cache = PathBuf::from(cache);
-        let store = Store::open_packed(cache.join("root"), cache.join("files")).unwrap();
-        store
-            .save_accounts(&[crate::model::AccountConfig { id: "d1".into(), name: "Big".into(), email: "big@local".into(), ..Default::default() }])
-            .unwrap();
-        (store, "d1".to_string())
-    } else {
+    let Some((store, account)) = super::bench_store() else {
         println!("MC_CACHE or MC_DATA: the mailbox to count");
         return;
     };
     // What's left to index, as the indexer does it: summaries found wrong are put right.
-    let mut p = crate::store::search::Pass::start(&store, &account, &[]).unwrap();
-    let adds = p.adds().clone();
-    for (i, m) in adds.iter().enumerate() {
-        let doc = store.read_body(&m.key).map(|raw| crate::mime::index_doc(&raw));
-        p.add(&store, i, doc.as_ref()).unwrap();
-    }
-    let mut corrected = 0;
-    for (folder, found) in p.take_files() {
-        corrected += store.set_has_files(&account, &folder, &found).unwrap();
-    }
-    p.finish(&store, true).unwrap();
-    println!("indexed {} left over, {corrected} summaries put right", adds.len());
-    drop(p);
+    let pass = crate::sample::big::index(&store, &account).unwrap();
+    println!("indexed {} left over, {} summaries put right", pass.added, pass.corrected);
     let mut s = Session::open(Some(store), Clock::new(1_800_000_000, 0));
     let folders: Vec<String> = s.account(&account).map(|a| a.folders.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
     let (mut messages, mut clipped, mut filtered) = (0usize, HashSet::new(), HashSet::new());

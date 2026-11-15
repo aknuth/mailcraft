@@ -8,7 +8,221 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 version is a milestone, named in italics under its heading. Numbers like (#11) are tester issues
 on GitHub.
 
-## 0.38.0
+## 0.39.0
+
+*What testers met in their first days with 0.38.*
+
+### Added
+
+- One of an account's other addresses can be the one new mail is written from (#88): tick **Write new mail from this address** when you add or change it under **File › Info › Other addresses**. A new message then starts from it, with its name and signature, and **From** still offers the others. An answer goes from the address the mail came to, as before, and from the chosen one when the mail came to none of the account's addresses (a list's mail, a hidden copy). For a mailbox that signs in as one address and writes as another, such as a Gmail mailbox with a domain of your own.
+
+### Removed
+
+- Windows 32-bit (x86) builds are no longer released, as the other Craft apps' aren't: 64-bit Windows runs the x64 or ARM64 build. A 32-bit copy already installed keeps working but gets no more updates; install the x64 one to keep up.
+
+### Fixed
+
+- A certificate file (`.p12`, `.pfx`) saved by Thunderbird or Firefox is imported (#89): they write the file another way than OpenSSL and Windows do, and every one was refused as a wrong password, old files and new. What stops an import is now said as what it is: a wrong password, a file locked in a way MailCraft doesn't read, or a file that isn't a certificate file.
+- An account with calendars and contacts only is no longer listed in the mail folder pane (#86), where it opened to nothing and several of them filled the pane. Its calendars and contacts are in Calendar and People as before, and the account under **File › Info**. **All Inboxes** and **All Sent** show only when more than one account has mail.
+- A signature set out in columns keeps them (#90): a logo, a name and an address side by side went one under the other in a reading pane of the usual width, and the line between them was gone, unless the window was wide. Short lines now wrap a little beside columns that say how wide they are, as in a browser. A signature written as HTML code also shows that way in the message you're writing, where it was its text, one part under another: its columns, colours, lines and pictures, as it's sent. It's one thing in the text there: the cursor passes it, and Backspace after it takes all of it. Pictures it names on the web load when you ask (**Show pictures**, under it), as for a message you read. Change it under **Signature**.
+- **Sign in again** says which user name the account signs in with, when that isn't its address (#88): asked for "the password for" the address, it read as signing in with the address.
+- In the browser, a picture or subscribed calendar larger than MailCraft takes is no longer downloaded whole before it's refused: reading stops once it passes the limit, or before it starts when the server gives its size. One answering with gigabytes could take the page down.
+- In the browser, a backup the browser's storage won't take (full, say) is said to be refused, and the page goes on keeping what you do. It used to say nothing, and nothing done afterwards was kept: it was gone at the next visit.
+- Rules, blocked senders and ignored conversations sort a lot of mail at once without holding up the window: **Run Rules Now** on a big Inbox, or the first sync after a long time away, changed each message on its own and asked the server once per message (20,000 messages filed by a rule took over two minutes). Mail they file together is now one change, as when you drag it.
+- Mail moved out of a data file or local folder whose copy was filed but which couldn't then be taken out where it was (the disk refused the write) is said to be in both places. It was said to be moved, with an **Undo** that couldn't put it back, or, moved to a server, a bare disk error followed by "moved".
+- With **Focused Inbox** on, mail arriving in the Inbox on screen no longer has every folder of every account read again to sort it: the people you write to, as counted in the last ten minutes, sort it, as they do for the sender check.
+- Replying to or forwarding a message with a link stuffed with `javascript:` no longer hangs MailCraft: each one was taken out by going over the whole link again (a megabyte of them took five minutes).
+- A big folder of a JMAP account (Fastmail, say) syncs without looking each message up in the whole folder: in a folder of 40,000 that was nearly two seconds of every sync, even when nothing had changed, and it grew with the square of the folder's size.
+- A calendar invitation or subscribed calendar with a very long list of skipped dates (`EXDATE`) is read at once: each date copied the whole list, so 100,000 of them took 40 seconds.
+- An event whose notes are full of web addresses, or of brackets after one, is opened and its meeting link found at once; a crafted invitation's notes could hold MailCraft up for minutes.
+- A contact from a CardDAV server that you edit goes back with what MailCraft doesn't show: saving it from **Edit contact**, even with nothing but its job title changed, cleared its last and first names (and dropped a middle name, title and suffix), took the type off its email addresses, and dropped its numbers' other types, which one is preferred and the label beside them (iPhone's "Studio fax", say).
+- Exporting into an Outlook data file that's damaged so that a folder is listed inside itself no longer hangs before it starts: each folder is looked through once, as an import does.
+- An export to an Outlook data file says so when a folder couldn't be read and its mail isn't in the file; it was left out with nothing said.
+- With an Exchange account (EWS or Microsoft 365), a calendar item, contact or note the server refuses to delete (access denied, say) is said not to be deleted and is asked again at the next sync; it was taken for already gone. A contact or note changed here whose old copy the server wouldn't delete is no longer made again beside it, twice over. One whose id the server can't read is said once, not at every sync.
+- A big folder of an Exchange account (EWS or Microsoft 365) syncs, and is searched on the server, without looking each message up in the whole folder, as a JMAP account's now does.
+- Automatic replies can be read and set for an account that signs in with OAuth on a server with ManageSieve: its sign-in there was encoded twice, and always refused.
+- A message with a line longer than 64 KB comes whole from a POP account: the line was broken in two, and a piece of it that was a lone `.` cut the message short there.
+- Turning on **Online only** for an account when one of its files can't be read says so and changes nothing; that file was left behind and then deleted with the rest, changes waiting for the server and the Outbox among what could go.
+- A move of the data files to another folder that stops, because a file of the same name turned up there meanwhile, leaves that file alone; it was deleted as the move was undone.
+- When the list of which data file is each account's (`datafiles.json`) is damaged, each account's data file is found again by its name, and the damaged list kept aside as `datafiles.json.bad`; one that can't be read at all is said, and tried again at the next start. Either was taken for an empty list: accounts showed no mail, and the next mail to come in started a second data file beside the first, which was then forgotten. Two accounts with one address each get their own file back, never the other's.
+- A rule with more than the rule editor shows (several conditions, any of which will do, several actions, or one account it's for: one brought in from a file, or made with a command) keeps all of that when you change it in the editor. Saving it, even only to rename it, kept just its first condition and first action, for every account, and a rule moving mail to Junk came back moving it to Archive.
+- A contact saved from **Edit contact** keeps the postal addresses the form has no place for (a second home address, say) and the kind of a number or address it shows under Other (a pager, a postal address): the extra addresses were deleted and those kinds dropped.
+- **Email** on a contact's card writes to that one person when the name has a comma, as Outlook's "Last, First" names do: the name was split into two recipients there, the first of them not an address, and the message couldn't be sent until it was put right.
+- In the browser, a change made while the account is signed out (a flag, a move, a delete) waits with the mail kept in the browser, so it reaches the server once you sign in again even after the page was reloaded or closed. It waited in the page only, and was lost with it: the next sync put the message back as the server still had it.
+- In the browser, a message popped out of a folder whose name has "sample" or "webgl" in it (`Samples`, say) opens in your own mailbox: its window opened the sample mailbox instead, and couldn't find the message.
+- An update that couldn't be installed (a portable zip that wouldn't unpack, a Mac disk image that wouldn't open, an administrator prompt declined, or MailCraft still running) is offered again at the next check, from the download already made. The download was thrown away, and that version wasn't offered again for a day.
+- `mailcraft-cli` takes `--headers` and `--checked` anywhere on the line, says which option was given no value, and says when `--limit` or `--timeout` isn't a number. `source --headers KEY` lost its KEY, an option without its value took the next option for it, and a bad number was quietly replaced by the default.
+- In the browser, a file attached or a picture put into a message no longer takes many times its size in memory on the way in: a 25 MB file took about 600 MB.
+- A category given twice to an event or task is kept once.
+- An account's address changed in its settings, when it signs in with its address, is used at once: the account went on signing in with the old one until MailCraft was started again.
+- `account.add` with a data file whose path is refused no longer leaves the account added.
+- In All Inboxes, one Undo puts back what was done to mail of several accounts at once (marked read, flagged, categorised, moved or deleted): it took one Undo per account, in no set order.
+- Archive or Move on mail of several accounts (All Inboxes) moves nothing when one of them has no such folder, instead of moving some and failing.
+- Copying a lot of mail, or moving it from another account, into a folder of a data file or a local account no longer holds up the window: each message was read twice and written on its own, and 5,000 of them took over ten seconds.
+- Deleting one changed occurrence of a repeating event from a calendar on Exchange or Microsoft 365 deletes it on the server too: it was taken out here only, and came back.
+- A colleague's copy of a meeting in a calendar you may only read is no longer shown beside your own, and doesn't come back at the next sync.
+- Moving more than 2,000 messages into an Inbox or Junk on a server no longer has some of them announced as new mail, or filed again by rules, when the server shows them there.
+- A dismissed reminder stays dismissed: one for an event that runs for weeks, or for a task whose reminder came long before its due day, came back at once, and snoozing another reminder for days could bring back those dismissed in the last month.
+- With a damaged key among your own OpenPGP keys, mail is no longer signed with another key than its address's.
+- Writing from another address of an account that has only an OpenPGP key for it, the message bar says whether OpenPGP reaches the recipients: it went by the account's certificate, turned encryption on by itself, and sending then failed. A recipient's certificate withdrawn is taken into account at once, not up to an hour later.
+- A message quoted in a reply or forward, and a signature's HTML code, lose every `on…` handler and script link a browser would run: one written without a space before it, after a `>` inside a quoted value, or as `javascript:` hidden behind character references went out as it came. Nor does one inside a tag written to end later than a browser ends it.
+- A message whose style sheet is longer than MailCraft reads keeps the part read, instead of losing its colours and sizes.
+- A picture written `<img`, a tab, `src=…`, or `src = …`, is blocked or shown with the rest, and an address inside another attribute's text isn't taken for one.
+- A recurring event begun long ago still shows: a daily one started more than about 55 years back, or an hourly one more than five, was missing from the calendar, and a calendar of years-old series is drawn much faster.
+- An event whose notes hold a long run of `<` brackets opens at once: the app froze for seconds on every frame it was open.
+- An event or task holding a huge part MailCraft doesn't read keeps only its first few hundred lines: all of it was saved with the calendar, and an event's read through each time the calendar was drawn. An event's reminder is still found after such a part.
+- An Outlook message file saved in a code page rather than Unicode keeps the accents and letters of its attachments' names: they were read as UTF-8 and lost, while its subject read right.
+- Clean Up leaves a message with a category another program gave it (`$label7`, shown as a category) where it is: every keyword starting with `$` was taken for a system mark, and such a message could be moved.
+- The search box says when part of a search was left out: a size or a yes-or-no it can't read (`larger:abc`, `isread:x`), or words past the 64th and names past a list's 50th. These were dropped without a word, and the search found more than was asked.
+- Exporting into an existing data file part of which can't be read back stops and leaves the file as it was, instead of adding contacts, calendar items, notes and tasks a second time.
+- Account setup still finds a provider's servers when the computer's first DNS resolver fails: the others weren't asked. Its lookups now carry a random id, so an answer can't be forged by guessing it.
+- Signing in with Google or Microsoft no longer fails when the browser opens an extra connection to MailCraft before the redirect.
+- Messages with unusual line endings (bare line feeds, or a mix) have their header read correctly when exported to or imported from an Outlook data file, or re-dated.
+- Exchange accounts with shared mailboxes or public folders no longer send a request again to every one of them when something isn't found: each folder's requests go where the folder is kept.
+- Changes made offline reach the server much faster when many are waiting (a thousand: 7 s instead of 25 s).
+- Syncing a very large calendar or address book is faster: the first read of 20,000 items took twice as long, and sending changed events was far slower.
+- Drafts kept on this computer while offline take a fraction of the room and time: each is a file of its own, and those kept by an earlier version are moved over the first time.
+- A POP account with more than about 130,000 messages left on the server downloads its mail instead of failing every check.
+- Checking a POP account that leaves many messages on the server, and moving or deleting many of them, is much faster.
+- The first download of a large POP mailbox is many times faster, and one stopped part-way never loses a message or brings one in twice.
+- A mail server sending a message date with an impossible year no longer crashes MailCraft; the date is ignored.
+- Large Exchange and calendar replies sent in small pieces are no longer refused as too big, and take less memory.
+- Exchange accounts with public folders sync faster: the public folder list is read once a sync instead of twice.
+- Turning an account's Work online only setting on or off no longer needs twice the account's size in memory.
+- Printing or saving as PDF a message with deeply nested tables is faster.
+- Removing an account while it searched the server or downloaded a message no longer brings its files back.
+- Syncing a very large IMAP folder kept whole is faster on servers without CONDSTORE.
+- A message sent from the Outbox is no longer sent again when its files can't be removed, and deleting or editing a queued message that can't be taken out of the Outbox now says so instead of sending it anyway.
+- When the disk fails to read MailCraft's cache, folders are no longer emptied or downloaded again, and an import says its folder list couldn't be read.
+- A damaged search index is rebuilt straight away over every folder, so search doesn't stay empty or partial.
+- A message whose source starts with bytes MailCraft uses inside its data file now reads back correctly, and no longer stops the data file from being compacted.
+- A signed message whose certificate is encoded in an unusual but valid way is now trusted when its issuer is, and shows the same fingerprint as other mail programs; one changed after it was signed is no longer accepted.
+- Signed mail sends your certificate exactly as your certificate authority issued it, so recipients can check it even when it's encoded unusually.
+- A message an Outlook file read again couldn't give is tried again on the next read, instead of being left out for good.
+- Flagging or categorising a message in a very large folder no longer rewrites megabytes of the folder's list.
+- An attachment opened while its message was still downloading now shows its preview once the file arrives, and previews no longer pile up in memory.
+- A POP account's Server settings now warn when its server doesn't use encryption, as adding the account already did.
+- When a dialog's OK is refused, MailCraft now says why, even in Select Names.
+- In the browser, a reply written in a message's own page now lists your contacts in Select Names.
+- Move to and Move folder find a folder by the name they show in your language.
+- Select Names adds someone whose address is part of another address, or of a name, already in the field.
+- Two video attachments with the same name now each show their own thumbnail.
+- An import no longer stops on its own when its account is switched to or from keeping mail online only.
+- A Microsoft or Google sign-in service that is busy or failing no longer makes MailCraft ask you to sign in again; it tries again later. A server that takes a renewed sign-in and then refuses it again is asked a few times, then at longer waits.
+- Exporting into an existing data file that can't be written to no longer loses track of its own Sent Items, Deleted Items, Drafts and Junk folders.
+- Exporting to a large Outlook data file is faster.
+- In the task list and the To-Do Bar, due dates are written in the order chosen under Dates, with the weekday.
+- On Windows without ffmpeg, video attachments now show their frame on a busy or slow computer too.
+- On Windows, changes made while an account syncs no longer briefly disappear from the folder it just synced.
+- Text with many unfinished links (`[a](` over and over, pasted or quoted in a reply) no longer slows the message editor down.
+- A reminder's event that is changed (renamed or moved) now shows so in the Reminders window at once.
+- The folder pane stays fast with thousands of folders.
+- People, Tasks and Notes stay fast with thousands of contacts, tasks or notes.
+- Picking Bold, a colour or another look with nothing selected no longer takes away Redo or makes the next Undo do nothing.
+- Undo no longer uses hundreds of megabytes of memory in a long message.
+- The message editor stays quick with a long selection while the ribbon or a menu is in use.
+- Writing a long message is smoother: the editor does much less work on each frame.
+- In the browser, a password-locked backup is refused, rather than locked with weak randomness, when the browser can't supply secure random numbers.
+- Replied and Forwarded marks owed by replies waiting in the Outbox are no longer lost when their file can't be read at start. MailCraft says when it couldn't be read.
+- On Linux, a data file whose name differs from an open one only in case is no longer refused as already open.
+- A refused edit of a message (an importance other than high, normal or low) no longer changes its recipients or text.
+- An Outlook message file over 16 MB opens even without its .msg extension.
+- Save all attachments no longer writes over a file when every numbered name is already taken.
+- A search from the command line no longer spins while read marks are being saved.
+- Dismissing a reminder for an event whose ID contains a "|" now sticks and reaches the server.
+- A directory search that failed is tried again after 30 seconds, not 5 minutes.
+- Flagging a whole folder at once no longer stalls the window when the To-Do Bar is open.
+- Push notifications from a JMAP server that ends its lines with a lone CR are understood.
+- Two JMAP folders whose names come out the same no longer swap their mail when the server lists them in another order.
+- A picture whose address is written with `&#38;` now loads when pictures are shown.
+- A file whose name appears in a picture's description no longer loses its paperclip.
+- A message can't set its text's size or typeface with the private characters MailCraft marks text with.
+- Pictures and buttons in newsletters' Outlook layouts take the size their style finally sets.
+- A page's background is taken out of a quoted message when its style isn't quoted, and `data-bgcolor` is left alone.
+- Pictures in pasted HTML are read from `file:` links on this computer only: one naming another computer was read as a path here.
+- Video attachments' thumbnails are made a couple at a time instead of all at once, and their frames no longer stay in memory for the whole session.
+- On Windows installed outside C:\Windows, the interface and PDFs use Segoe UI again, and Arabic and Hebrew text gets its font.
+- `--cmd` with bad JSON says so for the window's own commands too (ui.addAccount and others) instead of opening the dialog empty.
+- Started twice at the same moment, MailCraft no longer ends up opening a second window for every later launch.
+- Dragging an attachment out on Linux no longer floods the drop target with messages, and works for file names that aren't UTF-8.
+- In the browser, turning off "Keep unlocked in this browser" while a password is being sealed no longer leaves it kept.
+- `mailcraft-cli --help` now lists `--jmap`, `--cc` and `--timeout`.
+- With many web pictures loaded, the pictures of the open message and of the signature being written no longer disappear when others are shown.
+- An encrypted message on screen no longer asks for its key again after many other encrypted messages have been opened.
+- Reading a message in a very large folder is smoother: the reactions under it are no longer gathered on every frame.
+- A picture whose name starts with "signature" is no longer lost from a message when a signature is inserted.
+- An appointment from a damaged Outlook data file no longer comes in with a repeat rule calendars can't read; it comes in as a single event.
+- Commands on a very large selection (Select All, then Delete, Flag, Mark as Read or Mark Complete) are much faster.
+- Blocking a sender when the blocked list is full no longer drops them from Safe Senders, and a move to Junk that fails is now said. Block Sender on several messages says when the list was full for some of them.
+- A rules import that fails no longer leaves new categories behind.
+- When a server numbers a folder again, its old mail is no longer announced as new or run through rules again.
+- Clean Up is faster on folders where much of the mail is unread or flagged.
+- Ignoring a conversation when many are already ignored keeps it ignored.
+- Automatic replies on a mailbox kept on this computer no longer call it "the sample mailbox", and a failed move or copy names the folder as it's shown.
+- Searching the address book is faster with many contacts.
+- An event whose repeat rule has a frequency calendars don't define (such as FORTNIGHTLY) now still shows in the calendar, once.
+- Setting up an account whose address is typed with a trailing dot now finds the provider's servers.
+- Printing a message with a very long word followed by many accent marks no longer hangs.
+- Printing a message with huge text and a very long word no longer leaves near-empty pages.
+- A link that puts a name and password before its address is counted as a tracker, or not, by its real host.
+- A message attached inside a winmail.dat now opens the same way every time, and one with no date of its own no longer shows the time it was opened.
+- IMAP messages from servers that send bare line feeds no longer go missing.
+- Automatic replies work on servers that have a Sieve script named ok, no or bye.
+- A folder change no longer briefly empties the folder pane when the folder list can't be read.
+- Folders with millions of messages sync noticeably faster.
+- Automatic account setup no longer picks a server that a provider's settings file has commented out.
+- Exchange automatic replies containing <, > or & are kept as typed.
+- Exchange servers or proxies that name NTLM in lower case can be signed in to.
+- In Microsoft 365 accounts, pictures shown in a message's body no longer appear as attachments while the message is still downloading.
+- Public folders holding many subfolders now list them all.
+- Reminders written in unusual forms by other calendar programs are now found, changed and dismissed.
+- Calendar search is faster on large calendars.
+- Events with oddly written reminders from other programs can now be saved to the calendar server.
+- A message the server refused for good shows the server's reason in the Outbox, and no longer reads as one that will be tried again.
+- Sent mail is kept for outgoing servers whose names only end like Gmail's, and Gmail's own server is recognised however its name is written.
+- Signing or encrypting a message, and exporting, no longer wait forever when the computer can't start another task.
+- Clean Up keeps the message the list shows last: a reply from a computer whose clock is behind now counts as later than the message it quotes.
+- Mail deleted in MailCraft from a very large Outlook file no longer comes back at random when the file is read again.
+- Moving the data files to a network folder no longer fails when the copy was fine.
+- Adding messages that carry many custom properties to an Outlook data file is faster.
+- Reading large Outlook data files (importing from one, exporting into one) is faster.
+- Importing an Outlook data file with thousands of folders no longer stalls before the first message comes in.
+- An attachment whose long name is blank comes in under its short name instead of a name of spaces.
+- Messages attached side by side without their own ids no longer come in with the same id.
+- PDF previews draw text in bold when the PDF names a bold font it doesn't include.
+- The Read / Unread button's tooltip on the Home tab is now shown in your language.
+- Clicking a mailto: link in a message now fills in its subject and copies, and decodes characters such as %2E.
+- Save all in the browser now says which attachment couldn't be downloaded.
+- Accounts with thousands of folders, such as an imported Outlook file, update folder counts and delete folders faster.
+- S/MIME mail encrypted with AES-192-GCM can now be read.
+- Signed messages are checked faster.
+- A setting saved by another version that can't be read no longer resets all the others.
+- An event whose guest has a comma in their name can be saved again.
+- People's List view names an address book from the server the way the side pane does.
+- People's List view highlights the row under the pointer.
+- In a small window the month view shows all six weeks.
+- Searching a large mailbox for a phrase, and checking long result lists against the text kept, is faster.
+- Insert link reads an existing email link's subject and address however the link spells them.
+- Long messages open in several windows at once keep their scroll bars steady.
+- Newsletters with many centred lines and links draw faster.
+- Mail laid out in tables no longer slows down while its web pictures load.
+- A message with hundreds of pictures no longer slows down every frame of the reading pane.
+- In a very long formatted message, a picture inside a box over a deeply nested table is no longer shown again after the text.
+- A meeting whose invitation's id holds an invisible control character is found again on the calendar server.
+- An account removed while it was syncing no longer has its folder list come back.
+- An account removed while it was connecting or making a change no longer has its files come back.
+- On Linux, a MailCraft started by another program packaged as an AppImage (a `mailto:` link clicked in a browser, say) no longer puts its update over that program's AppImage: the program passes on where its own file is, and the updater took it for MailCraft's.
+- On a Linux desktop running Wayland without X11's libraries (which the `.deb` and `.rpm` only recommend), MailCraft opens on Wayland instead of failing to start: it asked for XWayland, where it opens by default, without looking for them first. The log names the ones missing.
+- On macOS 26, Chinese in the interface and in mail is drawn in PingFang again, which macOS moved: it came out in a Japanese or Korean font. Traditional Chinese takes STHeiti first, as PingFang's first face there is Simplified.
+- Chinese, Japanese and Korean words in a subject, a name or a message sit on the same line as the Latin letters and digits beside them, as in a browser: they were centred on it, a little higher or lower.
+- In the Flatpak, a screen reader (Orca) reads MailCraft's window, new mail is announced by the desktop's notifications, and the icon in the notification area is there: the sandbox let MailCraft reach none of them.
+- An internal error while the window or one of its windows was being drawn (a message, a dialog, a pane) no longer closes MailCraft with what's being written in it: it's said, the dialog it may have come from is put away, and MailCraft goes on. Only a window that fails frame after frame still closes, and keeps what's being written in Drafts first.
+- A window that was on a monitor since unplugged opens on screen when another monitor of the same size is left: it opened where no monitor was, out of reach. MailCraft now looks at where the monitors are, not their sizes alone, and brings a window it couldn't be dragged back by its top edge onto the main monitor.
+- On Windows, MailCraft started again in the instant the running one sets up to answer launches no longer waits five seconds and opens a second window: a launch that asked too early asks again, and Windows sometimes didn't tell the running MailCraft the first ask was gone, so it waited for it while the second one timed out.
+- On Windows, a pen or a finger moves the window by MailCraft's own title bar and resizes it from its edges, and drags a maximized window out restored, under the pen where it took it. It did nothing, and afterwards the mouse couldn't move the window either until MailCraft was restarted. A resize stops at the window's smallest size, as the mouse's does.
+- A screen reader says what each drop-down is for: **Font size** while writing, **When mail** and **Then** in a rule, **Show as**, **Reminder** and **Repeat** on an event or task, **Language** and **Dates** in **File › Options**, and the others with them. They were read only by what they showed ("combo box, 15 minutes"), and one showing nothing by nothing at all.
+
+## 0.38.0 - 2026-11-13
 
 *Messages as they look, on paper and from a file.*
 

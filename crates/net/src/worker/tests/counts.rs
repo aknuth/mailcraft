@@ -9,7 +9,7 @@ use super::*;
 /// under the new name, the folders in it with it.
 #[test]
 fn counts_said_before_a_rename_reaches_the_worker_follow_it() {
-    let store = crate::fake::tests_store("counts-follow-rename");
+    let store = crate::fake::store("counts-follow-rename");
     let pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
     let folder = |path: &str, unread, total| Folder {
         account: "a1".into(),
@@ -35,7 +35,6 @@ fn counts_said_before_a_rename_reaches_the_worker_follow_it() {
     assert_eq!(counts("Kept"), Some((1, 2)));
     assert_eq!(counts("Kept/2025"), Some((3, 4)));
     assert!(w.counts_unsaid.is_empty(), "{:?}", w.counts_unsaid);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Found in review: a POP account's folder made here had its worker write the folder list with
@@ -43,7 +42,7 @@ fn counts_said_before_a_rename_reaches_the_worker_follow_it() {
 /// writes its count) came back unread. The list keeps the window's counts, and says them.
 #[test]
 fn a_pop_folder_made_here_keeps_the_counts_of_mail_read_here() {
-    let store = crate::fake::tests_store("pop-counts-read-then-made");
+    let store = crate::fake::store("pop-counts-read-then-made");
     let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
     let inbox = Folder { account: "a1".into(), path: "INBOX".into(), selectable: true, unread: 3, total: 3, ..Default::default() };
     store.save_folders("a1", &[inbox]).unwrap();
@@ -65,5 +64,4 @@ fn a_pop_folder_made_here_keeps_the_counts_of_mail_read_here() {
         })
         .collect();
     assert_eq!(said, [(2, 3)]);
-    let _ = std::fs::remove_dir_all(store.root());
 }

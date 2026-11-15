@@ -8,8 +8,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::btree::{Changes, finish_page};
-use super::space::{self, AMAP_BYTES, MapKind, Space, run_at, run_of};
-use crate::messaging::NID_TYPE_NORMAL_FOLDER;
+use super::put_id;
+use super::space::{self, AMAP_BYTES, AMAP_INVALID, AMAP_VALID, DLIST_AT, MapKind, Space, run_at, run_of};
 use crate::messaging::PstStore;
 use crate::ndb::btree::{block_entry, block_entry_size, node_entry_size};
 use crate::ndb::*;
@@ -20,17 +20,6 @@ pub const ADD_MAX_VALUE_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Writes waiting to be made, to keep runs of blocks in one call.
 const WRITE_BUFFER: usize = 1 << 20;
-
-// Allocation map validity (`fAMapValid`).
-const AMAP_INVALID: u8 = 0;
-const AMAP_VALID: u8 = 2;
-
-const PT_AMAP: u8 = 0x84;
-const PT_PMAP: u8 = 0x83;
-const PT_FMAP: u8 = 0x82;
-const PT_FPMAP: u8 = 0x85;
-const PT_DLIST: u8 = 0x86;
-const DLIST_AT: u64 = 0x4200;
 
 /// A data file being changed.
 pub(crate) struct Editor {
@@ -113,11 +102,12 @@ impl Editor {
     fn find_free_space(&mut self) -> io::Result<()> {
         let (from, to) = self.space.scan();
         let eof = self.header.root.eof;
+        let bits_at = self.format().map_bits_at();
         let mut free = Vec::new();
         for i in from..to {
             let at = run_at(i);
             let Ok(page) = self.pst.page(at, PT_AMAP, at) else { return Ok(()) };
-            let bits = page.get(self.map_bits_at()..self.map_bits_at() + 496).ok_or_else(short)?;
+            let bits = page.get(bits_at..bits_at + MAP_BYTES).ok_or_else(short)?;
             free.extend(space::free_in(i, bits, eof));
         }
         if free.is_empty() {
@@ -130,10 +120,6 @@ impl Editor {
             self.maps_valid = false;
         }
         Ok(())
-    }
-
-    fn map_bits_at(&self) -> usize {
-        if self.format().wide() { 0 } else { 4 }
     }
 
     /// Whether nothing the file holds lies in the free ranges.
@@ -393,8 +379,8 @@ impl Editor {
         let old_runs = self.space.runs();
         let runs = self.space.final_runs();
         let mut delta = 0i64;
-        let bits_at = self.map_bits_at();
-        let mut amaps: BTreeMap<u64, [u8; 496]> = BTreeMap::new();
+        let bits_at = format.map_bits_at();
+        let mut amaps: BTreeMap<u64, [u8; MAP_BYTES]> = BTreeMap::new();
         let mut out = Vec::new();
         for i in old_runs..runs {
             let bits = space::new_bits(i);
@@ -418,7 +404,7 @@ impl Editor {
                     _ => PT_FPMAP,
                 };
                 let mut page = vec![0u8; PAGE];
-                page.get_mut(bits_at..bits_at + 496).ok_or_else(short)?.fill(filler);
+                page.get_mut(bits_at..bits_at + MAP_BYTES).ok_or_else(short)?.fill(filler);
                 finish_page(&mut page, format, ptype, at, at, false)?;
                 out.push((at, page));
                 at += PAGE as u64;
@@ -433,8 +419,8 @@ impl Editor {
                     if let std::collections::btree_map::Entry::Vacant(e) = amaps.entry(i) {
                         let at = run_at(i);
                         let page = self.pst.page(at, PT_AMAP, at)?;
-                        let mut bits = [0u8; 496];
-                        bits.copy_from_slice(page.get(bits_at..bits_at + 496).ok_or_else(short)?);
+                        let mut bits = [0u8; MAP_BYTES];
+                        bits.copy_from_slice(page.get(bits_at..bits_at + MAP_BYTES).ok_or_else(short)?);
                         e.insert(bits);
                     }
                     if let Some(bits) = amaps.get_mut(&i) {
@@ -446,7 +432,7 @@ impl Editor {
         for (i, bits) in amaps {
             let at = run_at(i);
             let mut page = vec![0u8; PAGE];
-            page.get_mut(bits_at..bits_at + 496).ok_or_else(short)?.copy_from_slice(&bits);
+            page.get_mut(bits_at..bits_at + MAP_BYTES).ok_or_else(short)?.copy_from_slice(&bits);
             finish_page(&mut page, format, PT_AMAP, at, at, false)?;
             out.push((at, page));
         }
@@ -467,15 +453,6 @@ impl Editor {
 
 fn apply_delta(v: u64, delta: i64) -> u64 {
     if delta >= 0 { v.saturating_add(delta.unsigned_abs()) } else { v.saturating_sub(delta.unsigned_abs()) }
-}
-
-fn put_id(out: &mut Vec<u8>, format: Format, id: u64) -> io::Result<()> {
-    if format.wide() {
-        out.extend(id.to_le_bytes());
-    } else {
-        out.extend(u32::try_from(id).map_err(|_| invalid("past what an ANSI data file can hold"))?.to_le_bytes());
-    }
-    Ok(())
 }
 
 /// A block entry as a leaf page keeps it.

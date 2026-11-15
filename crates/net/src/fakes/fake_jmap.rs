@@ -5,7 +5,6 @@
 //! `serve_for_the_browser`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +13,12 @@ use serde_json::{Map, Value, json};
 pub const ACCOUNT: &str = "A1";
 pub const USER: &str = "me@studio.example";
 pub const PASSWORD: &str = "pw";
+
+/// The account these tests sign in with (`id`, as [`USER`]), on the fake at `base`.
+pub fn account(id: &str, base: &str) -> mailcraft_model::AccountConfig {
+    mailcraft_model::AccountConfig { id: id.into(), email: USER.into(), username: USER.into(), jmap: Some(base.into()), ..Default::default() }
+}
+
 /// The most objects one `/get` takes (the session's `maxObjectsInGet`).
 const MAX_GET: usize = 100;
 
@@ -52,6 +57,9 @@ pub struct Data {
     /// with `Identity/set` are listed (their addresses).
     pub no_identity: bool,
     pub made_identities: Vec<String>,
+    /// What the client did that the fake checks it never does, each answered 400: the test
+    /// fails on any left here when the server is dropped (see [`Server`]'s `Drop`).
+    pub violations: Vec<String>,
     next: u32,
 }
 
@@ -100,30 +108,37 @@ impl Data {
     /// operators MailCraft asks, the words checked in the raw message.
     fn matches(&self, e: &Em, f: &Value) -> bool {
         if let Some(op) = f.get("operator").and_then(Value::as_str) {
-            let conds = f.get("conditions").and_then(Value::as_array).cloned().unwrap_or_default();
+            let conds = f.get("conditions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
             return match op {
                 "AND" => conds.iter().all(|c| self.matches(e, c)),
                 "OR" => conds.iter().any(|c| self.matches(e, c)),
                 _ => !conds.iter().any(|c| self.matches(e, c)),
             };
         }
-        let raw = String::from_utf8_lossy(&self.blobs.get(&e.blob).cloned().unwrap_or_default()).to_lowercase();
+        let word = |k: &str| f.get(k).and_then(Value::as_str);
+        let listed = word("inMailbox").is_none_or(|m| e.mailboxes.contains(m))
+            && word("hasKeyword").is_none_or(|k| e.keywords.contains(k))
+            && word("notKeyword").is_none_or(|k| !e.keywords.contains(k));
+        // The message's words read only when a condition asks for some.
+        if !listed || ["text", "from", "to", "subject", "body"].iter().all(|k| word(k).is_none()) {
+            return listed;
+        }
+        let raw = String::from_utf8_lossy(self.blobs.get(&e.blob).map(Vec::as_slice).unwrap_or_default()).to_lowercase();
         let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-        let header = |n: &str| head.split("\r\n").filter(|l| l.starts_with(&format!("{n}:"))).collect::<Vec<_>>().join(" ");
-        let has = |hay: &str, k: &str| f.get(k).and_then(Value::as_str).is_none_or(|w| hay.contains(&w.to_lowercase()));
-        f.get("inMailbox").and_then(Value::as_str).is_none_or(|m| e.mailboxes.contains(m))
-            && f.get("hasKeyword").and_then(Value::as_str).is_none_or(|k| e.keywords.contains(k))
-            && f.get("notKeyword").and_then(Value::as_str).is_none_or(|k| !e.keywords.contains(k))
-            && has(&raw, "text")
-            && has(&header("from"), "from")
-            && has(&header("to"), "to")
-            && has(&header("subject"), "subject")
-            && has(body, "body")
+        let has = |hay: &str, k: &str| word(k).is_none_or(|w| hay.contains(&w.to_lowercase()));
+        // A header's lines (`name:` first), when its condition is there.
+        let in_header = |n: &str| {
+            word(n).is_none() || {
+                let lines: Vec<&str> = head.split("\r\n").filter(|l| l.strip_prefix(n).is_some_and(|r| r.starts_with(':'))).collect();
+                has(&lines.join(" "), n)
+            }
+        };
+        has(&raw, "text") && in_header("from") && in_header("to") && in_header("subject") && has(body, "body")
     }
 
     fn email_json(&self, e: &Em) -> Value {
-        let raw = self.blobs.get(&e.blob).cloned().unwrap_or_default();
-        let text = String::from_utf8_lossy(&raw).to_string();
+        let raw = self.blobs.get(&e.blob).map(Vec::as_slice).unwrap_or_default();
+        let text = String::from_utf8_lossy(raw).to_string();
         let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
         let mut headers: Vec<(String, String)> = Vec::new();
         for line in head.split("\r\n") {
@@ -158,178 +173,37 @@ impl Data {
         })
     }
 
+    /// One method call: (the response's name, its result).
     fn method(&mut self, name: &str, args: &Value, earlier: &BTreeMap<String, Value>) -> (String, Value) {
         self.calls.push(name.to_string());
         if name.ends_with("/set") || name.ends_with("/import") {
             self.notify();
         }
-        let ids = |args: &Value| -> Option<Vec<String>> {
-            if let Some(r) = args.get("#ids") {
-                let of = r.get("resultOf")?.as_str()?;
-                return Some(earlier.get(of)?.get("ids")?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
-            }
-            args.get("ids")?.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        };
         match name {
-            "Mailbox/get" if self.fail_mailbox_get > 0 => {
-                self.fail_mailbox_get -= 1;
-                ("error".into(), json!({"type": "serverUnavailable"}))
-            }
-            "Mailbox/get" => {
-                let want = ids(args);
-                let list: Vec<Value> =
-                    self.mailboxes.iter().filter(|m| want.as_ref().is_none_or(|w| w.contains(&m.id))).map(|m| self.mailbox_json(m)).collect();
-                (name.into(), json!({"accountId": ACCOUNT, "state": "s", "list": list, "notFound": []}))
-            }
-            "Mailbox/set" => {
-                let mut created = Map::new();
-                for (k, v) in args.get("create").and_then(Value::as_object).cloned().unwrap_or_default() {
-                    let id = self.mailbox(v["name"].as_str().unwrap_or("?"), v["parentId"].as_str(), None);
-                    created.insert(k, json!({"id": id}));
-                }
-                let mut not_updated = Map::new();
-                for (id, v) in args.get("update").and_then(Value::as_object).cloned().unwrap_or_default() {
-                    match self.mailboxes.iter_mut().find(|m| m.id == id) {
-                        Some(m) => {
-                            m.name = v["name"].as_str().unwrap_or(&m.name).to_string();
-                            m.parent = v["parentId"].as_str().map(str::to_string);
-                        }
-                        None => {
-                            not_updated.insert(id, json!({"type": "notFound"}));
-                        }
-                    }
-                }
-                for id in args.get("destroy").and_then(Value::as_array).cloned().unwrap_or_default() {
-                    let id = id.as_str().unwrap_or_default().to_string();
-                    self.mailboxes.retain(|m| m.id != id);
-                    for e in &mut self.emails {
-                        e.mailboxes.remove(&id);
-                    }
-                    self.emails.retain(|e| !e.mailboxes.is_empty());
-                }
-                (name.into(), json!({"accountId": ACCOUNT, "created": created, "notUpdated": not_updated}))
-            }
-            "Email/query" => {
-                let mut found: Vec<&Em> = self.emails.iter().filter(|e| self.matches(e, &args["filter"])).collect();
-                found.sort_by(|a, b| b.received.cmp(&a.received));
-                let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
-                let position = args["position"].as_u64().unwrap_or(0) as usize;
-                let ids: Vec<&str> = found.iter().skip(position).take(limit).map(|e| e.id.as_str()).collect();
-                let mut answer = json!({"accountId": ACCOUNT, "queryState": "q", "ids": ids, "position": position});
-                if args["calculateTotal"] == Value::Bool(true) {
-                    answer["total"] = json!(found.len());
-                }
-                (name.into(), answer)
-            }
-            "Email/get" => {
-                let want = ids(args).unwrap_or_default();
-                // As a server refuses more than its maxObjectsInGet (RFC 8620 §5.1).
-                if want.len() > MAX_GET {
-                    return ("error".into(), json!({"type": "requestTooLarge"}));
-                }
-                let list: Vec<Value> = want.iter().filter_map(|id| self.email(id)).map(|e| self.email_json(e)).collect();
-                (name.into(), json!({"accountId": ACCOUNT, "state": "s", "list": list}))
-            }
-            "Email/set" => {
-                let mut not_updated = Map::new();
-                for (id, patch) in args.get("update").and_then(Value::as_object).cloned().unwrap_or_default() {
-                    let Some(e) = self.emails.iter_mut().find(|e| e.id == id) else {
-                        not_updated.insert(id, json!({"type": "notFound"}));
-                        continue;
-                    };
-                    for (path, v) in patch.as_object().cloned().unwrap_or_default() {
-                        let (field, key) = path.split_once('/').unwrap_or((&path, ""));
-                        let set = if field == "keywords" { &mut e.keywords } else { &mut e.mailboxes };
-                        if v == Value::Bool(true) {
-                            set.insert(key.to_string());
-                        } else {
-                            set.remove(key);
-                        }
-                    }
-                }
-                let destroy: Vec<String> = args
-                    .get("destroy")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                    .unwrap_or_default();
-                self.emails.retain(|e| !destroy.contains(&e.id));
-                (name.into(), json!({"accountId": ACCOUNT, "notUpdated": not_updated, "destroyed": destroy}))
-            }
-            "Email/import" => {
-                let mut created = Map::new();
-                for (k, v) in args.get("emails").and_then(Value::as_object).cloned().unwrap_or_default() {
-                    let blob = v["blobId"].as_str().unwrap_or_default().to_string();
-                    let id = self.id("E");
-                    let keys = |f: &str| v[f].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-                    self.emails.push(Em {
-                        id: id.clone(),
-                        blob: blob.clone(),
-                        mailboxes: keys("mailboxIds"),
-                        keywords: keys("keywords"),
-                        received: "2030-01-01T00:00:00Z".into(),
-                    });
-                    created.insert(k, json!({"id": id, "blobId": blob}));
-                }
-                (name.into(), json!({"accountId": ACCOUNT, "created": created}))
-            }
-            "Quota/get" => (
-                name.into(),
-                json!({"accountId": ACCOUNT, "list": [
-                    {"id": "q1", "resourceType": "count", "used": self.emails.len(), "hardLimit": 1000, "scope": "account"},
-                    {"id": "q2", "resourceType": "octets", "used": self.blobs.values().map(Vec::len).sum::<usize>(), "hardLimit": 1_000_000, "scope": "account"},
-                ]}),
-            ),
-            "VacationResponse/get" => {
-                let mut v = if self.vacation.is_object() { self.vacation.clone() } else { json!({"isEnabled": false}) };
-                v["id"] = json!("singleton");
-                (name.into(), json!({"accountId": ACCOUNT, "list": [v]}))
-            }
-            "VacationResponse/set" => {
-                let patch = args["update"]["singleton"].clone();
-                if patch["textBody"].as_str().is_some_and(|t| t.contains("refuse")) {
-                    return (
-                        name.into(),
-                        json!({"accountId": ACCOUNT, "notUpdated": {"singleton": {"type": "invalidProperties", "description": "not allowed"}}}),
-                    );
-                }
-                self.vacation = patch;
-                (name.into(), json!({"accountId": ACCOUNT, "updated": {"singleton": null}}))
-            }
-            "Identity/get" => {
-                let mut list: Vec<Value> = if self.no_identity { Vec::new() } else { vec![json!({"id": "I1", "email": USER, "name": "Me"})] };
-                list.extend(self.made_identities.iter().enumerate().map(|(i, e)| json!({"id": format!("M{i}"), "email": e, "name": ""})));
-                (name.into(), json!({"accountId": ACCOUNT, "list": list}))
-            }
-            "Identity/set" => {
-                let mut created = Map::new();
-                for (k, v) in args.get("create").and_then(Value::as_object).cloned().unwrap_or_default() {
-                    let email = v["email"].as_str().unwrap_or_default().to_string();
-                    created.insert(k, json!({"id": format!("M{}", self.made_identities.len())}));
-                    self.made_identities.push(email);
-                }
-                (name.into(), json!({"accountId": ACCOUNT, "created": created}))
-            }
-            "EmailSubmission/set" => {
-                let mut created = Map::new();
-                let mut not_created = Map::new();
-                for (k, v) in args.get("create").and_then(Value::as_object).cloned().unwrap_or_default() {
-                    let rcpt: Vec<String> = v["envelope"]["rcptTo"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|r| r["email"].as_str().map(str::to_string)).collect())
-                        .unwrap_or_default();
-                    if rcpt.iter().any(|r| r.starts_with("nobody@")) {
-                        not_created.insert(k, json!({"type": "forbiddenToSend", "description": "no such recipient"}));
-                        continue;
-                    }
-                    let from = v["envelope"]["mailFrom"]["email"].as_str().unwrap_or_default().to_string();
-                    self.submissions.push((v["emailId"].as_str().unwrap_or_default().to_string(), from, rcpt));
-                    created.insert(k, json!({"id": "S1"}));
-                }
-                (name.into(), json!({"accountId": ACCOUNT, "created": created, "notCreated": not_created}))
-            }
+            "Mailbox/get" => self.mailbox_get(name, ids(args, earlier)),
+            "Mailbox/set" => self.mailbox_set(name, args),
+            "Email/query" => self.email_query(name, args),
+            "Email/get" => self.email_get(name, ids(args, earlier)),
+            "Email/set" => self.email_set(name, args),
+            "Email/import" => self.email_import(name, args),
+            "Quota/get" => self.quota_get(name),
+            "VacationResponse/get" => self.vacation_get(name),
+            "VacationResponse/set" => self.vacation_set(name, args),
+            "Identity/get" => self.identity_get(name),
+            "Identity/set" => self.identity_set(name, args),
+            "EmailSubmission/set" => self.submission_set(name, args),
             _ => ("error".into(), json!({"type": "unknownMethod"})),
         }
     }
+}
+
+/// The ids a method's arguments name: given, or (`#ids`) an earlier call's result's.
+fn ids(args: &Value, earlier: &BTreeMap<String, Value>) -> Option<Vec<String>> {
+    if let Some(r) = args.get("#ids") {
+        let of = r.get("resultOf")?.as_str()?;
+        return Some(earlier.get(of)?.get("ids")?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+    }
+    args.get("ids")?.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
 }
 
 pub struct Server {
@@ -337,14 +211,16 @@ pub struct Server {
     pub data: Arc<Mutex<Data>>,
 }
 
-fn respond(s: &mut impl Write, status: u16, body: &[u8], kind: &str) {
-    let head = format!("HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n{CORS}Connection: close\r\n\r\n", body.len());
-    let _ = s.write_all(head.as_bytes());
-    let _ = s.write_all(body);
+impl Drop for Server {
+    /// A test whose client broke what the fake checks fails, even where it took the refusal.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let left = self.data.lock().map(|d| d.violations.clone()).unwrap_or_default();
+        assert!(left.is_empty(), "the client broke what the fake checks: {left:?}");
+    }
 }
-
-/// Any web page may call (a test server on this computer).
-const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, Accept\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 
 /// Start the server; it runs until the test process ends.
 pub fn serve(data: Data) -> Server {
@@ -356,511 +232,19 @@ pub fn serve_at(data: Data, port: u16) -> Server {
     let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
     let data = Arc::new(Mutex::new(data));
     let shared = data.clone();
-    let auth = format!("Basic {}", crate::imap::base64(format!("{USER}:{PASSWORD}").as_bytes()));
+    let auth = format!("Basic {}", mailcraft_model::base64::encode(format!("{USER}:{PASSWORD}").as_bytes()));
     std::thread::spawn(move || {
         for conn in l.incoming() {
             let Ok(s) = conn else { continue };
             let (shared, auth) = (shared.clone(), auth.clone());
-            std::thread::spawn(move || handle(s, &shared, &auth));
+            std::thread::spawn(move || serving::handle(s, &shared, &auth));
         }
     });
     Server { base, data }
 }
 
-/// One connection: one request (`Connection: close`), or an event stream held open.
-fn handle(mut s: std::net::TcpStream, shared: &Arc<Mutex<Data>>, auth: &str) {
-    {
-        {
-            let mut reader = BufReader::new(s.try_clone().unwrap());
-            let mut first = String::new();
-            if reader.read_line(&mut first).unwrap_or(0) == 0 {
-                return;
-            }
-            let (mut len, mut authorized) = (0usize, false);
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                    break;
-                }
-                let lower = line.to_ascii_lowercase();
-                if let Some(v) = lower.strip_prefix("content-length:") {
-                    len = v.trim().parse().unwrap_or(0);
-                }
-                if line.split_once(':').is_some_and(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.trim() == auth) {
-                    authorized = true;
-                }
-            }
-            let mut body = vec![0u8; len];
-            let _ = reader.read_exact(&mut body);
-            // A browser's CORS preflight carries no credentials.
-            if first.starts_with("OPTIONS ") {
-                respond(&mut s, 204, b"", "text/plain");
-                return;
-            }
-            if !authorized {
-                respond(&mut s, 401, b"{}", "application/json");
-                return;
-            }
-            let path = first.split(' ').nth(1).unwrap_or("/").to_string();
-            let mut d = shared.lock().unwrap();
-            if path.starts_with("/events/") {
-                assert!(path.contains("types=%2A") || path.contains("types=*"), "{path}");
-                let (tx, rx) = std::sync::mpsc::channel::<String>();
-                d.listeners.push(tx);
-                drop(d);
-                let _ =
-                    s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{CORS}Transfer-Encoding: chunked\r\n\r\n").as_bytes());
-                loop {
-                    let msg = match rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                        Ok(m) => format!("event: state\r\ndata: {m}\r\n\r\n"),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ": keep-alive\n\nevent: ping\ndata: {\"interval\":1}\n\n".to_string(),
-                        Err(_) => break,
-                    };
-                    if s.write_all(format!("{:x}\r\n{msg}\r\n", msg.len()).as_bytes()).is_err() {
-                        break;
-                    }
-                }
-                return;
-            }
-            if path == "/.well-known/jmap" {
-                let session = json!({
-                    "capabilities": {"urn:ietf:params:jmap:core": {"maxObjectsInGet": MAX_GET}, "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {}, "urn:ietf:params:jmap:quota": {}, "urn:ietf:params:jmap:vacationresponse": {}},
-                    "accounts": {ACCOUNT: {"name": USER}},
-                    "primaryAccounts": {"urn:ietf:params:jmap:mail": ACCOUNT, "urn:ietf:params:jmap:submission": ACCOUNT},
-                    "username": USER,
-                    "apiUrl": "/api/",
-                    "downloadUrl": "/download/{accountId}/{blobId}/{name}?accept={type}",
-                    "uploadUrl": "/upload/{accountId}/",
-                    "eventSourceUrl": "/events/?types={types}&closeafter={closeafter}&ping={ping}",
-                    "state": "1",
-                });
-                respond(&mut s, 200, session.to_string().as_bytes(), "application/json");
-            } else if path == "/api/" {
-                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let mut earlier = BTreeMap::new();
-                let mut out = Vec::new();
-                for call in req["methodCalls"].as_array().cloned().unwrap_or_default() {
-                    let (name, args, id) =
-                        (call[0].as_str().unwrap_or_default().to_string(), call[1].clone(), call[2].as_str().unwrap_or_default().to_string());
-                    let (rname, result) = d.method(&name, &args, &earlier);
-                    earlier.insert(id.clone(), result.clone());
-                    out.push(json!([rname, result, id]));
-                }
-                respond(&mut s, 200, json!({"methodResponses": out, "sessionState": "1"}).to_string().as_bytes(), "application/json");
-            } else if let Some(rest) = path.strip_prefix(&format!("/download/{ACCOUNT}/")) {
-                let blob = rest.split('/').next().unwrap_or_default();
-                match d.blobs.get(blob) {
-                    Some(raw) => respond(&mut s, 200, &raw.clone(), "message/rfc822"),
-                    None => respond(&mut s, 404, b"", "text/plain"),
-                }
-            } else if path == format!("/upload/{ACCOUNT}/") {
-                let blob = d.id("B");
-                d.blobs.insert(blob.clone(), body.clone());
-                let r = json!({"accountId": ACCOUNT, "blobId": blob, "type": "message/rfc822", "size": body.len()});
-                respond(&mut s, 201, r.to_string().as_bytes(), "application/json");
-            } else {
-                respond(&mut s, 404, b"", "text/plain");
-            }
-        }
-    }
-}
-
+mod account;
+mod mail;
+mod serving;
 #[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use mailcraft_model::job::Secret;
-    use mailcraft_model::{AccountConfig, Event, Flag, Job, Op, SyncStatus};
-    use mailcraft_store::Store;
-
-    use super::*;
-
-    fn until(pool: &crate::worker::Pool, what: &str, mut f: impl FnMut(&Event) -> bool) -> Vec<Event> {
-        let end = Instant::now() + Duration::from_secs(20);
-        let mut seen = Vec::new();
-        while Instant::now() < end {
-            if let Some(e) = pool.wait(Duration::from_millis(100)) {
-                let hit = f(&e);
-                seen.push(e);
-                if hit {
-                    return seen;
-                }
-            }
-        }
-        panic!("timed out waiting for {what}; saw {seen:?}");
-    }
-
-    fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-        let end = Instant::now() + Duration::from_secs(10);
-        while !f() {
-            assert!(Instant::now() < end, "never: {what}");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// A JMAP folder kept no more than the server's `maxObjectsInGet` (100 here) whatever it was
-    /// to keep, so Show more showed nothing more: the newest are asked a page at a time.
-    #[test]
-    fn a_jmap_folder_keeps_more_than_one_get() {
-        let mut d = Data::default();
-        let inbox = d.mailbox("Inbox", None, Some("inbox"));
-        for n in 1..=250 {
-            d.deliver(
-                &inbox,
-                &mail(&format!("Message {n}"), &format!("p{n}")),
-                &["$seen"],
-                &format!("2024-05-{:02}T{:02}:{:02}:00Z", 1 + n / 60, n % 24, n % 60),
-            );
-        }
-        let server = serve(d);
-        let dir = std::env::temp_dir().join(format!("mailcraft-jmap-pages-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        let c = crate::jmap::Client::connect(&server.base, USER, PASSWORD, false).unwrap();
-        let mut st = crate::jmap::State::default();
-        crate::jmap::list_folders(&c, &mut st, "a1").unwrap();
-        let opts = |window| crate::sync::SyncOptions { window, prefetch: 0, ..Default::default() };
-        let r = crate::jmap::sync_folder(&c, &mut st, &store, "a1", "INBOX", &opts(1000)).unwrap();
-        assert_eq!((store.load_folder("a1", "INBOX").unwrap().messages.len(), r.total), (250, 250));
-        crate::jmap::sync_folder(&c, &mut st, &store, "a1", "INBOX", &opts(150)).unwrap();
-        assert_eq!(store.load_folder("a1", "INBOX").unwrap().messages.len(), 150, "a window of 150 keeps 150");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Gap #7: searching a JMAP server (`Email/query` with a filter) for mail past the window.
-    #[test]
-    fn a_jmap_server_is_searched_past_the_window() {
-        let mut d = Data::default();
-        let inbox = d.mailbox("Inbox", None, Some("inbox"));
-        let mut ids = Vec::new();
-        for n in 1..=25 {
-            ids.push(
-                d.deliver(
-                    &inbox,
-                    &format!(
-                        "From: Zoe Park <zoe@x.example>\r\nTo: me@x.example\r\nSubject: Message {n}\r\nMessage-ID: <s{n}@x>\r\n\r\nBody tag{n}.\r\n"
-                    )
-                    .into_bytes(),
-                    if n <= 5 { &[] } else { &["$seen"] },
-                    &format!("2024-05-{n:02}T09:00:00Z"),
-                ),
-            );
-        }
-        let server = serve(d);
-        let account =
-            AccountConfig { id: "a1".into(), email: USER.into(), username: USER.into(), jmap: Some(server.base.clone()), ..Default::default() };
-        let data = server.data.clone();
-        crate::fake::search_the_server_past_the_window("jmap-search", account, PASSWORD, &|n, read| {
-            let mut d = data.lock().unwrap();
-            let id = ids[n as usize - 1].clone();
-            if read {
-                d.emails.iter_mut().filter(|e| e.id == id).for_each(|e| {
-                    e.keywords.insert("$seen".into());
-                });
-            } else {
-                d.emails.retain(|e| e.id != id);
-            }
-        });
-    }
-
-    fn mail(subject: &str, id: &str) -> Vec<u8> {
-        format!("From: Zoe Park <zoe@studio.example>\r\nTo: {USER}\r\nSubject: {subject}\r\nMessage-ID: <{id}@x>\r\n\r\nHello about {subject}.\r\n")
-            .into_bytes()
-    }
-
-    /// A rename, then a change naming the folder by its new name, with the folder listing in
-    /// between failing once (a busy server): the change waits for a fresh listing and is made,
-    /// not dropped as refused for want of the folder's id. (Seen once in CI: "never: deleted".)
-    #[test]
-    fn a_change_after_a_rename_outlives_a_failed_listing() {
-        let mut d = Data::default();
-        d.mailbox("Inbox", None, Some("inbox"));
-        d.mailbox("Sent", None, Some("sent"));
-        d.mailbox("Old name", None, None);
-        let server = serve(d);
-        let data = server.data.clone();
-        let dir = std::env::temp_dir().join(format!("mailcraft-jmap-relist-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        crate::fakes::fake_dav::looked_for_today(&store, "a1");
-        let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-        let account =
-            AccountConfig { id: "a1".into(), email: USER.into(), username: USER.into(), jmap: Some(server.base.clone()), ..Default::default() };
-        pool.submit(Job::Start { account, password: Some(Secret(PASSWORD.into())) });
-        until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-        // Both queued before the worker gets to them, the listing after the rename failing.
-        data.lock().unwrap().fail_mailbox_get = 1;
-        store.add_op("a1", Op::RenameFolder { from: "Old name".into(), to: "Clients".into() }).unwrap();
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::DeleteFolder { path: "Clients".into() } });
-        eventually("renamed, then deleted", || {
-            let d = data.lock().unwrap();
-            d.by_name("Old name").is_none() && d.by_name("Clients").is_none()
-        });
-        assert_eq!(data.lock().unwrap().fail_mailbox_get, 0, "the listing did fail once");
-        let mut failed = Vec::new();
-        while let Some(e) = pool.wait(Duration::from_millis(200)) {
-            if let Event::OpFailed { op, error, .. } = e {
-                failed.push(format!("{op:?}: {error}"));
-            }
-        }
-        assert!(failed.is_empty(), "{failed:?}");
-        pool.submit(Job::Remove { account: "a1".into() });
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_jmap_account_syncs_changes_and_sends() {
-        let mut d = Data::default();
-        let inbox = d.mailbox("Inbox", None, Some("inbox"));
-        d.mailbox("Sent", None, Some("sent"));
-        d.mailbox("Trash", None, Some("trash"));
-        let projects = d.mailbox("Projects", None, None);
-        let first = d.deliver(&inbox, &mail("Storyboard", "m1"), &["$seen"], "2024-05-06T09:00:00Z");
-        let second = d.deliver(&inbox, &mail("Sound mix", "m2"), &[], "2024-05-06T10:00:00Z");
-        d.deliver(&projects, &mail("Plan", "m3"), &["$seen", "$label1"], "2024-05-01T10:00:00Z");
-        let server = serve(d);
-        let data = server.data.clone();
-
-        let dir = std::env::temp_dir().join(format!("mailcraft-jmap-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        crate::fakes::fake_dav::looked_for_today(&store, "a1");
-        let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-        let account = AccountConfig {
-            id: "a1".into(),
-            name: "Me".into(),
-            email: USER.into(),
-            username: USER.into(),
-            jmap: Some(server.base.clone()),
-            ..Default::default()
-        };
-        assert!(!account.is_local());
-
-        // A wrong password is reported, not retried.
-        pool.submit(Job::Start { account: account.clone(), password: Some(Secret("nope".into())) });
-        until(&pool, "password prompt", |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
-
-        pool.submit(Job::Start { account: account.clone(), password: Some(Secret(PASSWORD.into())) });
-        let seen = until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-        let folders = seen
-            .iter()
-            .find_map(|e| match e {
-                Event::Folders { folders, .. } => Some(folders.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let paths: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, ["INBOX", "Sent", "Trash", "Projects"]);
-        assert_eq!((folders[0].total, folders[0].unread), (2, 1), "counts come with the list");
-        let st = store.load_folder("a1", "INBOX").unwrap();
-        let subjects: Vec<&str> = st.messages.iter().map(|m| m.subject.as_str()).collect();
-        assert_eq!(subjects, ["Sound mix", "Storyboard"], "newest first");
-        assert!(st.messages[1].flags.seen && !st.messages[0].flags.seen);
-        assert_eq!(st.messages[0].from.email, "zoe@studio.example");
-        assert!(st.messages[0].preview.contains("Hello about"));
-        assert!(store.has_body(&st.messages[0].key), "the newest sources are downloaded");
-        let plan = store.load_folder("a1", "Projects").unwrap();
-        assert!(plan.messages[0].flags.has("$label1"), "keywords become categories");
-
-        // Open a message whose source isn't cached.
-        let key = st.messages[0].key.clone();
-        store.remove_body(&key);
-        pool.submit(Job::FetchBody { key: key.clone() });
-        until(&pool, "body", |e| matches!(e, Event::Body { key: k, raw } if *k == key && raw.starts_with(b"From:")));
-
-        // Mark read, then move: the cache at once, the server right after.
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::SetFlag { keys: vec![key.clone()], flag: Flag::Seen, on: true } });
-        eventually("the server has the flag", || data.lock().unwrap().email(&second).unwrap().keywords.contains("$seen"));
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::Move { keys: vec![key.clone()], to: "Projects".into() } });
-        eventually("moved on the server", || data.lock().unwrap().email(&second).unwrap().mailboxes == [projects.clone()].into());
-        until(&pool, "the move shows in Projects", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "Projects"));
-        assert!(
-            store.load_folder("a1", "Projects").unwrap().messages.iter().any(|m| m.subject == "Sound mix" && m.key.uid == key.uid),
-            "same message, same number"
-        );
-
-        // Folders: create inside Projects, rename it, delete it.
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::CreateFolder { path: "Projects/Caf&AOk-".into() } });
-        eventually("created", || data.lock().unwrap().by_name("Café").is_some_and(|m| m.parent.as_deref() == Some(projects.as_str())));
-        until(&pool, "folder list", |e| matches!(e, Event::Folders { folders, .. } if folders.iter().any(|f| f.path == "Projects/Caf&AOk-")));
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::RenameFolder { from: "Projects/Caf&AOk-".into(), to: "Clients".into() } });
-        eventually("renamed", || data.lock().unwrap().by_name("Clients").is_some_and(|m| m.parent.is_none()));
-        until(&pool, "renamed in the list", |e| matches!(e, Event::Folders { folders, .. } if folders.iter().any(|f| f.path == "Clients")));
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::DeleteFolder { path: "Clients".into() } });
-        eventually("deleted", || data.lock().unwrap().by_name("Clients").is_none());
-
-        // New mail arrives: the server pushes the change and the Inbox updates by itself (once
-        // the worker is listening again after its last sync).
-        eventually("listening for changes", || !data.lock().unwrap().listeners.is_empty());
-        data.lock().unwrap().deliver(&inbox, &mail("Festival poster", "m4"), &[], "2024-05-07T08:00:00Z");
-        until(&pool, "new mail, pushed", |e| {
-            matches!(e, Event::FolderChanged { folder, .. } if folder == "INBOX")
-                && store.load_folder("a1", "INBOX").unwrap().messages.first().is_some_and(|m| m.subject == "Festival poster")
-        });
-
-        // Mailbox settings: the space used, automatic replies, emptying Deleted Items.
-        assert!(seen.iter().any(|e| matches!(e, Event::Quota { used, limit: 1_000_000, .. } if *used > 0)), "the quota comes with a full sync");
-        // The addresses it sends from, as the server keeps them (issue #81).
-        pool.submit(Job::FindIdentities { account: "a1".into() });
-        let seen = until(&pool, "identities", |e| matches!(e, Event::IdentitiesFound { .. }));
-        let Some(Event::IdentitiesFound { found, error: None, .. }) = seen.last() else { panic!("{:?}", seen.last()) };
-        assert_eq!(found.iter().map(|i| (i.email.as_str(), i.name.as_str())).collect::<Vec<_>>(), [(USER, "Me")]);
-        pool.submit(Job::GetVacation { account: "a1".into() });
-        until(&pool, "replies read", |e| matches!(e, Event::Vacation { vacation: Some(v), error: None, .. } if !v.enabled));
-        let away = mailcraft_model::job::Vacation {
-            enabled: true,
-            subject: "Away".into(),
-            text: "Back on Monday".into(),
-            from: Some("2026-10-15".into()),
-            until: Some("2026-10-20".into()),
-            ..Default::default()
-        };
-        pool.submit(Job::SetVacation { account: "a1".into(), vacation: away.clone() });
-        until(&pool, "replies on", |e| matches!(e, Event::Vacation { vacation: Some(v), error: None, .. } if *v == away));
-        assert_eq!(data.lock().unwrap().vacation["toDate"], "2026-10-20T23:59:59Z");
-        pool.submit(Job::SetVacation { account: "a1".into(), vacation: mailcraft_model::job::Vacation { text: "refuse".into(), ..away.clone() } });
-        until(&pool, "a refused change", |e| matches!(e, Event::Vacation { vacation: Some(v), error: Some(_), .. } if *v == away));
-        let trash = data.lock().unwrap().by_name("Trash").unwrap().id.clone();
-        for i in 0..3 {
-            data.lock().unwrap().deliver(&trash, &mail(&format!("Old {i}"), &format!("t{i}")), &[], "2024-01-01T00:00:00Z");
-        }
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::EmptyFolder { path: "Trash".into() } });
-        eventually("Trash emptied", || !data.lock().unwrap().emails.iter().any(|e| e.mailboxes.contains(&trash)));
-
-        // Delete for good.
-        let gone = store.load_folder("a1", "INBOX").unwrap().messages.iter().find(|m| m.subject == "Storyboard").unwrap().key.clone();
-        pool.submit(Job::Apply { account: "a1".into(), op: Op::Expunge { keys: vec![gone] } });
-        eventually("destroyed", || data.lock().unwrap().email(&first).is_none());
-
-        // Send: stored in Sent, then submitted.
-        let raw = b"From: me@studio.example\r\nTo: zoe@studio.example\r\nSubject: e2e\r\nMessage-ID: <e2e@x>\r\n\r\nhi\r\n".to_vec();
-        let send = |id: u64, to: &str| Job::Send {
-            account: "a1".into(),
-            id,
-            raw: raw.clone(),
-            from: USER.into(),
-            recipients: vec![to.into()],
-            sent_folder: Some("Sent".into()),
-        };
-        pool.submit(send(7, "zoe@studio.example"));
-        until(&pool, "sent", |e| matches!(e, Event::Sent { id: 7, .. }));
-        until(&pool, "the copy in Sent", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "Sent"));
-        {
-            let d = data.lock().unwrap();
-            let (email, from, rcpt) = d.submissions.last().unwrap().clone();
-            assert_eq!((from.as_str(), rcpt), (USER, vec!["zoe@studio.example".to_string()]));
-            assert!(d.email(&email).unwrap().keywords.contains("$seen"));
-        }
-        assert_eq!(store.load_folder("a1", "Sent").unwrap().messages[0].subject, "e2e");
-        // Refused by the server: reported, and no copy left in Sent.
-        let sent_before = data.lock().unwrap().emails.len();
-        pool.submit(send(8, "nobody@studio.example"));
-        until(&pool, "refused", |e| matches!(e, Event::SendFailed { id: 8, error, .. } if error.contains("no such recipient")));
-        assert_eq!(data.lock().unwrap().emails.len(), sent_before);
-
-        // A draft replaces its earlier copy.
-        pool.submit(Job::SaveDraft { account: "a1".into(), raw: mail("Draft one", "d1"), folder: "Sent".into(), replaces: None });
-        until(&pool, "draft", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "Sent"));
-        let draft = store.load_folder("a1", "Sent").unwrap().messages.iter().find(|m| m.subject == "Draft one").unwrap().key.clone();
-        assert!(store.load_folder("a1", "Sent").unwrap().find(draft.uid).unwrap().flags.draft);
-        pool.submit(Job::SaveDraft { account: "a1".into(), raw: mail("Draft two", "d2"), folder: "Sent".into(), replaces: Some(draft) });
-        eventually("one draft left", || {
-            let d = data.lock().unwrap();
-            d.emails.iter().filter(|e| e.keywords.contains("$draft")).count() == 1
-        });
-
-        // The numbering survives a restart.
-        let numbers = jmap_number(&store, &second);
-        pool.submit(Job::Remove { account: "a1".into() });
-        assert_eq!(numbers, Some(key.uid));
-        assert!(data.lock().unwrap().calls.iter().any(|c| c == "EmailSubmission/set"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A JMAP account the server made with no identity to send from (Stalwart's new accounts):
-    /// one is made for the address, and the mail goes; the next sends use it.
-    #[test]
-    fn an_account_with_no_identity_gets_one_and_sends() {
-        let mut d = Data { no_identity: true, ..Default::default() };
-        d.mailbox("Inbox", None, Some("inbox"));
-        d.mailbox("Sent", None, Some("sent"));
-        let server = serve(d);
-        let data = server.data.clone();
-        let dir = std::env::temp_dir().join(format!("mailcraft-jmap-identity-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        crate::fakes::fake_dav::looked_for_today(&store, "a1");
-        let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-        let account = AccountConfig {
-            id: "a1".into(),
-            name: "Me".into(),
-            email: USER.into(),
-            username: USER.into(),
-            jmap: Some(server.base.clone()),
-            ..Default::default()
-        };
-        pool.submit(Job::Start { account, password: Some(Secret(PASSWORD.into())) });
-        until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-        let raw = b"From: me@studio.example\r\nTo: zoe@studio.example\r\nSubject: first\r\nMessage-ID: <id1@x>\r\n\r\nhi\r\n".to_vec();
-        for id in [1, 2] {
-            pool.submit(Job::Send {
-                account: "a1".into(),
-                id,
-                raw: raw.clone(),
-                from: USER.into(),
-                recipients: vec!["zoe@studio.example".into()],
-                sent_folder: Some("Sent".into()),
-            });
-            until(&pool, "sent", |e| matches!(e, Event::Sent { id: i, .. } if *i == id));
-        }
-        let d = data.lock().unwrap();
-        assert_eq!(d.made_identities, [USER.to_string()], "made once, then used");
-        assert_eq!(d.submissions.len(), 2);
-        drop(d);
-        drop(pool);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// For trying the browser app by hand: a sample JMAP server at http://127.0.0.1:8775 (or
-    /// `MAILCRAFT_FAKE_JMAP_PORT`) for ten minutes, signing in as `me@studio.example` / `pw`.
-    /// `cargo test -p mailcraft-net serve_for_the_browser -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn serve_for_the_browser() {
-        let mut d = Data::default();
-        let inbox = d.mailbox("Inbox", None, Some("inbox"));
-        d.mailbox("Drafts", None, Some("drafts"));
-        d.mailbox("Sent", None, Some("sent"));
-        d.mailbox("Trash", None, Some("trash"));
-        let projects = d.mailbox("Projects", None, None);
-        d.deliver(&inbox, &mail("Storyboard", "m1"), &["$seen"], "2026-10-14T09:00:00Z");
-        d.deliver(&inbox, &mail("Sound mix", "m2"), &[], "2026-10-15T06:00:00Z");
-        d.deliver(&projects, &mail("Plan", "m3"), &["$seen"], "2026-10-01T10:00:00Z");
-        // `MAILCRAFT_FAKE_COUNT`: that many older ones in Projects ("Message 1" the oldest, each
-        // body `needle-<n>`), for more mail than the page keeps (gap #7).
-        let count: u32 = std::env::var("MAILCRAFT_FAKE_COUNT").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
-        for n in 1..=count.min(20_000) {
-            let raw = format!(
-                "From: Zoe Park <zoe@studio.example>\r\nTo: {USER}\r\nSubject: Message {n}\r\nMessage-ID: <old{n}@x>\r\n\r\nOld body needle-{n}.\r\n"
-            );
-            let at = format!("2025-01-{:02}T{:02}:{:02}:00Z", 1 + n / 1440, n / 60 % 24, n % 60);
-            d.deliver(&projects, raw.as_bytes(), &["$seen"], &at);
-        }
-        let port = std::env::var("MAILCRAFT_FAKE_JMAP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8775);
-        let server = serve_at(d, port);
-        println!("JMAP at {}/.well-known/jmap ({USER} / {PASSWORD})", server.base);
-        // New mail now and then, to watch push bring it in.
-        for n in 1..=10 {
-            std::thread::sleep(Duration::from_secs(60));
-            let subject = format!("Pushed message {n}");
-            server.data.lock().unwrap().deliver(&inbox, &mail(&subject, &format!("push{n}")), &[], "2026-10-15T12:00:00Z");
-            println!("delivered {subject}");
-        }
-    }
-
-    fn jmap_number(store: &Store, id: &str) -> Option<u32> {
-        let mut st = crate::jmap::State::load(store, "a1");
-        let known = st.id(1).is_some() || st.id(2).is_some();
-        known.then(|| st.number(id))
-    }
-}
+mod tests;

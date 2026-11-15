@@ -1,24 +1,11 @@
 use super::*;
-use crate::layout::{Block, Table, Width, html_layout, inline_css};
+use crate::layout::{Width, html_layout, inline_css};
+use crate::tests::util::{message, shown, tables};
 
 mod cap;
 mod deep;
 mod marks;
 mod written;
-
-/// Every table in `blocks`, those inside cells too.
-fn tables(blocks: &[Block]) -> Vec<&Table> {
-    let mut out = Vec::new();
-    for b in blocks {
-        if let Block::Table(t) = b {
-            out.push(t);
-            for c in t.rows.iter().flatten() {
-                out.extend(tables(&c.blocks));
-            }
-        }
-    }
-    out
-}
 
 /// What Outlook answers: Office is 16, it isn't Internet Explorer, VML is false (Word's own copy
 /// of a pasted picture, the picture given beside it); what can't be made out is false.
@@ -115,21 +102,27 @@ fn vml_is_read_as_html() {
     assert_eq!(as_outlook_reads(r#"<v:rect><p>x</p>"#), r#"<div style="display:block"><p>x</p></div>"#);
 }
 
-/// Hostile input: tens of thousands of comments never closed, tags never ended, deep shapes,
-/// text that isn't ASCII around every marker; quick, whole, and no panic.
+/// Tens of thousands of comments never closed, tags never ended, deep shapes, text that isn't
+/// ASCII around every marker, and a button cut at every byte.
+fn hostile_conditionals() -> Vec<String> {
+    let mut all = vec![
+        "<!--[if mso]>é<![if !mso]>ü<v:rect a=\"".repeat(40_000),
+        "<v:rect><v:fill src=\"x\">".repeat(10_000),
+        "<xml>".repeat(50_000),
+        format!("<!--[if {}]>x<![endif]-->", "é".repeat(500)),
+    ];
+    let s = "<!--[if mso]><v:roundrect href=\"h\" fillcolor=\"#fff\">é<![endif]-->";
+    all.extend((0..60).map(|cut| s.get(..cut).unwrap_or(s).to_string()));
+    all
+}
+
+/// Hostile input: quick, whole, and no panic. Quick is counted: the bytes looked through, held
+/// in proportion to the message whatever the machine's load.
 #[test]
 fn hostile_conditionals_stay_quick() {
-    let started = std::time::Instant::now();
-    let many = "<!--[if mso]>é<![if !mso]>ü<v:rect a=\"".repeat(40_000);
-    let _ = as_outlook_reads(&many);
-    let _ = as_outlook_reads(&"<v:rect><v:fill src=\"x\">".repeat(10_000));
-    let _ = as_outlook_reads(&"<xml>".repeat(50_000));
-    let _ = as_outlook_reads(&format!("<!--[if {}]>x<![endif]-->", "é".repeat(500)));
-    for cut in 0..60 {
-        let s = "<!--[if mso]><v:roundrect href=\"h\" fillcolor=\"#fff\">é<![endif]-->";
-        let _ = as_outlook_reads(s.get(..cut).unwrap_or(s));
+    for html in hostile_conditionals() {
+        let _ = work::linear(html.len(), || as_outlook_reads(&html));
     }
-    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
 }
 
 /// Issue #47: a newsletter of columns laid side by side with `inline-block`, which gives Outlook
@@ -158,14 +151,8 @@ fn outlooks_pictures_are_held_back_as_any() {
     let raw = "From: a@shop.example\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n<table width=\"600\"><tr><td>\
                <!--[if gte mso 9]><v:rect style=\"width:600px\"><v:fill type=\"frame\" src=\"https://img.example/banner.jpg\"/><v:textbox><![endif]-->\
                <h1>Autumn</h1><!--[if gte mso 9]></v:textbox></v:rect><![endif]--></td><td>b</td></tr></table>";
-    let p = crate::parse(raw.as_bytes()).unwrap_or_default();
+    let p = crate::parse(raw.as_bytes()).expect("the message parses");
     assert!(p.images.iter().any(|i| i == "https://img.example/banner.jpg"), "{:?}", p.images);
-}
-
-/// A message of `html`, as received.
-fn message(html: &str) -> crate::Parsed {
-    let raw = format!("From: a@shop.example\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n{html}");
-    crate::parse(raw.as_bytes()).unwrap_or_default()
 }
 
 /// Found in review: a picture pasted from Word or Outlook comes with Word's VML copy of it
@@ -231,16 +218,20 @@ fn an_unbalanced_comment_hides_nothing_after_it() {
     assert_eq!(as_outlook_reads("<!--[if mso]><!-- -->K<!--<![endif]-->tail"), "<!-- -->Ktail");
 }
 
+/// Thousands of fills, and a page's style sheet of thousands of `{`.
+fn many_fills_and_braces() -> (String, String) {
+    let fills = r#"<v:rect><v:fill color="red"/></v:rect>x"#.repeat(40_000);
+    (fills, format!("<body bgcolor=x><style>{}}}</style><p>a</p>", "{".repeat(200_000)))
+}
+
 /// Found in review: thousands of fills each written into their shape's style as they came, and
 /// a page's style sheet of thousands of `{`, took seconds to minutes at the size of a message.
+/// The work is counted, held in proportion to the message.
 #[test]
 fn many_fills_and_braces_stay_quick() {
-    let started = std::time::Instant::now();
-    let fills = r#"<v:rect><v:fill color="red"/></v:rect>x"#.repeat(40_000);
-    assert!(as_outlook_reads(&fills).contains("background-color:red"));
-    let braces = format!("<body bgcolor=x><style>{}}}</style><p>a</p>", "{".repeat(200_000));
-    let _ = crate::html_to_rich(&braces);
-    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    let (fills, braces) = many_fills_and_braces();
+    assert!(work::linear(fills.len(), || as_outlook_reads(&fills)).contains("background-color:red"));
+    let _ = work::linear(braces.len(), || crate::html_to_rich(&braces));
 }
 
 /// Found in review: an address's `&amp;` (every address with more than one parameter) has a `;`,
@@ -332,11 +323,6 @@ fn the_text_is_what_is_shown() {
         r#"<!--[if mso]><p>For Outlook</p><![endif]--><!--[if !mso]><!--><p>For the others</p><!--<![endif]--><a href="https://x.example/" style="mso-hide:all">Hidden copy</a>"#,
     );
     assert!(p.text.contains("For Outlook") && !p.text.contains("For the others") && !p.text.contains("Hidden copy"), "{:?}", p.text);
-}
-
-/// The words a message shows, its lines joined by `|`.
-fn shown(p: &crate::Parsed) -> String {
-    p.rich.iter().map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>()).collect::<Vec<_>>().join("|")
 }
 
 /// Found in review: a comment left open in Outlook's copy was cut at its last `<!--`, wherever
@@ -653,16 +639,42 @@ fn hostile_copies_read_no_more_than_they_show() {
 /// Found in review: reading through Outlook's copy looked for a comment's `--!>`, a
 /// declaration's `>` or a reference's `;` to the end of the copy from each one in turn, so a
 /// megabyte of comments took half a minute, four of them eight minutes. Each is looked through
-/// once now, as the whole message (the fuzz seed `outlook-read-once` has each case).
+/// once now, as the whole message (the fuzz seed `outlook-read-once` has each case): the bytes
+/// looked through are counted, held in proportion to the message.
 #[test]
 fn outlooks_copy_is_read_through_once() {
-    let mb = |unit: &str| unit.repeat(1_000_000 / unit.len());
-    let started = std::time::Instant::now();
-    for copy in [mb("<!-- x -->"), mb("<!-- x --!>"), mb("<!"), mb("</ "), mb("&"), mb("<? ")] {
-        let _ = outlook_copy(&format!("<!--[if mso]>{copy}<![endif]-->Tail"));
-        let _ = hidden_from_outlook(&format!(r#"<p style="mso-hide:all">x</p>{copy}"#));
+    for (copy, hidden) in megabytes_of_comments() {
+        let _ = work::linear(copy.len(), || outlook_copy(&copy));
+        let _ = work::linear(hidden.len(), || hidden_from_outlook(&hidden));
     }
-    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
+/// A megabyte of comments, declarations, `</` and references, in Outlook's copy and after what's
+/// hidden from Outlook.
+fn megabytes_of_comments() -> impl Iterator<Item = (String, String)> {
+    ["<!-- x -->", "<!-- x --!>", "<!", "</ ", "&", "<? "].into_iter().map(|unit| {
+        let copy = unit.repeat(1_000_000 / unit.len());
+        (format!("<!--[if mso]>{copy}<![endif]-->Tail"), format!(r#"<p style="mso-hide:all">x</p>{copy}"#))
+    })
+}
+
+/// How long the hostile copies above take to read: `cargo test --release -p mailcraft-mime --lib
+/// how_long_hostile_copies_take -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn how_long_hostile_copies_take() {
+    let took = |what: &str, f: &dyn Fn()| {
+        let started = std::time::Instant::now();
+        f();
+        println!("MEASURE {what}: {} ms", started.elapsed().as_millis());
+    };
+    took("hostile conditionals", &|| hostile_conditionals().iter().for_each(|h| drop(as_outlook_reads(h))));
+    let (fills, braces) = many_fills_and_braces();
+    took("40,000 fills", &|| drop(as_outlook_reads(&fills)));
+    took("200,000 braces", &|| drop(crate::html_to_rich(&braces)));
+    for (copy, hidden) in megabytes_of_comments() {
+        took(&format!("a megabyte of {:?}", &copy[13..23]), &|| drop((outlook_copy(&copy), hidden_from_outlook(&hidden))));
+    }
 }
 
 /// Found in review: Office's `<xml>` settings were looked for in comments, scripts, style sheets
@@ -690,4 +702,25 @@ fn xml_in_a_comment_or_raw_text_drops_nothing() {
     // An `<xml>` element is still dropped, a comment in it or not.
     let p = message("<!--[if gte mso 9]><xml><!-- x --><o:PixelsPerInch>96</o:PixelsPerInch></xml><![endif]--><p>Body</p>");
     assert!(!shown(&p).contains("96") && shown(&p).contains("Body"), "{:?}", shown(&p));
+}
+
+/// Every pass picks a style's value as CSS does ([`crate::css::pick`]): the last declaration, or
+/// the last marked `!important`. Outlook's pictures and buttons took the first, a picture's size
+/// and text too small to see the last whatever was `!important`.
+#[test]
+fn a_styles_value_is_the_one_css_picks() {
+    let read = as_outlook_reads(r#"<!--[if mso]><v:image style="width:1px;width:600px;height:40px" src="https://x.example/a.png"/><![endif]-->"#);
+    assert!(read.contains("width=\"600\""), "{read}");
+    let read =
+        as_outlook_reads(r#"<!--[if mso]><v:roundrect style="width:100px;width:200px;height:40px" arcsize="10%">Go</v:roundrect><![endif]-->"#);
+    assert!(read.contains("width:200px") && !read.contains("width:100px"), "{read}");
+    // Behind what's drawn after it, as big as the layout reads it: not a pixel drawn over it.
+    let read = as_outlook_reads(
+        r#"<!--[if mso]><v:image style="position:absolute;width:1px;height:1px;width:600px;height:300px" src="https://x.example/hero.png"/><![endif]-->"#,
+    );
+    assert!(!read.contains("<img"), "{read}");
+    let sizes = crate::html::picture_sizes(r#"<img src="https://x.example/p.png" style="width:600px !important;width:1px">"#);
+    assert_eq!(sizes.first().and_then(|(_, s)| s.width), Some(crate::layout::Width::Px(600)));
+    assert!(mso_hidden("mso-hide:none;mso-hide:all") && mso_hidden("mso-hide:all !important;mso-hide:none"));
+    assert!(mso_hidden("MSO-HIDE : ALL") && !mso_hidden("mso-hide:all;mso-hide:none"));
 }

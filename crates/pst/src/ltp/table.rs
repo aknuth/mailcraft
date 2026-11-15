@@ -3,13 +3,12 @@
 use std::io;
 use std::rc::Rc;
 
-use super::Heap;
 use super::props::stored;
 use super::value::{self, PropertyType, PropertyValue};
+use super::{Heap, TC_SIG};
 use crate::ndb::{NID_TYPE_MASK, PstFile, SubNodes};
 use crate::util::{invalid, short, u8_at, u16_at, u32_at};
 
-const TC_SIG: u8 = 0x7C;
 /// Rows read at most, whatever the blocks hold.
 const MAX_ROWS: usize = 1 << 24;
 /// Cells of a table written again at most, and the bytes of text they may hold: past what the
@@ -156,31 +155,24 @@ impl Table {
         }
     }
 
-    fn read_value(&self, row: &Row, column: &Column) -> io::Result<Option<PropertyValue>> {
-        let bytes = self.bytes(row).ok_or_else(short)?;
+    /// The cell of `column` in a row's `bytes`: `None` when the row's existence bitmap says it
+    /// has none there.
+    fn cell<'b>(&self, bytes: &'b [u8], column: &Column) -> io::Result<Option<&'b [u8]>> {
         let bit = usize::from(column.bit);
-        let flag = u8_at(bytes, self.bitmap + bit / 8)?;
-        if flag & (0x80 >> (bit % 8)) == 0 {
+        if u8_at(bytes, self.bitmap + bit / 8)? & (0x80 >> (bit % 8)) == 0 {
             return Ok(None);
         }
         let start = usize::from(column.offset);
-        let cell = bytes.get(start..start + usize::from(column.size)).ok_or_else(short)?;
+        bytes.get(start..start + usize::from(column.size)).ok_or_else(short).map(Some)
+    }
+
+    fn read_value(&self, row: &Row, column: &Column) -> io::Result<Option<PropertyValue>> {
+        let bytes = self.bytes(row).ok_or_else(short)?;
+        let Some(cell) = self.cell(bytes, column)? else { return Ok(None) };
         let kind = column.prop_type;
-        // A cell too small for the value holds where it is kept (MS-PST 2.3.4.4.1).
-        let held = matches!(
-            kind,
-            PropertyType::INT16
-                | PropertyType::INT32
-                | PropertyType::FLOAT32
-                | PropertyType::ERROR
-                | PropertyType::BOOLEAN
-                | PropertyType::FLOAT64
-                | PropertyType::CURRENCY
-                | PropertyType::APP_TIME
-                | PropertyType::INT64
-                | PropertyType::TIME
-        );
-        if held {
+        // A value that fits the row is in its cell; a bigger one is kept elsewhere, and the cell
+        // holds where (MS-PST 2.3.4.4.1).
+        if PropertyType(kind).row_width().is_some() {
             return value::parse(kind, cell).map(Some);
         }
         // Marked as there, but with nothing kept: no value.
@@ -195,6 +187,12 @@ impl Table {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn ends(&self) -> [u16; 4] {
         [self.ends[0], self.ends[1], u16::try_from(self.bitmap).unwrap_or(0), u16::try_from(self.width).unwrap_or(0)]
+    }
+
+    /// The subnodes its rows and values are kept in.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn subnodes(&self) -> &SubNodes {
+        &self.subs
     }
 
     /// That each column lies in the row, before the bitmap, and on no other: what the table says
@@ -214,7 +212,7 @@ impl Table {
     /// Its rows, each as the cells it has, to be written again.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn new_rows(&self) -> io::Result<Vec<crate::write_table::NewRow>> {
-        use crate::write_table::{Cell, NewRow, kept_elsewhere};
+        use crate::write_table::{Cell, NewRow};
         self.check_columns()?;
         if self.rows.len().saturating_mul(self.columns.len()) > MAX_CELLS {
             return Err(invalid("a table of more cells than can be written again"));
@@ -225,14 +223,11 @@ impl Table {
             let bytes = self.bytes(row).ok_or_else(short)?;
             let mut cells = Vec::with_capacity(self.columns.len());
             for c in &self.columns {
-                let bit = usize::from(c.bit);
-                if u8_at(bytes, self.bitmap + bit / 8)? & (0x80 >> (bit % 8)) == 0 {
+                let Some(raw) = self.cell(bytes, c)? else {
                     cells.push(None);
                     continue;
-                }
-                let start = usize::from(c.offset);
-                let raw = bytes.get(start..start + usize::from(c.size)).ok_or_else(short)?;
-                cells.push(Some(if kept_elsewhere(c.prop_type) {
+                };
+                cells.push(Some(if PropertyType(c.prop_type).row_width().is_none() {
                     let hnid = u32_at(raw, 0)?;
                     if hnid == 0 {
                         Cell::Bytes(Vec::new())

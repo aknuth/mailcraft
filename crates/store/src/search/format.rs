@@ -3,6 +3,9 @@
 //! checked (lengths against what's left, counts against caps, doc ids against the meta's), so a
 //! damaged or hostile file is an error, never a panic or a huge allocation.
 
+use std::ops::Range;
+use std::sync::Arc;
+
 use mailcraft_model::search::IndexDoc;
 
 use super::*;
@@ -142,6 +145,144 @@ pub(crate) fn put_var(out: &mut Vec<u8>, mut v: u64) {
 
 fn put_len(out: &mut Vec<u8>, n: usize) {
     put_var(out, n as u64);
+}
+
+/// Numbers kept rising, the first as it is and each after as the step from the one before (a
+/// varint each): a word's docs, below the index's next doc, or a doc's places of a word.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Rising {
+    /// Docs below this one.
+    Docs(u32),
+    Places,
+}
+
+impl Rising {
+    fn past(self) -> &'static str {
+        match self {
+            Rising::Docs(_) => "doc past the ids",
+            Rising::Places => "place past the end",
+        }
+    }
+
+    fn out_of_order(self) -> &'static str {
+        match self {
+            Rising::Docs(_) => "docs out of order",
+            Rising::Places => "places out of order",
+        }
+    }
+
+    /// `n` of them read from `r`: each step more than nothing, none past the end.
+    fn read(self, r: &mut Rd<'_>, n: usize) -> R<Vec<u32>> {
+        // Each is at least a byte.
+        let mut out = Vec::with_capacity(n.min(r.left()));
+        let mut last: Option<u32> = None;
+        for _ in 0..n {
+            let d = r.var32()?;
+            let v = match last {
+                None => d,
+                Some(l) if d > 0 => l.checked_add(d).ok_or(self.past())?,
+                Some(_) => return Err(self.out_of_order()),
+            };
+            if let Rising::Docs(below) = self
+                && v >= below
+            {
+                return Err(self.past());
+            }
+            out.push(v);
+            last = Some(v);
+        }
+        Ok(out)
+    }
+}
+
+/// Numbers rising, none twice, added to `out` as [`Rising`] reads them.
+fn put_rising(out: &mut Vec<u8>, values: &[u32]) {
+    let mut last: Option<u32> = None;
+    for &v in values {
+        put_var(out, u64::from(last.map_or(v, |l| v.wrapping_sub(l))));
+        last = Some(v);
+    }
+}
+
+/// Most bytes set aside for a run before it is read (its length is the file's word).
+const RUN_RESERVE: usize = 16 << 20;
+
+/// Which of a segment's pages a run of bytes is in: a word's docs ([`Postings::At`]) or its
+/// places ([`PosAt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Run {
+    Postings,
+    Places,
+}
+
+impl Run {
+    /// Page `p` of segment `seg`.
+    fn name(self, seg: u32, p: u32) -> Name {
+        match self {
+            Run::Postings => Name::SegPost(seg, p),
+            Run::Places => Name::SegPos(seg, p),
+        }
+    }
+
+    /// The segment's pages of this kind.
+    fn pages(self, info: &SegInfo) -> u32 {
+        match self {
+            Run::Postings => info.post_pages,
+            Run::Places => info.pos_pages,
+        }
+    }
+
+    /// A page's bytes past its header.
+    fn data(self, page: &[u8]) -> R<&[u8]> {
+        match self {
+            Run::Postings => decode_post_page(page),
+            Run::Places => decode_pos_page(page),
+        }
+    }
+
+    fn past_segment(self) -> &'static str {
+        match self {
+            Run::Postings => "postings past the segment",
+            Run::Places => "places past the segment",
+        }
+    }
+
+    fn past_page(self) -> &'static str {
+        match self {
+            Run::Postings => "postings past the page",
+            Run::Places => "places past the page",
+        }
+    }
+
+    /// `len` bytes of segment `info`'s pages of this kind, from `offset` in page `page` and on
+    /// into the next pages from their starts: each page one the segment has, and holding some of
+    /// what's left. `fetch` reads page `p`'s file (named `path` under `base`).
+    pub(crate) fn read(
+        self,
+        base: &Path,
+        info: &SegInfo,
+        (page, offset, len): (u32, usize, usize),
+        mut fetch: impl FnMut(u32, &Path) -> Result<Arc<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
+        let mut bytes: Vec<u8> = Vec::with_capacity(len.min(RUN_RESERVE));
+        let (mut p, mut from) = (page, offset);
+        while bytes.len() < len {
+            let path = self.name(info.id, p).path(base);
+            if p >= self.pages(info) {
+                return Err(damaged(&path, self.past_segment()));
+            }
+            let raw = fetch(p, &path)?;
+            let data = self.data(&raw).map_err(|what| damaged(&path, what))?;
+            let rest = data.get(from..).ok_or_else(|| damaged(&path, self.past_page()))?;
+            let want = (len - bytes.len()).min(rest.len());
+            if want == 0 {
+                return Err(damaged(&path, self.past_page()));
+            }
+            bytes.extend_from_slice(rest.get(..want).unwrap_or_default());
+            (p, from) = (p.saturating_add(1), 0);
+        }
+        Ok(bytes)
+    }
 }
 
 /// A text page as of the generation that wrote it.
@@ -538,10 +679,13 @@ pub(crate) fn decode_blob(b: &[u8]) -> R<Blob> {
     Ok(blob)
 }
 
+/// A text page's bytes for each text before the text: its doc and its length.
+pub(crate) const TEXT_REC_HEAD: usize = 8;
+
 /// A text page: each doc's text, by doc (rising).
 pub(crate) fn encode_text_page<'a>(recs: impl Iterator<Item = (u32, &'a [u8])>) -> Vec<u8> {
     let recs: Vec<(u32, &[u8])> = recs.collect();
-    let mut out = Vec::with_capacity(7 + recs.iter().map(|(_, b)| b.len() + 8).sum::<usize>());
+    let mut out = Vec::with_capacity(7 + recs.iter().map(|(_, b)| b.len() + TEXT_REC_HEAD).sum::<usize>());
     out.extend_from_slice(TEXT);
     out.push(VERSION);
     out.extend_from_slice(&u16::try_from(recs.len()).unwrap_or(u16::MAX).to_le_bytes());
@@ -555,24 +699,115 @@ pub(crate) fn encode_text_page<'a>(recs: impl Iterator<Item = (u32, &'a [u8])>) 
 
 /// A text page's texts (not yet read), their docs rising and below `next_doc`.
 pub(crate) fn decode_text_page(b: &[u8], next_doc: u32) -> R<Vec<(u32, &[u8])>> {
+    let at = text_page_index(b, next_doc)?;
+    Ok(at.into_iter().map(|(doc, at)| (doc, b.get(at).unwrap_or_default())).collect())
+}
+
+/// A text page's texts as [`decode_text_page`] reads them: each doc and where its text is in
+/// the page (kept by a reader asked for one text after another of the same page).
+pub(crate) fn text_page_index(b: &[u8], next_doc: u32) -> R<Vec<(u32, Range<usize>)>> {
     if b.len() > MAX_TEXT_PAGE {
         return Err("too big");
     }
     let mut r = Rd::new(b);
     r.header(TEXT)?;
     let n = usize::from(r.u16()?);
-    if n.saturating_mul(8) > r.left() {
+    if n.saturating_mul(TEXT_REC_HEAD) > r.left() {
         return Err("texts past what's there");
     }
-    let mut out: Vec<(u32, &[u8])> = Vec::with_capacity(n);
+    let mut out: Vec<(u32, Range<usize>)> = Vec::with_capacity(n);
     for _ in 0..n {
         let doc = r.u32()?;
         let len = r.u32()? as usize;
         if doc >= next_doc || out.last().is_some_and(|(d, _)| *d >= doc) {
             return Err("text of a doc out of order");
         }
-        out.push((doc, r.take(len)?));
+        let start = b.len() - r.left();
+        r.take(len)?;
+        out.push((doc, start..start + len));
     }
     r.end()?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(magic: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        [magic.as_slice(), &[VERSION], data].concat()
+    }
+
+    proptest::proptest! {
+        /// Rising numbers read back as they went in, as docs and as places; read as docs, one
+        /// at or past the doc given is damage.
+        #[test]
+        fn rising_numbers_read_back(v in proptest::collection::btree_set(proptest::prelude::any::<u32>(), 0..40)) {
+            let v: Vec<u32> = v.into_iter().collect();
+            let mut b = Vec::new();
+            put_rising(&mut b, &v);
+            for kind in [Rising::Places, Rising::Docs(u32::MAX)] {
+                let mut r = Rd::new(&b);
+                let got = kind.read(&mut r, v.len());
+                proptest::prop_assert!(r.end().is_ok() || got.is_err());
+                match kind {
+                    Rising::Docs(_) if v.last() == Some(&u32::MAX) => proptest::prop_assert_eq!(got, Err("doc past the ids")),
+                    _ => proptest::prop_assert_eq!(got, Ok(v.clone())),
+                }
+            }
+            if let Some(&last) = v.last() {
+                proptest::prop_assert_eq!(Rising::Docs(last).read(&mut Rd::new(&b), v.len()), Err("doc past the ids"));
+            }
+        }
+    }
+
+    /// Each way rising numbers can be damaged, the words said for docs and for places.
+    #[test]
+    fn rising_numbers_damaged() {
+        let read = |kind: Rising, b: &[u8], n| kind.read(&mut Rd::new(b), n);
+        assert_eq!(read(Rising::Docs(10), &[3, 0], 2), Err("docs out of order"), "a step of nothing");
+        assert_eq!(read(Rising::Places, &[3, 0], 2), Err("places out of order"));
+        let over = [0xff, 0xff, 0xff, 0xff, 0x0f, 1];
+        assert_eq!(read(Rising::Docs(u32::MAX), &over, 2), Err("doc past the ids"), "past u32");
+        assert_eq!(read(Rising::Places, &over, 2), Err("place past the end"));
+        assert_eq!(read(Rising::Docs(5), &[2, 3], 2), Err("doc past the ids"), "at the doc given");
+        assert_eq!(read(Rising::Docs(5), &[5], 1), Err("doc past the ids"), "the first too");
+        assert_eq!(read(Rising::Places, &[2], 2), Err("cut short"));
+        assert_eq!(read(Rising::Places, &[0x80, 0x80, 0x80, 0x80, 0x10], 1), Err("number too big"));
+        assert_eq!(read(Rising::Docs(5), &[2, 2], 2), Ok(vec![2, 4]));
+    }
+
+    /// A run read across pages; and each way one can be wrong, damage of the page it is in.
+    #[test]
+    fn a_run_reads_across_pages_or_is_damage() {
+        let base = Path::new("idx");
+        let info = SegInfo { id: 3, lex_pages: 1, post_pages: 2, pos_pages: 2, ..SegInfo::default() };
+        let files = [
+            (Name::SegPost(3, 0), page(POST, b"abcdef")),
+            (Name::SegPost(3, 1), page(POST, b"ghij")),
+            (Name::SegPos(3, 0), page(POS, b"klm")),
+            (Name::SegPos(3, 1), page(POST, b"nop")),
+        ];
+        let read = |kind: Run, at| {
+            let mut pages = Vec::new();
+            let fetch = |p, path: &Path| {
+                pages.push(p);
+                let file = files.iter().find(|(n, _)| n.path(base) == path).map(|(_, b)| Arc::new(b.clone()));
+                file.ok_or_else(|| damaged(path, "no such file"))
+            };
+            let got = kind.read(base, &info, at, fetch).map_err(|e| e.to_string());
+            (got, pages)
+        };
+        let at = |p: &str| Path::new("idx").join("s").join(p).display().to_string();
+        let damage = |p: &str, what: &str| Err(format!("{}: damaged ({what})", at(p)));
+        assert_eq!(read(Run::Postings, (0, 4, 4)), (Ok(b"efgh".to_vec()), vec![0, 1]));
+        assert_eq!(read(Run::Postings, (1, 9, 0)), (Ok(Vec::new()), vec![]), "nothing to read");
+        assert_eq!(read(Run::Postings, (1, 2, 4)).0, damage("3-p2.bin", "postings past the segment"));
+        assert_eq!(read(Run::Postings, (0, 7, 1)).0, damage("3-p0.bin", "postings past the page"));
+        assert_eq!(read(Run::Postings, (0, 6, 1)).0, damage("3-p0.bin", "postings past the page"), "nothing left in it");
+        assert_eq!(read(Run::Places, (0, 1, 2)), (Ok(b"lm".to_vec()), vec![0]));
+        assert_eq!(read(Run::Places, (0, 1, 4)).0, damage("3-x1.bin", "not this kind of file"));
+        assert_eq!(read(Run::Places, (0, 3, 1)).0, damage("3-x0.bin", "places past the page"));
+        assert_eq!(read(Run::Places, (2, 0, 1)).0, damage("3-x2.bin", "places past the segment"));
+    }
 }

@@ -66,6 +66,77 @@ fn a_local_move_that_cant_read_or_write_leaves_the_mail_where_it_was() {
     assert!(all_kept(&s, &folder(&s, SHORT_FILM)));
 }
 
+/// The path a folder's list is written to ends with this.
+fn list_of(folder: &str) -> String {
+    format!("f{:016x}/state.json", mailcraft_store::fnv64(folder))
+}
+
+/// A local move whose copies are filed but whose sources can't be taken out (their list can't be
+/// written) failed: the mail is in both folders, and there's nothing to undo. It said it was
+/// moved, with an Undo that couldn't put it back.
+#[test]
+fn a_local_move_that_cant_take_the_mail_out_says_so() {
+    let mut s = failing_session();
+    let inbox = folder(&s, "INBOX");
+    let film = folder(&s, SHORT_FILM);
+    let k = key_of(&s, "Character turnarounds");
+    s.run("list.select", &k).unwrap();
+    let undo = s.undo.len();
+    store(&s).fail(None, Some(&list_of("INBOX")));
+    let r = s.run("mail.move", &json!({"folder": SHORT_FILM}));
+    store(&s).fail(None, None);
+    assert!(matches!(&r, Err(CmdError::Failed(e)) if e.contains(SHORT_FILM)), "{r:?}");
+    assert_eq!(s.undo.len(), undo, "nothing to undo");
+    assert_eq!(subjects(&folder(&s, "INBOX")), subjects(&inbox), "still where it was");
+    assert_eq!(folder(&s, SHORT_FILM).messages.len(), film.messages.len() + 1, "and copied");
+    assert!(s.list.iter().any(|m| m.subject == "Character turnarounds"), "shown where it still is");
+}
+
+/// The same into a folder whose name isn't ASCII: named as it reads, not as its path is kept
+/// (`Caf&AOk-`).
+#[test]
+fn a_local_move_that_cant_take_the_mail_out_names_the_folder_as_it_reads() {
+    let mut s = failing_session();
+    s.run("folder.create", &json!({"name": "Café"})).unwrap();
+    let to = mailcraft_model::utf7::encode("Café");
+    assert_ne!(to, "Café");
+    s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
+    let k = key_of(&s, "Character turnarounds");
+    s.run("list.select", &k).unwrap();
+    store(&s).fail(None, Some(&list_of("INBOX")));
+    let r = s.run("mail.move", &json!({"folder": to}));
+    store(&s).fail(None, None);
+    assert!(matches!(&r, Err(CmdError::Failed(e)) if e.contains("copied to Café,") && !e.contains(&to)), "{r:?}");
+}
+
+/// Mail moved to a server whose copy is there, but that can't be deleted here, is said to be in
+/// both places.
+#[test]
+fn mail_moved_to_a_server_that_cant_be_deleted_here_says_so() {
+    let mut s = failing_session();
+    let server = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
+    let trash =
+        mailcraft_model::Folder { account: server.clone(), path: "Trash".into(), role: FolderRole::Trash, selectable: true, ..Default::default() };
+    s.apply(Event::Folders { account: server.clone(), folders: vec![trash] });
+    s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
+    let inbox = folder(&s, "INBOX");
+    let k = key_of(&s, "Character turnarounds");
+    let key: mailcraft_model::MessageKey = s.list.iter().find(|m| m.subject == "Character turnarounds").unwrap().key.clone();
+    s.run("list.select", &k).unwrap();
+    s.run("mail.move", &json!({"folder": "Trash", "account": server})).unwrap();
+    s.take_jobs();
+    store(&s).fail(None, Some(&list_of("INBOX")));
+    s.apply(Event::CopiesFiled { account: server.clone(), folder: "Trash".into(), done: vec![key], failed: vec![], moved: true });
+    store(&s).fail(None, None);
+    assert!(
+        s.notices.iter().any(|n| n.error && n.text.starts_with("The mail was copied to Trash, but couldn't be deleted where it was")),
+        "{:?}",
+        s.notices
+    );
+    assert!(!s.notices.iter().any(|n| n.text.contains("moved to Trash")), "not said to be moved: {:?}", s.notices);
+    assert_eq!(subjects(&folder(&s, "INBOX")), subjects(&inbox), "still here");
+}
+
 #[test]
 fn filing_locally_that_cant_read_or_write_keeps_the_draft_and_the_message() {
     let mut s = failing_session();
@@ -184,4 +255,105 @@ fn rules_and_snoozes_that_cant_be_read_arent_written_over() {
             assert_eq!(after.1, before.1, "the snoozes aren't saved over");
         }
     }
+}
+
+/// The Replied and Forwarded flags owed by replies waiting in the Outbox (`pending-marks.json`),
+/// when they can't be read at start, aren't saved over by the next reply queued.
+#[test]
+fn owed_flags_that_cant_be_read_arent_written_over() {
+    let cache = Store::failing();
+    let mut s = Session::open(Some(cache.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
+    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
+    let inbox =
+        mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() };
+    let key = mailcraft_model::MessageKey { account: id.clone(), folder: "INBOX".into(), validity: 9, uid: 1 };
+    let hello = mailcraft_model::Summary { key: key.clone(), subject: "Hello".into(), date: NOW - 60, ..Default::default() };
+    cache.save_folder(&id, "INBOX", &FolderState { validity: 9, uid_next: 2, messages: vec![hello.into()], ..Default::default() }).unwrap();
+    // A reply the network layer couldn't send: in the Outbox, its Replied flag owed (the
+    // account's folders as its sync finds them).
+    let queue_reply = |s: &mut Session| {
+        s.apply(Event::Folders { account: id.clone(), folders: vec![inbox.clone()] });
+        s.run("folder.open", &json!({"account": id, "folder": "INBOX"})).unwrap();
+        s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
+        s.run("list.open", &json!({"key": key.to_id()})).unwrap();
+        s.apply(Event::Body { key: key.clone(), raw: b"From: a@b.example\r\nSubject: Hello\r\nMessage-ID: <h@b>\r\n\r\nHi\r\n".to_vec() });
+        s.run("mail.reply", &json!({})).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        let Some(Job::Send { id: send_id, .. }) = s.take_jobs().into_iter().find(|j| matches!(j, Job::Send { .. })) else { panic!("not sent") };
+        s.apply(Event::Queued { account: id.clone(), id: send_id, error: "offline".into(), kind: Default::default() });
+    };
+    queue_reply(&mut s);
+    let owed = || cache.load_doc::<Value>("pending-marks.json").unwrap();
+    let before = owed();
+    assert_eq!(before.as_array().map(Vec::len), Some(1), "{before}");
+    drop(s);
+    cache.fail(Some("pending-marks.json"), None);
+    // (Later, so the reply has an id of its own.)
+    let mut s = Session::open(Some(cache.clone()), mailcraft_model::dates::Clock::new(NOW + 60, 0));
+    cache.fail(None, None);
+    // Said, as rules and snoozed mail that couldn't be read are (it was only logged).
+    assert!(s.notices.iter().any(|n| n.error && n.text.contains("Outbox")), "{:?}", s.notices);
+    s.take_jobs();
+    queue_reply(&mut s);
+    assert_eq!(owed(), before, "the owed flags aren't saved over");
+}
+
+/// An Outbox message the server refused for good says it isn't tried again; one that failed for
+/// now says it isn't sent yet (both read "Not sent yet").
+#[test]
+fn an_outbox_message_refused_for_good_doesnt_read_as_one_to_be_tried_again() {
+    let mut s = failing_session();
+    let item = |id: u64, refused: bool| mailcraft_store::OutboxItem {
+        id,
+        from: "me@example.com".into(),
+        recipients: vec!["ana@example.com".into()],
+        queued: NOW + i64::try_from(id).unwrap(),
+        error: Some("550 no such user here".into()),
+        refused,
+        ..Default::default()
+    };
+    let raw = |subject: &str| format!("From: me@example.com\r\nTo: ana@example.com\r\nSubject: {subject}\r\n\r\nhi\r\n").into_bytes();
+    store(&s).outbox_add(sample::SAMPLE_ACCOUNT, &item(81, true), &raw("Refused")).unwrap();
+    store(&s).outbox_add(sample::SAMPLE_ACCOUNT, &item(82, false), &raw("Later")).unwrap();
+    s.run("folder.outbox", &json!({})).unwrap();
+    let preview = |subject: &str| s.list.iter().find(|m| m.subject == subject).map(|m| m.preview.clone()).unwrap();
+    assert!(
+        preview("Refused").starts_with("Not sent, and not tried again") && preview("Refused").ends_with("550 no such user here"),
+        "{}",
+        preview("Refused")
+    );
+    assert_eq!(preview("Later"), "Not sent yet: 550 no such user here");
+}
+
+/// An Outbox message whose files can't be taken out stays, and that's said: deleted, it went all
+/// the same; taken back to be changed, it went twice (as it was, and as changed).
+#[test]
+fn an_outbox_message_that_cant_be_taken_out_says_so() {
+    let mut s = failing_session();
+    let item = mailcraft_store::OutboxItem {
+        id: 71,
+        from: "me@example.com".into(),
+        recipients: vec!["ana@example.com".into()],
+        queued: NOW,
+        ..Default::default()
+    };
+    let raw = b"From: me@example.com\r\nTo: ana@example.com\r\nSubject: Waiting\r\n\r\nhi\r\n";
+    store(&s).outbox_add(sample::SAMPLE_ACCOUNT, &item, raw).unwrap();
+    s.run("folder.outbox", &json!({})).unwrap();
+    let key = s.list[0].key.clone();
+    store(&s).fail(None, Some("outbox/71.json|outbox/71.eml|outbox/71.gone"));
+    let r = s.run("outbox.edit", &json!({"key": key.to_id()}));
+    assert!(matches!(r, Err(CmdError::Failed(_))), "{r:?}");
+    assert!(s.compose.is_none(), "not opened to be sent again");
+    s.run("list.select", &json!({"key": key.to_id()})).unwrap();
+    let r = s.run("mail.delete", &json!({}));
+    assert!(matches!(r, Err(CmdError::Failed(_))), "{r:?}");
+    assert_eq!(store(&s).outbox(sample::SAMPLE_ACCOUNT).len(), 1);
+    assert_eq!(s.outbox.len(), 1, "still shown");
+    // Its files held, but a mark beside them can be written: out of the Outbox.
+    store(&s).fail(None, Some("outbox/71.json|outbox/71.eml"));
+    s.run("list.select", &json!({"key": key.to_id()})).unwrap();
+    s.run("mail.delete", &json!({})).unwrap();
+    store(&s).fail(None, None);
+    assert!(store(&s).outbox(sample::SAMPLE_ACCOUNT).is_empty() && s.outbox.is_empty());
 }

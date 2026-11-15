@@ -23,7 +23,7 @@ fn add_to_file(pst: &str, subject: &str, id: &str) {
         body: "Later.",
         html_body: None,
         message_id: id,
-        delivery_time: (1_800_000_000 + 11_644_473_600) * 10_000_000,
+        delivery_time: filetime(1_800_000_000),
         message_class: "IPM.Note",
         properties: &[],
     };
@@ -50,7 +50,7 @@ fn an_opened_file_is_never_written_and_its_copy_beside_it_keeps_the_changes() {
 
     // Opened: the copy is made beside it, nothing with the other data files.
     p.submit(Job::ImportPst { account: "b1".into(), path: pst.clone(), resume: false });
-    let seen = events_until(&p, Duration::from_secs(60), ended);
+    let seen = until(&p, "the import to end", ended);
     assert!(matches!(seen.last(), Some(Event::Imported { messages: 7, error: None, .. })), "{seen:?}");
     assert_eq!(store.data_file("b1").as_deref(), Some(copy.as_path()));
     assert!(copy.is_file() && data_files(&dir).is_empty(), "{:?}", data_files(&dir));
@@ -83,7 +83,7 @@ fn an_opened_file_is_never_written_and_its_copy_beside_it_keeps_the_changes() {
     assert_eq!(found.path, dir.join("in (2).mailcraft"), "the copy is the account's still");
     assert!(store.data_file("b1").is_some());
     p.submit(Job::RereadDataFile { account: "b1".into(), path: pst.clone() });
-    let seen = events_until(&p, Duration::from_secs(60), ended);
+    let seen = until(&p, "the import to end", ended);
     let Some(Event::Imported { messages: 1, error: None, report: Some(report), .. }) = seen.last() else { panic!("{seen:?}") };
     assert_eq!((report.messages, report.folders), (1, 1));
     // What's new came in; what was done in MailCraft stayed done, the messages with no

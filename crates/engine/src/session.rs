@@ -11,10 +11,10 @@ use mailcraft_model::job::{Secret, Vacation};
 use mailcraft_model::search::{Doc, Query, SummaryText, TextField, TextSource, Tri};
 use mailcraft_model::thread::{Thread, threads};
 use mailcraft_model::{
-    AccountConfig, EmailAddress, Event, Flag, Folder, FolderRole, Job, MessageKey, Op, SharedSummary, Summary, SyncStatus, addr, sort_folders,
-    sort_newest_first,
+    AccountConfig, EmailAddress, Event, FailureKind, Flag, Folder, FolderRole, Job, MessageKey, Op, SharedSummary, Summary, SyncStatus, addr,
+    sort_folders, sort_newest_first,
 };
-use mailcraft_store::{FolderMarks, FolderState, LongWrite, MarksAfter, OutboxItem, Store};
+use mailcraft_store::{Filing, FolderMarks, FolderState, LongWrite, MarksAfter, OutboxItem, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -37,7 +37,12 @@ mod security;
 mod writing;
 #[cfg(test)]
 pub(crate) use accounts::REMOVE_BACKSTOP;
+pub(crate) use accounts::data_file_path;
 pub use accounts::{Changes, ImportState, Imports};
+use changing::Batch;
+#[cfg(test)]
+pub(crate) use changing::{MOVED_IN_MAX, MovedIn};
+use folder_edits::keys_by_account;
 pub use mailbox_settings::{Compacting, Compaction, IDLE_AFTER_S};
 #[cfg(test)]
 pub(crate) use opening::source_lines;
@@ -180,11 +185,13 @@ pub struct PaneSection {
 /// A change the user made that Undo can put back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Undo {
-    /// Messages moved (deleted to Deleted Items, archived, moved): found again in `to` by their
-    /// Message-ID (a move gives them new keys) and moved back where each came from.
-    Move { account: String, to: String, back: Vec<(String, String)> },
-    /// Flags or keywords changed: the changes that put them back.
-    Ops { account: String, ops: Vec<Op> },
+    /// Messages moved (deleted to Deleted Items, archived, moved), by account: where they went,
+    /// and each one's Message-ID (a move gives them new keys, so they're found again in that
+    /// folder by it) with the folder it's moved back to. One action over several accounts (All
+    /// Inboxes) is one entry.
+    Move { moves: Vec<(String, String, Vec<(String, String)>)> },
+    /// Flags or keywords changed: the changes that put them back, by account.
+    Ops { ops: Vec<(String, Vec<Op>)> },
     /// Follow-ups changed (flagged, cleared, marked complete): the flag and keyword changes that
     /// put them back, by account, and each message's due and done days as they were, by its
     /// follow-up id.
@@ -333,7 +340,8 @@ pub struct Session {
     pub undo: Vec<Undo>,
     /// Bumped whenever `list` changes.
     pub revision: u64,
-    /// Bumped whenever a calendar or address book changes.
+    /// Bumped whenever a calendar, a task list or an address book changes (an account's go with
+    /// it), and when a reminder is dismissed or snoozed.
     pub pim_revision: u64,
     /// Messages waiting in the Outbox, per account (oldest first).
     pub outbox: Vec<(String, OutboxItem)>,
@@ -363,6 +371,11 @@ pub struct Session {
     pub(crate) cache_limit: usize,
     /// Built on first use from the cached mail; dropped when mail arrives.
     contacts: Option<ContactBook>,
+    /// When `contacts` was counted.
+    contacts_at: i64,
+    /// The address book dropped last and when it was counted: the Focused split sorts by it a
+    /// while rather than counting the book again after every sync ([`Session::focus_book`]).
+    contacts_kept: Option<(ContactBook, i64)>,
     /// The organisation directory's answers (issue #9).
     pub directory: pim::Directory,
     /// Address books counted so far (each count starts the sender check again).
@@ -374,8 +387,10 @@ pub struct Session {
     /// memory only: the MIME entity inside, and whether it was authenticated), the ones being
     /// decrypted and why others couldn't be, and messages waiting to be signed or encrypted.
     smime: HashMap<String, SmimeSettings>,
+    /// What each account's own certificates are, read once each time they change.
+    smime_own: HashMap<String, security::OwnCerts>,
     trust_roots: Vec<Vec<u8>>,
-    opened: HashMap<MessageKey, (Vec<u8>, bool)>,
+    opened: security::Opened,
     opening: HashSet<MessageKey>,
     decrypt_errors: HashMap<MessageKey, String>,
     /// Answers still to come for messages asked to be decrypted before their keys came to
@@ -386,12 +401,11 @@ pub struct Session {
     cards: security::CardSearch,
     /// OpenPGP: each account's keys and its correspondents', signatures found in decrypted mail.
     pgp: security::PgpState,
-    /// The highest UID seen per Inbox, so only mail that arrives later is announced.
-    pub(crate) seen_uid: HashMap<(String, String), u32>,
-    /// Mail the user put in a server account's Inbox or Junk (a move, an undo, a snooze over),
-    /// by (account, folder, Message-ID): the server gives it a new UID there, and it isn't
-    /// mail arriving.
-    pub(crate) moved_in: std::collections::HashSet<(String, String, String)>,
+    /// The highest UID seen per Inbox (and Junk), with the UIDVALIDITY it's of, so only mail that
+    /// arrives later is announced.
+    pub(crate) seen_uid: HashMap<(String, String), (u32, u32)>,
+    /// Mail the user put in a server account's Inbox or Junk, not mail arriving there.
+    pub(crate) moved_in: changing::MovedIn,
     /// When mail was last moved (Unix seconds): its Undo waits for a server to have moved it.
     pub(crate) moved_at: i64,
     /// Mail moved or copied into a folder on this computer, waiting for its source (issue #82).
@@ -404,6 +418,11 @@ pub struct Session {
     pub rules: Vec<mailcraft_model::organize::Rule>,
     /// Snoozed messages and when they come back (`snoozes.json`).
     pub snoozes: Vec<mailcraft_model::organize::Snooze>,
+    /// When due snoozes were last looked for in their folders, and what has changed since: one
+    /// not found waits for that, or a minute, not the next frame.
+    pub(crate) snoozes_looked: organize::SnoozesLooked,
+    #[cfg(test)]
+    pub(crate) snooze_looks: u64,
     /// The Other tab of a Focused/Other Inbox is showing.
     pub focus_other: bool,
     /// Pictures from the web, by address: downloaded only after the user asked.
@@ -422,6 +441,9 @@ pub struct Session {
     pub jmap_only: bool,
     /// The fonts PDFs embed (regular, bold): the system's, set by the app.
     pub print_fonts: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Files the window handed over for a command ([`Session::hand`]), by number, newest last.
+    pub(crate) handed: Vec<(u64, Vec<u8>)>,
+    pub(crate) last_handed: u64,
     /// Pages to show in the browser (OAuth sign-in), oldest first.
     pub open_urls: Vec<String>,
     /// Each account's calendars and address books.
@@ -430,10 +452,10 @@ pub struct Session {
     pub(crate) pim_unread: HashSet<String>,
     /// The flagged mail of every folder, for the To-Do Bar's task list.
     pub(crate) todo: pim::TodoMail,
-    /// The documents (`rules.json`, `snoozes.json`) that couldn't be read at start: never saved
-    /// over with what's shown in their place.
+    /// The documents (`rules.json`, `snoozes.json`, `pending-marks.json`) that couldn't be read
+    /// at start: never saved over with what's shown or kept in their place.
     pub(crate) docs_unread: HashSet<&'static str>,
-    /// Mail, Calendar or People.
+    /// Mail, Calendar, People, Tasks or Notes.
     pub module: pim::Module,
     pub cal_mode: pim::CalMode,
     /// The local day the calendar shows (`None`: today).
@@ -524,12 +546,15 @@ impl Session {
             pending_marks: BTreeMap::new(),
             cache_limit: CACHE_MESSAGES,
             contacts: None,
+            contacts_at: 0,
+            contacts_kept: None,
             directory: pim::Directory::default(),
             contacts_built: 0,
             senders: None,
             smime: HashMap::new(),
+            smime_own: HashMap::new(),
             trust_roots: Vec::new(),
-            opened: HashMap::new(),
+            opened: security::Opened::default(),
             opening: HashSet::new(),
             decrypt_errors: HashMap::new(),
             stale_decrypts: HashMap::new(),
@@ -538,13 +563,16 @@ impl Session {
             cards: Default::default(),
             pgp: Default::default(),
             seen_uid: HashMap::new(),
-            moved_in: std::collections::HashSet::new(),
+            moved_in: changing::MovedIn::default(),
             moved_at: 0,
             transfers: Vec::new(),
             arrived_invites: Vec::new(),
             new_mail: Vec::new(),
             rules: Vec::new(),
             snoozes: Vec::new(),
+            snoozes_looked: organize::SnoozesLooked::default(),
+            #[cfg(test)]
+            snooze_looks: 0,
             focus_other: false,
             pictures: HashMap::new(),
             pictures_for: BTreeSet::new(),
@@ -554,6 +582,8 @@ impl Session {
             portable: false,
             jmap_only: false,
             print_fonts: None,
+            handed: Vec::new(),
+            last_handed: 0,
             open_urls: Vec::new(),
             pim: HashMap::new(),
             pim_unread: HashSet::new(),
@@ -595,16 +625,22 @@ impl Session {
                     s.notice("Snoozed mail couldn't be read: changes to it won't be saved", true);
                 }
             }
-            s.pending_marks = store
-                .load_doc::<Vec<(u64, MessageKey, Flag)>>(PENDING_MARKS)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(id, k, f)| (id, (k, f)))
-                .collect();
+            match store.load_doc::<Vec<(u64, MessageKey, Flag)>>(PENDING_MARKS) {
+                Ok(marks) => s.pending_marks = marks.into_iter().map(|(id, k, f)| (id, (k, f))).collect(),
+                Err(e) => {
+                    // The Replied and Forwarded flags replies in the Outbox owe: ones owed from
+                    // now on are set if they go before MailCraft closes, but never saved over it.
+                    // Said, as for the rules and the snoozed mail: what they answer may never show
+                    // as answered.
+                    log::warn!("the flags owed by replies in the Outbox couldn't be read: {e}");
+                    s.docs_unread.insert(PENDING_MARKS);
+                    s.notice("What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered", true);
+                }
+            }
         }
         s.load_accounts();
         for id in s.accounts.iter().map(|a| a.config.id.clone()).collect::<Vec<_>>() {
-            s.mark_junk(&id);
+            s.mark_role(&id, FolderRole::Junk);
             s.read_drafts(&id);
         }
         s.refresh_outbox();
@@ -628,11 +664,18 @@ impl Session {
     /// Run a command by id. Disabled commands fail with [`CmdError::Disabled`]. A panic inside a
     /// command is caught and reported as an error rather than taking the app down.
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
+        let result = self.run_command(id, params);
+        // A file handed over for it that it didn't take (refused before it looked for it).
+        self.drop_handed(params);
+        result
+    }
+
+    fn run_command(&mut self, id: &str, params: &Value) -> CmdResult {
         let reg = self.registry.clone();
         let spec = reg.get(id).ok_or_else(|| CmdError::Unknown(id.to_string()))?;
         // What the command acts on is the message as shown: its body, still being got ready on
         // another thread, is got ready here first (moving about the list doesn't wait for it).
-        if !crate::cmd::leaves_body_waiting(id) && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish_pending_body())).is_err() {
+        if !spec.leaves_body && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish_pending_body())).is_err() {
             log::error!("the open message couldn't be shown");
             PANICS_CAUGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -748,9 +791,4 @@ pub fn parse_key(v: &Value) -> Option<MessageKey> {
         return MessageKey::from_id(s);
     }
     serde_json::from_value::<MessageKey>(v.clone()).ok().filter(|k| !k.account.is_empty())
-}
-
-/// What a follow-up date is kept under ([`Summary::follow_up_id`]).
-fn follow_up_id(m: &Summary) -> String {
-    m.follow_up_id()
 }

@@ -112,7 +112,7 @@ fn unflow(text: &str, delsp: bool) -> String {
 /// Latin-1, unencoded), with those lines read in the character set the message names for its
 /// text, or else Windows-1252: they showed as `caf�`. Any other message is returned as it is.
 pub(crate) fn readable_headers(raw: &[u8]) -> Cow<'_, [u8]> {
-    let end = header_end(raw);
+    let end = crate::header_end(raw).map_or(raw.len(), |blank| blank.start);
     let head = raw.get(..end).unwrap_or(raw);
     if head.is_ascii() || std::str::from_utf8(head).is_ok() {
         return Cow::Borrowed(raw);
@@ -134,18 +134,6 @@ pub(crate) fn readable_headers(raw: &[u8]) -> Cow<'_, [u8]> {
     }
     out.extend_from_slice(raw.get(end..).unwrap_or_default());
     Cow::Owned(out)
-}
-
-/// Where the header ends: after its last line, before the empty one.
-fn header_end(raw: &[u8]) -> usize {
-    let mut at = 0;
-    for line in raw.split_inclusive(|b| *b == b'\n') {
-        if line == b"\n" || line == b"\r\n" {
-            break;
-        }
-        at += line.len();
-    }
-    at
 }
 
 /// The character set a header names (`charset=iso-8859-2`), when it's one whose letters and
@@ -180,7 +168,7 @@ mod tests {
     #[test]
     fn a_body_in_parts_is_whole() {
         let raw = b"Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=Z\r\n\r\n--Z\r\nContent-Type: text/plain\r\n\r\nfirst\r\n--Z\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n--Z\r\nContent-Type: text/plain; format=flowed\r\n\r\nsecond \r\nhalf\r\n--Z--\r\n";
-        let p = crate::parse(raw).unwrap_or_default();
+        let p = crate::parse(raw).expect("the message parses");
         assert_eq!(p.text, "first\n\nsecond half");
         assert_eq!(p.attachments.len(), 1);
     }
@@ -190,7 +178,7 @@ mod tests {
         let raw = b"Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=Z\r\n\r\n--Z\r\nContent-Type: text/html\r\n\r\n<p>The <b>message</b></p>\r\n--Z\r\nContent-Type: text/plain\r\n\r\n-- \r\nlist <footer> & more\r\n--Z--\r\n";
         let html = crate::html_body(raw).unwrap_or_default();
         assert!(html.contains("<b>message</b>") && html.contains("list &lt;footer&gt; &amp; more"), "{html}");
-        let p = crate::parse(raw).unwrap_or_default();
+        let p = crate::parse(raw).expect("the message parses");
         let shown: String = p.rich.iter().map(|r| format!("{r:?}")).collect();
         assert!(shown.contains("message") && shown.contains("list <footer> & more"), "{shown}");
         assert!(p.text.contains("message") && p.text.contains("list <footer> & more"), "{}", p.text);
@@ -202,14 +190,14 @@ mod tests {
     #[test]
     fn a_header_that_is_not_utf8_is_read() {
         let raw = b"From: J\xf6rg M\xfcller <jorg@studio.example>\nSubject: caf\xe9\nContent-Type: text/plain; charset=iso-8859-1\n\nBody caf\xe9\n";
-        let p = crate::parse(raw).unwrap_or_default();
+        let p = crate::parse(raw).expect("the message parses");
         assert_eq!((p.from.name.as_str(), p.subject.as_str(), p.text.as_str()), ("Jörg Müller", "café", "Body café"));
         // In the set the message names for its text.
         let raw = b"Subject: \xf0\xd2\xc9\xd7\xc5\xd4\nContent-Type: text/plain; charset=koi8-r\n\nx\n";
-        assert_eq!(crate::parse(raw).unwrap_or_default().subject, "Привет");
+        assert_eq!(crate::parse(raw).expect("the message parses").subject, "Привет");
         // No set named, or one a header can't be in: Windows-1252.
         assert_eq!(
-            crate::parse(b"Subject: \x93x\x94\nContent-Type: text/plain; charset=utf-16\n\n").unwrap_or_default().subject,
+            crate::parse(b"Subject: \x93x\x94\nContent-Type: text/plain; charset=utf-16\n\n").expect("the message parses").subject,
             "\u{201c}x\u{201d}"
         );
         // UTF-8 and ASCII headers aren't touched, nor is the body.

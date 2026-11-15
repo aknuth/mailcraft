@@ -2,7 +2,7 @@
 //! and a change that doesn't finish leaves the file as it was.
 
 pub(crate) mod table_types {
-    pub(crate) use super::table::{Cell, NewRow, kept_elsewhere};
+    pub(crate) use super::table::{Cell, NewRow};
 }
 
 mod blocks;
@@ -26,6 +26,7 @@ pub use edit::ADD_MAX_VALUE_SIZE;
 pub use types::*;
 
 use crate::ndb::Format;
+use crate::util::invalid;
 
 /// Makes a new, empty data file at `path`, with an Inbox.
 pub fn create_empty(path: impl AsRef<Path>, format: Format) -> io::Result<()> {
@@ -76,6 +77,28 @@ pub fn set_special_folder(path: impl AsRef<Path>, role: SpecialFolder, folder: &
 /// Sets the file's display name.
 pub fn set_store_display_name(path: impl AsRef<Path>, name: &str) -> io::Result<()> {
     folders::set_store_display_name(path.as_ref(), name)
+}
+
+/// A node's subnodes (values kept outside its heap, a table's cells kept apart) are numbered from
+/// this index up.
+pub(crate) const FIRST_SUBNODE: u32 = 0x80;
+
+/// The entry ID (`ENTRYID`, MS-PST 2.4.3.2) of node `nid` in the file whose record key is `key`.
+pub(crate) fn entry_id(key: &[u8; 16], nid: u32) -> Vec<u8> {
+    let mut e = vec![0u8; 4];
+    e.extend_from_slice(key);
+    e.extend(nid.to_le_bytes());
+    e
+}
+
+/// Writes an ID (a block's, a page's, a node's, a file offset) at the format's width.
+fn put_id(out: &mut Vec<u8>, format: Format, id: u64) -> io::Result<()> {
+    if format.wide() {
+        out.extend(id.to_le_bytes());
+    } else {
+        out.extend(u32::try_from(id).map_err(|_| invalid("past what an ANSI data file can hold"))?.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Takes messages (by their node IDs) out of the file, in one change.

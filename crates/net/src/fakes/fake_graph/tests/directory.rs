@@ -10,19 +10,6 @@ fn people(d: &mut Data) {
     }
 }
 
-/// HTTP answers from a token endpoint, one per connection, in order.
-fn token_answers(answers: &[(&str, &str)]) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    let replies = answers
-        .iter()
-        .map(|(status, json)| {
-            let mut r = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n", json.len()).into_bytes();
-            r.extend_from_slice(json.as_bytes());
-            r
-        })
-        .collect();
-    crate::http::tests::serve(replies)
-}
-
 /// The search: `/users` with the header Microsoft's directory wants for `$search`; refused
 /// there, `/me/people` with the directory's people asked for; nothing found is no one; a search
 /// with quotes, backslashes and controls sent safely; refused everywhere is a missing permission.
@@ -74,16 +61,10 @@ fn exchange_online_searches_with_a_token_of_its_own() {
     d.deliver(&inbox, &mail("Hello", "m1"), true, "2024-05-06T09:00:00Z");
     people(&mut d);
     let server = serve(d);
-    let store = crate::fake::tests_store("graph-directory");
+    let store = crate::fake::store("graph-directory");
     let creds = Arc::new(crate::worker::MemoryCredentials::default());
     let mut pool = crate::worker::Pool::new(store.clone(), creds.clone());
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@contoso.example".into(),
-        graph: Some(server.base.clone()),
-        oauth: Some("test-graph-directory".into()),
-        ..Default::default()
-    };
+    let account = AccountConfig { oauth: Some("test-graph-directory".into()), ..account("a1", &server.base) };
     pool.submit(Job::Start { account: account.clone(), password: Some(Secret("r1".into())) });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     let search = |pool: &mut crate::worker::Pool, q: &str| {
@@ -127,7 +108,6 @@ fn exchange_online_searches_with_a_token_of_its_own() {
     }
     assert!(!directory_refresh.contains("Mail."), "{directory_refresh}");
     eventually("its directory sign-in removed with it", || crate::worker::Credentials::get_secret(creds.as_ref(), &account, "directory").is_none());
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Allowing it: the browser asked for the directory's permissions alone (no mail ones), the
@@ -139,16 +119,10 @@ fn the_directory_is_allowed_in_a_sign_in_of_its_own() {
     let mut p = crate::oauth::tests::local(&format!("{oauth_base}/token"));
     p.id = "test-graph-allow".into();
     crate::oauth::TEST_PROVIDERS.lock().unwrap().push(p);
-    let store = crate::fake::tests_store("graph-allow");
+    let store = crate::fake::store("graph-allow");
     let creds = Arc::new(crate::worker::MemoryCredentials::default());
     let mut pool = crate::worker::Pool::new(store.clone(), creds.clone());
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@contoso.example".into(),
-        graph: Some("http://127.0.0.1:9/v1.0".into()),
-        oauth: Some("test-graph-allow".into()),
-        ..Default::default()
-    };
+    let account = AccountConfig { oauth: Some("test-graph-allow".into()), ..account("a1", "http://127.0.0.1:9/v1.0") };
     // The "browser" answers the page MailCraft opens: allowed, then refused.
     for (allow, kept) in [(true, true), (false, false)] {
         crate::worker::Credentials::delete_secret(creds.as_ref(), &account, "directory");
@@ -169,5 +143,4 @@ fn the_directory_is_allowed_in_a_sign_in_of_its_own() {
     pool.submit(Job::AllowDirectory { account: imap });
     let seen = until(&pool, "refused", |e| matches!(e, Event::DirectoryAllowed { account, .. } if account == "a2"));
     assert!(matches!(seen.last(), Some(Event::DirectoryAllowed { error: Some(_), .. })));
-    let _ = std::fs::remove_dir_all(store.root());
 }

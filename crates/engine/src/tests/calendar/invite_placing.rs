@@ -6,9 +6,9 @@ use mailcraft_model::ical::{Attendee, CalEvent};
 use mailcraft_model::pim::{CalendarInfo, DavSync, LOCAL, StoredEvent};
 use mailcraft_model::{Folder, MessageKey, Summary};
 
+use super::invites::ZOE;
 use super::*;
 
-const ZOE: (&str, &str) = ("Zoe Park", "zoe@studio.example");
 pub(super) const OWN: &str = "https://dav.example.org/SOGo/dav/riley/Calendar/personal/";
 const THEIRS: &str = "https://dav.example.org/SOGo/dav/riley/Calendar/sam_team/";
 
@@ -56,28 +56,9 @@ fn invitation(uid: &str, sequence: u32) -> CalEvent {
 
 /// A message carrying a calendar arrives in the account's Inbox (its body downloaded).
 pub(super) fn arrive(s: &mut Session, id: &str, n: u32, method: &str, events: &[CalEvent]) -> MessageKey {
-    let ics = mailcraft_model::ical::write(events, Some(method), NOW);
-    let d = mailcraft_mime::Draft {
-        to: vec![mailcraft_model::EmailAddress::new("Riley", "riley@studio.example")],
-        subject: format!("{method} {n}"),
-        body: "See the calendar.".into(),
-        attachments: vec![mailcraft_mime::OutAttachment {
-            name: "invite.ics".into(),
-            mime: format!("text/calendar; method={method}"),
-            data: ics.into_bytes(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let raw = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new(ZOE.0, ZOE.1), NOW, &format!("<p{n}@x>")).unwrap();
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder(id, "INBOX").unwrap();
-    let key = MessageKey { account: id.into(), folder: "INBOX".into(), validity: 7, uid: n };
-    st.messages.insert(0, mailcraft_mime::summary_from_full(&raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder(id, "INBOX", &st).unwrap();
-    store.write_body(&key, &raw).unwrap();
-    s.apply(Event::FolderChanged { account: id.into(), folder: "INBOX".into() });
-    key
+    let ics = mailcraft_model::ical::write(events, Some(method), NOW).into_bytes();
+    let raw = calendar_mail(ZOE, &format!("{method} {n}"), &format!("text/calendar; method={method}"), ics, &format!("<p{n}@x>"));
+    file_whole(s, MessageKey { account: id.into(), folder: "INBOX".into(), validity: 7, uid: n }, &raw)
 }
 
 fn cal(id: &str, name: &str, foreign: bool) -> CalendarInfo {
@@ -98,7 +79,8 @@ pub(super) fn found(s: &mut Session, id: &str, events: Vec<StoredEvent>) {
     s.apply(Event::DavSynced { account: id.into(), sync: Box::new(sync) });
 }
 
-pub(super) fn parts<'a>(s: &'a Session, id: &str, uid: &str) -> Vec<&'a StoredEvent> {
+/// The copies of the event `uid` in account `id`'s calendars ([`super::invites::parts`]: the sample's).
+pub(super) fn account_parts<'a>(s: &'a Session, id: &str, uid: &str) -> Vec<&'a StoredEvent> {
     s.pim[id].events.iter().filter(|e| e.event.uid == uid).collect()
 }
 
@@ -115,7 +97,7 @@ fn held_until_the_calendars_are_found() {
     let (mut s, id) = imap_session("placing-held");
     assert!(s.calendars_pending(&id));
     arrive(&mut s, &id, 1, "REQUEST", &[invitation("a@studio.example", 0)]);
-    assert!(parts(&s, &id, "a@studio.example").is_empty(), "not on this computer's calendar");
+    assert!(account_parts(&s, &id, "a@studio.example").is_empty(), "not on this computer's calendar");
     assert_eq!(s.pim[&id].held.len(), 1);
     // A restart keeps it.
     let store = s.store.clone().unwrap();
@@ -124,7 +106,7 @@ fn held_until_the_calendars_are_found() {
     assert_eq!(s.pim[&id].held.len(), 1, "kept with the calendar");
     s.take_jobs();
     found(&mut s, &id, Vec::new());
-    let e = parts(&s, &id, "a@studio.example");
+    let e = account_parts(&s, &id, "a@studio.example");
     assert_eq!(e.len(), 1);
     assert!(e[0].calendar == OWN && e[0].dirty && e[0].href.is_empty(), "{:?}", e[0]);
     assert!(s.pim[&id].held.is_empty() && s.pim[&id].placed.is_empty());
@@ -134,8 +116,7 @@ fn held_until_the_calendars_are_found() {
     folders(&mut s, &id);
     s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
     arrive(&mut s, &id, 2, "REQUEST", &[invitation("b@studio.example", 0)]);
-    assert_eq!(parts(&s, &id, "b@studio.example")[0].calendar, OWN);
-    done(s);
+    assert_eq!(account_parts(&s, &id, "b@studio.example")[0].calendar, OWN);
 }
 
 /// Waited too long (the server slow or unreachable): on this computer, then moved to the
@@ -150,10 +131,10 @@ fn too_long_to_wait_goes_here_then_moves() {
     s.store.as_ref().unwrap().remove_body(&key);
     s.clock.now = NOW + crate::session::invite::HOLD_SECS - 1;
     s.tick();
-    assert!(parts(&s, &id, "slow@studio.example").is_empty(), "still waiting");
+    assert!(account_parts(&s, &id, "slow@studio.example").is_empty(), "still waiting");
     s.clock.now = NOW + crate::session::invite::HOLD_SECS;
     s.tick();
-    assert_eq!(parts(&s, &id, "slow@studio.example")[0].calendar, LOCAL);
+    assert_eq!(account_parts(&s, &id, "slow@studio.example")[0].calendar, LOCAL);
     assert_eq!(s.pim[&id].placed, ["slow@studio.example", "dup@studio.example"]);
     // Answered here meanwhile.
     s.run("event.respond", &json!({"uid": "dup@studio.example", "answer": "accepted"})).unwrap();
@@ -167,16 +148,15 @@ fn too_long_to_wait_goes_here_then_moves() {
         dirty: false,
     };
     found(&mut s, &id, vec![server_copy]);
-    let slow = parts(&s, &id, "slow@studio.example");
+    let slow = account_parts(&s, &id, "slow@studio.example");
     assert!(slow.len() == 1 && slow[0].calendar == OWN && slow[0].dirty && slow[0].href.is_empty(), "{slow:?}");
-    let dup = parts(&s, &id, "dup@studio.example");
+    let dup = account_parts(&s, &id, "dup@studio.example");
     assert_eq!(dup.len(), 1, "not doubled: {dup:?}");
     assert!(dup[0].calendar == OWN && dup[0].href.ends_with("dup.ics") && dup[0].dirty, "{dup:?}");
     assert!(dup[0].event.attendees.iter().any(|a| a.email == "riley@studio.example" && a.partstat == "ACCEPTED"), "the answer kept");
     let p = &s.pim[&id];
     assert!(p.placed.is_empty() && !p.calendars.iter().any(|c| c.id == LOCAL), "the calendar here is empty, so gone");
     assert!(asks_sync(&mut s));
-    done(s);
 }
 
 /// An account whose server has no calendars: invitations go here, as they should; given a
@@ -186,19 +166,19 @@ fn no_calendars_then_a_server_given_by_hand() {
     let (mut s, id) = imap_session("placing-given");
     arrive(&mut s, &id, 1, "REQUEST", &[invitation("x@studio.example", 0)]);
     s.apply(Event::DavSynced { account: id.clone(), sync: Box::new(DavSync { checked: NOW, ..Default::default() }) });
-    assert_eq!(parts(&s, &id, "x@studio.example")[0].calendar, LOCAL);
+    assert_eq!(account_parts(&s, &id, "x@studio.example")[0].calendar, LOCAL);
     assert!(s.local_events(&id).is_none(), "nowhere to move them yet");
     // One the user made here: not MailCraft's to move by itself.
     s.run("event.create", &json!({"account": id, "summary": "Dentist", "start": NOW + 3600, "end": NOW + 7200})).unwrap();
     s.run("account.dav", &json!({"account": id, "caldav": "https://dav.example.org/SOGo/dav/riley/"})).unwrap();
     assert!(s.calendars_pending(&id), "looked for again");
     arrive(&mut s, &id, 2, "REQUEST", &[invitation("y@studio.example", 0)]);
-    assert!(parts(&s, &id, "y@studio.example").is_empty(), "held");
+    assert!(account_parts(&s, &id, "y@studio.example").is_empty(), "held");
     s.take_jobs();
     found(&mut s, &id, Vec::new());
     assert!(asks_sync(&mut s), "one sync for the one moved and the one held");
-    assert_eq!(parts(&s, &id, "x@studio.example")[0].calendar, OWN);
-    assert_eq!(parts(&s, &id, "y@studio.example")[0].calendar, OWN);
+    assert_eq!(account_parts(&s, &id, "x@studio.example")[0].calendar, OWN);
+    assert_eq!(account_parts(&s, &id, "y@studio.example")[0].calendar, OWN);
     let dentist = s.pim[&id].events.iter().find(|e| e.event.summary == "Dentist").unwrap();
     assert_eq!(dentist.calendar, LOCAL);
     // Offered: Move 1 event to Personal Calendar.
@@ -208,7 +188,6 @@ fn no_calendars_then_a_server_given_by_hand() {
     assert_eq!(r["moved"], 1);
     assert!(s.pim[&id].events.iter().all(|e| e.calendar == OWN));
     assert!(s.local_events(&id).is_none() && !s.pim[&id].calendars.iter().any(|c| c.id == LOCAL));
-    done(s);
 }
 
 /// The order invitations came in is kept: one cancelled while held never shows.
@@ -221,8 +200,7 @@ fn held_in_order() {
     s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
     assert_eq!(s.pim[&id].held.len(), 2);
     found(&mut s, &id, Vec::new());
-    assert!(parts(&s, &id, "c@studio.example").is_empty());
-    done(s);
+    assert!(account_parts(&s, &id, "c@studio.example").is_empty());
 }
 
 /// The Default calendar: the user's choice, kept to calendars that can be added to; offered
@@ -252,8 +230,6 @@ fn the_default_calendar_and_keeping_events_here() {
     let mut sample = sample_session("placing-sample");
     assert!(!sample.calendars_pending("sample") && sample.local_events("sample").is_none());
     assert!(sample.run("calendar.moveLocal", &json!({"account": "sample"})).is_err());
-    done(sample);
-    done(s);
 }
 
 /// An OAuth account without a calendar sign-in of its own is never asked for calendars: its
@@ -264,8 +240,7 @@ fn accounts_never_asked_dont_wait() {
     s.accounts.iter_mut().filter(|a| a.config.id == id).for_each(|a| a.config.oauth = Some("google".into()));
     assert!(!s.calendars_pending(&id));
     arrive(&mut s, &id, 1, "REQUEST", &[invitation("o@studio.example", 0)]);
-    assert_eq!(parts(&s, &id, "o@studio.example")[0].calendar, LOCAL);
-    done(s);
+    assert_eq!(account_parts(&s, &id, "o@studio.example")[0].calendar, LOCAL);
 }
 
 /// Trying to break it: an invitation too big to hold, more than can be held, a held calendar
@@ -278,7 +253,7 @@ fn holding_has_its_limits() {
     let mut big = invitation("big@studio.example", 0);
     big.description = "x".repeat(300 << 10);
     arrive(&mut s, &id, 1, "REQUEST", &[big]);
-    assert_eq!(parts(&s, &id, "big@studio.example")[0].calendar, LOCAL);
+    assert_eq!(account_parts(&s, &id, "big@studio.example")[0].calendar, LOCAL);
     assert!(s.pim[&id].held.is_empty());
     // Junk in what's held.
     let junk = mailcraft_model::pim::HeldInvite {
@@ -304,8 +279,6 @@ fn holding_has_its_limits() {
     s2.accounts.retain(|a| a.config.id != id2);
     s2.tick();
     assert!(s2.pim[&id2].held.is_empty() && s2.pim[&id2].events.is_empty());
-    done(s2);
-    done(s);
 }
 
 /// Trying to break it: the calendar on this computer (or someone else's opened by address)
@@ -323,9 +296,8 @@ fn only_a_calendar_on_the_server_is_the_default() {
     }
     assert_eq!(s.pim[&id].chosen_calendar, None);
     arrive(&mut s, &id, 1, "REQUEST", &[invitation("d@studio.example", 0)]);
-    let d = parts(&s, &id, "d@studio.example");
+    let d = account_parts(&s, &id, "d@studio.example");
     assert!(!d.is_empty() && d.iter().all(|e| e.calendar == OWN));
-    done(s);
 }
 
 /// Trying to break it: a calendar sent for reading isn't held (it has nothing for the
@@ -343,11 +315,10 @@ fn only_invitations_are_held_and_only_so_much() {
     let held = s.pim[&id].held.len();
     let bytes: usize = s.pim[&id].held.iter().map(|h| h.ics.len()).sum();
     assert!(held > 0 && held < 12 && bytes <= 2 << 20, "{held} held, {bytes} bytes");
-    let here = (0..12).filter(|n| parts(&s, &id, &format!("big{n}@studio.example")).iter().any(|e| e.calendar == LOCAL)).count();
+    let here = (0..12).filter(|n| account_parts(&s, &id, &format!("big{n}@studio.example")).iter().any(|e| e.calendar == LOCAL)).count();
     assert_eq!(held + here, 12, "none lost");
     found(&mut s, &id, Vec::new());
-    assert!((0..12).all(|n| parts(&s, &id, &format!("big{n}@studio.example")).iter().all(|e| e.calendar == OWN)));
-    done(s);
+    assert!((0..12).all(|n| account_parts(&s, &id, &format!("big{n}@studio.example")).iter().all(|e| e.calendar == OWN)));
 }
 
 /// Trying to break it: an invitation answered (declined) from its message while held, or a
@@ -367,8 +338,52 @@ fn dealt_with_while_held_stays_dealt_with() {
     s.run("list.open", &json!({"key": cancel.to_id()})).unwrap();
     s.run("invite.apply", &json!({})).unwrap();
     found(&mut s, &id, Vec::new());
-    assert!(parts(&s, &id, "no@studio.example").is_empty(), "declined: not back as tentative");
-    assert!(parts(&s, &id, "off@studio.example").is_empty(), "cancelled: not back");
-    assert_eq!(parts(&s, &id, "later@studio.example").len(), 1, "the others held still go in");
-    done(s);
+    assert!(account_parts(&s, &id, "no@studio.example").is_empty(), "declined: not back as tentative");
+    assert!(account_parts(&s, &id, "off@studio.example").is_empty(), "cancelled: not back");
+    assert_eq!(account_parts(&s, &id, "later@studio.example").len(), 1, "the others held still go in");
+}
+
+/// An invitation's uid with characters a calendar's line can't hold is kept as its organizer
+/// wrote it: the answer names it byte for byte (they look for their meeting by it; one read
+/// without them named another meeting), and the server's copy, which has it without them, is
+/// that meeting here, not another beside it, so the next answer and an update still find it.
+#[test]
+fn an_odd_uid_is_answered_as_it_was_written() {
+    let (mut s, id) = imap_session("placing-odd-uid");
+    const ODD: &str = "odd\u{1}uid\u{1b}-7\u{7f}@studio.example";
+    arrive(&mut s, &id, 1, "REQUEST", &[invitation(ODD, 0)]);
+    found(&mut s, &id, Vec::new());
+    assert_eq!(account_parts(&s, &id, ODD).len(), 1);
+    s.take_jobs();
+    let answer = |s: &mut Session, with: &str| {
+        s.run("event.respond", &json!({"uid": ODD, "answer": with})).unwrap();
+        let raw = s.take_jobs().into_iter().find_map(|j| if let Job::Send { raw, .. } = j { Some(raw) } else { None }).expect("an answer sent");
+        let part = mailcraft_mime::parse(&raw).unwrap().attachments.iter().find(|a| a.name.ends_with(".ics")).map(|a| a.index).unwrap();
+        String::from_utf8(mailcraft_mime::attachment_data(&raw, part).unwrap()).unwrap()
+    };
+    let reply = answer(&mut s, "accepted");
+    assert!(reply.contains(&format!("\r\nUID:{ODD}\r\n")), "{reply:?}");
+    // Stored, and read again from a server that keeps the uid without them, changed here since.
+    let mut theirs = account_parts(&s, &id, ODD)[0].clone();
+    theirs.event.uid = mailcraft_model::ical::stored_uid(ODD);
+    theirs.href = format!("{OWN}odd.ics");
+    theirs.dirty = false;
+    assert_eq!(theirs.event.uid, "odduid-7@studio.example");
+    found(&mut s, &id, vec![theirs.clone()]);
+    let parts = account_parts(&s, &id, ODD);
+    assert_eq!((parts.len(), s.pim[&id].events.len()), (1, 1), "{:?}", s.pim[&id].events);
+    // Unchanged here since: the server's copy, under the uid kept.
+    s.pim.get_mut(&id).unwrap().events.iter_mut().for_each(|e| e.dirty = false);
+    theirs.event.location = "Room 2".into();
+    found(&mut s, &id, vec![theirs]);
+    let parts = account_parts(&s, &id, ODD);
+    assert_eq!((parts.len(), s.pim[&id].events.len(), parts[0].event.location.as_str()), (1, 1, "Room 2"));
+    assert!(parts[0].href.ends_with("odd.ics"));
+    s.take_jobs();
+    let reply = answer(&mut s, "tentative");
+    assert!(reply.contains(&format!("\r\nUID:{ODD}\r\n")), "{reply:?}");
+    // The organizer's update finds it.
+    arrive(&mut s, &id, 2, "REQUEST", &[CalEvent { summary: "Moved".into(), ..invitation(ODD, 1) }]);
+    let parts = account_parts(&s, &id, ODD);
+    assert_eq!((parts.len(), s.pim[&id].events.len(), parts[0].event.summary.as_str()), (1, 1, "Moved"));
 }

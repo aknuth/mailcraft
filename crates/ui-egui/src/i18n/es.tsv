@@ -72,6 +72,7 @@
 	Edit rule	Editar regla
 	Email address	Dirección de correo
 	Enter the password for {email}.	Escribe la contraseña de {email}.
+	Enter the password for {email}, which signs in as {user}.	Escriba la contraseña de {email}, que inicia sesión como {user}.
 	Favorites	Favoritos
 	Feb	feb
 	File	Archivo
@@ -409,7 +410,7 @@
 	Mark messages as read when opened	Marcar los mensajes como leídos al abrirlos
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Todavía no hay remitentes.
-	Not available: the sample mailbox has no server.	No disponible: el buzón de ejemplo no tiene servidor.
+	Not available: this mailbox has no server.	No disponible: este buzón no tiene servidor.
 	Not available: {error}	No disponible: {error}
 	On	Activadas
 	On from {from}	Activadas desde el {from}
@@ -841,7 +842,8 @@
 	Formatted	Con formato
 	HTML code	Código HTML
 	From a file…	Desde un archivo…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	Pega el HTML de una firma hecha en otro lugar o abre una guardada como página web (.htm de Outlook). Se envía tal como está escrita; mientras escribes, el mensaje muestra su texto.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	Pega el HTML de una firma hecha en otro lugar o abre una guardada como página web (.htm de Outlook). Se envía tal como está escrita, y así se muestra mientras escribes.
+	Your signature as it will be sent. To change it, pick Signature above the message.	Tu firma tal como se enviará. Para cambiarla, elige Firma encima del mensaje.
 	{name} can't be read as a signature	{name} no se puede leer como firma
 	All contacts	Todos los contactos
 	Always open with this address book	Abrir siempre con esta libreta de direcciones
@@ -933,6 +935,9 @@
 	Name on mail from it	Nombre en el correo enviado desde ella
 	Replies go to	Las respuestas van a
 	(the account's own)	(la de la cuenta)
+	Write new mail from this address	Escribir los mensajes nuevos desde esta dirección
+	A new message starts from this address, not from {email}. Pick another in From as ever.	Un mensaje nuevo empieza desde esta dirección, no desde {email}. En De puede elegir otra, como siempre.
+	{address} (new mail)	{address} (mensajes nuevos)
 	Add…	Agregar…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	Sus carpetas aparecen debajo de esta cuenta. Necesitas acceso a él en el servidor Exchange; los buzones a los que tienes acceso completo se abren solos.
 	Mailboxes you have full access to open by themselves.	Los buzones a los que tienes acceso completo se abren solos.
@@ -1107,6 +1112,7 @@ month	May	mayo
 	Check before sending	Comprobar antes de enviar
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} parece una dirección de {like}, pero no lo es. ¿Es la correcta?
 	{n} people who may not know each other will all see each other's addresses.	{n} personas que quizá no se conocen verán todas las direcciones de las demás.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	Se encontró algo en los destinatarios que conviene revisar, pero no se puede mostrar. Revísalos antes de enviar.
 	Put everyone in Bcc	Poner a todos en CCO
 	Each of them gets the message without seeing who else did; you're in To	Cada uno recibe el mensaje sin ver quién más lo recibió; tú quedas en Para
 	Open links without their tracking	Abrir vínculos sin su seguimiento
@@ -1446,6 +1452,7 @@ month	May	mayo
 	Calendar and contacts couldn't be read: changes to them won't be saved	No se pudieron leer el calendario y los contactos: los cambios en ellos no se guardarán
 	Your rules couldn't be read: changes to them won't be saved	No se pudieron leer tus reglas: los cambios en ellas no se guardarán
 	Snoozed mail couldn't be read: changes to it won't be saved	No se pudo leer el correo pospuesto: los cambios en él no se guardarán
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	No se pudo leer a qué responden las respuestas que esperan en la Bandeja de salida: puede que ese correo no se marque como respondido
 	Checking your data file	Comprobando su archivo de datos
 	Opening your mail…	Abriendo su correo…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} no se cerró correctamente la última vez. MailCraft lo está comprobando; un archivo grande puede tardar uno o dos minutos.
@@ -1463,6 +1470,8 @@ month	May	mayo
 	Some results may be missing: still indexing	Puede que falten resultados: aún se está indexando
 	Some long messages were searched only in part	Algunos mensajes largos solo se buscaron en parte
 	Couldn't read the date “{value}”	No se pudo leer la fecha «{value}»
+	Couldn't read “{value}”	No se pudo leer «{value}»
+	Part of a long search was left out	Se omitió parte de una búsqueda larga
 	Received after	Recibido después del
 	Received before	Recibido antes del
 	About {h} h {m} min left	Quedan unas {h} h {m} min
@@ -1709,3 +1718,7 @@ month	May	mayo
 	Nothing to do	Nada pendiente
 	Nothing in the next 7 days	Nada en los próximos 7 días
 	Show the calendar, what's coming up and your tasks beside the mail	Mostrar el calendario, lo próximo y sus tareas junto al correo
+	Read / Unread (Ctrl+Q / Ctrl+U)	Leído / No leído (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	No se pudo descargar {name}: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Algo salió mal en la ventana y se detuvo lo que estaba haciendo. MailCraft sigue funcionando; el registro indica dónde ocurrió.
+	Font size	Tamaño de fuente

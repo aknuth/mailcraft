@@ -7,7 +7,7 @@
 use mailcraft_model::ical::{self, Attendee, CalEvent};
 use mailcraft_model::pim::{CalendarInfo, DavSync, StoredEvent};
 
-use super::invite_placing::{OWN, arrive, imap_session, parts};
+use super::invite_placing::{OWN, account_parts, arrive, imap_session};
 use super::*;
 
 const ANN: &str = "ann@studio.example";
@@ -51,7 +51,7 @@ fn sent(s: &mut Session) -> Vec<(String, String)> {
 /// The stored copy of an event as the server has it now: its item, a new etag, and what the
 /// server changed (`change`).
 fn as_stored(s: &Session, id: &str, uid: &str, change: impl Fn(&mut CalEvent)) -> StoredEvent {
-    let mine = parts(s, id, uid)[0].clone();
+    let mine = account_parts(s, id, uid)[0].clone();
     let mut e = mine.event.clone();
     change(&mut e);
     StoredEvent { href: format!("{OWN}{uid}.ics"), etag: format!("\"{}\"", e.sequence + 7), event: e, dirty: false, ..mine }
@@ -60,7 +60,7 @@ fn as_stored(s: &Session, id: &str, uid: &str, change: impl Fn(&mut CalEvent)) -
 /// The server stored what was sent (`pushed`), and its copy is read again.
 fn stored(s: &mut Session, id: &str, uid: &str, change: impl Fn(&mut CalEvent)) {
     let server = as_stored(s, id, uid, change);
-    let mine = parts(s, id, uid)[0].clone();
+    let mine = account_parts(s, id, uid)[0].clone();
     let pushed = StoredEvent { href: server.href.clone(), etag: server.etag.clone(), dirty: false, ..mine };
     synced(s, id, true, vec![pushed], vec![server], Vec::new());
 }
@@ -105,7 +105,6 @@ fn the_users_meeting_is_mailed_once_the_server_has_it() {
     synced(&mut s, &id, true, Vec::new(), Vec::new(), vec![href]);
     let mail = sent(&mut s);
     assert!(mail.len() == 1 && mail[0].0 == "CANCEL" && mail[0].1.contains("SEQUENCE:4"), "{mail:?}");
-    done(s);
 }
 
 /// Called off before the server had it: the guests, never invited, hear nothing. And a server
@@ -128,7 +127,6 @@ fn nothing_is_mailed_twice_or_for_nothing() {
     let theirs = create(&mut s, "Delivered");
     stored(&mut s, &id, &theirs, |e| e.server_delivered = true);
     assert!(sent(&mut s).is_empty(), "the server sent them");
-    done(s);
 }
 
 /// On a server that doesn't schedule, everything is mailed at once, as before.
@@ -140,7 +138,6 @@ fn a_server_that_doesnt_schedule_changes_nothing() {
     s.run("event.create", &json!({"account": id, "summary": "Planning", "start": "2026-11-10T10:00", "attendees": ANN})).unwrap();
     assert_eq!(sent(&mut s).len(), 1);
     assert!(s.pim[&id].notices.is_empty());
-    done(s);
 }
 
 /// A meeting a colleague on the same server organised, as the server put it in the user's
@@ -177,7 +174,6 @@ fn an_answer_to_a_meeting_the_server_put_there_is_the_servers_to_send() {
     s.run("event.respond", &json!({"uid": "c1", "answer": "declined"})).unwrap();
     stored(&mut s, &id, "c1", |_| {});
     assert!(sent(&mut s).is_empty());
-    done(s);
 }
 
 /// An invitation from elsewhere, put in the calendar by MailCraft (the copy is marked as the
@@ -198,7 +194,6 @@ fn an_answer_to_a_guests_own_copy_is_mailed() {
     let mail = sent(&mut s);
     assert!(mail.len() == 1 && mail[0].0 == "REPLY", "{mail:?}");
     assert!(mail[0].1.contains("PARTSTAT=TENTATIVE") && !mail[0].1.contains(ical::GUEST_COPY), "{}", mail[0].1);
-    done(s);
 }
 
 /// An invitation answered in its message before the calendar was read again: MailCraft can't
@@ -223,7 +218,6 @@ fn an_answer_from_the_message_waits_to_know_who_sends_it() {
         });
         let mail = sent(&mut s);
         assert_eq!(mail.len(), usize::from(!server_had_it), "{mail:?}");
-        done(s);
     }
 }
 
@@ -244,12 +238,11 @@ fn a_guests_own_copy_declined_is_mailed_once_deleted() {
     s.take_jobs();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     s.run("invite.respond", &json!({"answer": "declined"})).unwrap();
-    assert!(parts(&s, &id, "d1").is_empty());
+    assert!(account_parts(&s, &id, "d1").is_empty());
     assert!(sent(&mut s).is_empty(), "not before it's deleted");
     synced(&mut s, &id, true, Vec::new(), Vec::new(), vec![copy.href.clone()]);
     let mail = sent(&mut s);
     assert!(mail.len() == 1 && mail[0].0 == "REPLY" && mail[0].1.contains("PARTSTAT=DECLINED"), "{mail:?}");
-    done(s);
 }
 
 /// Microsoft Graph mails the invitations, changes and cancellations of a meeting stored there
@@ -274,7 +267,7 @@ fn graph_sends_the_users_meeting_itself() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(parts(&s, &id, &uid)[0].calendar, cal);
+    assert_eq!(account_parts(&s, &id, &uid)[0].calendar, cal);
     s.run("event.update", &json!({"uid": uid, "summary": "Planning (moved)"})).unwrap();
     s.run("event.delete", &json!({"uid": uid})).unwrap();
     assert!(sent(&mut s).is_empty());
@@ -288,9 +281,8 @@ fn graph_sends_the_users_meeting_itself() {
         .unwrap()
         .to_string();
     assert!(sent(&mut s).is_empty());
-    let week = parts(&s, &id, &uid)[0].event.start + 7 * 86_400;
+    let week = account_parts(&s, &id, &uid)[0].event.start + 7 * 86_400;
     s.run("event.delete", &json!({"uid": uid, "occurrence": week})).unwrap();
     let mail = sent(&mut s);
     assert!(mail.len() == 1 && mail[0].0 == "CANCEL" && mail[0].1.contains("RECURRENCE-ID"), "{mail:?}");
-    done(s);
 }

@@ -5,12 +5,18 @@
 //! the window's edges that resize it. The system keeps the window borderless meanwhile
 //! (`window_frame.rs` in the app, [`crate::Services::keep_frame`]). While a dialog holds the
 //! window, the bar's drag and buttons are laid again above it ([`over_a_modal`], PhotoCraft's
-//! `modal_drag_overlay`).
+//! `modal_drag_overlay`). A pen or a finger moves and resizes the window itself ([`pen`]).
 
 use egui::{Color32, CursorIcon, Id, LayerId, Order, PointerButton, Rect, ResizeDirection, Sense, Stroke, Ui, ViewportCommand, pos2, vec2};
 
 use crate::look::theme::Tokens;
 use crate::*;
+
+mod pen;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use pen::note_os_pointer;
 
 /// One caption button: as wide as Windows' own.
 pub(crate) const BUTTON_W: f32 = 46.0;
@@ -20,6 +26,9 @@ pub(crate) const CAPTIONS_W: f32 = 3.0 * BUTTON_W;
 /// to find; 8 pt is about a native resize border).
 const EDGE: f32 = 8.0;
 const CORNER: f32 = 12.0;
+/// The main window's smallest inner size (`apps/mailcraft`'s viewport). A pen's resize stops
+/// there, as the system's own does.
+pub const MIN_WINDOW_SIZE: egui::Vec2 = vec2(760.0, 480.0);
 /// The red Windows' Close button turns under the pointer, its glyph white.
 const CLOSE_RED: Color32 = Color32::from_rgb(0xC4, 0x2B, 0x1C);
 
@@ -55,14 +64,16 @@ pub fn take_zooming(ctx: &egui::Context) -> bool {
 /// The bar's free space, `rect`: a press drags the window (Windows snaps it at the screen's
 /// edges), a double-click maximizes or restores it. Laid down before the bar's own controls, so
 /// they keep their clicks; where it's laid over them (`except`, the bar's controls), a press
-/// there does nothing. Not in the Tab order, as a system title bar isn't.
+/// there does nothing. Not in the Tab order, as a system title bar isn't. A pen's or a finger's
+/// press moves the window itself ([`pen`]).
 pub(crate) fn drag_area(ui: &mut Ui, rect: Rect, except: &[Rect]) {
+    pen::follow(ui.ctx());
     let resp = ui.interact(rect, ui.scope_id().with("title-bar-drag"), Sense::CLICK | Sense::DRAG);
     let at = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.press_origin()));
     if at.is_some_and(|p| except.iter().any(|r| r.contains(p))) {
         return;
     }
-    if resp.drag_started_by(PointerButton::Primary) {
+    if resp.drag_started_by(PointerButton::Primary) && !pen::start(ui.ctx(), pen::Kind::Move) {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
     if resp.double_clicked() {
@@ -78,6 +89,32 @@ pub(crate) fn mark(ui: &mut Ui, t: &Tokens) {
     let (fill, ink) = if t.on_bar == Color32::WHITE { (Color32::WHITE, t.bar) } else { (t.accent, t.on_accent) };
     ui.painter().rect_filled(tile, 5.0, fill);
     icons::paint(ui.painter(), icons::centered(tile, 14.0), Icon::Unread, ink);
+}
+
+/// The mark alone at the start of `free` (a title bar with nothing else on it: the File page's,
+/// the card's before MailCraft is in the window), right to left too.
+pub(crate) fn mark_in(ui: &mut Ui, t: &Tokens, free: Rect) {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(free).layout(bidi::row_from_start(egui::Align::Center)), |ui| mark(ui, t));
+}
+
+/// The title bar's top row, where the window's buttons are, of `bar` (its whole rect).
+pub(crate) fn top_row(bar: Rect) -> Rect {
+    Rect::from_min_size(bar.min, vec2(bar.width(), super::frame::TOP_BAR_H))
+}
+
+/// MailCraft's own title bar over `bar`, its whole rect (the top bar's panel, margins and all):
+/// its free space to drag the window by, laid first so what's drawn on it keeps its clicks, and
+/// the window's buttons at the end of its top row, flush with the window's corner (named to a
+/// screen reader unless they're laid again over a dialog). Where the bar's own contents go:
+/// inside its margins, clear of the buttons. The top bar, the File page and the card shown
+/// before MailCraft is in the window all draw theirs here.
+pub(crate) fn title_bar(ui: &mut Ui, t: &Tokens, bar: Rect) -> Rect {
+    drag_area(ui, bar, &[]);
+    let live = !laid_over_a_dialog(ui.ctx());
+    caption_buttons(ui, t, top_row(bar), live);
+    let margin = vec2(f32::from(super::frame::TOP_BAR_MARGIN.0), f32::from(super::frame::TOP_BAR_MARGIN.1));
+    let inner = bar.shrink2(margin);
+    Rect::from_min_max(inner.min, pos2(inner.max.x - (CAPTIONS_W - margin.x), inner.max.y))
 }
 
 /// The minimize, maximize (restore) and close buttons at the right end of `bar` (the title
@@ -226,9 +263,11 @@ pub(crate) fn clear_scroll_bars(ctx: &egui::Context) {
 }
 
 /// Invisible resize zones along the window's edges, above everything else; a press in one starts
-/// a resize by the system in that direction. None while the window is maximized or full screen.
+/// a resize by the system in that direction (a pen's or a finger's resizes it itself: [`pen`]).
+/// None while the window is maximized or full screen.
 pub(crate) fn resize_zones(ui: &mut Ui) {
     let ctx = ui.ctx().clone();
+    pen::follow(&ctx);
     if maximized(&ctx) || ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
         return;
     }
@@ -237,7 +276,7 @@ pub(crate) fn resize_zones(ui: &mut Ui) {
     let zui = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(w));
     for (i, (r, dir, cursor)) in zones(w).into_iter().enumerate() {
         let resp = zui.interact(r, Id::unique(("title-bar-resize", i)), Sense::DRAG).on_hover_cursor(cursor);
-        if resp.drag_started_by(PointerButton::Primary) {
+        if resp.drag_started_by(PointerButton::Primary) && !pen::start(&ctx, pen::Kind::Resize(dir)) {
             ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
         }
     }

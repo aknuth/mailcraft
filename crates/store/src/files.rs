@@ -23,24 +23,45 @@ pub(super) struct Faults {
     pub(super) files: Files,
     pub(super) reads: Mutex<Option<String>>,
     pub(super) writes: Mutex<Option<String>>,
+    /// Told each path as it's read or written, before it is ([`Store::watch_files`]).
+    pub(super) watch: Mutex<Option<Watch>>,
+}
+
+/// What a test has told of each file read or written.
+#[derive(Clone)]
+pub(super) struct Watch(Arc<dyn Fn(&Path) + Send + Sync>);
+
+impl std::fmt::Debug for Watch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Watch")
+    }
 }
 
 impl Faults {
+    /// Tell the test watching, if one is, that `p` is about to be read or written.
+    fn tell(&self, p: &Path) {
+        let watch = self.watch.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if let Some(Watch(told)) = watch {
+            told(p);
+        }
+    }
+
     /// An error when `rule` names how `p` ends: never "not found", which the store reads as an
     /// empty file. A rule starting with `!` is a damaged file (invalid data), and one starting
-    /// with `#` a full drive, not a failing disk.
+    /// with `#` a full drive, not a failing disk. Several endings are separated by `|`.
     fn check(rule: &Mutex<Option<String>>, p: &Path) -> io::Result<()> {
         let rule = rule.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(rule) = rule.as_deref() else { return Ok(()) };
+        let path = p.to_string_lossy().replace('\\', "/");
+        let named = |ends: &str| ends.split('|').any(|end| path.ends_with(end));
         if let Some(end) = rule.strip_prefix('#') {
-            let full = p.to_string_lossy().replace('\\', "/").ends_with(end);
-            return if full { Err(io::Error::new(io::ErrorKind::StorageFull, "full on purpose")) } else { Ok(()) };
+            return if named(end) { Err(io::Error::new(io::ErrorKind::StorageFull, "full on purpose")) } else { Ok(()) };
         }
         let (damaged, end) = match rule.strip_prefix('!') {
             Some(end) => (true, end),
             None => (false, rule),
         };
-        if !p.to_string_lossy().replace('\\', "/").ends_with(end) {
+        if !named(end) {
             return Ok(());
         }
         Err(if damaged { io::Error::new(io::ErrorKind::InvalidData, "damaged on purpose") } else { io::Error::other("failed on purpose") })
@@ -51,12 +72,64 @@ fn not_found() -> io::Error {
     io::Error::from(io::ErrorKind::NotFound)
 }
 
-/// The paths at or under `dir` in memory, from where they start in the map (paths sort by
-/// component, so everything under a folder is together): an online-only account's listing doesn't
-/// pass over every other file.
-fn under<'a>(m: &'a BTreeMap<PathBuf, Vec<u8>>, dir: &'a Path) -> impl Iterator<Item = &'a PathBuf> + 'a {
+/// How long a read refused as its file is replaced or removed is tried again, at most.
+#[cfg(windows)]
+const REFUSED_FOR: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A file read from the disk. On Windows a read that comes as another thread replaces the file
+/// (a new one renamed over it, as every write here does) or removes it is refused for a moment,
+/// "access denied" (os error 5; for up to a tenth of a second, measured): callers took that for
+/// a disk that fails (the changes waiting read by the worker as none, and not put back on a
+/// folder it had just synced). It's read again, a few milliseconds apart, for half a second at
+/// most: a file that stays refused (its permissions) is still an error.
+#[cfg(windows)]
+fn read_settled(p: &Path) -> io::Result<Vec<u8>> {
+    let began = std::time::Instant::now();
+    read_again(|| fs::read(p), || began.elapsed() < REFUSED_FOR, || std::thread::sleep(std::time::Duration::from_millis(5)))
+}
+
+/// `read`, again after each `wait` while it's refused ("access denied") and `still` says to go on.
+#[cfg(any(windows, test))]
+fn read_again(mut read: impl FnMut() -> io::Result<Vec<u8>>, mut still: impl FnMut() -> bool, mut wait: impl FnMut()) -> io::Result<Vec<u8>> {
+    loop {
+        match read() {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && still() => wait(),
+            read => return read,
+        }
+    }
+}
+
+/// A file read from the disk, anywhere else: read once. A rename over a file or its removal
+/// doesn't refuse a read there, so "access denied" is the file's permissions, an error at once
+/// (and in the browser there's no clock to wait by).
+#[cfg(not(windows))]
+fn read_settled(p: &Path) -> io::Result<Vec<u8>> {
+    fs::read(p)
+}
+
+/// The files at or under `dir` in memory, from where they start in the map (paths sort by
+/// component, so everything under a folder is together): an online-only account's listing,
+/// move, removal or size doesn't pass over every other file.
+fn entries_under<'a>(m: &'a BTreeMap<PathBuf, Vec<u8>>, dir: &'a Path) -> impl Iterator<Item = (&'a PathBuf, &'a Vec<u8>)> + 'a {
     use std::ops::Bound;
-    m.range::<Path, _>((Bound::Included(dir), Bound::Unbounded)).map(|(k, _)| k).take_while(move |k| k.starts_with(dir))
+    m.range::<Path, _>((Bound::Included(dir), Bound::Unbounded)).take_while(move |(k, _)| k.starts_with(dir))
+}
+
+/// The paths at or under `dir` in memory ([`entries_under`]).
+fn under<'a>(m: &'a BTreeMap<PathBuf, Vec<u8>>, dir: &'a Path) -> impl Iterator<Item = &'a PathBuf> + 'a {
+    entries_under(m, dir).map(|(k, _)| k)
+}
+
+/// Each file under `p` on the disk, folders followed eight deep at most.
+fn disk_files(p: &Path, depth: usize, each: &mut dyn FnMut(&fs::DirEntry)) {
+    let Ok(rd) = fs::read_dir(p) else { return };
+    for e in rd.filter_map(|e| e.ok()) {
+        match e.file_type() {
+            Ok(t) if t.is_dir() && depth < 8 => disk_files(&e.path(), depth + 1, each),
+            Ok(t) if t.is_file() => each(&e),
+            _ => {}
+        }
+    }
 }
 
 impl Files {
@@ -77,11 +150,12 @@ impl Files {
 
     pub(super) fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
         match self {
-            Files::Disk => fs::read(p),
+            Files::Disk => read_settled(p),
             #[cfg(not(target_arch = "wasm32"))]
             Files::Packed(x) => x.read(p),
             Files::Memory(m, _) => Files::with(m, |m| m.get(p).cloned().ok_or_else(not_found)),
             Files::Failing(f) => {
+                f.tell(p);
                 Faults::check(&f.reads, p)?;
                 f.files.read(p)
             }
@@ -99,20 +173,71 @@ impl Files {
                 Ok(())
             }
             Files::Failing(f) => {
+                f.tell(p);
                 Faults::check(&f.writes, p).map_err(io_err(p))?;
                 f.files.write(p, bytes)
             }
         }
     }
 
-    /// Many files at once (importing a data file: desktop only).
+    /// Many files at once (importing a data file: desktop only), moved into memory rather than
+    /// copied.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn write_many(&self, items: &[(PathBuf, Vec<u8>)]) -> Result<()> {
+    pub(super) fn write_many(&self, items: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
         match self {
-            Files::Packed(x) => x.write_many(items),
+            Files::Packed(x) => x.write_many(&items),
+            Files::Memory(m, _) => {
+                let paths: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
+                Files::with(m, |m| m.extend(items));
+                self.mark(paths.iter().map(PathBuf::as_path));
+                Ok(())
+            }
             _ => {
-                for (p, bytes) in items {
+                for (p, bytes) in &items {
                     self.write(p, bytes)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Files read one at a time by `read` (`None`: gone, so skipped) and written as they come
+    /// (an account moved between memory and the store's own files, [`Store::set_online_only`]):
+    /// no more than one of them is held twice at once. A failure leaves none written in a data
+    /// file (one transaction) or in memory (what was moved in goes again); elsewhere what was
+    /// written before it stays.
+    pub(super) fn write_each(&self, paths: &[PathBuf], read: &mut dyn FnMut(&Path) -> Result<Option<Vec<u8>>>) -> Result<()> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Files::Packed(x) => x.write_each(paths, read),
+            Files::Memory(m, _) => {
+                // What each path held before, put back on a failure.
+                let mut undo: Vec<(&Path, Option<Vec<u8>>)> = Vec::new();
+                for p in paths {
+                    match read(p) {
+                        Ok(Some(bytes)) => undo.push((p.as_path(), Files::with(m, |m| m.insert(p.clone(), bytes)))),
+                        Ok(None) => {}
+                        Err(e) => {
+                            Files::with(m, |m| {
+                                for (p, before) in undo.into_iter().rev() {
+                                    match before {
+                                        Some(bytes) => m.insert(p.to_path_buf(), bytes),
+                                        None => m.remove(p),
+                                    };
+                                }
+                            });
+                            return Err(e);
+                        }
+                    }
+                }
+                self.mark(undo.into_iter().map(|(p, _)| p));
+                Ok(())
+            }
+            _ => {
+                for p in paths {
+                    if let Some(bytes) = read(p)? {
+                        self.write(p, &bytes)?;
+                    }
                 }
                 Ok(())
             }
@@ -216,7 +341,7 @@ impl Files {
             Files::Packed(x) => x.rename(from, to),
             Files::Memory(m, _) => {
                 let moved = Files::with(m, |m| {
-                    let moving: Vec<PathBuf> = m.keys().filter(|k| k.starts_with(from)).cloned().collect();
+                    let moving: Vec<PathBuf> = under(m, from).cloned().collect();
                     let mut moved = Vec::new();
                     for k in moving {
                         if let (Some(v), Ok(rest)) = (m.remove(&k), k.strip_prefix(from)) {
@@ -265,7 +390,7 @@ impl Files {
             Files::Packed(x) => x.remove_dir_all(p),
             Files::Memory(m, _) => {
                 let gone: Vec<PathBuf> = Files::with(m, |m| {
-                    let gone: Vec<PathBuf> = m.keys().filter(|k| k.starts_with(p)).cloned().collect();
+                    let gone: Vec<PathBuf> = under(m, p).cloned().collect();
                     for k in &gone {
                         m.remove(k);
                     }
@@ -325,20 +450,10 @@ impl Files {
 
     /// Every file under a folder, at any depth.
     pub(super) fn walk(&self, dir: &Path) -> Vec<PathBuf> {
-        fn disk(p: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = fs::read_dir(p) else { return };
-            for e in rd.filter_map(|e| e.ok()) {
-                match e.file_type() {
-                    Ok(t) if t.is_dir() && depth < 8 => disk(&e.path(), depth + 1, out),
-                    Ok(t) if t.is_file() => out.push(e.path()),
-                    _ => {}
-                }
-            }
-        }
         match self {
             Files::Disk => {
                 let mut out = Vec::new();
-                disk(dir, 0, &mut out);
+                disk_files(dir, 0, &mut |e| out.push(e.path()));
                 out
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -350,23 +465,16 @@ impl Files {
 
     /// Bytes under a folder.
     pub(super) fn size(&self, dir: &Path) -> u64 {
-        fn walk(p: &Path, depth: usize) -> u64 {
-            let Ok(rd) = fs::read_dir(p) else { return 0 };
-            rd.filter_map(|e| e.ok())
-                .map(|e| match e.file_type() {
-                    Ok(t) if t.is_dir() && depth < 8 => walk(&e.path(), depth + 1),
-                    Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
-                    _ => 0,
-                })
-                .fold(0u64, u64::saturating_add)
-        }
+        let disk = || {
+            let mut bytes = 0u64;
+            disk_files(dir, 0, &mut |e| bytes = bytes.saturating_add(e.metadata().map(|m| m.len()).unwrap_or(0)));
+            bytes
+        };
         match self {
-            Files::Disk => walk(dir, 0),
+            Files::Disk => disk(),
             #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.size(dir).unwrap_or_else(|| walk(dir, 0)),
-            Files::Memory(m, _) => {
-                Files::with(m, |m| m.iter().filter(|(k, _)| k.starts_with(dir)).map(|(_, v)| v.len() as u64).fold(0u64, u64::saturating_add))
-            }
+            Files::Packed(x) => x.size(dir).unwrap_or_else(disk),
+            Files::Memory(m, _) => Files::with(m, |m| entries_under(m, dir).map(|(_, v)| v.len() as u64).fold(0u64, u64::saturating_add)),
             Files::Failing(f) => f.files.size(dir),
         }
     }
@@ -416,9 +524,9 @@ impl Routed {
     pub(super) fn write_many(&self, items: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
         let (held, main): (Vec<_>, Vec<_>) = items.into_iter().partition(|(p, _)| self.is_held(p));
         if !held.is_empty() {
-            self.held.write_many(&held)?;
+            self.held.write_many(held)?;
         }
-        if main.is_empty() { Ok(()) } else { self.main.write_many(&main) }
+        if main.is_empty() { Ok(()) } else { self.main.write_many(main) }
     }
 
     pub(super) fn write_prepared(&self, items: Vec<(PathBuf, Prepared)>, durable: bool) -> Result<()> {
@@ -484,3 +592,17 @@ impl Routed {
         self.at(dir).size(dir)
     }
 }
+
+#[cfg(test)]
+impl Store {
+    /// From now on, a [`Store::failing`] cache tells `told` each path it reads or writes, just
+    /// before it does (`None`: no more).
+    pub(crate) fn watch_files(&self, told: Option<Arc<dyn Fn(&Path) + Send + Sync>>) {
+        if let Files::Failing(f) = &self.files.main {
+            *f.watch.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = told.map(Watch);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

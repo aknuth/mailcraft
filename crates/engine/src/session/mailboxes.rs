@@ -1,5 +1,6 @@
 //! The session: accounts' folder lists and what's kept of each folder.
 
+use super::opening::FRESH_SECS;
 use super::*;
 
 mod across;
@@ -70,6 +71,12 @@ impl ListFilter {
 impl Session {
     pub fn account(&self, id: &str) -> Option<&AccountState> {
         self.accounts.iter().find(|a| a.config.id == id)
+    }
+
+    /// A copy of account `id`'s settings, to change and give to [`Session::update_account`] (or
+    /// a job); the error that there's no such account.
+    pub(crate) fn config_of(&self, id: &str) -> Result<AccountConfig, CmdError> {
+        self.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))
     }
 
     pub(super) fn account_mut(&mut self, id: &str) -> Option<&mut AccountState> {
@@ -249,15 +256,8 @@ impl Session {
         if visible {
             self.refresh_list();
         }
-        if let Some(r) = &self.reading
-            && r.key.account == account
-            && r.key.folder == folder
-        {
-            let key = r.key.clone();
-            let thread = self.thread_of(&key);
-            if let Some(r) = self.reading.as_mut() {
-                r.thread = thread;
-            }
+        if self.reading.as_ref().is_some_and(|r| r.key.account == account && r.key.folder == folder) {
+            self.rethread_reading();
         }
     }
 
@@ -265,7 +265,7 @@ impl Session {
         let k = (account.to_string(), folder.to_string());
         self.cache.remove(&k);
         self.search_folder_changed(account, folder);
-        self.contacts = None;
+        self.drop_contacts();
     }
 
     /// Remember what an Inbox holds; unread mail above the last high-water mark is new. The first
@@ -286,20 +286,19 @@ impl Session {
         // A data file's mail coming in (or its import waiting to go on) isn't new: no rules,
         // nothing announced; what it brought is the backlog from then on.
         if self.importing.held(account) {
-            self.seen_uid.insert(k, max);
+            self.seen_uid.insert(k, (validity, max));
             return;
         }
+        // A folder the server numbered again (another UIDVALIDITY: the cache dropped and synced
+        // again) is looked at as for the first time: its numbers say nothing of what's new. One
+        // marked before anything was kept (0: an Inbox empty at the first sync) has had none.
         let arrived: Vec<Summary> = match self.seen_uid.get(&k) {
-            Some(&seen) => self
-                .folder_state(account, folder)
-                .messages
-                .iter()
-                .filter(|m| m.key.uid > seen && m.key.validity == validity)
-                .map(|m| Summary::clone(m))
-                .collect(),
-            None => Vec::new(),
+            Some(&(was, seen)) if was == validity || was == 0 => {
+                self.folder_state(account, folder).messages.iter().filter(|m| m.key.uid > seen).map(|m| Summary::clone(m)).collect()
+            }
+            _ => Vec::new(),
         };
-        self.seen_uid.insert(k, max);
+        self.seen_uid.insert(k, (validity, max));
         // What the user put here didn't arrive: no rules, nothing announced.
         let arrived: Vec<Summary> =
             arrived.into_iter().filter(|m| !self.moved_in.remove(&(account.to_string(), folder.to_string(), m.message_id.clone()))).collect();
@@ -319,7 +318,7 @@ impl Session {
         let rest: Vec<Summary> = arrived.iter().filter(|m| !quiet.contains(&m.key)).cloned().collect();
         quiet.extend(self.run_rules(&rest));
         // Mail older than a day (a resync after a long time away) isn't "new" any more.
-        let cutoff = self.clock.now - 86_400;
+        let cutoff = self.clock.now.saturating_sub(86_400);
         let fresh: Vec<Summary> = arrived.into_iter().filter(|m| !m.flags.seen && m.when() >= cutoff && !quiet.contains(&m.key)).collect();
         if self.prefs.notify {
             self.new_mail.extend(fresh.into_iter().rev());
@@ -329,23 +328,17 @@ impl Session {
         }
     }
 
-    /// Junk's high-water mark, from what's kept, as soon as the folder is known: what the server
-    /// files there after is seen arriving (a safe sender's goes back to the Inbox), even when the
-    /// folder was empty at the first sync and so never changed until then.
-    pub(super) fn mark_junk(&mut self, account: &str) {
-        let Some(junk) = self.account(account).and_then(|a| a.folder(FolderRole::Junk)).map(|f| f.path.clone()) else { return };
-        if !self.seen_uid.contains_key(&(account.to_string(), junk.clone())) {
-            self.note_new_mail(account, &junk);
-        }
-    }
-
-    /// The Inbox's high-water mark, from what's kept, once the account's mail has been synced
-    /// in full: an Inbox empty at the first sync never changed, so it had none, and its first
-    /// message was taken for the backlog (not announced, no rules, no invitation taken in).
-    pub(super) fn mark_inbox(&mut self, account: &str) {
-        let Some(inbox) = self.account(account).and_then(|a| a.folder(FolderRole::Inbox)).map(|f| f.path.clone()) else { return };
-        if !self.seen_uid.contains_key(&(account.to_string(), inbox.clone())) {
-            self.note_new_mail(account, &inbox);
+    /// The high-water mark of `account`'s folder with `role` (Inbox or Junk), from what's kept,
+    /// when it has none yet. Junk's as soon as the folder is known: what the server files there
+    /// after is seen arriving (a safe sender's goes back to the Inbox), even when the folder was
+    /// empty at the first sync and so never changed until then. The Inbox's once the account's
+    /// mail has been synced in full: an Inbox empty at the first sync never changed, so it had
+    /// none, and its first message was taken for the backlog (not announced, no rules, no
+    /// invitation taken in).
+    pub(super) fn mark_role(&mut self, account: &str, role: FolderRole) {
+        let Some(path) = self.account(account).and_then(|a| a.folder(role)).map(|f| f.path.clone()) else { return };
+        if !self.seen_uid.contains_key(&(account.to_string(), path.clone())) {
+            self.note_new_mail(account, &path);
         }
     }
 
@@ -376,6 +369,15 @@ impl Session {
             }
         }
         out
+    }
+
+    /// A value that changes whenever what [`Session::suggest_contacts`] answers can: the people
+    /// seen in mail and saved (`None` while they're to be counted again), the directories'
+    /// answers, and the time by the second (how lately each was written to ranks them; a
+    /// directory's answer gone stale is asked again). What's suggested for the same text with
+    /// the same value is the same, so a window can keep it rather than ask on every frame.
+    pub fn suggestions_rev(&self) -> (Option<u64>, u64, i64) {
+        (self.contacts.as_ref().map(|_| self.contacts_built), self.directory.rev, self.clock.now)
     }
 
     /// Whether anything was written in the message being written (more than its signature):
@@ -437,7 +439,7 @@ impl Session {
         }
         if !more.is_empty() {
             list.extend(more);
-            list.sort_by_key(|a| (if a.name.is_empty() { a.email.to_lowercase() } else { a.name.to_lowercase() }, a.email.to_lowercase()));
+            list.sort_by_cached_key(|a| (if a.name.is_empty() { a.email.to_lowercase() } else { a.name.to_lowercase() }, a.email.to_lowercase()));
             list.truncate(MAX);
         }
         list
@@ -475,8 +477,34 @@ impl Session {
                 }
             }
             self.contacts = Some(book);
+            self.contacts_at = self.clock.now;
+            self.contacts_kept = None;
             self.contacts_built = self.contacts_built.wrapping_add(1);
         }
+    }
+
+    /// Mail or saved contacts changed: the address book is counted again when it's next wanted,
+    /// and kept meanwhile for the Focused split.
+    pub(super) fn drop_contacts(&mut self) {
+        if let Some(book) = self.contacts.take() {
+            self.contacts_kept = Some((book, self.contacts_at));
+        }
+    }
+
+    /// Have the address book the Focused split sorts by ([`Session::focus_book`]): the one
+    /// counted last while it's under ten minutes old (as the sender check's), else counted
+    /// again. Counting reads every folder of every account, and the Inbox on screen asked for it
+    /// on each of its syncs.
+    pub(super) fn ensure_focus_book(&mut self) {
+        let kept = self.contacts_kept.as_ref().is_some_and(|(_, at)| self.clock.now.saturating_sub(*at) < FRESH_SECS);
+        if self.contacts.is_none() && !kept {
+            self.ensure_contacts();
+        }
+    }
+
+    /// The address book as counted now, else the one counted last.
+    pub(super) fn focus_book(&self) -> Option<&ContactBook> {
+        self.contacts.as_ref().or(self.contacts_kept.as_ref().map(|(book, _)| book))
     }
 
     /// The folders the view draws from.
@@ -536,7 +564,7 @@ impl Session {
         let reading = self.reading.as_ref().map(|r| r.key.clone()).filter(|k| self.index_of(k).is_some());
         list.retain(|m| self.filter_keeps(filter, m) || reading.as_ref() == Some(&m.key));
         if self.focus_split() {
-            self.ensure_contacts();
+            self.ensure_focus_book();
             let other = self.focus_other;
             list.retain(|m| self.is_focused(m) != other);
         }

@@ -2,10 +2,24 @@
 
 use super::*;
 
+/// Run `f` with `slot` (where requests are anchored, or routed) set to `mailbox`, then as it was.
+fn with_mailbox<T>(slot: &RefCell<Option<String>>, mailbox: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let before = slot.replace(Some(mailbox.to_string()));
+    let r = f();
+    *slot.borrow_mut() = before;
+    r
+}
+
 impl Client {
     /// The shared mailboxes added to the account by hand.
     pub fn set_shared(&self, addresses: &[String]) {
         *self.shared_added.borrow_mut() = addresses.iter().map(|a| a.trim().to_string()).filter(|a| a.contains('@')).take(MAX_SHARED).collect();
+        self.shared_listed.borrow_mut().take();
+    }
+
+    /// [`Client::shared_mailboxes`]: those the folder listing just found, else asked now.
+    pub(crate) fn listed_shared_mailboxes(&self) -> Vec<SharedMailbox> {
+        Listed::take(&self.shared_listed).unwrap_or_else(|| self.shared_mailboxes())
     }
 
     /// The account's Autodiscover answer, asked once.
@@ -68,10 +82,36 @@ impl Client {
 
     /// Run `f` with every request routed to another mailbox (a shared one).
     pub(super) fn anchored_to<T>(&self, mailbox: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let before = self.anchor.replace(Some(mailbox.to_string()));
-        let r = f();
-        *self.anchor.borrow_mut() = before;
-        r
+        with_mailbox(&self.anchor, mailbox, f)
+    }
+
+    /// Run `f` with its requests sent where folder `id` (its EWS id) is kept: to the shared
+    /// mailbox it was listed in, or to the public folder mailbox holding its content (Exchange
+    /// 2013 and later answer only there); as they are for the account's own folders. Nothing
+    /// is asked again elsewhere when it isn't found.
+    pub(crate) fn in_folder<T>(&self, id: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.route.borrow().is_some() || self.anchor.borrow().is_some() {
+            return f();
+        }
+        let shared = self.shared_roles.borrow().get(id).map(|(address, _)| address.clone());
+        if let Some(address) = shared {
+            return self.anchored_to(&address, f);
+        }
+        let replica = self.pf_folders.borrow().get(id).cloned();
+        if let Some(guid) = replica {
+            match self.public_folder_mailbox(&guid) {
+                Ok(mailbox) => return self.routed_to(&mailbox, f),
+                Err(e) => log::info!("public folder mailbox {guid}: {e}"),
+            }
+        }
+        f()
+    }
+
+    /// Run `f` with its requests sent to the mailbox of `address` when it's a shared mailbox
+    /// whose folders were listed (its calendar, say); as they are otherwise.
+    pub(crate) fn in_mailbox<T>(&self, address: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let open = self.shared_open.borrow().iter().any(|a| a.eq_ignore_ascii_case(address));
+        if open && self.route.borrow().is_none() && self.anchor.borrow().is_none() { self.anchored_to(address, f) } else { f() }
     }
 
     /// A shared mailbox's mail folders, under a folder named for it (`top`): asked for in that
@@ -97,10 +137,7 @@ impl Client {
             let doc = self.call(&format!(
                 "<m:GetFolder><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape><m:FolderIds>{ids}</m:FolderIds></m:GetFolder>"
             ))?;
-            let found: Vec<Option<String>> = messages(&doc)
-                .iter()
-                .map(|m| if m.attr("ResponseClass") == Some("Error") { None } else { m.find("FolderId").and_then(|f| f.attr("Id")).map(str::to_string) })
-                .collect();
+            let found = folder_ids(&doc);
             let skip: Vec<String> = found.iter().skip(SPECIAL.len()).flatten().cloned().collect();
             {
                 let mut roles = self.shared_roles.borrow_mut();
@@ -111,44 +148,18 @@ impl Client {
                     }
                 }
             }
+            // Its folders, after the one named for it: as many in all as the account's own.
+            let root = format!("<t:DistinguishedFolderId Id=\"msgfolderroot\">{mb}</t:DistinguishedFolderId>");
+            let folders = self.mail_folders(&root, &skip, MAX_FOLDERS.saturating_sub(1))?;
             let mut out = vec![Mailbox { id: root_id.clone(), name: top.to_string(), parent: None, role: FolderRole::Other, total: 0, unread: 0 }];
-            let mut offset = 0;
-            loop {
-                let m = self.call_one(&format!(
-                    "<m:FindFolder Traversal=\"Deep\"><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>\
-                     <t:FieldURI FieldURI=\"folder:DisplayName\"/><t:FieldURI FieldURI=\"folder:ParentFolderId\"/>\
-                     <t:FieldURI FieldURI=\"folder:TotalCount\"/><t:FieldURI FieldURI=\"folder:UnreadCount\"/>\
-                     <t:FieldURI FieldURI=\"folder:FolderClass\"/>{HIDDEN}</t:AdditionalProperties></m:FolderShape>\
-                     <m:IndexedPageFolderView MaxEntriesReturned=\"500\" Offset=\"{offset}\" BasePoint=\"Beginning\"/>\
-                     <m:ParentFolderIds><t:DistinguishedFolderId Id=\"msgfolderroot\">{mb}</t:DistinguishedFolderId></m:ParentFolderIds></m:FindFolder>"
-                ))?;
-                let Some(rf) = m.child("RootFolder") else { break };
-                let folders = rf.folders();
-                let n = folders.len();
-                for f in folders {
-                    let Some(id) = f.child("FolderId").and_then(|i| i.attr("Id")).map(str::to_string) else { continue };
-                    let class = f.text_of("FolderClass").unwrap_or("");
-                    if !(class.is_empty() || class == "IPF.Note" || class.starts_with("IPF.Note.")) || skip.contains(&id) || is_hidden(f) || out.len() >= MAX_FOLDERS {
-                        continue;
-                    }
-                    let parent = f.child("ParentFolderId").and_then(|p| p.attr("Id")).map(str::to_string).or_else(|| Some(root_id.clone()));
-                    let count = |k: &str| f.text_of(k).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-                    self.shared_roles.borrow_mut().entry(id.clone()).or_insert_with(|| (sm.address.clone(), FolderRole::Other));
-                    out.push(Mailbox {
-                        name: f.text_of("DisplayName").unwrap_or_default().chars().take(255).collect(),
-                        parent,
-                        role: FolderRole::Other,
-                        total: count("TotalCount"),
-                        unread: count("UnreadCount"),
-                        id,
-                    });
-                }
-                let last = rf.attr("IncludesLastItemInRange").is_none_or(|v| v == "true");
-                offset += n;
-                if last || n == 0 || out.len() >= MAX_FOLDERS {
-                    break;
-                }
+            let mut roles = self.shared_roles.borrow_mut();
+            for mut m in folders {
+                // One whose parent isn't said goes under the one named for it.
+                m.parent = m.parent.or_else(|| Some(root_id.clone()));
+                roles.entry(m.id.clone()).or_insert_with(|| (sm.address.clone(), FolderRole::Other));
+                out.push(m);
             }
+            drop(roles);
             keep_rooted(&mut out);
             Ok(out)
         })
@@ -157,11 +168,7 @@ impl Client {
     /// Ask Autodiscover about an address (at the Exchange server's own Autodiscover first, then
     /// the domain's): the first answer.
     pub(super) fn ask_autodiscover(&self, address: &str) -> Result<String> {
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?><Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006\">\
-             <Request><EMailAddress>{}</EMailAddress><AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema></Request></Autodiscover>",
-            esc(address)
-        );
+        let body = autodiscover_request(address);
         let mut urls = Vec::new();
         if let Ok(u) = http::Url::parse(&self.url)
             && let Some(origin) = self.url.len().checked_sub(u.path.len()).and_then(|end| self.url.get(..end))
@@ -200,10 +207,7 @@ impl Client {
 
     /// Run `f` with every request routed to a public folder mailbox.
     pub(crate) fn routed_to<T>(&self, mailbox: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let before = self.route.replace(Some(mailbox.to_string()));
-        let r = f();
-        *self.route.borrow_mut() = before;
-        r
+        with_mailbox(&self.route, mailbox, f)
     }
 
     /// The address of the public folder mailbox with this GUID, from Autodiscover (asked at
@@ -224,26 +228,29 @@ impl Client {
 
     /// Exchange's public folders (the organization's shared folders): their mail folders, under
     /// a "Public Folders" folder. Public folders only list one level at a time, so the tree is
-    /// walked, a few levels deep and up to a few hundred folders.
+    /// walked, a few levels deep and up to a few hundred folders; it's kept for the calendars
+    /// and contacts read next ([`Listed`]).
     pub(super) fn public_folders(&self) -> Result<Vec<Mailbox>> {
+        // One that can't be walked now leaves none kept from before.
+        self.pf_listed.borrow_mut().take();
         let (root_id, all) = self.public_tree()?;
         // Calendars and contacts kept as public folders aren't mail; a folder holding others is
         // kept for them.
-        let mut out: Vec<Mailbox> = all
-            .into_iter()
-            .filter(|t| t.class.is_empty() || t.class == "IPF.Note" || t.class.starts_with("IPF.Note.") || t.children)
-            .map(|t| t.mailbox)
-            .collect();
-        if out.is_empty() {
-            return Ok(out);
+        let mut out: Vec<Mailbox> = all.iter().filter(|t| is_mail_class(&t.class) || t.children).map(|t| t.mailbox.clone()).collect();
+        if !out.is_empty() {
+            out.insert(0, Mailbox { id: root_id.clone(), name: PUBLIC_FOLDERS.into(), parent: None, role: FolderRole::Other, total: 0, unread: 0 });
         }
-        out.insert(0, Mailbox { id: root_id, name: PUBLIC_FOLDERS.into(), parent: None, role: FolderRole::Other, total: 0, unread: 0 });
+        *self.pf_listed.borrow_mut() = Listed::now((root_id, all));
         Ok(out)
     }
 
-    /// Exchange's public contact folders and calendars (shared address books and calendars).
+    /// Exchange's public contact folders and calendars (shared address books and calendars):
+    /// from the tree the folder listing just walked, else walked now.
     pub(crate) fn public_pim_folders(&self) -> Result<Vec<PublicFolder>> {
-        let (_, all) = self.public_tree()?;
+        let (_, all) = match Listed::take(&self.pf_listed) {
+            Some(tree) => tree,
+            None => self.public_tree()?,
+        };
         let path = |m: &Mailbox| {
             let mut parts = vec![m.name.clone()];
             let mut up = m.parent.clone();
@@ -302,64 +309,88 @@ impl Client {
             if depth >= PUBLIC_DEPTH || out.len() >= MAX_PUBLIC {
                 break;
             }
-            let m = self.call_one(&format!(
-                "<m:FindFolder Traversal=\"Shallow\"><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>\
-                 <t:FieldURI FieldURI=\"folder:DisplayName\"/><t:FieldURI FieldURI=\"folder:TotalCount\"/>\
-                 <t:FieldURI FieldURI=\"folder:UnreadCount\"/><t:FieldURI FieldURI=\"folder:FolderClass\"/>\
-                 <t:FieldURI FieldURI=\"folder:ChildFolderCount\"/>{REPLICA_LIST}</t:AdditionalProperties></m:FolderShape>\
-                 <m:IndexedPageFolderView MaxEntriesReturned=\"200\" Offset=\"0\" BasePoint=\"Beginning\"/>\
-                 <m:ParentFolderIds><t:FolderId Id=\"{}\"/></m:ParentFolderIds></m:FindFolder>",
-                esc(&parent)
-            ));
-            let m = match m {
-                Ok(m) => m,
-                Err(e) if depth == 0 => return Err(e),
-                Err(e) => {
-                    log::info!("a public folder's folders: {e}");
-                    continue;
-                }
-            };
-            let folders = m.child("RootFolder").map(El::folders).unwrap_or_default();
-            for f in folders {
-                let Some(id) = f.child("FolderId").and_then(|i| i.attr("Id")).map(str::to_string) else { continue };
-                let count = |k: &str| f.text_of(k).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-                let class = f.text_of("FolderClass").unwrap_or("").to_string();
-                let replica = f
-                    .children("ExtendedProperty")
-                    .find(|p| {
-                        p.child("ExtendedFieldURI")
-                            .and_then(|u| u.attr("PropertyTag"))
-                            .is_some_and(|t| t.eq_ignore_ascii_case("0x6698") || t == "26264")
-                    })
-                    .and_then(|p| p.text_of("Value"))
-                    .and_then(replica_guid);
-                if let Some(g) = &replica {
-                    let mut known = self.pf_replicas.borrow_mut();
-                    if !known.contains(g) && known.len() < 20 {
-                        known.push(g.clone());
+            // A page of its folders at a time, as every listing here.
+            let mut offset = 0usize;
+            loop {
+                let m = self.call_one(&format!(
+                    "<m:FindFolder Traversal=\"Shallow\"><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>\
+                     <t:FieldURI FieldURI=\"folder:DisplayName\"/><t:FieldURI FieldURI=\"folder:TotalCount\"/>\
+                     <t:FieldURI FieldURI=\"folder:UnreadCount\"/><t:FieldURI FieldURI=\"folder:FolderClass\"/>\
+                     <t:FieldURI FieldURI=\"folder:ChildFolderCount\"/>{}</t:AdditionalProperties></m:FolderShape>\
+                     <m:IndexedPageFolderView MaxEntriesReturned=\"200\" Offset=\"{offset}\" BasePoint=\"Beginning\"/>\
+                     <m:ParentFolderIds><t:FolderId Id=\"{}\"/></m:ParentFolderIds></m:FindFolder>",
+                    replica_list(),
+                    esc(&parent)
+                ));
+                let m = match m {
+                    Ok(m) => m,
+                    Err(e) if depth == 0 => return Err(e),
+                    Err(e) => {
+                        log::info!("a public folder's folders: {e}");
+                        break;
                     }
-                }
-                out.push(TreeFolder {
-                    mailbox: Mailbox {
-                        name: f.text_of("DisplayName").unwrap_or_default().chars().take(255).collect(),
-                        parent: Some(parent.clone()),
-                        role: FolderRole::Other,
-                        total: count("TotalCount"),
-                        unread: count("UnreadCount"),
-                        id: id.clone(),
-                    },
-                    class,
-                    children: count("ChildFolderCount") > 0,
-                    replica,
-                });
-                if count("ChildFolderCount") > 0 {
-                    queue.push_back((id, depth + 1));
-                }
-                if out.len() >= MAX_PUBLIC {
+                };
+                let Some(rf) = m.child("RootFolder") else { break };
+                let before = out.len();
+                let n = self.take_public_page(rf, &parent, depth, &mut out, &mut queue);
+                offset = offset.saturating_add(n);
+                // A page that brought no folder is the last, whatever the server says of more to
+                // come (one of folders without ids, over and over, would be asked for without end).
+                if rf.attr("IncludesLastItemInRange").is_none_or(|v| v == "true") || out.len() == before || out.len() >= MAX_PUBLIC {
                     break;
                 }
             }
         }
         Ok((root_id, out))
+    }
+
+    /// One page of a public folder's folders (`rf`, those of `parent`, `depth` down) into `out`,
+    /// and those holding others into `queue`: how many the page had.
+    fn take_public_page(
+        &self,
+        rf: &El,
+        parent: &str,
+        depth: usize,
+        out: &mut Vec<TreeFolder>,
+        queue: &mut std::collections::VecDeque<(String, usize)>,
+    ) -> usize {
+        let folders = rf.folders();
+        let n = folders.len();
+        for f in folders {
+            let Some(id) = f.child("FolderId").and_then(|i| i.attr("Id")).map(str::to_string) else { continue };
+            let count = |k: &str| count_of(f, k);
+            let class = f.text_of("FolderClass").unwrap_or("").to_string();
+            let replica = f
+                .children("ExtendedProperty")
+                .find(|p| p.child("ExtendedFieldURI").and_then(|u| u.attr("PropertyTag")).is_some_and(is_replica_tag))
+                .and_then(|p| p.text_of("Value"))
+                .and_then(replica_guid);
+            if let Some(g) = &replica {
+                let mut known = self.pf_folders.borrow_mut();
+                if known.len() < MAX_PUBLIC * 2 || known.contains_key(&id) {
+                    known.insert(id.clone(), g.clone());
+                }
+            }
+            out.push(TreeFolder {
+                mailbox: Mailbox {
+                    name: f.text_of("DisplayName").unwrap_or_default().chars().take(255).collect(),
+                    parent: Some(parent.to_string()),
+                    role: FolderRole::Other,
+                    total: count("TotalCount"),
+                    unread: count("UnreadCount"),
+                    id: id.clone(),
+                },
+                class,
+                children: count("ChildFolderCount") > 0,
+                replica,
+            });
+            if count("ChildFolderCount") > 0 {
+                queue.push_back((id, depth + 1));
+            }
+            if out.len() >= MAX_PUBLIC {
+                break;
+            }
+        }
+        n
     }
 }

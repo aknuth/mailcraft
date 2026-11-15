@@ -136,35 +136,35 @@ impl EventQuery {
                 _ => (false, tok),
             };
             let field = tok.split_once(':').filter(|(k, v)| !v.is_empty() && !k.starts_with('"'));
+            // The token as typed, looked for anywhere: a bare word, and a field that isn't one or
+            // whose value can't be read.
+            let anywhere = || EventTerm::Text(EventField::Any, needles(&tok));
             let term = match field {
-                Some((k, v)) if k.eq_ignore_ascii_case("after") || k.eq_ignore_ascii_case("before") => {
-                    // A date that can't be read is looked for as words.
-                    match date_value(v) {
-                        Some(d) => {
-                            // `-after:x` is before it, `-before:x` from it on.
-                            if k.eq_ignore_ascii_case("after") != negated {
-                                q.after = Some(q.after.map_or(d, |a| a.max(d)));
-                            } else {
-                                q.before = Some(q.before.map_or(d, |b| b.min(d)));
-                            }
-                            continue;
+                Some((k, v)) if k.eq_ignore_ascii_case("after") || k.eq_ignore_ascii_case("before") => match date_value(v) {
+                    Some(d) => {
+                        // `-after:x` is before it, `-before:x` from it on.
+                        if k.eq_ignore_ascii_case("after") != negated {
+                            q.after = Some(q.after.map_or(d, |a| a.max(d)));
+                        } else {
+                            q.before = Some(q.before.map_or(d, |b| b.min(d)));
                         }
-                        None => Some(EventTerm::Text(EventField::Any, needles(&tok))),
+                        continue;
                     }
-                }
+                    None => anywhere(),
+                },
                 Some((k, v)) if k.eq_ignore_ascii_case("is") => match v.to_ascii_lowercase().as_str() {
-                    "private" | "confidential" => Some(EventTerm::Private),
-                    "recurring" | "series" => Some(EventTerm::Recurring),
-                    _ => Some(EventTerm::Text(EventField::Any, needles(&tok))),
+                    "private" | "confidential" => EventTerm::Private,
+                    "recurring" | "series" => EventTerm::Recurring,
+                    _ => anywhere(),
                 },
                 Some((k, v)) => match FIELDS.iter().find(|(f, _)| f.eq_ignore_ascii_case(k)) {
-                    Some((_, f)) => Some(EventTerm::Text(*f, needles(v))),
-                    None => Some(EventTerm::Text(EventField::Any, needles(&tok))),
+                    Some((_, f)) => EventTerm::Text(*f, needles(v)),
+                    None => anywhere(),
                 },
-                None => Some(EventTerm::Text(EventField::Any, needles(&tok))),
+                None => anywhere(),
             };
-            if let Some(t) = term.filter(|t| !matches!(t, EventTerm::Text(_, n) if n.is_empty())) {
-                q.terms.push((t, negated));
+            if !matches!(&term, EventTerm::Text(_, n) if n.is_empty()) {
+                q.terms.push((term, negated));
             }
         }
         q
@@ -177,11 +177,12 @@ impl EventQuery {
 
     /// Whether an event is one looked for (the dates aside: they pick its occurrences).
     pub fn matches(&self, e: &CalEvent) -> bool {
-        self.terms.iter().all(|(t, negated)| term_matches(t, e) != *negated)
+        let mut texts = Texts::default();
+        self.terms.iter().all(|(t, negated)| term_matches(t, e, &mut texts) != *negated)
     }
 }
 
-fn people(list: &[&Attendee]) -> String {
+fn people<'a>(list: impl IntoIterator<Item = &'a Attendee>) -> String {
     let mut s = String::new();
     for a in list {
         s.push_str(&a.name);
@@ -213,8 +214,8 @@ fn field_text(f: EventField, e: &CalEvent) -> String {
             s
         }
         EventField::Notes => notes(),
-        EventField::Organizer => people(&e.organizer.iter().collect::<Vec<_>>()),
-        EventField::Attendees => people(&e.attendees.iter().collect::<Vec<_>>()),
+        EventField::Organizer => people(&e.organizer),
+        EventField::Attendees => people(&e.attendees),
         EventField::Categories => e.categories.join(" \u{1f} "),
         EventField::Any => {
             [EventField::Subject, EventField::Location, EventField::Organizer, EventField::Attendees, EventField::Categories, EventField::Notes]
@@ -226,14 +227,33 @@ fn field_text(f: EventField, e: &CalEvent) -> String {
     }
 }
 
-fn term_matches(t: &EventTerm, e: &CalEvent) -> bool {
+/// A field's text as it's searched: lower-cased, and its words.
+struct Searched {
+    lower: String,
+    words: Vec<String>,
+}
+
+/// An event's fields as searched, each made the first time a term looks in it (a query's terms
+/// often look in the same one).
+#[derive(Default)]
+struct Texts([Option<Searched>; 7]);
+
+impl Texts {
+    fn of(&mut self, f: EventField, e: &CalEvent) -> Option<&Searched> {
+        let slot = self.0.get_mut(f as usize)?;
+        Some(slot.get_or_insert_with(|| {
+            let text = field_text(f, e);
+            Searched { lower: text.to_lowercase(), words: words(&text).collect() }
+        }))
+    }
+}
+
+fn term_matches(t: &EventTerm, e: &CalEvent, texts: &mut Texts) -> bool {
     match t {
         EventTerm::Private => privacy(e) != Privacy::Public,
         EventTerm::Recurring => e.rrule.is_some() || e.recurrence_id.is_some(),
         EventTerm::Text(f, list) => {
-            let text = field_text(*f, e);
-            let lower = text.to_lowercase();
-            let have: Vec<String> = words(&text).collect();
+            let Some(Searched { lower, words: have }) = texts.of(*f, e) else { return false };
             list.iter().any(|n| match n {
                 Needle::Phrase(p) => lower.contains(p.as_str()),
                 // Each word starts one of the field's (an address, or a room's `2.14`, inside one).

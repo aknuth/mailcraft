@@ -35,6 +35,14 @@ impl Changes {
             Some(c) => Err(CmdError::Params(format!("`changes` is \"read\" or \"keep\", not `{c}`"))),
         }
     }
+
+    /// As the command takes it: what [`Changes::parse`] reads back.
+    pub fn code(self) -> &'static str {
+        match self {
+            Changes::Read => "read",
+            Changes::Keep => "keep",
+        }
+    }
 }
 
 /// Whether `path` names an Outlook data file (its copy goes beside it), not MailCraft's own.
@@ -119,17 +127,21 @@ impl Session {
             let _ = self.drop_account(id, Leaves::DataFile);
             return Err(CmdError::Failed(format!("MailCraft's copy of this file couldn't be opened: {e}")));
         }
-        let mut folders = store.load_folders(id).unwrap_or_default();
+        // Its folder list not read, it would open with no folders, saying nothing: it goes again.
+        let mut folders = match store.load_folders(id) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = self.drop_account(id, Leaves::DataFile);
+                return Err(CmdError::Failed(format!("MailCraft's copy of this file couldn't be opened: {e}")));
+            }
+        };
         sort_folders(&mut folders);
         if let Some(a) = self.account_mut(id) {
             a.folders = folders;
             a.status = SyncStatus::Offline;
         }
-        let stage = match found.state.as_str() {
-            "done" => ImportStage::Done,
-            "running" => ImportStage::Running,
-            _ => ImportStage::Stopped,
-        };
+        // A copy whose note says nothing it knows of waits on the user, as one cancelled.
+        let stage = ImportStage::from_note_state(&found.state).unwrap_or(ImportStage::Stopped);
         let record_key = self.facts_for(path).map(|f| f.record_key.clone()).unwrap_or_default();
         let row = DataSource { path: path.to_string(), size: found.size, modified: found.modified, record_key, stage, report: None };
         self.importing.sources.insert(id.to_string(), row);
@@ -251,3 +263,6 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

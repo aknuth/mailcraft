@@ -19,10 +19,21 @@ mod backend;
 mod fetch;
 #[cfg(target_arch = "wasm32")]
 mod idb;
+mod index_queue;
+mod lists_kept;
+mod query;
+mod sealing;
 #[cfg(target_arch = "wasm32")]
 mod vault;
 #[cfg(target_arch = "wasm32")]
 mod web;
+
+/// What a browser error says: its message, else the value itself.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn js(e: &wasm_bindgen::JsValue) -> String {
+    use wasm_bindgen::JsCast as _;
+    e.as_string().or_else(|| e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message()))).unwrap_or_else(|| format!("{e:?}"))
+}
 
 #[cfg(target_arch = "wasm32")]
 fn main() {

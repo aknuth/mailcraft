@@ -20,10 +20,14 @@ use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 use crate::{Action, Dialog};
 
+mod carets;
 mod layout;
 mod links;
 mod pictures;
 mod toolbar;
+mod tracked;
+mod undo;
+pub(crate) use layout::Card;
 use layout::*;
 pub(crate) use links::link_dialog;
 use links::*;
@@ -34,13 +38,13 @@ pub use toolbar::Counts;
 #[cfg(test)]
 pub(crate) use toolbar::{count_words, date_choices};
 pub(crate) use toolbar::{ribbon, signature_bar};
+use tracked::Tracked;
+use undo::{History, Snap};
 
 /// Pixels per point.
 const PX: f32 = 4.0 / 3.0;
 /// One indent step (and the room for a bullet or number).
 const INDENT: f32 = 28.0;
-/// Most undo steps kept.
-const UNDO_MAX: usize = 200;
 
 /// Outlook's standard colours, and its highlighter's.
 pub(crate) const COLORS: [[u8; 3]; 12] = [
@@ -75,8 +79,8 @@ pub(crate) struct Editor {
     typing: Option<Style>,
     /// The selection (characters) at the end of the last frame.
     pub sel: Range<usize>,
-    undo: Vec<Snap>,
-    redo: Vec<Snap>,
+    undo: History,
+    redo: History,
     last_change: f64,
     /// The Insert link dialog, while open.
     link: Option<LinkForm>,
@@ -95,13 +99,12 @@ pub(crate) struct Editor {
     /// The text box this tall at least, when not the room there is (a block of the quoted
     /// original, as tall as its text).
     pub(crate) min_height: Option<f32>,
-}
-
-#[derive(Clone)]
-struct Snap {
-    text: String,
-    styles: Styles,
-    cursor: usize,
+    /// A part of the text drawn as something else, set for each frame by who draws it (a
+    /// signature's HTML code, laid out), and where its room was in the last frame.
+    pub(crate) card: Option<Card>,
+    pub(crate) card_rect: Option<Rect>,
+    /// The text as laid out last.
+    laid: Laid,
 }
 
 impl Editor {
@@ -110,8 +113,8 @@ impl Editor {
             id,
             typing: None,
             sel: 0..0,
-            undo: Vec::new(),
-            redo: Vec::new(),
+            undo: History::default(),
+            redo: History::default(),
             last_change: 0.0,
             link: None,
             paste: false,
@@ -121,22 +124,28 @@ impl Editor {
             placed: Vec::new(),
             refocus: None,
             min_height: None,
+            card: None,
+            card_rect: None,
+            laid: Laid::default(),
         }
     }
 
+    /// Take an undo step: the message as it is, the cursor at `cursor`.
     fn remember(&mut self, c: &Compose, cursor: usize) {
-        self.undo.push(Snap { text: c.body.clone(), styles: c.styles.clone(), cursor });
-        if self.undo.len() > UNDO_MAX {
-            self.undo.remove(0);
-        }
+        self.remember_snap(Snap::of(c, cursor));
+    }
+
+    /// Take an undo step back to `s` (what's to redo is gone).
+    fn remember_snap(&mut self, s: Snap) {
+        self.undo.push(s);
         self.redo.clear();
     }
 }
 
-/// The message text box's id.
 /// The id of the signature being edited (the signature editor is a message editor of its own).
 pub(crate) const SIGNATURE_ID: u64 = u64::MAX;
 
+/// The message text box's id.
 pub(crate) fn body_id(c: &Compose) -> egui::Id {
     egui::Id::unique(("compose-body", c.id))
 }
@@ -153,18 +162,45 @@ fn set_selection(ctx: &egui::Context, id: egui::Id, r: Range<usize>) {
     state.store(ctx, id);
 }
 
+/// The characters of `text` in `range` (character positions, as the selection's are).
+fn chars_in(text: &str, range: Range<usize>) -> impl Iterator<Item = char> + '_ {
+    text.chars().skip(range.start).take(range.end.saturating_sub(range.start))
+}
+
 /// The look typing at `at` takes: the character before (or after, at a paragraph's start),
 /// without a link the text doesn't continue.
 fn typing_style(text: &str, styles: &Styles, at: usize) -> Style {
-    let chars: Vec<char> = text.chars().collect();
-    let before = at.checked_sub(1).filter(|i| chars.get(*i).is_some_and(|c| *c != '\n'));
-    let i = before.or_else(|| chars.get(at).filter(|c| **c != '\n').map(|_| at));
+    // The characters either side of `at` (the ribbon asks every frame: the text isn't copied).
+    let mut around = text.chars().skip(at.saturating_sub(1));
+    let before = if at > 0 { around.next() } else { None };
+    let after = around.next();
+    let i = if before.is_some_and(|c| c != '\n') { at.checked_sub(1) } else { after.filter(|c| *c != '\n').map(|_| at) };
     let Some(i) = i else { return Style::default() };
     let mut s = styles.style(i).for_typing();
     if s.link.is_some() && styles.style(at).link != s.link {
         s.link = None;
     }
     s
+}
+
+/// The line (paragraph) character `at` is in, the character it starts at, and whether it's
+/// empty: one look along the text as far as `at`.
+fn line_at(text: &str, at: usize) -> (usize, usize, bool) {
+    let mut chars = text.chars();
+    let (mut line, mut start, mut i) = (0, 0, 0);
+    while i < at {
+        match chars.next() {
+            Some('\n') => {
+                line += 1;
+                start = i + 1;
+            }
+            Some(_) => {}
+            None => break,
+        }
+        i += 1;
+    }
+    // Empty: nothing between its start and `at`, and a break or the end after.
+    (line, start, start == i && chars.next().is_none_or(|ch| ch == '\n'))
 }
 
 /// A change the ribbon or a shortcut asks for.
@@ -202,8 +238,14 @@ pub(crate) fn apply(ed: &mut Editor, c: &mut Compose, op: Op) {
         replace(ed, c, sel, text, style);
         return;
     }
-    ed.remember(c, sel.end);
     let collapsed = sel.is_empty();
+    // With nothing selected, a character's look is only how what's typed next looks: the text
+    // is as it was, so it's no undo step (one made the next Undo seem to do nothing, and took
+    // Redo away). A paragraph's look changes the text's.
+    let paragraph = matches!(op, Op::Bullets | Op::Numbers | Op::Align(_) | Op::Indent | Op::Outdent | Op::Clear);
+    if !collapsed || paragraph {
+        ed.remember(c, sel.end);
+    }
     let base = ed.typing.clone().unwrap_or_else(|| typing_style(&c.body, &c.styles, sel.start));
     let toggled = |get: fn(&Style) -> bool| -> bool { if collapsed { !get(&base) } else { !rich::all(&c.body, &c.styles, sel.clone(), get) } };
     type F = Box<dyn Fn(&Style) -> Style>;
@@ -281,7 +323,7 @@ fn replace(ed: &mut Editor, c: &mut Compose, range: Range<usize>, text: &str, st
 fn undo(ed: &mut Editor, c: &mut Compose, ctx: &egui::Context, redo: bool) {
     let (from, to) = if redo { (&mut ed.redo, &mut ed.undo) } else { (&mut ed.undo, &mut ed.redo) };
     let Some(s) = from.pop() else { return };
-    to.push(Snap { text: c.body.clone(), styles: c.styles.clone(), cursor: ed.sel.end });
+    to.push(Snap::of(c, ed.sel.end));
     c.body = s.text;
     c.styles = s.styles;
     let at = s.cursor.min(c.body.chars().count());
@@ -304,12 +346,32 @@ fn keys(ui: &mut Ui, ed: &mut Editor, c: &mut Compose, acts: &mut Vec<Action>) {
     let (mut undo_k, mut redo_k, mut link_k, mut book_k) = (false, false, false, false);
     // Lists: Enter on an empty item ends the list, Backspace at an item's start takes its bullet
     // away, Tab and Shift+Tab move it in and out.
-    let line = rich::lines_of(&c.body, ed.sel.start..ed.sel.start).0;
+    let (line, line_start, line_empty) = line_at(&c.body, ed.sel.start);
     let para = c.styles.para(line);
-    let line_start = c.body.split('\n').take(line).map(|l| l.chars().count() + 1).sum::<usize>();
-    let line_empty = c.body.split('\n').nth(line).is_some_and(str::is_empty);
     let at_start = ed.sel.is_empty() && ed.sel.start == line_start;
     let listed = para.list != List::None;
+    // A card is one thing: Backspace after it, or Delete before it, takes all of it (its
+    // unseen letters one at a time would leave the rest of them as text).
+    if let Some(card) = ed.card.clone().filter(|card| !c.sending && ed.sel.is_empty() && card.whole.end <= n) {
+        let first = card.before(&c.body);
+        let key = if ed.sel.start == card.whole.end {
+            Some(Key::Backspace)
+        } else if ed.sel.start == first {
+            Some(Key::Delete)
+        } else {
+            None
+        };
+        let pressed = key.is_some_and(|key| {
+            ui.input_mut(|i| [Modifiers::NONE, Modifiers::SHIFT, Modifiers::COMMAND, Modifiers::ALT].iter().any(|m| i.consume_key(*m, key)))
+        });
+        if pressed {
+            let style = typing_style(&c.body, &c.styles, first);
+            replace(ed, c, first..card.whole.end, "", style);
+            set_selection(&ctx, id, ed.sel.clone());
+            ed.card = None;
+            return;
+        }
+    }
     ui.input_mut(|i| {
         // With Shift first, so Ctrl+Shift+Z isn't taken as Ctrl+Z.
         for (m, k, op) in [
@@ -360,7 +422,7 @@ fn keys(ui: &mut Ui, ed: &mut Editor, c: &mut Compose, acts: &mut Vec<Action>) {
         ed.link = Some(LinkForm::open(c, ed.sel.clone()));
     }
     if book_k && c.id != SIGNATURE_ID {
-        acts.push(Action::Dialog(Dialog::select_names(c, "to")));
+        acts.push(Action::Dialog(Dialog::select_names(c, crate::dialogs::Recipients::To)));
     }
 }
 
@@ -377,11 +439,7 @@ fn paste_formatted(ui: &mut Ui, ed: &mut Editor, c: &mut Compose, id: egui::Id) 
     pictures::take_pasted(c, &add, &mut add_styles, found);
     ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
     c.styles.fit(&c.body);
-    ed.undo.push(Snap { text: c.body.clone(), styles: c.styles.clone(), cursor: ed.sel.start });
-    if ed.undo.len() > UNDO_MAX {
-        ed.undo.remove(0);
-    }
-    ed.redo.clear();
+    ed.remember(c, ed.sel.start);
     let n = c.body.chars().count();
     let sel = ed.sel.start.min(n)..ed.sel.end.min(n);
     rich::splice(&mut c.body, &mut c.styles, sel.clone(), &add, &add_styles);
@@ -420,12 +478,17 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
             paste_formatted(ui, ed, c, id);
         }
     }
-    let before = c.body.clone();
-    let styles = c.styles.clone();
     let plain = c.plain;
     let tokens = *t;
     let own = if plain { HashMap::new() } else { pictures::own_sizes(ui.ctx(), ed, c) };
-    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout(ui, buf.as_str(), &styles, plain, &tokens, wrap, &own);
+    let card = ed.card.clone().filter(|_| !plain);
+    // The text box changes the text; its look is laid out as it was at the frame's start.
+    let mut text = Tracked::new(&mut c.body);
+    let styles = &c.styles;
+    let laid = &mut ed.laid;
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+        layout_kept(laid, ui, buf.as_str(), Lay { st: styles, plain, t: &tokens, wrap, own: &own, card: card.as_ref() })
+    };
     // As tall as the pane, or, above the original of a reply shown as it came, as its text.
     let height = ed.min_height.unwrap_or_else(|| if c.quote.is_some() { 96.0 } else { ui.available_height().max(220.0) });
     // A right-click inside the selection keeps it (egui's text box moves the cursor on any
@@ -442,7 +505,7 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
         (true, true) => tl!("Write your signature, or paste it…"),
         (true, false) => tl!("Write your message…"),
     };
-    let out = egui::TextEdit::multiline(&mut c.body)
+    let out = egui::TextEdit::multiline(&mut text)
         .id(id)
         .frame(egui::Frame::NONE)
         .hint_text(hint)
@@ -452,6 +515,8 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
         .desired_rows(if ed.min_height.is_some() { 1 } else { 4 })
         .layouter(&mut layouter)
         .show(ui);
+    // What the text was, when the text box changed it.
+    let before = text.before();
     let mut cursor = out.cursor_range.map(|r| {
         let r = r.as_sorted_char_range();
         r.start.0..r.end.0
@@ -466,20 +531,46 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
             cursor = Some(kept.clone());
         }
     }
-    if c.body != before {
+    // A card is passed as one thing: the cursor doesn't stop among its unseen letters (on the
+    // way down it comes out after it, on the way up before it), and a selection that reaches
+    // into it takes all of it.
+    if let (Some(card), Some(r)) = (&card, cursor.as_mut())
+        && before.is_none()
+    {
+        let (first, last) = (card.before(&c.body), card.whole.end);
+        let inside = |p: usize| p > first && p < last;
+        let moved = if r.start == r.end && inside(r.start) {
+            let p = if ed.sel.start >= last { first } else { last };
+            Some(p..p)
+        } else if r.start != r.end && (inside(r.start) || inside(r.end)) {
+            Some(if inside(r.start) { first } else { r.start }..r.end.max(last))
+        } else {
+            None
+        };
+        if let Some(to) = moved.filter(|to| to != r) {
+            set_selection(ui.ctx(), id, to.clone());
+            *r = to;
+            ui.ctx().request_repaint();
+        }
+    }
+    // Where its room is: its last line's row, the width of the text.
+    ed.card_rect = card.as_ref().filter(|card| card.range.end <= c.body.chars().count()).map(|card| {
+        let row = out.galley.pos_from_cursor(CCursor::new(card.last_line(&c.body)));
+        let top = out.galley_pos.y + row.min.y + 2.0;
+        Rect::from_min_size(egui::pos2(out.galley_pos.x, top), vec2(out.response.rect.width(), card.size.y))
+    });
+    if let Some(before) = before {
         // The look of what was typed: the ribbon's choice, else the text's at the cursor.
-        let typing = ed.typing.take().unwrap_or_else(|| typing_style(&before, &styles, ed.sel.start));
+        let typing = ed.typing.take().unwrap_or_else(|| typing_style(&before, &c.styles, ed.sel.start));
         let now = ui.input(|i| i.time);
         let breaks = c.body.matches('\n').count() != before.matches('\n').count();
-        if now - ed.last_change > 1.0 || breaks || ed.undo.is_empty() {
-            ed.undo.push(Snap { text: before.clone(), styles: styles.clone(), cursor: ed.sel.start });
-            if ed.undo.len() > UNDO_MAX {
-                ed.undo.remove(0);
-            }
-            ed.redo.clear();
-        }
+        let step = now - ed.last_change > 1.0 || breaks || ed.undo.is_empty();
+        let styles = step.then(|| c.styles.clone());
         ed.last_change = now;
         c.styles.edit_at(&before, &c.body, &typing, cursor.as_ref().map(|r| r.end));
+        if let Some(styles) = styles {
+            ed.remember_snap(Snap { text: before, styles, cursor: ed.sel.start });
+        }
         ui.ctx().request_repaint();
     } else if cursor.as_ref().is_some_and(|r| *r != ed.sel) {
         // The cursor moved: what the ribbon set for typing no longer applies.
@@ -498,7 +589,7 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
     }
     if !out.response.has_focus() && !ed.sel.is_empty() {
         let color = ui.visuals().selection.bg_fill.gamma_multiply(0.45);
-        let shapes: Vec<egui::Shape> = selection_rects(&out.galley, ed.sel.clone())
+        let shapes: Vec<egui::Shape> = carets::selection_rects(&out.galley, ed.sel.clone())
             .into_iter()
             .map(|r| egui::Shape::rect_filled(r.translate(out.galley_pos.to_vec2()), 0.0, color))
             .collect();
@@ -507,30 +598,13 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
     text_menu(&out.response, ed, c, acts);
 }
 
-/// The rectangles a selection covers, one per row (galley coordinates).
-fn selection_rects(g: &Galley, sel: Range<usize>) -> Vec<Rect> {
-    let mut out: Vec<Rect> = Vec::new();
-    // Long selections are drawn in full; past this many characters only their start is.
-    for i in sel.start..sel.end.min(sel.start + 20_000) {
-        let a = g.pos_from_cursor(CCursor::new(i));
-        let b = g.pos_from_cursor(CCursor::new(i + 1));
-        // A line's end: the selection runs a little past the text, as text boxes show it.
-        let right = if (b.min.y - a.min.y).abs() < 0.5 { b.min.x } else { a.min.x + 5.0 };
-        let r = Rect::from_min_max(egui::pos2(a.min.x, a.min.y), egui::pos2(right.max(a.min.x), a.max.y));
-        match out.last_mut() {
-            Some(last) if (last.min.y - r.min.y).abs() < 0.5 => *last = last.union(r),
-            _ => out.push(r),
-        }
-    }
-    out
-}
-
 /// The right-click menu on the text, as Outlook's: Cut, Copy, Paste and Select all; the link
 /// (insert, edit, open, remove); and clearing the formatting.
 fn text_menu(resp: &egui::Response, ed: &mut Editor, c: &mut Compose, acts: &mut Vec<Action>) {
     let n = c.body.chars().count();
     let sel = ed.sel.start.min(n)..ed.sel.end.min(n);
-    let chosen: String = c.body.chars().skip(sel.start).take(sel.end - sel.start).collect();
+    // What's selected, copied out only when it's cut or copied (not every frame).
+    let chosen = |text: &str| -> String { chars_in(text, sel.clone()).collect() };
     let link = c.styles.style(sel.start).link.filter(|_| n > 0);
     let shown = resp.context_menu(|ui| {
         ui.set_min_width(190.0);
@@ -544,13 +618,13 @@ fn text_menu(resp: &egui::Response, ed: &mut Editor, c: &mut Compose, acts: &mut
         };
         let some = !sel.is_empty();
         if item(ui, "Cut", "Ctrl+X", some && !c.sending) {
-            ui.ctx().copy_text(chosen.clone());
+            ui.ctx().copy_text(chosen(&c.body));
             let style = typing_style(&c.body, &c.styles, sel.start);
             replace(ed, c, sel.clone(), "", style);
             ed.refocus = Some(ed.sel.clone());
         }
         if item(ui, "Copy", "Ctrl+C", some) {
-            ui.ctx().copy_text(chosen.clone());
+            ui.ctx().copy_text(chosen(&c.body));
             ed.refocus = Some(sel.clone());
         }
         if item(ui, "Paste", "Ctrl+V", !c.sending) {
@@ -599,14 +673,22 @@ fn text_menu(resp: &egui::Response, ed: &mut Editor, c: &mut Compose, acts: &mut
 /// Bullets and numbers, rules and pictures.
 fn decorate(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, g: &Galley, origin: egui::Pos2) {
     let painter = ui.painter().clone();
-    let at = |i: usize| -> Rect { g.pos_from_cursor(CCursor::new(i)).translate(origin.to_vec2()) };
+    // Each line's start, in order: its row found walking on from the last line's (looked for
+    // from the first row each time, a long message's lines took lines × rows a frame).
+    let mut carets = carets::Carets::new(g);
+    let mut at = |i: usize| -> Rect { carets.at(i).translate(origin.to_vec2()) };
+    // A character's look, not copied.
+    let look = |i: usize| c.styles.chars.get(i).and_then(|k| c.styles.palette.get(usize::from(*k)));
     let mut i = 0usize;
     let mut numbers: Vec<u32> = vec![0; 16];
     let right = ui.min_rect().right().max(origin.x + g.size().x);
     let mut pictures = Vec::new();
     ed.placed.clear();
+    // (Nothing is drawn over a card's unseen letters: what stands for them is drawn there.)
+    let card = ed.card.clone();
+    let in_card = |i: usize| card.as_ref().is_some_and(|c| c.range.contains(&i));
     for (n, line) in c.body.split('\n').enumerate() {
-        let p = c.styles.para(n);
+        let p = if in_card(i) { Default::default() } else { c.styles.para(n) };
         let r = at(i);
         if p.rule {
             let y = r.center().y;
@@ -619,8 +701,7 @@ fn decorate(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, g: &Galle
                 for x in numbers.iter_mut().skip(depth + 1) {
                     *x = 0;
                 }
-                let style = c.styles.style(i);
-                let px = f32::from(style.size()) * PX;
+                let px = f32::from(look(i).map_or(rich::DEFAULT_SIZE, Style::size)) * PX;
                 let mark = if p.list == List::Bullet {
                     if depth % 2 == 0 { "•".to_string() } else { "◦".to_string() }
                 } else {
@@ -639,14 +720,17 @@ fn decorate(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, g: &Galle
         {
             *x = 0;
         }
+        let mut count = 0;
         for (k, ch) in line.chars().enumerate() {
+            count = k + 1;
             if ch == PICTURE
-                && let Some(cid) = c.styles.style(i + k).picture
+                && !in_card(i + k)
+                && let Some(cid) = look(i + k).and_then(|s| s.picture.clone())
             {
                 pictures.push((i + k, cid));
             }
         }
-        i += line.chars().count() + 1;
+        i += count + 1;
     }
     for (at, cid) in pictures {
         let last = c.body.chars().nth(at + 1).is_none_or(|ch| ch == '\n');
@@ -656,109 +740,4 @@ fn decorate(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, g: &Galle
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn link_addresses() {
-        let web = |a: &str| LinkForm { address: a.into(), ..Default::default() }.url();
-        assert_eq!(web("example.com").as_deref(), Some("https://example.com"));
-        assert_eq!(web("http://x.example/a").as_deref(), Some("http://x.example/a"));
-        assert_eq!(web("C:/Users/me/plan.docx").as_deref(), Some("file:///C:/Users/me/plan.docx"));
-        assert_eq!(web("https://"), None);
-        assert_eq!(web("  "), None);
-        let mail = LinkForm { email: true, to: "zoe@studio.example".into(), subject: "Poster & sizes".into(), ..Default::default() };
-        assert_eq!(mail.url().as_deref(), Some("mailto:zoe@studio.example?subject=Poster%20%26%20sizes"));
-        assert_eq!(LinkForm { email: true, ..Default::default() }.url(), None);
-        // An existing mailto link opens as an email address with its subject.
-        let mut c = Compose { body: "write".into(), ..Default::default() };
-        c.styles = Styles::plain(&c.body);
-        c.styles.restyle(&c.body, 0..5, |s| Style { link: Some("mailto:ann@x.example?subject=Hi%20there".into()), ..s.clone() });
-        let f = LinkForm::open(&c, 0..5);
-        assert!(f.email && f.editing && !f.multi);
-        assert_eq!((f.to.as_str(), f.subject.as_str(), f.text.as_str()), ("ann@x.example", "Hi there", "write"));
-    }
-
-    /// Right-to-left paragraphs in a message start against the editor's right edge, a short one
-    /// and every row of a wrapped one, in rich and plain text; a left-to-right one stays left. (egui
-    /// put them against the widest line, so a short Hebrew line sat in the middle.)
-    #[test]
-    fn right_to_left_paragraphs_start_on_the_right() {
-        let text = "שלום עולם
-English stays left.
-זוהי פסקה ארוכה מאוד בעברית שתיכנס לכמה שורות כשהעורך צר, וכל שורה שלה צריכה להתחיל בצד ימין של העורך.";
-        let wrap = 300.0;
-        let ctx = egui::Context::default();
-        let t = Tokens::light();
-        for plain in [false, true] {
-            let mut rows = Vec::new();
-            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let g = layout::layout(ui, text, &Styles::plain(text), plain, &t, wrap, &HashMap::new());
-                rows = g
-                    .rows
-                    .iter()
-                    .map(|r| {
-                        // Where its letters are (a row's rect takes in its leading space).
-                        let ink =
-                            |f: fn(f32, f32) -> f32, init: f32| r.row.glyphs.iter().filter(|g| !g.chr.is_whitespace()).map(|g| g.pos.x).fold(init, f);
-                        let right = r.row.glyphs.iter().map(|g| g.max_x()).fold(0.0, f32::max);
-                        (r.pos.x + ink(f32::min, f32::INFINITY), r.pos.x + right, r.ends_with_newline)
-                    })
-                    .collect();
-            });
-            out.textures_delta.clear();
-            assert!(rows.len() > 3, "the long paragraph wraps: {rows:?}");
-            // Row 0: the short Hebrew line; row 1: English; then the wrapped Hebrew paragraph.
-            let (min0, max0, _) = rows[0];
-            assert!((wrap - max0).abs() < 2.0 && min0 > 100.0, "plain={plain}: the short line against the right edge: {rows:?}");
-            assert!(rows[1].0 < 2.0, "plain={plain}: English on the left: {rows:?}");
-            for r in &rows[2..] {
-                assert!((wrap - r.1).abs() < 2.0, "plain={plain}: each wrapped row against the right edge: {rows:?}");
-            }
-        }
-    }
-
-    /// A picture has room as wide as it is, in a row as tall: after its character, or before it
-    /// when it's last in its line (letter spacing put it some 60 points right of its place after
-    /// text, and none at a line's start; room after the last one wasn't the row's, so a picture
-    /// that didn't fit stayed on its row, squeezed). One that doesn't fit starts the next row.
-    #[test]
-    fn a_picture_sits_where_it_is_in_the_text() {
-        let ctx = egui::Context::default();
-        let t = Tokens::light();
-        let own = HashMap::from([("cid".to_string(), vec2(300.0, 150.0))]);
-        // (text, picture, editor width, it starts a row of its own)
-        let cases = [
-            ("\u{FFFC}", 0, 600.0, false),
-            ("ab\u{FFFC}cd", 2, 600.0, false),
-            ("x\n\u{FFFC}\u{FFFC}", 2, 900.0, false),
-            ("x\n\u{FFFC}\u{FFFC}", 3, 900.0, false),
-            ("x\n\u{FFFC}\u{FFFC}", 3, 500.0, true),
-        ];
-        for (body, at, wrap, alone) in cases {
-            let mut st = Styles::plain(body);
-            for (i, ch) in body.chars().enumerate() {
-                if ch == PICTURE {
-                    st.restyle(body, i..i + 1, |s| Style { picture: Some("cid".into()), ..s.clone() });
-                }
-            }
-            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let g = layout::layout(ui, body, &st, false, &t, wrap, &own);
-                let (a, b) = (g.pos_from_cursor(CCursor::new(at)), g.pos_from_cursor(CCursor::new(at + 1)));
-                let last = body.chars().nth(at + 1).is_none_or(|c| c == '\n');
-                let place = pictures::Place::of(&g, egui::Pos2::ZERO, at, last);
-                assert_eq!(place.wrapped, alone, "{body:?} at {at}, {wrap} wide");
-                if last && !alone {
-                    // Room before it: after what's before it in its line.
-                    let before =
-                        if at == 0 || body.chars().nth(at - 1) == Some('\n') { 0.0 } else { g.pos_from_cursor(CCursor::new(at - 1)).min.x + 7.0 };
-                    assert!(place.glyph.min.x - 300.0 >= before - 0.5, "{body:?} at {at}: room before it from {}", place.glyph.min.x - 300.0);
-                } else if !last {
-                    assert!(b.min.x - a.min.x >= 300.0, "{body:?} at {at}: a room {} wide", b.min.x - a.min.x);
-                }
-                assert!(place.glyph.height() >= 150.0, "{body:?} at {at}: its row as tall as the picture ({})", place.glyph.height());
-            });
-            out.textures_delta.clear();
-        }
-    }
-}
+mod tests;

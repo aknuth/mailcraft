@@ -41,8 +41,8 @@ fn sets_and_dates() {
     assert_eq!(parse_internal_date(" 4-Jan-1970 00:00:00 -0100"), Some(3 * 86_400 + 3600));
     assert_eq!(parse_internal_date("junk"), None);
     assert_eq!(parse_internal_date("99-Oct-2026 09:30:00 +0200"), None);
-    assert_eq!(base64(b"\0user\0pass"), "AHVzZXIAcGFzcw==");
-    assert_eq!(base64(b"ab"), "YWI=");
+    assert_eq!(parse_internal_date("31-Dec-9999 23:59:59 +0000"), Some(253_402_300_799));
+    assert_eq!(parse_internal_date("01-Jan-0001 00:00:00 +0000"), Some(-62_135_596_800));
     assert_eq!(quoted("a\"b\\c").as_deref(), Some("\"a\\\"b\\\\c\""));
     assert_eq!(quoted("pässword"), None);
 }
@@ -56,16 +56,22 @@ fn literals() {
     assert_eq!(literal_len(b"{99999999999999999}"), None);
 }
 
+/// A password that can't be quoted (not ASCII) goes as a literal: its bytes are sent only once
+/// the server asks for them with `+`. A server that answers the command instead has refused the
+/// sign-in, and never sees the password.
 #[test]
-fn greeting_login_fetch_with_literals() {
-    let server = b"* OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS] ready\r\n\
-M1 OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS CONDSTORE] logged in\r\n\
-* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 12 BODY[HEADER] {12}\r\nSubject: x\r\n)\r\n\
-* 2 FETCH (FLAGS (\\Flagged))\r\n\
-M2 OK done\r\n";
+fn a_literal_login_needs_its_continuation() {
+    let refused = b"* OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS] ready\r\nM1 NO not like that\r\n";
+    let mut c = Client::from_stream(Script::new(refused)).unwrap();
+    assert!(c.has("move") && !c.has("CONDSTORE"), "the greeting's capabilities");
+    assert!(matches!(c.login("zoe@x", "pässword"), Err(NetError::Auth(m)) if m == "not like that"));
+    assert_eq!(c.conn.into_inner().written, b"M1 LOGIN \"zoe@x\" {9}\r\n", "the password held back");
+
+    let server = b"* OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS] ready\r\n+ go on\r\nM1 OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS CONDSTORE] logged in\r\n";
     let mut c = Client::from_stream(Script::new(server)).unwrap();
-    assert!(c.has("move") && !c.has("CONDSTORE"));
-    c.login("zoe@x", "pässword").unwrap_err(); // literal path needs a '+' the script lacks
+    c.login("zoe@x", "pässword").unwrap();
+    assert!(c.has("CONDSTORE"), "the capabilities said at sign-in");
+    assert_eq!(c.conn.into_inner().written, "M1 LOGIN \"zoe@x\" {9}\r\npässword\r\n".as_bytes());
 }
 
 #[test]
@@ -103,6 +109,21 @@ fn errors_and_hostile_input() {
     assert_eq!(c.uid_search("ALL").unwrap(), vec![1, 2, 3]);
 }
 
+/// Found in review: bare LF line ends were mended across the whole response, literals too, so a
+/// literal holding bare LFs outgrew its `{n}` and the response was dropped; and a response ending
+/// in CRLF was never mended, so a bare LF before its literal stayed.
+#[test]
+fn bare_lf_line_ends_are_mended_outside_literals_only() {
+    let s = b"* OK hi\r\n\
+* 1 FETCH (UID 7 BODY[] {6}\r\na\nb\nc\n)\n\
+* 2 FETCH (UID 8 BODY[] {3}\nx\r\n)\r\n\
+M1 OK done\r\n";
+    let mut c = Client::from_stream(Script::new(s)).unwrap();
+    let got = c.uid_fetch("7:8", "UID BODY.PEEK[]", "").unwrap();
+    let bodies: Vec<(u32, Option<&[u8]>)> = got.iter().map(|f| (f.uid, f.body.as_deref())).collect();
+    assert_eq!(bodies, [(7, Some(&b"a\nb\nc\n"[..])), (8, Some(&b"x\r\n"[..]))]);
+}
+
 /// A response code followed straight by a non-ASCII character (found by `fuzz/`): imap-proto
 /// sliced inside the character and panicked, so a server could crash the client.
 #[test]
@@ -127,6 +148,30 @@ fn a_response_the_parser_panics_on_is_skipped() {
     let mut c = Client::from_stream(Script::new(s)).unwrap();
     let got = c.uid_fetch("5:6", "UID FLAGS INTERNALDATE", "").unwrap();
     assert_eq!(got.iter().map(|f| f.uid).collect::<Vec<_>>(), [6]);
+}
+
+/// An INTERNALDATE with a year far out of range (found in review: the day count overflowed, a
+/// panic in debug builds and a garbage date in release) or a negative time is refused.
+#[test]
+fn a_hostile_internal_date_is_refused() {
+    for bad in [
+        "01-Jan-9000000000000000000 00:00:00 +0000",
+        "01-Jan--9000000000000000000 00:00:00 +0000",
+        "01-Jan-10000 00:00:00 +0000",
+        "01-Jan-0 00:00:00 +0000",
+        "01-Mar-9223372036854775807 00:00:00 +0000",
+        "01-Jan-2026 -1:00:00 +0000",
+        "01-Jan-2026 10:-5:00 +0000",
+        "01-Jan-2026 10:00:-1 +0000",
+        "01-Jan-2026 +1:00:00 +0000",
+        "01-Jan-2026 10:00:00 +00-5",
+    ] {
+        assert_eq!(parse_internal_date(bad), None, "{bad}");
+    }
+    let s = b"* OK hi\r\n* 1 FETCH (UID 5 INTERNALDATE \"01-Jan-9000000000000000000 00:00:00 +0000\")\r\nM1 OK done\r\n";
+    let mut c = Client::from_stream(Script::new(s)).unwrap();
+    let got = c.uid_fetch("5", "UID INTERNALDATE", "").unwrap();
+    assert!(got.iter().all(|f| f.internal_date.is_none()));
 }
 
 /// A signed or encrypted message never comes as its text first (only its whole source shows it
@@ -183,6 +228,64 @@ fn a_big_folders_search_line_is_read() {
     assert!(s.len() > 1 << 20);
     let mut c = Client::from_stream(Script { step: 16 << 10, ..Script::new(&s) }).unwrap();
     assert_eq!(c.uid_search("ALL").unwrap().len(), 200_000);
+}
+
+/// Responses are framed the same however the server's bytes come: each look at the buffer takes
+/// up where the last stopped, inside a line, before a literal or inside one.
+#[test]
+fn responses_are_framed_the_same_however_the_bytes_come() {
+    let s = b"* OK hi\r\n\
+* 1 FETCH (UID 7 BODY[] {12}\r\nSubject: x\r\n BODY[HEADER] {3}\r\nabc)\r\n\
+* SEARCH 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\r\n\
+* 2 FETCH (BODY[] {0}\r\n)\r\n\
+M1 OK done\r\n";
+    let frames = |step: usize| {
+        let mut c = super::conn::Conn::new(Script { step, ..Script::new(s) });
+        std::iter::from_fn(|| c.read_raw().ok()).collect::<Vec<_>>()
+    };
+    let whole = frames(s.len());
+    assert_eq!(whole.len(), 5);
+    assert_eq!(whole.concat(), s);
+    for step in 1..=40 {
+        assert_eq!(frames(step), whole, "{step} bytes a read");
+    }
+}
+
+/// A line whose literal hasn't all come is read once: as the literal's bytes arrive only they are
+/// waited for (the line, up to `MAX_LINE` long, was searched from its first byte at every read).
+/// Shown by blanking the line in the buffer once it was read: the response is framed all the same.
+#[test]
+fn a_line_waiting_for_its_literal_is_not_read_again() {
+    let line = b"* 1 FETCH (UID 7 BODY[] {10}\r\n";
+    let mut c = super::conn::Conn::new(Script { step: 1 << 10, ..Script::new(&[&line[..], b"ab"].concat()) });
+    assert!(matches!(c.read_raw(), Err(NetError::Closed(_))), "the literal isn't whole yet");
+    c.buf.get_mut(c.pos..c.pos + line.len()).unwrap().fill(b'x');
+    c.buf.extend_from_slice(b"\ncdefghi)\r\n* 2 EXPUNGE\r\n");
+    assert_eq!(c.read_raw().unwrap().len(), line.len() + 10 + 3);
+    assert_eq!(c.read_raw().unwrap(), b"* 2 EXPUNGE\r\n");
+    // The command's byte budget is still asked about as the literal comes.
+    let mut c = super::conn::Conn::new(Script { step: 1 << 10, ..Script::new(&[&line[..], b"ab"].concat()) });
+    assert!(matches!(c.read_raw(), Err(NetError::Closed(_))));
+    c.set_limits(super::conn::Limits { bytes: line.len() + 9, ..Default::default() });
+    assert!(matches!(c.read_raw(), Err(NetError::Protocol(_))));
+}
+
+/// How long the longest answer `MAX_LINE` is for takes to frame: a folder's `UID SEARCH ALL` of
+/// three million messages on one line, read as a socket hands it over, 32 KB at a time.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_huge_search_line() {
+    let mut s = b"* SEARCH".to_vec();
+    for u in 1..=3_000_000u32 {
+        s.extend(format!(" {u}").as_bytes());
+    }
+    s.extend(b"\r\n");
+    let len = s.len();
+    let mut c = super::conn::Conn::new(Script { step: 32 << 10, ..Script::new(&s) });
+    let began = std::time::Instant::now();
+    let raw = c.read_raw().unwrap();
+    eprintln!("MEASURE a {} MB search line framed in {:?}", len >> 20, began.elapsed());
+    assert_eq!(raw.len(), len);
 }
 
 /// A refused SELECT leaves no folder selected (RFC 3501 §6.3.1): the one before was still

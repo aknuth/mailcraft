@@ -29,7 +29,7 @@ fn picture(a: &MailApp) -> (Option<u16>, egui::Rect) {
 /// undo takes that back; its menu sets it to half its own size.
 #[test]
 fn pictures_show_at_their_size_and_resize() {
-    let (mut a, dir) = app("picture-size-shown");
+    let (mut a, _) = app("picture-size-shown");
     let ctx = egui::Context::default();
     a.session.prefs.new_mail_window = false;
     // The message as wide as the window.
@@ -38,8 +38,7 @@ fn pictures_show_at_their_size_and_resize() {
     a.run("mail.new", json!({}));
     frame(&ctx, &mut a, vec![]);
     // A screenshot 1600 wide, pasted.
-    let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(image::RgbaImage::new(1600, 800)).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let png = png(1600, 800);
     assert_eq!(own_size(&png), Some((1600, 800)));
     let size = own_size(&png);
     let r = a.session.run(
@@ -77,26 +76,13 @@ fn pictures_show_at_their_size_and_resize() {
     // Sent at the width it shows.
     let html = a.session.compose.as_ref().unwrap().bodies().1.unwrap();
     assert!(html.contains(&format!("width=\"{FIT_WIDTH}\"")), "{html}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Services whose clipboard holds a picture.
 struct Clip(Vec<u8>);
 
 impl crate::Services for Clip {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
-    fn notify(&mut self, _: &str, _: &str) {}
+    stub_services!();
     fn clipboard_picture(&mut self) -> Option<Vec<u8>> {
         Some(self.0.clone())
     }
@@ -106,7 +92,7 @@ impl crate::Services for Clip {
 /// signature keeps its picture, and a new message has it.
 #[test]
 fn a_picture_goes_into_the_signature() {
-    let (mut a, dir) = app("signature-picture-pasted");
+    let (mut a, _) = app("signature-picture-pasted");
     let ctx = egui::Context::default();
     a.services = Box::new(Clip(mailcraft_engine::sample::sample_png()));
     a.session.prefs.new_mail_window = false;
@@ -134,14 +120,13 @@ fn a_picture_goes_into_the_signature() {
     a.act(crate::Action::SignaturePicture { paste: true });
     let Some(Dialog::Signature(f)) = a.ui.dialog.as_ref() else { panic!() };
     assert_eq!(f.compose.inline.len(), 1, "only the one it had");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #11: a signature copied from Word or Outlook with its logo, pasted into the signature
 /// editor or a message, brings the logo along (only the text and its look came), at its size.
 #[test]
 fn a_logo_pasted_with_a_signature_comes_along() {
-    let (mut a, dir) = app("pasted-logo");
+    let (mut a, _) = app("pasted-logo");
     let ctx = egui::Context::default();
     a.session.prefs.new_mail_window = false;
     // The picture written into the HTML, as Word writes it (`data:`).
@@ -183,7 +168,6 @@ fn a_logo_pasted_with_a_signature_comes_along() {
     let cids: Vec<&str> = c.inline.iter().map(|p| p.cid.as_str()).collect();
     assert!(cids.iter().any(|cid| c.bodies().1.is_some_and(|h| h.contains(&format!("cid:{cid}")))), "{cids:?}");
     crate::TEST_CLIPBOARD_HTML.with(|h| *h.borrow_mut() = None);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A PDF of `pages` pages (100 x 50 points), each with a box in it.
@@ -218,33 +202,6 @@ pub(super) fn png(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// A message with these files put first in the Inbox, and the Inbox shown.
-fn with_files(a: &mut MailApp, uid: u32, files: Vec<(String, &str, Vec<u8>)>) -> MessageKey {
-    use mailcraft_engine::mime::{self, Draft, OutAttachment};
-    let d = Draft {
-        subject: format!("Files {uid}"),
-        body: "Here they are.".into(),
-        attachments: files.into_iter().map(|(name, mime, data)| OutAttachment { name, mime: mime.into(), data, ..Default::default() }).collect(),
-        ..Default::default()
-    };
-    let raw = mime::build(&d, &mailcraft_engine::model::EmailAddress::new("Sam", "sam@studio.example"), NOW, &format!("<files{uid}@x>")).unwrap();
-    with_raw(a, uid, &raw)
-}
-
-/// A message of this source put first in the Inbox, and the Inbox shown.
-fn with_raw(a: &mut MailApp, uid: u32, raw: &[u8]) -> MessageKey {
-    use mailcraft_engine::mime;
-    let store = a.session.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid };
-    inbox.messages.insert(0, mime::summary_from_full(raw, key.clone(), Default::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, raw).unwrap();
-    a.session.apply(MailEvent::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
-    a.run("folder.open", json!({"account": "sample", "folder": "INBOX"}));
-    key
-}
-
 fn pictures(n: usize) -> Vec<(String, &'static str, Vec<u8>)> {
     (0..n).map(|i| (format!("photo {i}.png"), "image/png", png(8 + (i % 5) as u32, 8))).collect()
 }
@@ -273,7 +230,7 @@ const WINDOW: egui::Vec2 = egui::vec2(1280.0, 800.0);
 /// one read of the message, a picture a frame (none of it in one long frame).
 #[test]
 fn seventy_pictures_decode_once_each() {
-    let (mut a, dir) = app("seventy-pictures");
+    let (mut a, _) = app("seventy-pictures");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = with_files(&mut a, 9001, pictures(70));
@@ -286,14 +243,13 @@ fn seventy_pictures_decode_once_each() {
     assert_eq!(a.ui.pictures.counts(), (1, 70), "and not again");
     assert_eq!(a.ui.pictures.working(), 0);
     assert_eq!(a.ui.pictures.steps().1, 0, "no threads here: done in the window");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The 36 thumbnails, a picture opened big and a PDF's ten pages all come from one read of the
 /// message (each was a read and a parse of the whole message, per picture and per page).
 #[test]
 fn one_extraction_per_message() {
-    let (mut a, dir) = app("one-extraction");
+    let (mut a, _) = app("one-extraction");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let mut files = pictures(36);
@@ -313,14 +269,13 @@ fn one_extraction_per_message() {
     assert!(frames < 30, "its ten pages ({} ready)", a.ui.pictures.ready());
     assert_eq!(a.ui.pictures.pages(&k, 36), Some(10));
     assert_eq!(a.ui.pictures.counts(), (1, 48), "one read of the message for all of them");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A 60-page PDF draws the pages on screen only, and what it keeps stays within the budget
 /// even when every page shows (those that don't fit come smaller, or not at all).
 #[test]
 fn a_long_pdf_stays_within_the_budget() {
-    let (mut a, dir) = app("long-pdf");
+    let (mut a, _) = app("long-pdf");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = with_files(&mut a, 9003, vec![("manual.pdf".into(), "application/pdf", pdf(60))]);
@@ -338,13 +293,12 @@ fn a_long_pdf_stays_within_the_budget() {
         assert!(a.ui.pictures.bytes() <= budget, "{} kept", a.ui.pictures.bytes());
     }
     assert!(a.ui.pictures.ready() > 3, "the pages that fit ({})", a.ui.pictures.ready());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A picture bigger than a frame's uploads (2048 pixels square, 16 MiB) is still made, alone.
 #[test]
 fn a_single_big_upload() {
-    let (mut a, dir) = app("big-upload");
+    let (mut a, _) = app("big-upload");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = with_files(&mut a, 9004, vec![("poster.png".into(), "image/png", png(2048, 2048))]);
@@ -353,14 +307,13 @@ fn a_single_big_upload() {
     let (frames, _) = pump(&ctx, &mut a, WINDOW, 20, |a| a.ui.pictures.ready() == 2);
     assert!(frames < 20, "the thumbnail and the picture big ({} ready)", a.ui.pictures.ready());
     assert!(a.ui.pictures.bytes() >= 16 << 20, "{}", a.ui.pictures.bytes());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A picture that breaks the decoder fails, with the rest of its message's, and the next
 /// message's pictures show.
 #[test]
 fn a_panicking_decode_leaves_later_work_alone() {
-    let (mut a, dir) = app("panicking-decode");
+    let (mut a, _) = app("panicking-decode");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let bad = with_files(&mut a, 9005, pictures(5));
@@ -377,13 +330,12 @@ fn a_panicking_decode_leaves_later_work_alone() {
     let before = a.ui.pictures.ready();
     let (frames, _) = pump(&ctx, &mut a, WINDOW, 20, |a| a.ui.pictures.ready() >= before + 4);
     assert!(frames < 20, "the next message's four ({} ready)", a.ui.pictures.ready());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Moving on to another message stops the work on the last one's pictures.
 #[test]
 fn pictures_of_a_message_left_are_cancelled() {
-    let (mut a, dir) = app("pictures-left");
+    let (mut a, _) = app("pictures-left");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let many = with_files(&mut a, 9007, pictures(70));
@@ -396,7 +348,6 @@ fn pictures_of_a_message_left_are_cancelled() {
     assert_eq!(reads, 2);
     assert!(decodes < 10, "the first message's stopped: {decodes} decoded");
     assert_eq!(a.ui.pictures.working(), 0);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A window resized a pixel a frame with a PDF's pages shown: the pages are made again only
@@ -404,7 +355,7 @@ fn pictures_of_a_message_left_are_cancelled() {
 /// width it ends at (each width was a new page kept, until the message's 200 failed them all).
 #[test]
 fn resizing_keeps_a_pdf_showing() {
-    let (mut a, dir) = app("pdf-resized");
+    let (mut a, _) = app("pdf-resized");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = with_files(&mut a, 9009, vec![("plan.pdf".into(), "application/pdf", pdf(3))]);
@@ -421,13 +372,12 @@ fn resizing_keeps_a_pdf_showing() {
     assert!(decodes <= 20, "the pages made again at each 100 pixels only: {decodes}");
     let (kept, shown) = a.ui.pictures.of(&k);
     assert!(shown >= 3 && kept <= 12, "the three pages show at the last width: {shown} shown, {kept} kept");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Past 200 pictures the chips show their kind's icon, but one opened still shows.
 #[test]
 fn a_picture_past_the_chips_opens() {
-    let (mut a, dir) = app("many-chips");
+    let (mut a, _) = app("many-chips");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = with_files(&mut a, 9010, pictures(205));
@@ -436,14 +386,13 @@ fn a_picture_past_the_chips_opens() {
     a.ui.attachment_view = Some((k.clone(), 204));
     pump(&ctx, &mut a, WINDOW, 10, |_| false);
     assert!(matches!(a.ui.pictures.get(&k, 204, crate::reading::Want::Big), crate::reading::Got::Ready(_)), "the last picture big");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Pictures left out of a read for room are read again, not failed: with room for two files
 /// taken out, all six show.
 #[test]
 fn pictures_left_out_for_room_show() {
-    let (mut a, dir) = app("sources-room");
+    let (mut a, _) = app("sources-room");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let files = pictures(6);
@@ -455,14 +404,13 @@ fn pictures_left_out_for_room_show() {
     assert!(frames < 40, "all six ({} ready)", a.ui.pictures.ready());
     let (reads, decodes) = a.ui.pictures.counts();
     assert!(decodes == 6 && reads <= 3, "two at a time, each decoded once: {reads} reads, {decodes} decodes");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// More web pictures shown at once than are kept: each is decoded once and kept while shown,
 /// not decoded again every frame.
 #[test]
 fn many_web_pictures_are_kept_while_shown() {
-    let (mut a, dir) = app("web-pictures");
+    let (mut a, _) = app("web-pictures");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let urls: Vec<String> = (0..250).map(|i| format!("https://cdn.shop.example/{i}.png")).collect();
@@ -476,7 +424,6 @@ fn many_web_pictures_are_kept_while_shown() {
     }
     pump(&ctx, &mut a, egui::vec2(1280.0, 8000.0), 3, |_| false);
     assert_eq!(a.ui.web_pictures.len(), 250, "all of them kept while shown");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// One read looks for 256 files at most: the pictures past them (an HTML message's 300) are
@@ -484,7 +431,7 @@ fn many_web_pictures_are_kept_while_shown() {
 #[test]
 fn more_pictures_than_one_read_takes_show() {
     use crate::reading::Want;
-    let (mut a, dir) = app("past-one-read");
+    let (mut a, _) = app("past-one-read");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let k = with_files(&mut a, 9013, pictures(300));
@@ -500,14 +447,13 @@ fn more_pictures_than_one_read_takes_show() {
     }
     assert_eq!(a.ui.pictures.ready(), 300, "all of them");
     assert_eq!(a.ui.pictures.counts(), (2, 300), "two reads, each picture decoded once");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A picture that can't be shown is tried again when its message is opened again, after its
 /// work ended (it was only when the work was still running).
 #[test]
 fn a_failed_picture_is_tried_again_when_opened_again() {
-    let (mut a, dir) = app("failed-again");
+    let (mut a, _) = app("failed-again");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let broken = with_files(&mut a, 9014, vec![("broken.png".into(), "image/png", b"not a picture at all".to_vec())]);
@@ -521,14 +467,13 @@ fn a_failed_picture_is_tried_again_when_opened_again() {
     a.run("list.open", json!({"key": broken.to_id()}));
     pump(&ctx, &mut a, WINDOW, 10, |_| false);
     assert_eq!(a.ui.pictures.counts(), (3, 3), "read and tried again");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A picture bigger than all the room there is lets go of no other: the last message's
 /// thumbnails are kept (all of them went, for a picture then thrown away).
 #[test]
 fn a_picture_too_big_for_the_budget_evicts_nothing() {
-    let (mut a, dir) = app("too-big");
+    let (mut a, _) = app("too-big");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let small = with_files(&mut a, 9016, pictures(3));
@@ -542,25 +487,13 @@ fn a_picture_too_big_for_the_budget_evicts_nothing() {
     pump(&ctx, &mut a, WINDOW, 10, |_| false);
     assert_eq!(a.ui.pictures.counts().1, 4, "the big one decoded");
     assert_eq!(a.ui.pictures.ready(), 3, "and the three kept");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Services with threads for slow work: each piece on a thread of its own.
 struct Threads;
 
 impl crate::Services for Threads {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
+    stub_services!();
     fn background(&mut self, _: crate::Lane, work: crate::Work) -> Result<(), crate::Work> {
         std::thread::spawn(work.run);
         Ok(())
@@ -574,18 +507,7 @@ impl crate::Services for Threads {
 struct Held(std::sync::Arc<std::sync::Mutex<Vec<crate::Work>>>);
 
 impl crate::Services for Held {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
+    stub_services!();
     fn background(&mut self, _: crate::Lane, work: crate::Work) -> Result<(), crate::Work> {
         self.0.lock().unwrap().push(work);
         Ok(())
@@ -599,18 +521,7 @@ impl crate::Services for Held {
 struct Refused;
 
 impl crate::Services for Refused {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
+    stub_services!();
     fn background(&mut self, _: crate::Lane, work: crate::Work) -> Result<(), crate::Work> {
         Err(work)
     }
@@ -622,7 +533,7 @@ impl crate::Services for Refused {
 /// Work a thread gives back is done in the window, a step a frame: every picture still shows.
 #[test]
 fn work_given_back_is_done_in_the_window() {
-    let (mut a, dir) = app("pictures-refused");
+    let (mut a, _) = app("pictures-refused");
     let ctx = egui::Context::default();
     a.services = Box::new(Refused);
     frame(&ctx, &mut a, vec![]);
@@ -633,14 +544,13 @@ fn work_given_back_is_done_in_the_window() {
     let (inline, wakes) = a.ui.pictures.steps();
     assert!(inline > 0, "stepped in the window");
     assert_eq!(wakes, 0, "nothing ran on a thread");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// With a thread to work on, the 36 pictures are read and decoded there, none of it in a frame:
 /// each comes once, from one read.
 #[test]
 fn pictures_are_decoded_on_a_thread() {
-    let (mut a, dir) = app("pictures-thread");
+    let (mut a, _) = app("pictures-thread");
     let ctx = egui::Context::default();
     a.services = Box::new(Threads);
     frame(&ctx, &mut a, vec![]);
@@ -656,14 +566,13 @@ fn pictures_are_decoded_on_a_thread() {
     let (inline, wakes) = a.ui.pictures.steps();
     assert_eq!(inline, 0, "no step of it in a frame");
     assert_eq!(wakes, 36, "a frame asked for after each picture");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The work handed to a thread asks for a frame after each picture it makes (not once at its
 /// end), a picture opened big while it waits goes first, and work for a message left stops.
 #[test]
 fn work_on_a_thread_asks_for_frames_and_stops_when_left() {
-    let (mut a, dir) = app("pictures-held");
+    let (mut a, _) = app("pictures-held");
     let ctx = egui::Context::default();
     let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     a.services = Box::new(Held(held.clone()));
@@ -690,5 +599,60 @@ fn work_on_a_thread_asks_for_frames_and_stops_when_left() {
     assert_eq!(a.ui.pictures.steps(), (0, 7), "a frame asked for after each");
     let (frames, _) = pump(&ctx, &mut a, WINDOW, 5, |a| a.ui.pictures.ready() == 7);
     assert!(frames < 5, "all shown ({} ready)", a.ui.pictures.ready());
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Services that keep the work handed to them and count how often they're told to look after
+/// their threads.
+struct Tended(std::sync::Arc<std::sync::Mutex<Vec<crate::Work>>>, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::Services for Tended {
+    fn clock(&self) -> (i64, i32) {
+        (NOW, 0)
+    }
+    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
+    fn background(&mut self, _: crate::Lane, work: crate::Work) -> Result<(), crate::Work> {
+        self.0.lock().unwrap().push(work);
+        Ok(())
+    }
+    fn has_background(&self) -> bool {
+        true
+    }
+    fn tend_background(&mut self) {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// While pictures are being made on a thread, the threads are told to look after themselves
+/// each frame (where a lane caught on cancelled work gets a new one), by a call that says so;
+/// once the pictures are made, they aren't.
+#[test]
+fn the_lanes_are_tended_while_pictures_are_made_on_them() {
+    use std::sync::atomic::Ordering;
+    let (mut a, _) = app("pictures-tended");
+    let ctx = egui::Context::default();
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    a.services = Box::new(Tended(held.clone(), tended.clone()));
+    frame(&ctx, &mut a, vec![]);
+    let k = with_files(&mut a, 9016, pictures(4));
+    a.run("list.open", json!({"key": k.to_id()}));
+    pump(&ctx, &mut a, WINDOW, 4, |_| false);
+    assert!(!held.lock().unwrap().is_empty(), "the pictures' work is on the lane");
+    assert!(tended.load(Ordering::Relaxed) >= 2, "tended while it's there: {}", tended.load(Ordering::Relaxed));
+    let work: Vec<crate::Work> = std::mem::take(&mut *held.lock().unwrap());
+    for w in work {
+        (w.run)();
+    }
+    pump(&ctx, &mut a, WINDOW, 5, |a| a.ui.pictures.ready() == 4);
+    let after = tended.load(Ordering::Relaxed);
+    pump(&ctx, &mut a, WINDOW, 3, |_| false);
+    assert_eq!(tended.load(Ordering::Relaxed), after, "nothing on the lane: left alone");
 }

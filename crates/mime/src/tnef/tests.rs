@@ -53,8 +53,7 @@ pub(crate) fn str8(s: &str) -> Vec<u8> {
 }
 
 fn unicode(s: &str) -> Vec<u8> {
-    let mut b: Vec<u8> = s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
-    b.truncate(b.len());
+    let b: Vec<u8> = s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
     binary(&b)
 }
 
@@ -66,33 +65,30 @@ fn boolean(on: bool) -> Vec<u8> {
     vec![u8::from(on), 0, 0, 0]
 }
 
+/// `ATT_REND_DATA` as Outlook writes it for a file (MS-OXTNEF's attRenddata): a file (1), at no
+/// place in the text (-1), no picture size, no flags.
+const REND_DATA: [u8; 14] = [1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// What an attached message's `PR_ATTACH_DATA` starts with: the interface it's stored as,
+/// `IMessage` (00020307-0000-0000-C000-000000000046), ahead of its own stream.
+const MESSAGE_OBJECT: [u8; 16] = [0x07, 0x03, 0x02, 0x00, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+
 /// RTF as `PidTagRtfCompressed` holds it: literals only, ended by the reference to where the
 /// next byte would go (MS-OXRTFCP), so any RTF can be written.
 pub(crate) fn compress(rtf: &[u8]) -> Vec<u8> {
-    let mut body = Vec::new();
-    let mut chunks = rtf.chunks(8).peekable();
     let end = ((DICTIONARY_LEN + rtf.len()) % 4096) as u16;
-    let mut ended = false;
-    while let Some(c) = chunks.next() {
-        if c.len() == 8 {
-            body.push(0);
-            body.extend(c);
-        } else {
-            body.push(1 << c.len());
-            body.extend(c);
-            body.extend((end << 4).to_be_bytes());
-            ended = true;
-        }
-        if chunks.peek().is_none() && !ended {
-            body.push(1);
-            body.extend((end << 4).to_be_bytes());
-            ended = true;
-        }
+    let mut body = Vec::new();
+    // Runs of up to eight literals, each after its control byte; a short last run's control
+    // byte also flags the end reference that follows it.
+    for c in rtf.chunks(8) {
+        body.push(if c.len() == 8 { 0 } else { 1 << c.len() });
+        body.extend(c);
     }
-    if !ended {
+    // After a full last run, or none, the end reference is a run of its own.
+    if rtf.len().is_multiple_of(8) {
         body.push(1);
-        body.extend((end << 4).to_be_bytes());
     }
+    body.extend((end << 4).to_be_bytes());
     let mut out = ((body.len() + 12) as u32).to_le_bytes().to_vec();
     out.extend((rtf.len() as u32).to_le_bytes());
     out.extend(0x7546_5A4Cu32.to_le_bytes());
@@ -107,11 +103,7 @@ const DICTIONARY_LEN: usize = 207;
 /// reaches past where the dictionary was written to when it started.
 #[test]
 fn the_specifications_compressed_rtf_comes_out() {
-    let simple = [
-        0x2d, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00, 0x4c, 0x5a, 0x46, 0x75, 0xf1, 0xc5, 0xc7, 0xa7, 0x03, 0x00, 0x0a, 0x00, 0x72, 0x63, 0x70,
-        0x67, 0x31, 0x32, 0x35, 0x42, 0x32, 0x0a, 0xf3, 0x20, 0x68, 0x65, 0x6c, 0x09, 0x00, 0x20, 0x62, 0x77, 0x05, 0xb0, 0x6c, 0x64, 0x7d, 0x0a,
-        0x80, 0x0f, 0xa0,
-    ];
+    let simple = fixtures::SPEC_LZFU;
     assert_eq!(decompress_rtf(&simple).as_deref(), Some(&b"{\\rtf1\\ansi\\ansicpg1252\\pard hello world}\r\n"[..]));
     let crossing = [
         0x1a, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x4c, 0x5a, 0x46, 0x75, 0xe2, 0xd4, 0x4b, 0x51, 0x41, 0x00, 0x04, 0x20, 0x57, 0x58, 0x59,
@@ -119,11 +111,7 @@ fn the_specifications_compressed_rtf_comes_out() {
     ];
     assert_eq!(decompress_rtf(&crossing).as_deref(), Some(&b"{\\rtf1 WXYZWXYZWXYZWXYZWXYZ}"[..]));
     // Stored as it is (`MELA`).
-    let mut plain = 16u32.to_le_bytes().to_vec();
-    plain.extend(4u32.to_le_bytes());
-    plain.extend(0x414C_454Du32.to_le_bytes());
-    plain.extend(0u32.to_le_bytes());
-    plain.extend(b"{\\rt");
+    let plain = fixtures::stored_rtf(b"{\\rt");
     assert_eq!(decompress_rtf(&plain).as_deref(), Some(&b"{\\rt"[..]));
     assert_eq!(decompress_rtf(&compress(b"{\\rtf1 any RTF at all}")).as_deref(), Some(&b"{\\rtf1 any RTF at all}"[..]));
     // Not compressed RTF; cut short; a size far past what's there.
@@ -237,7 +225,7 @@ fn formatting_inside_a_link_stays_within_the_cap() {
 /// A `winmail.dat` as Outlook writes one: a subject, an RTF body wrapping HTML with a picture in
 /// it, a file, and an attached message with a file of its own.
 pub(crate) fn outlook_stream() -> Vec<u8> {
-    let rtf = br#"{\rtf1\ansi\ansicpg1252\fromhtml1 \deff0{\fonttbl{\f0\fswiss Calibri;}}{\*\htmltag19 <html>}{\*\htmltag34 <body>}{\*\htmltag <p>}\htmlrtf {\htmlrtf0 Hi Riley, the {\*\htmltag <b>}\htmlrtf\b\htmlrtf0 storyboard{\*\htmltag </b>}\htmlrtf\b0\htmlrtf0  is attached.{\*\htmltag <img src="cid:logo@studio.example">}\htmlrtf\par\htmlrtf0}{\*\htmltag </p></body></html>}}"#;
+    let rtf = fixtures::STORYBOARD_RTF;
     let mut inner_attrs = Vec::new();
     attr(&mut inner_attrs, 1, ATT_SUBJECT, b"Notes from Monday\0");
     attr(
@@ -251,11 +239,11 @@ pub(crate) fn outlook_stream() -> Vec<u8> {
             (0x0040, PR_CLIENT_SUBMIT_TIME, 133_400_000_000_000_000u64.to_le_bytes().to_vec()),
         ]),
     );
-    attr(&mut inner_attrs, 2, ATT_REND_DATA, &[1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]);
+    attr(&mut inner_attrs, 2, ATT_REND_DATA, &REND_DATA);
     attr(&mut inner_attrs, 2, ATT_TITLE, b"notes.txt\0");
     attr(&mut inner_attrs, 2, ATT_DATA, b"Monday's notes");
     let inner = stream(&inner_attrs);
-    let mut object = vec![0x07, 0x03, 0x02, 0x00, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+    let mut object = MESSAGE_OBJECT.to_vec();
     object.extend(&inner);
 
     let mut a = Vec::new();
@@ -289,7 +277,7 @@ pub(crate) fn outlook_stream() -> Vec<u8> {
             (0x001E, PR_BODY, str8("Hi Riley, the storyboard is attached.")),
         ]),
     );
-    attr(&mut a, 2, ATT_REND_DATA, &[1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]);
+    attr(&mut a, 2, ATT_REND_DATA, &REND_DATA);
     attr(&mut a, 2, ATT_TITLE, b"STORYB~1.PDF\0");
     attr(&mut a, 2, ATT_DATA, b"%PDF-1.4 storyboard");
     attr(
@@ -301,7 +289,7 @@ pub(crate) fn outlook_stream() -> Vec<u8> {
             (0x001E, PR_ATTACH_MIME_TAG, str8("application/pdf")),
         ]),
     );
-    attr(&mut a, 2, ATT_REND_DATA, &[1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]);
+    attr(&mut a, 2, ATT_REND_DATA, &REND_DATA);
     attr(
         &mut a,
         2,
@@ -313,7 +301,7 @@ pub(crate) fn outlook_stream() -> Vec<u8> {
             (0x000B, PR_ATTACHMENT_HIDDEN, boolean(true)),
         ]),
     );
-    attr(&mut a, 2, ATT_REND_DATA, &[1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]);
+    attr(&mut a, 2, ATT_REND_DATA, &REND_DATA);
     attr(
         &mut a,
         2,
@@ -343,6 +331,33 @@ fn a_winmail_dat_gives_its_files_and_body() {
     assert_eq!((inner.subject.as_str(), inner.text.trim(), inner.from.email.as_str()), ("Notes from Monday", "The notes.", "zoe@studio.example"));
     assert!(inner.date > 1_600_000_000, "{}", inner.date);
     assert_eq!(inner.attachments.first().map(|a| a.name.as_str()), Some("notes.txt"));
+}
+
+/// An attached message is written the same each time its `winmail.dat` is read: its Message-ID
+/// and boundary from its stream's hash, its date its own (the epoch, read as none, without one).
+/// Left to mail-builder, they came from the clock and a random number, and differed every time.
+#[test]
+fn an_attached_message_is_the_same_each_time() {
+    let eml = || read_tnef(&outlook_stream()).unwrap().attachments.pop().unwrap().data;
+    let first = eml();
+    assert_eq!(first, eml());
+    let inner = crate::parse(&first).unwrap();
+    assert_eq!(inner.message_id, "winmail.15ea124d783d9ef5@mailcraft.invalid");
+    // One without a date of its own: none read back, not the time it was read.
+    let mut a = Vec::new();
+    attr(&mut a, 1, ATT_SUBJECT, b"Undated\0");
+    let mut object = MESSAGE_OBJECT.to_vec();
+    object.extend(stream(&a));
+    let mut outer = Vec::new();
+    attr(&mut outer, 2, ATT_REND_DATA, &REND_DATA);
+    attr(
+        &mut outer,
+        2,
+        ATT_ATTACHMENT,
+        &props(&[(0x001E, PR_DISPLAY_NAME, str8("Undated")), (0x0003, PR_ATTACH_METHOD, long(5)), (0x000D, PR_ATTACH_DATA, binary(&object))]),
+    );
+    let undated = read_tnef(&stream(&outer)).unwrap().attachments.pop().unwrap().data;
+    assert_eq!(crate::parse(&undated).unwrap().date, 0, "{}", String::from_utf8_lossy(&undated));
 }
 
 /// The plain text when there's no RTF; the HTML property over the RTF; strings in the message's
@@ -407,7 +422,7 @@ fn a_damaged_winmail_dat_never_crashes() {
     // Attached messages inside attached messages, past the depth read.
     let mut s = outlook_stream();
     for _ in 0..6 {
-        let mut object = vec![0x07, 0x03, 0x02, 0x00, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+        let mut object = MESSAGE_OBJECT.to_vec();
         object.extend(&s);
         let mut a = Vec::new();
         attr(&mut a, 2, ATT_REND_DATA, &[1, 0]);
@@ -546,7 +561,7 @@ pub(crate) fn outlook_message(dat: Vec<u8>) -> Vec<u8> {
         .text_body("Hi Riley, the storyboard is attached.")
         .attachment("application/ms-tnef", "winmail.dat", dat)
         .write_to_vec()
-        .unwrap_or_default()
+        .expect("the message builds")
 }
 
 /// The reading pane shows the formatted body and lists the files, by indexes that read them;
@@ -591,7 +606,7 @@ fn search_reads_what_a_winmail_dat_holds() {
         .subject("Rich")
         .attachment("application/ms-tnef", "winmail.dat", stream(&a))
         .write_to_vec()
-        .unwrap_or_default();
+        .expect("the message builds");
     let d = crate::index_doc(&raw);
     assert_eq!((d.text.as_str(), d.has_text, d.files), ("Only in the winmail.dat", true, 0));
     let key = mailcraft_model::MessageKey { account: "a".into(), folder: "INBOX".into(), validity: 1, uid: 1 };
@@ -671,7 +686,7 @@ fn outlooks_rich_text_reads_as_outlook_shows_it() {
             (0x001E, PR_ATTACH_CONTENT_ID, str8("logo@x")),
         ]),
     );
-    let mut object = vec![0x07, 0x03, 0x02, 0x00, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+    let mut object = MESSAGE_OBJECT.to_vec();
     object.extend(stream(&inner));
     let mut a = Vec::new();
     attr(&mut a, 2, ATT_REND_DATA, &[]);
@@ -696,4 +711,19 @@ fn a_winmail_dat_in_a_draft_is_a_file_when_it_holds_one() {
     let mut a = Vec::new();
     attr(&mut a, 1, ATT_BODY, b"Only in the winmail.dat\0");
     crate::tests::index_text::assert_built_files(&dat(stream(&a)), false);
+}
+
+#[test]
+#[ignore = "a measurement: cargo test --release -p mailcraft-mime --lib rtf_cost -- --ignored --nocapture"]
+fn rtf_cost() {
+    // 4 MB of text, plain and inside a link, as Outlook's own RTF (no HTML in it).
+    let text = r"Some words, \'e9t\'e9 and {\b bold} ones. ".repeat(100_000);
+    let link = format!("https://studio.example/{}", "a".repeat(200));
+    let plain = format!(r"{{\rtf1\ansi\deff0 {text}}}");
+    let linked = format!(r#"{{\rtf1\ansi\deff0 {{\field{{\*\fldinst{{HYPERLINK "{link}"}}}}{{\fldrslt{{{text}}}}}}}}}"#);
+    for (what, rtf) in [("plain", &plain), ("linked", &linked)] {
+        let t = std::time::Instant::now();
+        let TnefBody::Html(h) = rtf_body(rtf.as_bytes()) else { panic!() };
+        println!("MEASURE RTF of {} KB, {what}: {} ms ({} KB of HTML)", rtf.len() / 1024, t.elapsed().as_millis(), h.len() / 1024);
+    }
 }

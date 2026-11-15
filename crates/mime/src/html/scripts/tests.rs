@@ -1,11 +1,6 @@
 use super::*;
 use crate::html::mark_headings;
-
-/// A message of `html`, as received.
-fn message(html: &str) -> crate::Parsed {
-    let raw = format!("From: a@shop.example\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n{html}");
-    crate::parse(raw.as_bytes()).unwrap_or_default()
-}
+use crate::tests::util::message;
 
 /// Found on the same notice: a heading holding a box (`<h2><div>`) kept the `##` the text
 /// converter starts each of its lines with, and wasn't centred; so with a line break in it.
@@ -59,16 +54,50 @@ fn raised_text_is_raised_and_not_written_out() {
     assert!(r.last().unwrap().iter().all(|s| s.rise == Rise::Normal));
 }
 
+/// A megabyte of each of the marks the scans look for, none of them ended.
+fn hostile_scans() -> impl Iterator<Item = String> {
+    ["<h ", "<h1 ", "<h1>", "<sup ", "<sup>", "</sup", "<sub>x"].into_iter().map(|unit| format!("{}>", unit.repeat(1_000_000 / unit.len())))
+}
+
 /// Hostile: these scans stay linear (found in review of the same kind of scan: a million `<h`
-/// each looked through to the end of the message took minutes).
+/// each looked through to the end of the message took minutes): the bytes they look through
+/// are counted, held in proportion to the message whatever the machine's load.
 #[test]
 fn the_scans_stay_quick() {
-    for unit in ["<h ", "<h1 ", "<h1>", "<sup ", "<sup>", "</sup", "<sub>x"] {
-        let html = format!("{}>", unit.repeat(1_000_000 / unit.len()));
+    for html in hostile_scans() {
+        work::linear(html.len(), || {
+            let _ = mark_headings(&html);
+            let _ = mark_scripts(&html);
+            let _ = plain_scripts(&html);
+        });
+    }
+}
+
+/// How long those scans take: `cargo test --release -p mailcraft-mime --lib how_long_the_scans_take -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn how_long_the_scans_take() {
+    for html in hostile_scans() {
         let started = std::time::Instant::now();
         let _ = mark_headings(&html);
         let _ = mark_scripts(&html);
         let _ = plain_scripts(&html);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{unit}: {:?}", started.elapsed());
+        println!("MEASURE scans of a megabyte of {:?}: {} ms", &html[..5], started.elapsed().as_millis());
     }
+}
+
+/// Lowered text in plain text: the converter writes what's in a `<sub>` as it is, so
+/// [`plain_scripts`] has only `<sup>` to look at.
+#[test]
+fn lowered_text_is_written_plainly() {
+    assert_eq!(html_to_text("<p>H<sub>2</sub>O and x<sub>ab</sub> and 1<sup>st</sup></p>"), "H2O and xab and 1st");
+}
+
+/// A mark stands for a size [`size_mark`] writes, whatever character of the marks' range it is:
+/// one from outside what's written (U+F00FF, 255 pixels) set its text that large.
+#[test]
+fn a_mark_is_no_size_past_what_is_written() {
+    assert_eq!(marked_size(size_mark(24)), Some(24));
+    assert_eq!((marked_size('\u{F00FF}'), marked_size('\u{F0001}')), (Some(96), Some(9)));
+    assert_eq!((marked_size(SIZE_END), marked_size('a')), (None, None));
 }

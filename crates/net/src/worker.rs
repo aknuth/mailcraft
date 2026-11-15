@@ -7,20 +7,20 @@
 //! password stops retrying until the user enters a new one.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mailcraft_model::job::Secret;
-use mailcraft_model::{AccountConfig, Event, Flag, Folder, FolderRole, Job, MessageKey, Op, SyncStatus, sort_folders};
+use mailcraft_model::{AccountConfig, Event, FailureKind, Flag, Folder, FolderRole, Job, MessageKey, Op, SyncStatus, sort_folders};
 use mailcraft_store::{OutboxItem, Store};
 
 use crate::imap::{Client, uid_set};
 use crate::jmap;
 use crate::stream::Stream;
-use crate::sync::{SyncOptions, fetch_body, sync_folder_as};
+use crate::sync::{SyncOptions, sync_folder_as};
 use crate::{NetError, Result, smtp};
 
 /// Sends events and wakes the UI.
@@ -45,9 +45,10 @@ impl Sink {
     }
 }
 
+/// An account's thread, as the pool holds it. The thread itself isn't held: stopped, it ends on its
+/// own once it notices (a slow network call may hold it a while), and nothing waits for it.
 struct Handle {
     tx: Sender<Job>,
-    thread: Option<JoinHandle<()>>,
     /// The account's second connection, for work the user sees happen (sending, automatic
     /// replies): it never waits behind a sync. `None` where it can't be used (POP, JMAP sends).
     quick: Option<Sender<Job>>,
@@ -61,10 +62,41 @@ struct Handle {
     quick_link: QuickLink,
     /// What the pool did as it stopped the worker: that it did, and the drafts it kept then.
     stop: Arc<changes::Stopped>,
+    /// How many waits to connect again the main connection began ([`Worker::waits`]): read by
+    /// the tests only, counted in every build.
+    #[cfg_attr(not(test), allow(dead_code))]
+    waits: Arc<AtomicUsize>,
+}
+
+impl Handle {
+    /// The pool's hold on an account's main connection `w` (its only one, for calendars alone),
+    /// which reads `tx`.
+    fn of(w: &Worker, tx: Sender<Job>) -> Handle {
+        let quick_link = w.quick.clone();
+        let quick = quick_link.lock().ok().and_then(|q| q.clone());
+        Handle { tx, quick, no_password: w.no_password.clone(), busy: w.busy.clone(), quick_link, stop: w.stop.clone(), waits: w.waits.clone() }
+    }
 }
 
 /// The second connection's queue, as the main one holds it ([`Handle::quick_link`]).
 type QuickLink = Arc<Mutex<Option<Sender<Job>>>>;
+
+/// What an account's connections share with the pool, and with each other, handed to each as
+/// it's made ([`Worker::with`]): set one by one after, a part forgotten ran against a stand-in of
+/// its own rather than the pool's.
+#[derive(Clone)]
+struct Shared {
+    store: Store,
+    sink: Sink,
+    opts: SyncOptions,
+    /// Where passwords live (none for a worker of the tests' own).
+    creds: Option<Arc<dyn Credentials>>,
+    /// The server search still wanted ([`Pool::search`]).
+    search: Arc<AtomicU64>,
+    order: changes::Order,
+    filing: Arc<changes::Filing>,
+    sieve_port: u16,
+}
 
 /// What an account signs in with, shared by its connections: the password or refresh token, and
 /// the current access token (refreshed by one, used by both).
@@ -76,6 +108,12 @@ struct Auth {
 impl Auth {
     fn shared(secret: impl Into<String>) -> Arc<Mutex<Auth>> {
         Arc::new(Mutex::new(Auth { secret: secret.into(), access: None }))
+    }
+
+    /// An account's sign-in, held: taken back from a thread that panicked holding it (each part
+    /// of it is only ever set whole), never left unset for want of the lock.
+    fn held(auth: &Mutex<Auth>) -> std::sync::MutexGuard<'_, Auth> {
+        auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -141,7 +179,7 @@ pub struct Pool {
 
 use changes::{DraftOrder, keep_draft};
 #[cfg(test)]
-use changes::{Order, PENDING_DRAFTS, PendingDraft};
+use changes::{KEPT_DRAFTS, Order, PENDING_DRAFTS, PendingDraft, kept_raws, sweep_kept};
 pub use mailcraft_model::MICROSOFT_NO_PASSWORDS;
 
 /// What a mailbox Microsoft won't open over IMAP needs: IMAP switched on (Outlook.com's own
@@ -161,9 +199,22 @@ pub(crate) fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)).unwrap_or(0)
 }
 
+/// `m` locked, even when a thread panicked holding it: what it guards is still read.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Pool {
     pub fn new(store: Store, creds: Arc<dyn Credentials>) -> Pool {
         let (tx, rx) = mpsc::channel();
+        let filing: Arc<changes::Filing> = Arc::default();
+        // A test's folders go once the pool and its accounts' threads (each holds `filing`)
+        // have ended: none writes in them after.
+        #[cfg(test)]
+        {
+            let threads = Arc::downgrade(&filing);
+            crate::data_files::scratch::wait_for(move || threads.strong_count() > 0);
+        }
         Pool {
             store,
             creds,
@@ -181,7 +232,7 @@ impl Pool {
             edits: edits::Edits::default(),
             compacts: compact::Compacts::default(),
             order: changes::Order::default(),
-            filing: Arc::default(),
+            filing,
         }
     }
 
@@ -189,298 +240,6 @@ impl Pool {
     pub fn set_waker(&self, f: Arc<dyn Fn() + Send + Sync>) {
         if let Ok(mut w) = self.sink.wake.lock() {
             *w = Some(f);
-        }
-    }
-
-    pub fn submit(&mut self, job: Job) {
-        self.forget_unstarted();
-        self.release_compacted();
-        let Some(job) = self.held_for_compaction(job) else { return };
-        if let Job::SearchServer { search, .. } = &job {
-            self.search.store(*search, Ordering::Relaxed);
-        }
-        match job {
-            Job::FetchUrl { url } => self.fetch_url(url),
-            Job::FetchCalendar { account, calendar, url, etag, modified } => self.fetch_calendar(account, calendar, url, etag, modified),
-            Job::StopSearch => self.search.store(0, Ordering::Relaxed),
-            Job::Index { account, folders } => self.indexer.ask(&self.store, &self.sink, account, folders),
-            Job::StopIndex { account } => self.indexer.stop(&account),
-            Job::CheckUpdates => {
-                let sink = self.sink.clone();
-                let spawned = std::thread::Builder::new().name("mail-updates".into()).spawn(move || {
-                    let (releases, error) = match crate::updates::releases(&crate::updates::Feed::current()) {
-                        Ok(r) => (r, None),
-                        Err(e) => (Vec::new(), Some(e.to_string())),
-                    };
-                    sink.emit(Event::Releases { releases, error });
-                });
-                if let Err(e) = spawned {
-                    self.sink.emit(Event::Releases { releases: Vec::new(), error: Some(e.to_string()) });
-                }
-            }
-            Job::SignIn { account } => self.sign_in(account),
-            Job::AllowDirectory { account } => self.allow_directory(account),
-            Job::Discover { email } => {
-                let sink = self.sink.clone();
-                let spawned = std::thread::Builder::new().name("mail-discover".into()).spawn(move || {
-                    let found = crate::autoconfig::discover(&email);
-                    let (config, source) = match found {
-                        Some(f) => (Some(Box::new(f.config)), f.source),
-                        None => (None, String::new()),
-                    };
-                    sink.emit(Event::Discovered { email, config, source });
-                });
-                if let Err(e) = spawned {
-                    log::warn!("autoconfiguration: {e}");
-                }
-            }
-            Job::ImportPst { account, path, resume } => self.import_pst(account, path, resume),
-            Job::RereadDataFile { account, path } => self.reread_data_file(account, path),
-            Job::InspectDataFile { path } => self.inspect_data_file(path),
-            Job::ReadMessageFile { path } => self.read_message_file(path),
-            // Into an account on this computer: with the other changes to its mail. An account
-            // with a server that isn't connected can't take them now.
-            Job::FileMessages { account, folder, paths } if self.mail_offline(&account) => {
-                if self.configs.get(&account).is_some_and(|c| !c.is_local()) {
-                    let failed = paths.iter().map(|p| (imports::filing::file_name(p), "the account is offline".to_string())).collect();
-                    self.sink.emit(Event::MessagesFiled { account, folder, added: 0, failed });
-                } else {
-                    self.edits.file(&self.store, &self.sink, account, folder, paths);
-                }
-            }
-            // Onto a server that isn't connected: none goes, and each says so.
-            Job::FileCopies { account, folder, mail, moved } if self.mail_offline(&account) => {
-                let failed = mail.into_iter().map(|(k, _)| (k, "the account is offline".to_string())).collect();
-                self.sink.emit(Event::CopiesFiled { account, folder, done: Vec::new(), failed, moved });
-            }
-            Job::StopImport { account, how } => self.stop_import(&account, how),
-            Job::KeepImport { account } => self.keep_import(account),
-            Job::DataFileHealth { account } => self.data_file_health(account),
-            Job::CompactDataFile { account, mode } => self.compact_data_file(account, mode),
-            Job::CancelCompact { account } => self.cancel_compact(&account),
-            // The desktop keeps keys in the system's keychain: nothing to keep unlocked.
-            Job::KeepUnlocked { .. } => {}
-            j @ (Job::ImportIdentity { .. }
-            | Job::ForgetIdentity { .. }
-            | Job::ForgetOlderIdentity { .. }
-            | Job::UseOlderIdentity { .. }
-            | Job::Protect { .. }
-            | Job::Decrypt { .. }
-            | Job::CheckRevocation { .. }
-            | Job::FindHeldKeys { .. }
-            | Job::UseHeldKey { .. }) => self.smime(j),
-            Job::Pgp { account, work } => self.pgp(account, work),
-            Job::SealDraft { account, raw, folder, replaces, keep } => {
-                let raw = self.seal(&account, raw.0);
-                let account = account.id;
-                self.submit(if keep { Job::KeepDraft { account, raw, folder, replaces } } else { Job::SaveDraft { account, raw, folder, replaces } });
-            }
-            Job::ExportPst { account, path, name, follow_up } => self.export_pst(account, path, name, follow_up),
-            Job::SetSync { messages, offline } => {
-                let opts =
-                    SyncOptions { window: if messages == 0 { usize::MAX } else { messages as usize }, prefetch: offline as usize, ..self.opts };
-                if opts.window != self.opts.window || opts.prefetch != self.opts.prefetch {
-                    self.opts = opts;
-                    // Connected accounts start again with it (a rare change, from Options).
-                    let running: Vec<AccountConfig> = self.workers.keys().filter_map(|id| self.configs.get(id).cloned()).collect();
-                    for c in running {
-                        self.start(c, None);
-                    }
-                }
-            }
-            Job::WorkOffline { on } => {
-                self.offline = on;
-                if on {
-                    let ids: Vec<String> = self.workers.keys().cloned().collect();
-                    for id in ids {
-                        self.stop(&id);
-                        self.sink.emit(Event::Status { account: id, status: SyncStatus::Offline });
-                    }
-                } else {
-                    let configs: Vec<AccountConfig> = self.configs.values().cloned().collect();
-                    for c in configs {
-                        self.start(c, None);
-                    }
-                }
-            }
-            Job::Start { account, password } if self.offline => {
-                // Working offline: remembered (and its password kept) for when that's turned off.
-                if let Some(p) = &password
-                    && let Err(e) = self.creds.set(&account, &p.0)
-                {
-                    self.sink.emit(Event::Notice {
-                        account: account.id.clone(),
-                        message: format!("the password could not be saved in the keychain: {e}"),
-                    });
-                }
-                self.sink.emit(Event::Status { account: account.id.clone(), status: SyncStatus::Offline });
-                self.configs.insert(account.id.clone(), account);
-            }
-            Job::Start { account, password } => self.start(account, password),
-            // An empty one: the calendar server signs in as the mail server again.
-            Job::DavPassword { account, password } if password.0.is_empty() => self.creds.delete_secret(&account, DAV_SECRET),
-            Job::DavPassword { account, password } => {
-                if let Err(e) = self.creds.set_secret(&account, DAV_SECRET, &password.0) {
-                    self.sink.emit(Event::Notice {
-                        account: account.id.clone(),
-                        message: format!("the calendar server's password could not be saved in the keychain: {e}"),
-                    });
-                }
-            }
-            Job::SmtpPassword { account, password } => {
-                if let Err(e) = self.creds.set_smtp(&account, &password.0) {
-                    self.sink.emit(Event::Notice {
-                        account: account.id.clone(),
-                        message: format!("the outgoing server's password could not be saved in the keychain: {e}"),
-                    });
-                }
-            }
-            Job::Remove { account } => {
-                self.forget_saves(&account);
-                self.stop(&account);
-                self.indexer.stop(&account);
-                // An import into it is thrown away, its data file with it.
-                self.stop_import(&account, mailcraft_model::job::StopHow::Discard);
-                if let Some(c) = self.configs.remove(&account) {
-                    self.creds.delete(&c);
-                    self.creds.delete_smtp(&c);
-                    // Its certificates' keys and its calendar server's password go with it.
-                    smime::forget_all(self.creds.as_ref(), &c);
-                    pgp::forget_all(self.creds.as_ref(), &c);
-                    self.creds.delete_secret(&c, DAV_SECRET);
-                    self.creds.delete_secret(&c, DIRECTORY_SECRET);
-                }
-            }
-            Job::FetchBody { key } if self.mail_offline(&key.account) => {
-                // Offline or not started: the cache may still have it.
-                match self.store.read_body(&key) {
-                    Some(raw) => self.sink.emit(Event::Body { key, raw }),
-                    None => self.sink.emit(Event::BodyFailed { key, error: "not downloaded yet, and the account is offline".into() }),
-                }
-            }
-            Job::Send { account, id, .. } if self.no_mail_server(&account) => {
-                self.sink.emit(Event::SendFailed {
-                    account,
-                    id,
-                    error: "this account has calendars and contacts only: it has no mail server".into(),
-                });
-            }
-            Job::Send { account, id, raw, from, recipients, sent_folder } if !self.workers.contains_key(&account) => {
-                // Not connected: straight into the Outbox.
-                let item = OutboxItem { id, from, recipients, sent_folder, queued: now(), attempts: 0, error: Some("offline".into()), not_before: 0 };
-                match self.store.outbox_add(&account, &item, &raw) {
-                    Ok(()) => self.sink.emit(Event::Queued { account, id, error: "offline".into() }),
-                    Err(e) => self.sink.emit(Event::SendFailed { account, id, error: e.to_string() }),
-                }
-            }
-            // Offline: changes wait in the cache for the next sync.
-            Job::SyncDav { account } if !self.workers.contains_key(&account) => {}
-            Job::SearchServer { account, query, .. } if self.mail_offline(&account) => {
-                self.sink.emit(Event::ServerSearched { account, query, keys: Vec::new(), error: Some("the account is offline".into()), done: true });
-            }
-            Job::SearchDirectory { account, query } if self.mail_offline(&account) => {
-                self.sink.emit(Event::Directory { account, query, people: Vec::new(), error: Some("the account is offline".into()), consent: false });
-            }
-            // Working offline: nothing connects, by choice.
-            Job::SyncAll { account } | Job::SyncFolder { account, .. } | Job::FlushOutbox { account }
-                if self.offline && !self.workers.contains_key(&account) => {}
-            // Closing with a message written: on disk before the app goes (the worker may be busy
-            // or about to stop); filed on the server at the next connection, as offline drafts.
-            Job::KeepDraft { account, raw, folder, replaces } => {
-                if let Err(e) = keep_draft(&self.store, &account, &folder, replaces, raw, true, &self.order) {
-                    log::warn!("{account}: the draft couldn't be kept: {e}");
-                }
-            }
-            Job::SaveDraft { account, raw, folder, replaces } if self.mail_offline(&account) => {
-                let message_id = mailcraft_model::thread::written_message_id(&raw);
-                // Handed out now, as one handed to a worker is: newer than a save of the draft a
-                // stopped worker is still filing, which, filed, leaves it kept (found in review:
-                // taken for older, it was taken off this computer, and never got to the server).
-                DraftOrder::handed(&self.order, &raw);
-                let error = keep_draft(&self.store, &account, &folder, replaces, raw, false, &self.order).err().map(|e| e.to_string());
-                let kept = error.is_none();
-                self.sink.emit(Event::DraftSaved { account: account.clone(), message_id, error });
-                // Said after the save's end, so it's the last word on it.
-                if kept {
-                    self.sink.emit(Event::Notice {
-                        account,
-                        message: "the draft is kept on this computer; it goes to Drafts when you're back online".into(),
-                    });
-                }
-            }
-            Job::FindIdentities { account } if self.mail_offline(&account) => {
-                self.sink.emit(Event::IdentitiesFound { account, found: Vec::new(), error: Some("the account is offline".into()) });
-            }
-            Job::GetVacation { account } | Job::SetVacation { account, .. } if self.mail_offline(&account) => {
-                self.sink.emit(Event::Vacation { account, vacation: None, error: Some("the account is offline".into()) });
-            }
-            // Persisted on the pool's thread for changes, not the account's: it may be minutes
-            // into a full sync, and waiting meant the cache could be overwritten by a folder
-            // refresh and an exit dropped the job. Nor the caller's, the window's (`edits.rs`).
-            // The account's thread is woken after, to upload the queue at its next opportunity.
-            // POP accounts keep the old route since their worker does extra local bookkeeping.
-            Job::Apply { account, op } if self.records_edits(&account) => {
-                let wake = self.workers.get(&account).map(|h| h.tx.clone());
-                self.edits.send(&self.store, &self.sink, account, op, wake);
-            }
-            other => {
-                let id = other.account().to_string();
-                let quick = self.configs.get(&id).is_some_and(|c| quick_job(&other, c));
-                self.save_on_its_way(&other);
-                match self.workers.get(&id) {
-                    Some(h) => {
-                        // A message opened while the main connection syncs a folder, or the
-                        // calendars, doesn't wait for that to end (issue #24).
-                        let opened = matches!(other, Job::FetchBody { .. })
-                            && h.busy.load(Ordering::Relaxed)
-                            && self.configs.get(&id).is_some_and(|c| c.pop.is_none());
-                        let quick = quick || opened;
-                        // Sending and automatic replies go on the second connection; if it has
-                        // stopped, the main one does it (after its sync).
-                        let other = match h.quick.as_ref().filter(|_| quick) {
-                            Some(q) => match q.send(other) {
-                                Ok(()) => return,
-                                Err(mpsc::SendError(j)) => j,
-                            },
-                            None => other,
-                        };
-                        if let Err(mpsc::SendError(unsent)) = h.tx.send(other) {
-                            // Mail that was to be copied there is answered for: none went.
-                            if let Job::FileCopies { account, folder, mail, moved } = unsent {
-                                let failed = mail.into_iter().map(|(k, _)| (k, "the account's connection stopped".to_string())).collect();
-                                self.sink.emit(Event::CopiesFiled { account, folder, done: Vec::new(), failed, moved });
-                            }
-                            self.sink.emit(Event::Notice {
-                                account: id,
-                                message: "the account's connection stopped; restart it from the account menu".into(),
-                            });
-                        }
-                    }
-                    None => self.sink.emit(Event::Notice { account: id, message: "the account is not connected".into() }),
-                }
-            }
-        }
-    }
-
-    /// A calendar-only account (issue #61): its thread syncs calendars and contacts, and has no
-    /// mail server for anything else.
-    fn no_mail_server(&self, account: &str) -> bool {
-        self.configs.get(account).is_some_and(AccountConfig::is_calendar_only)
-    }
-
-    /// Whether what's for an account's mail is done here, as for an account that isn't connected:
-    /// no thread runs for it, or the one that does has no mail server.
-    fn mail_offline(&self, account: &str) -> bool {
-        !self.workers.contains_key(account) || self.no_mail_server(account)
-    }
-
-    /// Whether this side writes an account's edits to the cache and ops.json: always when no
-    /// thread runs for it; for a running one unless it is POP (whose thread does it, with its
-    /// own bookkeeping).
-    fn records_edits(&self, account: &str) -> bool {
-        match self.workers.get(account) {
-            None => true,
-            Some(_) => matches!(self.configs.get(account), Some(c) if c.pop.is_none()),
         }
     }
 
@@ -522,65 +281,41 @@ impl Pool {
         }
     }
 
+    /// What an account's connections share with the pool.
+    fn shared(&self) -> Shared {
+        Shared {
+            store: self.store.clone(),
+            sink: self.sink.clone(),
+            opts: self.opts,
+            creds: Some(self.creds.clone()),
+            search: self.search.clone(),
+            order: self.order.clone(),
+            filing: self.filing.clone(),
+            sieve_port: self.sieve_port,
+        }
+    }
+
     fn start(&mut self, account: AccountConfig, password: Option<Secret>) {
         self.stop(&account.id);
         let (tx, rx) = mpsc::channel();
         // The password is kept in the keychain, or read from it, by the account's own thread
         // (`credentials.rs`): the keychain may ask the user first (macOS, after an update), and
         // the window keeps drawing meanwhile.
-        let auth = Auth::shared(String::new());
-        let mut w = Worker::new(account.clone(), auth.clone(), self.store.clone(), self.sink.clone(), self.opts);
-        w.creds = Some(self.creds.clone());
-        w.keychain = Some(password.map(|p| p.0));
-        let no_password = w.no_password.clone();
-        w.sieve_port = self.sieve_port;
-        w.search = self.search.clone();
+        let mut w = Worker::main_connection(account.clone(), self.shared(), password.map(|p| p.0));
         // No mail server (issue #61): its calendars and contacts are all its thread does.
-        if account.is_calendar_only() {
-            let busy = w.busy.clone();
-            let stop: Arc<changes::Stopped> = Arc::default();
-            w.stop = stop.clone();
-            match std::thread::Builder::new().name(format!("mail-{}", account.id)).spawn(move || w.run_calendars(rx)) {
-                Ok(thread) => {
-                    let h = Handle { tx, thread: Some(thread), quick: None, no_password, busy, quick_link: Arc::default(), stop };
-                    self.workers.insert(account.id.clone(), h);
-                }
-                Err(e) => self.sink.emit(Event::Status { account: account.id.clone(), status: SyncStatus::Error { error: e.to_string() } }),
-            }
-            self.configs.insert(account.id.clone(), account);
-            return;
+        let calendars_only = account.is_calendar_only();
+        if !calendars_only {
+            let q = w.second_connection(tx.clone(), self.shared());
+            w.pair(q);
         }
-        // The second connection: quiet (the account's status is the main one's), connecting
-        // only when there's something to do.
-        let (qtx, qrx) = mpsc::channel();
-        let mut q = Worker::new(account.clone(), auth, self.store.clone(), self.sink.clone(), self.opts);
-        q.creds = Some(self.creds.clone());
-        q.sieve_port = self.sieve_port;
-        q.main = Some(tx.clone());
-        q.given_back = w.given_back.clone();
-        q.whole_only = w.whole_only.clone();
-        let busy = w.busy.clone();
-        // Started by the main connection once the password is known; what's for it waits in its
-        // queue till then.
-        let quick_name = format!("mail-{}-quick", account.id);
-        w.quick_start = Some(Box::new(move || {
-            if let Err(e) = std::thread::Builder::new().name(quick_name).spawn(move || q.run_quick(qrx)) {
-                log::warn!("the account's second connection didn't start: {e}");
-            }
-        }));
-        let quick = Some(qtx);
-        let quick_link: QuickLink = Arc::new(Mutex::new(quick.clone()));
-        w.quick = quick_link.clone();
-        let stop: Arc<changes::Stopped> = Arc::default();
-        w.stop = stop.clone();
-        w.order = self.order.clone();
-        w.filing = self.filing.clone();
+        let handle = Handle::of(&w, tx);
         let name = format!("mail-{}", account.id);
-        match std::thread::Builder::new().name(name).spawn(move || w.run(rx)) {
-            Ok(thread) => {
-                self.workers.insert(account.id.clone(), Handle { tx, thread: Some(thread), quick, no_password, busy, quick_link, stop });
+        let spawned = std::thread::Builder::new().name(name).spawn(move || if calendars_only { w.run_calendars(rx) } else { w.run(rx) });
+        match spawned {
+            Ok(_) => {
+                self.workers.insert(account.id.clone(), handle);
             }
-            Err(e) => self.sink.emit(Event::Status { account: account.id.clone(), status: SyncStatus::Error { error: e.to_string() } }),
+            Err(e) => self.sink.emit(Event::Status { account: account.id.clone(), status: SyncStatus::error(e.to_string()) }),
         }
         self.configs.insert(account.id.clone(), account);
     }
@@ -594,15 +329,16 @@ impl Pool {
             if let Ok(mut q) = h.quick_link.lock() {
                 q.take();
             }
-            // The thread notices the closed channel within half a second (IDLE slices); don't
-            // block the UI waiting for a slow network call to finish.
-            // The second connection's thread ends as its queue closes (it was started by this one).
-            if let Some(t) = h.thread.take() {
-                std::thread::spawn(move || {
-                    let _ = t.join();
-                });
-            }
+            // The thread notices the closed channel within half a second (IDLE slices), and ends
+            // on its own: the UI never waits for a slow network call to finish. The second
+            // connection's thread ends as its queue closes (it was started by this one).
         }
+    }
+
+    /// How many waits to connect again `account`'s main connection has begun.
+    #[cfg(test)]
+    fn waits_begun(&self, account: &str) -> usize {
+        self.workers.get(account).map_or(0, |h| h.waits.load(Ordering::Relaxed))
     }
 
     /// Stop every account's threads.
@@ -611,6 +347,14 @@ impl Pool {
         for id in ids {
             self.stop(&id);
         }
+    }
+
+    /// Shut down as [`Pool::shutdown`] does, then wait for every account's threads to end (each
+    /// holds the pool's `filing`): nothing writes in the test's folder after, when it's removed.
+    #[cfg(test)]
+    pub(crate) fn shutdown_and_wait(mut self) {
+        self.shutdown();
+        crate::waiting::eventually("the pool's account threads to end", || Arc::strong_count(&self.filing) == 1);
     }
 }
 
@@ -625,6 +369,7 @@ mod indexing;
 mod opening;
 mod pgp;
 mod remote;
+mod routing;
 mod send;
 mod smime;
 
@@ -633,11 +378,12 @@ pub(crate) const DAV_SECRET: &str = "dav";
 /// Where an Exchange Online account's directory sign-in (its refresh token) is kept (issue #9).
 pub(crate) const DIRECTORY_SECRET: &str = "directory";
 mod sync;
-mod threads;
 
 pub use credentials::{Credentials, MemoryCredentials};
+#[cfg(test)]
+pub(crate) use remote::apply_remote;
+pub use remote::apply_remote_with;
 use remote::*;
-pub use remote::{apply_remote, apply_remote_with};
 
 /// Largest picture downloaded for a message.
 const MAX_PICTURE: usize = 8 << 20;
@@ -649,18 +395,13 @@ const POLL_EVERY: Duration = Duration::from_secs(120);
 /// moment later), and once more in case that was too soon.
 const SENT_SOON: Duration = Duration::from_secs(3);
 const SENT_LATER: Duration = Duration::from_secs(15);
+/// How often the wait for those looks whether its connection has ended.
+const SENT_LATER_SLICE: Duration = Duration::from_millis(250);
 /// An account's second connection lets go after this long with nothing to do.
 const QUICK_IDLE: Duration = Duration::from_secs(5 * 60);
-
-/// The connection to an account's server.
-enum Conn {
-    Imap(Client<Stream>),
-    Jmap(jmap::Client),
-    Graph(crate::graph::Client),
-    Ews(Box<crate::ews::Client>),
-    /// POP3: signed in once to check the password; every download is a session of its own.
-    Pop,
-}
+/// The first wait before connecting again after a connection is lost; it grows with each failure,
+/// and comes back to this once signed in again (the second connection) or synced (the main one).
+const FIRST_BACKOFF: Duration = Duration::from_secs(5);
 
 struct Worker {
     acc: AccountConfig,
@@ -688,6 +429,10 @@ struct Worker {
     /// What the pool did as it stopped this worker: it says nothing more of the account, and
     /// leaves the drafts the pool kept then (`changes/drafts.rs`).
     stop: Arc<changes::Stopped>,
+    /// Held while this worker lives: a thread it starts to ask something of the main connection
+    /// later (Sent Items read again) ends with it, rather than keep a stopped account's main
+    /// thread waiting for its jobs.
+    alive: Arc<()>,
     /// The order drafts were handed out to be saved and kept as MailCraft closed (the pool's).
     order: changes::Order,
     /// The drafts being filed on the server now, by this worker or another (the pool's).
@@ -708,6 +453,9 @@ struct Worker {
     whole_only: Arc<std::sync::Mutex<std::collections::HashSet<mailcraft_model::MessageKey>>>,
     /// Set while the main connection works rather than waits ([`Worker::working`]).
     busy: Arc<AtomicBool>,
+    /// How many waits to connect again after a connection failed it began, shared with the
+    /// pool: counted, not timed (the tests ask).
+    waits: Arc<AtomicUsize>,
     backoff: Duration,
     next_attempt: Instant,
     last_full: Option<Instant>,
@@ -720,6 +468,8 @@ struct Worker {
     auth_failed: bool,
     /// An OAuth refusal was answered with a fresh token once; another means signing in again.
     token_retried: bool,
+    /// The connections made again at once with a renewed token, lately: only so many are.
+    renewals: connect::Renewals,
     closed: bool,
     /// Where a rotated OAuth refresh token is saved.
     creds: Option<Arc<dyn Credentials>>,
@@ -749,6 +499,9 @@ struct Worker {
     quick_start: Option<Box<dyn FnOnce() + Send>>,
     /// Set when the keychain had no password ([`Handle::no_password`]).
     no_password: Arc<AtomicBool>,
+    /// Outbox messages sent, or refused for good, that the Outbox couldn't be told of (its files
+    /// couldn't be changed): not sent again while this runs.
+    outbox_done: std::collections::HashSet<u64>,
 }
 
 /// Where an account keeps its folders' own windows.
@@ -757,7 +510,60 @@ const WINDOWS: &str = "windows.json";
 const FOUND_MAX: usize = 500;
 
 impl Worker {
+    /// A connection of the tests' own: nothing shared with a pool, no passwords kept.
+    #[cfg(test)]
     fn new(acc: AccountConfig, auth: Arc<Mutex<Auth>>, store: Store, sink: Sink, opts: SyncOptions) -> Worker {
+        let shared = Shared {
+            store,
+            sink,
+            opts,
+            creds: None,
+            search: Arc::default(),
+            order: changes::Order::default(),
+            filing: Arc::default(),
+            sieve_port: crate::sieve::PORT,
+        };
+        Worker::with(acc, auth, shared)
+    }
+
+    /// An account's main connection, its only one when it has calendars alone. `password`: one
+    /// just given, kept in the keychain on its own thread before it first connects; `None` to read
+    /// the one kept there.
+    fn main_connection(acc: AccountConfig, shared: Shared, password: Option<String>) -> Worker {
+        let mut w = Worker::with(acc, Auth::shared(String::new()), shared);
+        w.keychain = Some(password);
+        w
+    }
+
+    /// The account's second connection, for work the user sees happen (sending, automatic
+    /// replies): quiet, the account's status being the main one's (`self`), and connecting only
+    /// when there's something to do. It signs in as the main one does, leaves to it (`main`, its
+    /// queue) what it can't do, and shares with it the messages given back and those whose text
+    /// went first.
+    fn second_connection(&self, main: Sender<Job>, shared: Shared) -> Worker {
+        let mut q = Worker::with(self.acc.clone(), self.auth.clone(), shared);
+        q.main = Some(main);
+        q.given_back = self.given_back.clone();
+        q.whole_only = self.whole_only.clone();
+        q
+    }
+
+    /// The main connection's second one, `q`: started once the password is known (what's for it
+    /// waits in its queue till then).
+    fn pair(&mut self, q: Worker) {
+        let (qtx, qrx) = mpsc::channel();
+        let name = format!("mail-{}-quick", self.acc.id);
+        self.quick_start = Some(Box::new(move || {
+            if let Err(e) = std::thread::Builder::new().name(name).spawn(move || q.run_quick(qrx)) {
+                log::warn!("the account's second connection didn't start: {e}");
+            }
+        }));
+        self.quick = Arc::new(Mutex::new(Some(qtx)));
+    }
+
+    /// A connection of `acc`'s, signing in with `auth`, with what it shares with the pool.
+    fn with(acc: AccountConfig, auth: Arc<Mutex<Auth>>, shared: Shared) -> Worker {
+        let Shared { store, sink, opts, creds, search, order, filing, sieve_port } = shared;
         let folders = store.load_folders(&acc.id).unwrap_or_default();
         let jstate = if acc.is_api() { jmap::State::load(&store, &acc.id) } else { jmap::State::default() };
         // Online only (issue #4): nothing downloaded in full ahead of reading; a message comes
@@ -781,8 +587,9 @@ impl Worker {
             quick: Arc::default(),
             given_back: Arc::default(),
             stop: Arc::default(),
-            order: changes::Order::default(),
-            filing: Arc::default(),
+            alive: Arc::default(),
+            order,
+            filing,
             kept: changes::KeptDrafts::default(),
             counts_unsaid: Vec::new(),
             gone_meanwhile: Vec::new(),
@@ -790,25 +597,28 @@ impl Worker {
             dav_looked: false,
             whole_only: Arc::default(),
             busy: Arc::default(),
-            backoff: Duration::from_secs(5),
+            waits: Arc::default(),
+            backoff: FIRST_BACKOFF,
             next_attempt: Instant::now(),
             last_full: None,
             looked: None,
             directory_token: None,
             auth_failed: false,
             token_retried: false,
+            renewals: connect::Renewals::default(),
             closed: false,
-            creds: None,
-            sieve_port: crate::sieve::PORT,
+            creds,
+            sieve_port,
             no_push: false,
             pushed: false,
             soon: Vec::new(),
-            search: Arc::new(AtomicU64::new(0)),
+            search,
             dav_digest: None,
             dav_said: None,
             keychain: None,
             quick_start: None,
             no_password: Arc::default(),
+            outbox_done: std::collections::HashSet::new(),
         }
     }
 
@@ -820,7 +630,7 @@ impl Worker {
         // The second connection's comings and goings aren't the account's, nor a stopped one's.
         if self.main.is_none() && !self.stopped() {
             match &status {
-                SyncStatus::Error { error } => log::warn!("{}: {error}", self.acc.id),
+                SyncStatus::Error { error, .. } => log::warn!("{}: {error}", self.acc.id),
                 SyncStatus::NeedsPassword { error } => log::warn!("{}: needs signing in again: {error}", self.acc.id),
                 SyncStatus::Online { .. } | SyncStatus::Syncing { .. } => {}
                 s => log::info!("{}: {s:?}", self.acc.id),
@@ -847,6 +657,8 @@ impl Worker {
     }
 
     fn run(mut self, rx: Receiver<Job>) {
+        #[cfg(test)]
+        let _ending = self.main.is_none().then(|| connect::ended::Ending(self.store.root().to_path_buf(), self.acc.id.clone()));
         self.status(SyncStatus::Connecting);
         if !self.settle_password() {
             return;
@@ -881,8 +693,7 @@ impl Worker {
                 }
                 let wait = self.next_attempt.saturating_duration_since(Instant::now());
                 if !wait.is_zero() {
-                    #[cfg(test)]
-                    connect::waits::began(&self.store, &self.acc.id);
+                    self.waits.fetch_add(1, Ordering::Relaxed);
                     self.working(false);
                     match rx.recv_timeout(wait) {
                         Ok(j) => push_job(&mut self.queue, j),

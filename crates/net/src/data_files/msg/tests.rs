@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use super::*;
+use crate::data_files::test_data::filetime;
 
 /// A property of a message file being built: its tag, and its value as the file keeps it.
 enum P {
@@ -44,7 +45,7 @@ fn write_props(cf: &mut CompoundFile<Cursor<Vec<u8>>>, dir: &str, header: usize,
 }
 
 /// 2026-11-03 10:00 UTC as a FILETIME.
-const FILETIME: i64 = (1_793_700_000 + 11_644_473_600) * 10_000_000;
+const FILETIME: i64 = filetime(1_793_700_000);
 
 /// A message as Outlook saves one: text and HTML, a sender, two recipients, a file and an
 /// attached message with a file of its own.
@@ -166,6 +167,82 @@ fn an_ole_object_isnt_an_attached_message() {
     assert!(p.attachments.iter().all(|a| a.mime != "message/rfc822"), "{:?}", p.attachments);
 }
 
+/// A message saved in a code page (8-bit strings, not Unicode) names its files in it too: a
+/// file's name was read as UTF-8, its letters lost, while the subject beside it read right. An
+/// attached message names its own in its own code page.
+#[test]
+fn eight_bit_file_names_are_read_in_the_messages_code_page() {
+    let mut cf = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    write_props(
+        &mut cf,
+        "",
+        TOP_HEADER,
+        &[
+            (0x001A_001E, P::Bin(b"IPM.Note".to_vec())),
+            (0x0037_001E, P::Bin(b"Gr\xfc\xdfe".to_vec())),
+            (0x1000_001E, P::Bin(b"Anbei.".to_vec())),
+            (0x3FFD_0003, P::Int(1252)),
+        ],
+    );
+    let file = "/__attach_version1.0_#00000000";
+    cf.create_storage(file).unwrap();
+    write_props(
+        &mut cf,
+        file,
+        PART_HEADER,
+        &[(0x3707_001E, P::Bin(b"R\xe4der.csv".to_vec())), (0x3705_0003, P::Int(1)), (0x3701_0102, P::Bin(b"a,b\n".to_vec()))],
+    );
+    let attached = "/__attach_version1.0_#00000001";
+    cf.create_storage(attached).unwrap();
+    write_props(&mut cf, attached, PART_HEADER, &[(0x3705_0003, P::Int(5))]);
+    let inner = format!("{attached}/__substg1.0_3701000D");
+    cf.create_storage(&inner).unwrap();
+    write_props(
+        &mut cf,
+        &inner,
+        EMBEDDED_HEADER,
+        &[(0x001A_001E, P::Bin(b"IPM.Note".to_vec())), (0x0037_001E, P::Bin(b"\xce\xf2\xf7\xe5\xf2".to_vec())), (0x3FFD_0003, P::Int(1251))],
+    );
+    let inner_file = format!("{inner}/__attach_version1.0_#00000000");
+    cf.create_storage(&inner_file).unwrap();
+    write_props(
+        &mut cf,
+        &inner_file,
+        PART_HEADER,
+        &[(0x3707_001E, P::Bin(b"\xce\xf2\xf7\xe5\xf2.txt".to_vec())), (0x3705_0003, P::Int(1)), (0x3701_0102, P::Bin(b"x".to_vec()))],
+    );
+    cf.flush().unwrap();
+    let raw = to_mime(&cf.into_inner().into_inner()).unwrap();
+    let p = mailcraft_mime::parse(&raw).unwrap();
+    assert_eq!(p.subject, "Grüße");
+    assert!(p.attachments.iter().any(|a| a.name == "Räder.csv"), "{:?}", p.attachments);
+    let msg = p.attachments.iter().position(|a| a.mime == "message/rfc822").unwrap();
+    let files = mailcraft_mime::attachments_data(&raw, &[msg], 1 << 20, 1 << 20);
+    let ip = mailcraft_mime::parse(&files[0].1).unwrap();
+    assert_eq!(ip.subject, "Отчет");
+    assert!(ip.attachments.iter().any(|a| a.name == "Отчет.txt"), "{:?}", ip.attachments);
+}
+
+/// A file whose long name is blank is named by its short name, as a data file's is: it came
+/// in named with spaces.
+#[test]
+fn a_blank_long_file_name_gives_way_to_the_short_one() {
+    let mut cf = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    write_props(&mut cf, "", TOP_HEADER, &[(0x001A_001F, P::Text("IPM.Note")), (0x0037_001F, P::Text("Plan")), (0x1000_001F, P::Text("Attached."))]);
+    let file = "/__attach_version1.0_#00000000";
+    cf.create_storage(file).unwrap();
+    write_props(
+        &mut cf,
+        file,
+        PART_HEADER,
+        &[(0x3707_001F, P::Text("   ")), (0x3704_001F, P::Text("PLAN~1.CSV")), (0x3705_0003, P::Int(1)), (0x3701_0102, P::Bin(b"a,b\n".to_vec()))],
+    );
+    cf.flush().unwrap();
+    let raw = to_mime(&cf.into_inner().into_inner()).unwrap();
+    let p = mailcraft_mime::parse(&raw).unwrap();
+    assert_eq!(p.attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["PLAN~1.CSV"]);
+}
+
 /// What isn't a message file is an error, never a panic: other files, a compound file that
 /// holds no message, one cut short, one damaged byte by byte, and one too big.
 #[test]
@@ -190,12 +267,95 @@ fn junk_is_an_error_not_a_panic() {
     assert!(to_mime(&huge).is_err());
 }
 
-/// The fuzz target's seed (`fuzz/seeds/msg`), written again: `cargo test -p mailcraft-net
-/// write_msg_fuzz_seed -- --ignored`.
+/// The fuzz target's seed (`fuzz/seeds/msg/outlook.msg`) holds [`sample`] as made here, so the
+/// weekly run starts from the message these tests read. `MAILCRAFT_WRITE_SEED=1` writes it again
+/// first.
 #[test]
-#[ignore]
-fn write_msg_fuzz_seed() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/msg");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("outlook.msg"), sample()).unwrap();
+fn the_fuzz_seed_is_the_sample() {
+    let seed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/msg/outlook.msg");
+    if std::env::var_os("MAILCRAFT_WRITE_SEED").is_some() {
+        std::fs::write(&seed, sample()).unwrap();
+    }
+    // Its bytes differ from each new sample's by the times the compound file notes; what it holds
+    // doesn't.
+    let written = std::fs::read(&seed).unwrap_or_default();
+    assert_eq!(to_mime(&written).ok(), Some(to_mime(&sample()).unwrap()), "MAILCRAFT_WRITE_SEED=1 writes it");
+}
+
+/// A message file with a 60 MB file, read: its bytes were copied twice more on their way.
+/// `cargo test --release -p mailcraft-net --lib measure_msg_big_file -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn measure_msg_big_file() {
+    let mut cf = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    write_props(&mut cf, "", TOP_HEADER, &[(0x001A_001F, P::Text("IPM.Note")), (0x0037_001F, P::Text("Big")), (0x1000_001F, P::Text("Attached."))]);
+    let file = "/__attach_version1.0_#00000000";
+    cf.create_storage(file).unwrap();
+    let data: Vec<u8> = (0..60_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    write_props(&mut cf, file, PART_HEADER, &[(0x3707_001F, P::Text("big.bin")), (0x3705_0003, P::Int(1)), (0x3701_0102, P::Bin(data))]);
+    cf.flush().unwrap();
+    let bytes = cf.into_inner().into_inner();
+    let n = to_mime(&bytes).unwrap().len();
+    let t = std::time::Instant::now();
+    for _ in 0..5 {
+        assert_eq!(to_mime(&bytes).unwrap().len(), n);
+    }
+    println!("MEASURE .msg with a 60 MB file read: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+}
+
+/// How long turning a message file's multi-megabyte UTF-16 and 8-bit text property into its
+/// value takes.
+/// `cargo test --release -p mailcraft-net --lib msg_text_property_speed -- --ignored --nocapture`
+#[test]
+#[ignore = "a measurement"]
+fn msg_text_property_speed() {
+    const ROUNDS: u32 = 20;
+    let line = "Dear Ana, the r\u{e9}sum\u{e9} is attached; see you on Thursday at the caf\u{e9}.\r\n";
+    let text = line.repeat(8 * 1024 * 1024 / line.len());
+    let wide = Prop { id: 0x1000, ty: 0x001F, value: Stored::Bytes([utf16le(&text), vec![0; 4]].concat()) };
+    let narrow_bytes = text.chars().map(|c| if c == '\u{e9}' { 0xE9 } else { c as u8 }).chain([0]).collect();
+    let narrow = Prop { id: 0x1000, ty: 0x001E, value: Stored::Bytes(narrow_bytes) };
+    for (name, p) in [("UTF-16", &wide), ("8-bit", &narrow)] {
+        assert_eq!(val(p, 1252), Val::Text(Cow::Borrowed(text.as_str())), "{name}");
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            std::hint::black_box(val(std::hint::black_box(p), 1252));
+        }
+        let per = started.elapsed() / ROUNDS;
+        println!("MEASURE .msg {name} text property of {} bytes into its value: {per:?} each ({ROUNDS} rounds)", text.len());
+    }
+}
+
+mod text_values {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// What a text came to before NULs were cut in place: trimmed, then copied.
+    fn copied(s: &str) -> String {
+        s.trim_end_matches('\0').to_string()
+    }
+
+    proptest! {
+        /// A message file's text value is what it was when it was trimmed and copied: trailing
+        /// NULs gone, inner ones kept, single and multi-valued, UTF-16 and 8-bit in a code page.
+        #[test]
+        fn a_text_value_is_unchanged(
+            s in proptest::collection::vec(prop_oneof![3 => Just('\0'), 2 => any::<char>()], 0..40),
+            b in proptest::collection::vec(prop_oneof![3 => Just(0u8), 2 => any::<u8>()], 0..40),
+            page in prop_oneof![Just(0u32), Just(1252), Just(65001), Just(932)],
+        ) {
+            let wide_bytes = utf16le(&s.into_iter().collect::<String>());
+            let wide = copied(&utf16(&wide_bytes));
+            let narrow = copied(&eight_bit(&b, page));
+            let one = |ty: u16, bytes: &[u8]| Prop { id: 0x0037, ty, value: Stored::Bytes(bytes.to_vec()) };
+            let many = |ty: u16, bytes: &[u8]| Prop { id: 0x0037, ty, value: Stored::Many(vec![bytes.to_vec(), bytes.to_vec()]) };
+            let (one_wide, one_narrow) = (one(0x001F, &wide_bytes), one(0x001E, &b));
+            let (some_wide, some_narrow) = (many(0x101F, &wide_bytes), many(0x101E, &b));
+            prop_assert_eq!(val(&one_wide, page), Val::Text(Cow::Borrowed(wide.as_str())));
+            prop_assert_eq!(val(&one_narrow, page), Val::Text(Cow::Borrowed(narrow.as_str())));
+            prop_assert_eq!(val(&some_wide, page), Val::Texts(vec![wide.clone(), wide]));
+            prop_assert_eq!(val(&some_narrow, page), Val::Texts(vec![narrow.clone(), narrow]));
+        }
+    }
 }

@@ -72,6 +72,7 @@
 	Edit rule	تحرير القاعدة
 	Email address	عنوان البريد الإلكتروني
 	Enter the password for {email}.	أدخل كلمة المرور لـ {email}.
+	Enter the password for {email}, which signs in as {user}.	أدخل كلمة المرور لـ {email}، الذي يسجّل الدخول باسم {user}.
 	Favorites	المفضلة
 	Feb	فبراير
 	File	ملف
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	تعليم الرسائل كمقروءة عند فتحها
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	لا مرسلين بعد.
-	Not available: the sample mailbox has no server.	غير متاح: صندوق البريد التجريبي بلا خادم.
+	Not available: this mailbox has no server.	غير متاح: صندوق البريد هذا بلا خادم.
 	Not available: {error}	غير متاح: {error}
 	On	تشغيل
 	On from {from}	تعمل من {from}
@@ -842,7 +843,8 @@ month	May	مايو
 	Formatted	منسّق
 	HTML code	شيفرة HTML
 	From a file…	من ملف…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	الصق HTML لتوقيع صُنع في مكان آخر، أو افتح توقيعًا محفوظًا كصفحة ويب (‎.htm من Outlook). يُرسل كما كُتب؛ وأثناء الكتابة تعرض الرسالة نصّه.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	الصق HTML لتوقيع صُنع في مكان آخر، أو افتح توقيعًا محفوظًا كصفحة ويب (‎.htm من Outlook). يُرسل كما كُتب، ويظهر كذلك أثناء الكتابة.
+	Your signature as it will be sent. To change it, pick Signature above the message.	توقيعك كما سيُرسل. لتغييره، اختر «التوقيع» أعلى الرسالة.
 	{name} can't be read as a signature	لا يمكن قراءة {name} كتوقيع
 	All contacts	كل جهات الاتصال
 	Always open with this address book	الفتح دائمًا بدفتر العناوين هذا
@@ -934,6 +936,9 @@ month	May	مايو
 	Name on mail from it	الاسم على البريد المرسل منه
 	Replies go to	الردود تذهب إلى
 	(the account's own)	(توقيع الحساب نفسه)
+	Write new mail from this address	اكتب الرسائل الجديدة من هذا العنوان
+	A new message starts from this address, not from {email}. Pick another in From as ever.	تبدأ الرسالة الجديدة من هذا العنوان، لا من {email}. ويمكنك اختيار عنوان آخر في «من» كما في السابق.
+	{address} (new mail)	{address} (الرسائل الجديدة)
 	Add…	إضافة…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	تظهر مجلداته تحت هذا الحساب. تحتاج إلى صلاحية الوصول إليه على خادم Exchange؛ وتُفتح الصناديق التي لديك وصول كامل إليها تلقائيًا.
 	Mailboxes you have full access to open by themselves.	تُفتح الصناديق التي لديك وصول كامل إليها تلقائيًا.
@@ -1102,6 +1107,7 @@ month	May	مايو
 	Check before sending	تحقّق قبل الإرسال
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	يبدو {address} كعنوان في {like}، لكنه ليس كذلك. هل هو العنوان الصحيح؟
 	{n} people who may not know each other will all see each other's addresses.	سيرى {n} أشخاص قد لا يعرف بعضهم بعضًا عناوينَ بعضهم.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	عُثر في المستلمين على شيء يستحق النظر، لكن لا يمكن عرضه. راجعهم قبل الإرسال.
 	Put everyone in Bcc	ضع الجميع في Bcc
 	Each of them gets the message without seeing who else did; you're in To	يتلقى كل منهم الرسالة دون أن يرى من تلقاها غيره؛ وتكون أنت في «إلى»
 	Open links without their tracking	فتح الروابط دون التتبّع
@@ -1441,6 +1447,7 @@ month	May	مايو
 	Calendar and contacts couldn't be read: changes to them won't be saved	تعذّرت قراءة التقويم وجهات الاتصال: لن تُحفظ التغييرات عليها
 	Your rules couldn't be read: changes to them won't be saved	تعذّرت قراءة القواعد: لن تُحفظ التغييرات عليها
 	Snoozed mail couldn't be read: changes to it won't be saved	تعذّرت قراءة البريد المؤجَّل: لن تُحفظ التغييرات عليه
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	تعذّرت قراءة ما تردّ عليه الردود المنتظرة في علبة الصادر: قد لا يُعلَّم ذلك البريد على أنه مُجاب عليه
 	Checking your data file	جارٍ فحص ملف البيانات
 	Opening your mail…	جارٍ فتح البريد…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	لم يُغلق {file} بشكل صحيح في المرة السابقة. يفحصه MailCraft الآن؛ وقد يستغرق الملف الكبير دقيقة أو اثنتين.
@@ -1458,6 +1465,8 @@ month	May	مايو
 	Some results may be missing: still indexing	قد تنقص بعض النتائج: ما زالت الفهرسة جارية
 	Some long messages were searched only in part	بُحث في بعض الرسائل الطويلة جزئيًا فقط
 	Couldn't read the date “{value}”	تعذّرت قراءة التاريخ «{value}»
+	Couldn't read “{value}”	تعذّرت قراءة «{value}»
+	Part of a long search was left out	أُهمل جزء من بحث طويل
 	Received after	مستلمة بعد
 	Received before	مستلمة قبل
 	About {h} h {m} min left	يتبقى نحو {h} س {m} د
@@ -1704,3 +1713,7 @@ month	May	مايو
 	Nothing to do	لا شيء للقيام به
 	Nothing in the next 7 days	لا شيء في الأيام السبعة القادمة
 	Show the calendar, what's coming up and your tasks beside the mail	إظهار التقويم والمواعيد القادمة ومهامك بجانب البريد
+	Read / Unread (Ctrl+Q / Ctrl+U)	مقروء / غير مقروء (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	تعذّر تنزيل {name}: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	حدث خطأ في النافذة، فأُوقف ما كانت تقوم به. يواصل MailCraft العمل، ويذكر السجل أين حدث ذلك.
+	Font size	حجم الخط

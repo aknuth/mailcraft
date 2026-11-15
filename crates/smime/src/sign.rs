@@ -9,8 +9,9 @@ use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use cms::content_info::{CmsVersion, ContentInfo};
 use cms::signed_data::{CertificateSet, DigestAlgorithmIdentifiers, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo, SignerInfos};
 use der::asn1::{ObjectIdentifier, OctetString, SetOfVec};
-use der::{Any, Decode, Encode};
+use der::{Any, Decode, DerOrd as _, Encode, Reader as _, Tag, TagNumber};
 use spki::AlgorithmIdentifierOwned;
+use std::cmp::Ordering;
 use x509_cert::Certificate;
 use x509_cert::attr::Attribute;
 
@@ -20,10 +21,10 @@ use crate::{Error, Identity, der_of, oids};
 /// A signature that holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Signed {
-    /// The signer's certificate (DER).
+    /// The signer's certificate, as the signature carried it.
     pub signer: Vec<u8>,
-    /// Every certificate the signature carried (the signer's among them): the chain to check it
-    /// with, and what to encrypt to the signer with.
+    /// Every certificate the signature carried (the signer's among them), as it carried them:
+    /// the chain to check it with, and what to encrypt to the signer with.
     pub certs: Vec<Vec<u8>>,
     /// When the signer's program says it signed (Unix seconds).
     pub signed_at: Option<i64>,
@@ -117,14 +118,21 @@ pub fn sign_with(content: &[u8], chain: &[Vec<u8>], key: &mut dyn crate::Private
     };
     let mut digests = SetOfVec::new();
     digests.insert(algorithm(oids::SHA256)).map_err(|_| Error::Malformed("can't be written"))?;
-    let mut certs = SetOfVec::new();
+    // Each certificate as it was kept, the bytes its issuer signed: decoded and written again,
+    // some aren't those ([`carried_certs`]).
+    let mut certs: Vec<&[u8]> = Vec::new();
     for d in chain {
         let c = Certificate::from_der(d).map_err(|_| Error::Malformed("a certificate can't be read"))?;
         // The root is the reader's to have; sending it proves nothing.
         if c.tbs_certificate.subject == c.tbs_certificate.issuer && chain.len() > 1 {
             continue;
         }
-        certs.insert(CertificateChoices::Certificate(c)).map_err(|_| Error::Malformed("can't be written"))?;
+        certs.push(d);
+    }
+    // A SET OF in DER: its elements in the order of their bytes, none twice.
+    certs.sort_unstable();
+    if certs.windows(2).any(|w| w.first() == w.get(1)) {
+        return Err(Error::Malformed("can't be written"));
     }
     let mut signers = SetOfVec::new();
     signers.insert(signer).map_err(|_| Error::Malformed("can't be written"))?;
@@ -132,12 +140,29 @@ pub fn sign_with(content: &[u8], chain: &[Vec<u8>], key: &mut dyn crate::Private
         version: CmsVersion::V1,
         digest_algorithms: DigestAlgorithmIdentifiers::from(digests),
         encap_content_info: EncapsulatedContentInfo { econtent_type: oids::DATA, econtent: None },
-        certificates: Some(CertificateSet(certs)),
+        certificates: None,
         crls: None,
         signer_infos: SignerInfos(signers),
     };
-    let ci = ContentInfo { content_type: oids::SIGNED_DATA, content: any(&sd)? };
+    let ci = ContentInfo { content_type: oids::SIGNED_DATA, content: carrying(&sd, &certs)? };
     ci.to_der().map_err(|_| Error::Malformed("can't be written"))
+}
+
+/// `sd` (its certificates and CRLs left out) carrying `certs` (DER, in order) in its
+/// `[0] IMPLICIT CertificateSet`, written as they are.
+fn carrying(sd: &SignedData, certs: &[&[u8]]) -> Result<Any, Error> {
+    let written = |r: der::Result<Vec<u8>>| r.map_err(|_| Error::Malformed("can't be written"));
+    let set = Any::new(Tag::ContextSpecific { constructed: true, number: TagNumber::N0 }, certs.concat())
+        .map_err(|_| Error::Malformed("can't be written"))?;
+    let inner = [
+        written(sd.version.to_der())?,
+        written(sd.digest_algorithms.to_der())?,
+        written(sd.encap_content_info.to_der())?,
+        written(set.to_der())?,
+        written(sd.signer_infos.to_der())?,
+    ]
+    .concat();
+    Any::new(Tag::Sequence, inner).map_err(|_| Error::Malformed("can't be written"))
 }
 
 /// The value of the attribute `oid` among `attrs`, when it has exactly one.
@@ -152,27 +177,14 @@ fn single(attrs: &SetOfVec<Attribute>, oid: ObjectIdentifier) -> Option<&Any> {
 /// and the content comes back. The first signer whose signature holds is the one returned; none
 /// holding is [`Error::BadSignature`].
 pub fn verify(cms: &[u8], detached: Option<&[u8]>) -> Result<(Signed, Vec<u8>), Error> {
-    let der_bytes = der_of(cms)?;
-    let ci = ContentInfo::from_der(&der_bytes).map_err(|_| Error::Malformed("not a signature"))?;
-    if ci.content_type != oids::SIGNED_DATA {
-        return Err(Error::Malformed("not a signature"));
-    }
-    let sd: SignedData = ci.content.decode_as().map_err(|_| Error::Malformed("the signature can't be read"))?;
+    let (signed_data, sd) = signed_data(cms)?;
     let carried = sd.encap_content_info.econtent.as_ref().map(|c| c.value().to_vec());
     let content: Vec<u8> = match (detached, carried) {
         (Some(d), _) => d.to_vec(),
         (None, Some(c)) => c,
         (None, None) => return Err(Error::Malformed("the signed content is missing")),
     };
-    let certs: Vec<(Vec<u8>, Certificate)> = sd
-        .certificates
-        .iter()
-        .flat_map(|s| s.0.iter())
-        .filter_map(|c| match c {
-            CertificateChoices::Certificate(c) => c.to_der().ok().map(|d| (d, c.clone())),
-            CertificateChoices::Other(_) => None,
-        })
-        .collect();
+    let certs = carried_certs(&signed_data, sd.certificates.as_ref())?;
     let mut seen_signer = false;
     for si in sd.signer_infos.0.iter() {
         let Some((signer_der, signer)) = certs.iter().find(|(_, c)| identifies(&si.sid, c)) else { continue };
@@ -200,7 +212,7 @@ pub fn verify(cms: &[u8], detached: Option<&[u8]>) -> Result<(Signed, Vec<u8>), 
         let signed_at = single(attrs, oids::SIGNING_TIME)
             .and_then(|v| v.to_der().ok())
             .and_then(|d| x509_cert::time::Time::from_der(&d).ok())
-            .and_then(|t| i64::try_from(t.to_unix_duration().as_secs()).ok());
+            .map(|t| cert::secs(t.to_unix_duration()));
         let reads = single(attrs, oids::SMIME_CAPABILITIES)
             .and_then(|v| v.decode_as::<Vec<AlgorithmIdentifierOwned>>().ok())
             .map(|v| v.into_iter().map(|a| a.oid).collect())
@@ -215,28 +227,84 @@ pub fn verify(cms: &[u8], detached: Option<&[u8]>) -> Result<(Signed, Vec<u8>), 
     Err(Error::BadSignature)
 }
 
+/// The certificates a `SignedData` (`signed_data`, as read) carries, each with its bytes as they
+/// came: its issuer signed those, and its fingerprint is theirs, but `der` reads some that DER
+/// doesn't allow (a `critical FALSE` written out, a SET out of order) and would write the
+/// certificate again otherwise. In the order `set` (the same certificates, decoded) has them;
+/// other kinds of certificate left out.
+fn carried_certs(signed_data: &Any, set: Option<&CertificateSet>) -> Result<Vec<(Vec<u8>, Certificate)>, Error> {
+    let Some(set) = set else { return Ok(Vec::new()) };
+    let unreadable = || Error::Malformed("the signature can't be read");
+    let raw = cert_set_bytes(signed_data.value()).ok_or_else(unreadable)?;
+    // Mostly each came as DER writes it, in DER's order: written again, each is what came.
+    let read: Vec<(&[u8], CertificateChoices)> =
+        if raw.len() == set.0.len() && raw.iter().zip(set.0.iter()).all(|(d, c)| c.to_der().is_ok_and(|again| again == *d)) {
+            raw.into_iter().zip(set.0.iter().cloned()).collect()
+        } else {
+            let mut read: Vec<(&[u8], CertificateChoices)> =
+                raw.into_iter().map(|d| CertificateChoices::from_der(d).map(|c| (d, c))).collect::<Result<_, _>>().map_err(|_| unreadable())?;
+            // `der` sorts a SET OF as it reads it (refusing two the same): the order they're
+            // tried in is that one, whatever order they came in.
+            let as_set = |read: &[(&[u8], CertificateChoices)]| read.len() == set.0.len() && read.iter().zip(set.0.iter()).all(|((_, a), b)| a == b);
+            if !as_set(&read) {
+                read.sort_by(|(_, a), (_, b)| a.der_cmp(b).unwrap_or(Ordering::Equal));
+                if !as_set(&read) {
+                    return Err(unreadable());
+                }
+            }
+            read
+        };
+    Ok(read
+        .into_iter()
+        .filter_map(|(d, c)| match c {
+            CertificateChoices::Certificate(c) => Some((d.to_vec(), c)),
+            CertificateChoices::Other(_) => None,
+        })
+        .collect())
+}
+
+/// The elements of a `SignedData`'s `certificates` (`[0] IMPLICIT CertificateSet`, after its
+/// version, digest algorithms and content), each as written. `signed_data` is the SEQUENCE's
+/// contents (DER).
+fn cert_set_bytes(signed_data: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut r = der::SliceReader::new(signed_data).ok()?;
+    for _ in 0..3 {
+        r.tlv_bytes().ok()?;
+    }
+    let header = der::Header::decode(&mut r).ok()?;
+    if header.tag != (Tag::ContextSpecific { constructed: true, number: TagNumber::N0 }) {
+        return None;
+    }
+    let mut set = der::SliceReader::new(r.read_slice(header.length).ok()?).ok()?;
+    let mut out = Vec::new();
+    while !set.is_finished() {
+        out.push(set.tlv_bytes().ok()?);
+    }
+    Some(out)
+}
+
 /// The content a signature carries (`smime-type=signed-data`), whether or not the signature holds:
 /// a message whose signature is broken is still shown, saying so.
 pub fn carried(cms: &[u8]) -> Result<Vec<u8>, Error> {
+    let (_, sd) = signed_data(cms)?;
+    sd.encap_content_info.econtent.map(|c| c.value().to_vec()).ok_or(Error::Malformed("the signed content is missing"))
+}
+
+/// The `SignedData` of `cms` (BER or DER `ContentInfo`), and its encoding as read (DER).
+fn signed_data(cms: &[u8]) -> Result<(Any, SignedData), Error> {
     let der_bytes = der_of(cms)?;
     let ci = ContentInfo::from_der(&der_bytes).map_err(|_| Error::Malformed("not a signature"))?;
     if ci.content_type != oids::SIGNED_DATA {
         return Err(Error::Malformed("not a signature"));
     }
     let sd: SignedData = ci.content.decode_as().map_err(|_| Error::Malformed("the signature can't be read"))?;
-    sd.encap_content_info.econtent.map(|c| c.value().to_vec()).ok_or(Error::Malformed("the signed content is missing"))
+    Ok((ci.content, sd))
 }
 
 /// Whether `sid` names `c` (by issuer and serial number, or by subject key identifier).
-pub(crate) fn identifies(sid: &SignerIdentifier, c: &Certificate) -> bool {
+fn identifies(sid: &SignerIdentifier, c: &Certificate) -> bool {
     match sid {
-        SignerIdentifier::IssuerAndSerialNumber(i) => i.issuer == c.tbs_certificate.issuer && i.serial_number == c.tbs_certificate.serial_number,
-        SignerIdentifier::SubjectKeyIdentifier(k) => key_id(c).is_some_and(|id| id == k.0.as_bytes()),
+        SignerIdentifier::IssuerAndSerialNumber(i) => cert::is_named(c, &i.issuer, &i.serial_number),
+        SignerIdentifier::SubjectKeyIdentifier(k) => cert::has_key_id(c, k.0.as_bytes()),
     }
-}
-
-/// A certificate's subject key identifier.
-pub(crate) fn key_id(c: &Certificate) -> Option<Vec<u8>> {
-    let e = c.tbs_certificate.extensions.as_ref()?.iter().find(|e| e.extn_id == oids::SUBJECT_KEY_ID)?;
-    OctetString::from_der(e.extn_value.as_bytes()).ok().map(|o| o.as_bytes().to_vec())
 }

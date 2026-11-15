@@ -100,7 +100,9 @@ fn action(d: &mut Dice, size: egui::Vec2) -> Vec<Event> {
 
 /// Plays `actions` random actions with `seed`; any panic fails the test with the seed and step.
 fn play(seed: u64, actions: usize) {
-    let (mut a, dir) = app(&format!("soak-{seed}"));
+    let (mut a, _) = app(&format!("soak-{seed}"));
+    // The count is the process's: what other tests caught before this one began isn't its.
+    let caught = PANICS_CAUGHT.load(Ordering::Relaxed);
     let ctx = egui::Context::default();
     let mut d = Dice(seed);
     let mut slowest = std::time::Duration::ZERO;
@@ -121,6 +123,11 @@ fn play(seed: u64, actions: usize) {
         // Let what was asked settle (a dialog opening, a pane laid out).
         frame(&ctx, &mut a, vec![]);
         let took = began.elapsed();
+        // What the frames made, whatever the machine's speed: a window of the sample mailbox
+        // draws some 500 shapes and lays out some 300 texts at most, so ten times that is a
+        // frame doing far more than it shows (every row of a list, every line of a text).
+        let (shapes, texts) = (out.shapes.len(), ctx.fonts(|f| f.num_galleys_in_cache()));
+        assert!(shapes < MOST_SHAPES && texts < MOST_TEXTS, "seed {seed}, step {step}: a frame of {shapes} shapes, {texts} texts laid out");
         if a.ui.dialog.is_some() {
             dialogs += 1;
         }
@@ -133,20 +140,28 @@ fn play(seed: u64, actions: usize) {
         slowest = slowest.max(took);
         total += took;
         if step % 10 == 9 {
-            assert_eq!(PANICS_CAUGHT.load(Ordering::Relaxed), 0, "seed {seed}, step {step}: a command panicked (see the log)");
+            assert_eq!(PANICS_CAUGHT.load(Ordering::Relaxed), caught, "seed {seed}, step {step}: a command panicked (see the log)");
         }
     }
-    assert_eq!(PANICS_CAUGHT.load(Ordering::Relaxed), 0, "seed {seed}: a command panicked");
+    assert_eq!(PANICS_CAUGHT.load(Ordering::Relaxed), caught, "seed {seed}: a command panicked");
     let mean = total / actions.max(1) as u32;
     eprintln!(
         "soak seed {seed}: {actions} actions, mean {mean:?}, slowest {slowest:?}; a dialog open {dialogs}, writing {writing}, selected {selected}"
     );
-    // Debug builds on a busy CI machine: generous, but a frame that takes seconds is a bug.
-    assert!(mean < std::time::Duration::from_millis(400), "seed {seed}: frames take {mean:?}");
-    let _ = std::fs::remove_dir_all(dir);
+    // Timed only in a release build (a debug build on a busy machine measures the machine):
+    // generous, but a frame that takes seconds is a bug. What each frame made is counted in
+    // every build, above.
+    if !cfg!(debug_assertions) {
+        assert!(mean < std::time::Duration::from_millis(400), "seed {seed}: frames take {mean:?}");
+    }
 }
 
 use mailcraft_engine::PANICS_CAUGHT;
+
+/// More shapes in a frame, or more texts laid out and kept for it, than a window of the sample
+/// mailbox comes near.
+const MOST_SHAPES: usize = 5_000;
+const MOST_TEXTS: usize = 3_000;
 
 #[test]
 fn the_window_survives_a_random_hand() {

@@ -4,22 +4,10 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 /// Services whose clipboard holds files copied in a file manager.
-pub(super) struct Copied(pub(super) Vec<PathBuf>);
+struct Copied(Vec<PathBuf>);
 
 impl crate::Services for Copied {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &Path) -> Result<(), String> {
-        Ok(())
-    }
-    fn notify(&mut self, _: &str, _: &str) {}
+    stub_services!();
     fn clipboard_files(&mut self) -> Vec<PathBuf> {
         self.0.clone()
     }
@@ -125,7 +113,6 @@ fn files_copied_in_a_file_manager_are_attached_when_pasted() {
     frame(&ctx, &mut a, vec![]);
     assert!(a.session.compose.as_ref().unwrap().body.contains("hello there"));
     assert_eq!(attached(&a).len(), 3);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Files dropped on the main window with nothing being written start a message with them
@@ -153,37 +140,26 @@ fn files_dropped_on_the_main_window_start_a_message() {
     out.textures_delta.clear();
     frame(&ctx, &mut a, vec![]);
     assert!(a.session.compose.is_none(), "a folder starts no message");
-    let dropped: Vec<egui::DroppedFileHandle> = vec![std::sync::Arc::new(LetGo(file)), std::sync::Arc::new(LetGo("relative.txt".into()))];
+    // A path relative to nowhere is left, even one that names a file from where MailCraft runs
+    // (the tests run in the crate's folder): it isn't what was dropped.
+    let relative = PathBuf::from("Cargo.toml");
+    assert!(relative.is_file(), "a relative path to a file");
+    let dropped: Vec<egui::DroppedFileHandle> = vec![std::sync::Arc::new(LetGo(file)), std::sync::Arc::new(LetGo(relative.clone()))];
     let mut out = ctx.run_ui(RawInput { screen_rect: screen, dropped_files: dropped, ..Default::default() }, |ui| a.ui(ui));
     out.textures_delta.clear();
     frame(&ctx, &mut a, vec![]);
     assert_eq!(attached(&a), ["brief.pdf"]);
-    // Dropped again while it's being written: attached to it, not another message.
+    // Dropped again while it's being written: attached to it, not another message (and again
+    // a relative path is left, by the message's own form).
     let again = dir.join("notes.txt");
     std::fs::write(&again, b"n").unwrap();
     let id = a.session.compose.as_ref().map(|c| c.id);
-    let dropped: Vec<egui::DroppedFileHandle> = vec![std::sync::Arc::new(LetGo(again))];
+    let dropped: Vec<egui::DroppedFileHandle> = vec![std::sync::Arc::new(LetGo(again)), std::sync::Arc::new(LetGo(relative))];
     let mut out = ctx.run_ui(RawInput { screen_rect: screen, dropped_files: dropped, ..Default::default() }, |ui| a.ui(ui));
     out.textures_delta.clear();
     frame(&ctx, &mut a, vec![]);
     assert_eq!(a.session.compose.as_ref().map(|c| c.id), id);
     assert_eq!(attached(&a), ["brief.pdf", "notes.txt"]);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// A backend that keeps the jobs it's given.
-#[derive(Clone, Default)]
-struct Kept(std::sync::Arc<std::sync::Mutex<Vec<mailcraft_engine::model::Job>>>);
-
-impl crate::Backend for Kept {
-    fn submit(&mut self, job: mailcraft_engine::model::Job) {
-        if let Ok(mut j) = self.0.lock() {
-            j.push(job);
-        }
-    }
-    fn poll(&mut self) -> Vec<mailcraft_engine::model::Event> {
-        Vec::new()
-    }
 }
 
 /// Issue #38: Outlook message files and `.eml` files dropped on the main window go into the
@@ -192,7 +168,7 @@ impl crate::Backend for Kept {
 #[test]
 fn message_files_dropped_on_the_window_go_into_the_folder_open() {
     let (mut a, dir) = app("drop-messages");
-    let kept = Kept::default();
+    let kept = Jobs::default();
     a.backend = Box::new(kept.clone());
     let ctx = egui::Context::default();
     a.session.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
@@ -207,7 +183,7 @@ fn message_files_dropped_on_the_window_go_into_the_folder_open() {
     let mut out = ctx.run_ui(RawInput { screen_rect: screen, dropped_files: dropped, ..Default::default() }, |ui| a.ui(ui));
     out.textures_delta.clear();
     frame(&ctx, &mut a, vec![]);
-    let jobs = kept.0.lock().unwrap().clone();
+    let jobs = kept.take();
     let filed: Vec<&Vec<String>> = jobs
         .iter()
         .filter_map(|j| {
@@ -219,7 +195,6 @@ fn message_files_dropped_on_the_window_go_into_the_folder_open() {
     a.session.apply(mailcraft_engine::model::Event::MessagesFiled { account: "sample".into(), folder: "INBOX".into(), added: 2, failed: Vec::new() });
     frame(&ctx, &mut a, vec![]);
     assert!(a.session.notices.last().is_some_and(|n| n.text.contains('2') && !n.error), "{:?}", a.session.notices.last());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Services that can print on two printers, as Windows does: what's printed is kept.
@@ -305,14 +280,13 @@ fn a_mail_files_own_pictures_are_shown() {
     let ctx = egui::Context::default();
     let mut got = false;
     for _ in 0..40 {
-        super::rtl::drawn_text(&ctx, &mut a, egui::vec2(1600.0, 1000.0));
+        drawn_text(&ctx, &mut a, egui::vec2(1600.0, 1000.0));
         if matches!(a.ui.pictures.get(&w.key, index, crate::reading::Want::Body), crate::reading::Got::Ready(_)) {
             got = true;
             break;
         }
     }
     assert!(got, "the file's own picture is shown");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #56: a mail file opened to be looked at, picked in MailCraft itself, shows in a message
@@ -321,27 +295,15 @@ fn a_mail_files_own_pictures_are_shown() {
 /// toolbar answers or files nothing, and a file that's no message says so.
 #[test]
 fn a_mail_file_is_opened_to_be_looked_at() {
-    struct Picks(std::path::PathBuf);
-    impl crate::Services for Picks {
-        fn clock(&self) -> (i64, i32) {
-            (NOW, 0)
-        }
-        fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-            Vec::new()
-        }
-        fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-            None
-        }
-        fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-            Ok(())
-        }
-        fn notify(&mut self, _: &str, _: &str) {}
+    struct PicksMailFile(std::path::PathBuf);
+    impl crate::Services for PicksMailFile {
+        stub_services!();
         fn pick_mail_file(&mut self) -> Option<std::path::PathBuf> {
             Some(self.0.clone())
         }
     }
     let (mut a, dir) = app("open-mail-file");
-    let kept = Kept::default();
+    let kept = Jobs::default();
     a.backend = Box::new(kept.clone());
     std::fs::create_dir_all(&dir).unwrap();
     let eml = dir.join("inspect me.eml");
@@ -353,7 +315,7 @@ fn a_mail_file_is_opened_to_be_looked_at() {
          --b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=update.exe\r\n\r\nMZ\r\n--b--\r\n",
     )
     .unwrap();
-    a.services = Box::new(Picks(eml));
+    a.services = Box::new(PicksMailFile(eml));
     // Even from a sender whose pictures always load.
     a.session.prefs.trusted_senders.insert("billing@paypa1.example".into());
     a.act(crate::Action::OpenMailFile);
@@ -362,11 +324,10 @@ fn a_mail_file_is_opened_to_be_looked_at() {
     let ctx = egui::Context::default();
     let size = egui::vec2(1600.0, 1000.0);
     for _ in 0..3 {
-        super::rtl::drawn_text(&ctx, &mut a, size);
+        drawn_text(&ctx, &mut a, size);
     }
     // What the window draws: from its title on.
-    let drawn: Vec<String> =
-        super::rtl::drawn_text(&ctx, &mut a, size).into_iter().map(|(t, ..)| t).skip_while(|t| t != "Invoice – Message").collect();
+    let drawn: Vec<String> = drawn_strings(&ctx, &mut a, size).into_iter().skip_while(|t| t != "Invoice – Message").collect();
     let has = |want: &str| drawn.iter().any(|t| t.contains(want));
     // Its pictures from the web are there to ask for, this once: not to always show its sender's,
     // who may be anyone.
@@ -386,19 +347,19 @@ fn a_mail_file_is_opened_to_be_looked_at() {
         assert!(!has(gone), "{gone:?} drawn: {drawn:?}");
     }
     // (The window's own search index may be built meanwhile.)
-    let asked = kept.0.lock().unwrap().clone();
+    let asked = kept.take();
     assert!(asked.iter().all(|j| matches!(j, mailcraft_engine::model::Job::Index { .. })), "nothing fetched or filed: {asked:?}");
     // In a narrow window everything wraps within it: the line saying where it was opened from
     // didn't, and widened the whole message past the window's edge.
     let narrow = egui::vec2(640.0, 1000.0);
     for _ in 0..3 {
-        super::rtl::drawn_text(&ctx, &mut a, narrow);
+        drawn_text(&ctx, &mut a, narrow);
     }
-    let past: Vec<(String, egui::Rect)> = super::rtl::drawn_text(&ctx, &mut a, narrow)
+    let past: Vec<(String, egui::Rect)> = drawn_text(&ctx, &mut a, narrow)
         .into_iter()
-        .skip_while(|(t, ..)| t != "Invoice – Message")
-        .filter(|(_, r, _)| r.max.x > narrow.x + 1.0)
-        .map(|(t, r, _)| (t, r))
+        .skip_while(|d| d.text != "Invoice – Message")
+        .filter(|d| d.ink.max.x > narrow.x + 1.0)
+        .map(|d| (d.text, d.ink))
         .collect();
     assert!(past.is_empty(), "drawn past the window: {past:?}");
     // Its buttons act on it: saved as a PDF, it's this message.
@@ -412,7 +373,7 @@ fn a_mail_file_is_opened_to_be_looked_at() {
     // Bytes that are no message: said, in one line that names it once.
     let junk = dir.join("junk.eml");
     std::fs::write(&junk, [0xFFu8, 0xFE, 0x00, 0x01, 0x80].repeat(400)).unwrap();
-    a.services = Box::new(Picks(junk));
+    a.services = Box::new(PicksMailFile(junk));
     a.act(crate::Action::OpenMailFile);
     assert!(a.ui.dialog.is_none());
     let said = a.session.notices.last().unwrap();
@@ -421,10 +382,9 @@ fn a_mail_file_is_opened_to_be_looked_at() {
     // Past what's read: said by its name, not its path, and not as a program's error.
     let huge = dir.join("huge.eml");
     std::fs::File::create(&huge).unwrap().set_len(65 << 20).unwrap();
-    a.services = Box::new(Picks(huge));
+    a.services = Box::new(PicksMailFile(huge));
     a.act(crate::Action::OpenMailFile);
     assert_eq!(a.session.notices.last().unwrap().text, "huge.eml is too big");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A mail file handed to MailCraft opens in front: its window is brought forward once, when it's
@@ -456,5 +416,4 @@ fn a_mail_files_window_comes_to_the_front() {
     assert_eq!(focused(&mut a, 3), 0);
     a.open_handed(&eml.to_string_lossy());
     assert_eq!(focused(&mut a, 6), 1, "opened again: in front again");
-    let _ = std::fs::remove_dir_all(dir);
 }

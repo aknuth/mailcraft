@@ -2,34 +2,33 @@
 
 use std::time::{Duration, Instant};
 
-use mailcraft_model::job::Secret;
-use mailcraft_model::{AccountConfig, Event, Flag, Job, Op, SyncStatus};
+use mailcraft_model::job::{Secret, Vacation};
+use mailcraft_model::{AccountConfig, Event, Job, SyncStatus};
 
 use super::*;
+use crate::fakes::exchange_e2e::{Exchange, OnServer, an_exchange_account_end_to_end};
+use crate::waiting::{eventually, until};
 
+mod checks;
 mod directory;
+mod large_folder;
+mod renewal;
 
-fn until(pool: &crate::worker::Pool, what: &str, mut f: impl FnMut(&Event) -> bool) -> Vec<Event> {
-    let end = Instant::now() + Duration::from_secs(20);
-    let mut seen = Vec::new();
-    while Instant::now() < end {
-        if let Some(e) = pool.wait(Duration::from_millis(100)) {
-            let hit = f(&e);
-            seen.push(e);
-            if hit {
-                return seen;
+/// HTTP answers from a token endpoint, one per connection, in order: (status, JSON); an empty
+/// status, the connection closed with no answer.
+fn token_answers(answers: &[(&str, &str)]) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let replies = answers
+        .iter()
+        .map(|(status, json)| {
+            if status.is_empty() {
+                return Vec::new();
             }
-        }
-    }
-    panic!("timed out waiting for {what}; saw {seen:?}");
-}
-
-fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(Instant::now() < end, "never: {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+            let mut r = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n", json.len()).into_bytes();
+            r.extend_from_slice(json.as_bytes());
+            r
+        })
+        .collect();
+    crate::http::tests::serve(replies)
 }
 
 /// Gap #7: searching Microsoft Graph (`$search`, and `$filter` for the read state) for mail
@@ -53,7 +52,7 @@ fn graph_is_searched_past_the_window() {
         );
     }
     let server = serve(d);
-    let account = AccountConfig { id: "a1".into(), email: "me@contoso.example".into(), graph: Some(server.base.clone()), ..Default::default() };
+    let account = account("a1", &server.base);
     let data = server.data.clone();
     crate::fake::search_the_server_past_the_window("graph-search", account, TOKEN, &|n, read| {
         let mut d = data.lock().unwrap();
@@ -67,6 +66,42 @@ fn graph_is_searched_past_the_window() {
     let calls = server.data.lock().unwrap().calls.clone();
     assert!(calls.iter().any(|c| c.contains("$search=%22tag3%22")), "{calls:?}");
     assert!(calls.iter().any(|c| c.contains("$filter=isRead%20eq%20false")), "{calls:?}");
+}
+
+/// Found in review: a search of the server, and a message downloaded, wrote the cache of an
+/// account removed meanwhile, and its files came back. Over Graph (and EWS, whose code it shares)
+/// neither writes anything of it.
+#[test]
+fn a_search_or_a_download_writes_nothing_for_an_account_removed_meanwhile() {
+    let mut d = Data::default();
+    let inbox = d.folder("Inbox", None, Some("inbox"));
+    for n in 1..=6 {
+        d.deliver(&inbox, &mail(&format!("Message {n}"), &format!("r{n}")), n > 3, &format!("2024-05-{n:02}T09:00:00Z"));
+    }
+    let server = serve(d);
+    let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
+    let store = crate::fake::store("graph-removed");
+    let mut st = crate::jmap::State::default();
+    crate::graph::list_folders(&c, &mut st, "a1").unwrap();
+    crate::graph::sync_folder(&c, &mut st, &store, "a1", "INBOX", &crate::sync::SyncOptions { window: 2, prefetch: 0, ..Default::default() })
+        .unwrap();
+    let fs = store.load_folder("a1", "INBOX").unwrap();
+    let key = fs.messages[0].key.clone();
+    // As the worker started, and as a search read the folder; then removed, the server asked.
+    let seen = store.removals("a1");
+    store.remove_account("a1").unwrap();
+    let mut came = (*fs.messages[1]).clone();
+    came.key.uid = 999;
+    assert!(crate::exchange::window::found(&mut st, &store, ("a1", seen), "INBOX", fs, &[999], vec![came]).is_err());
+    assert!(crate::graph::fetch_body(&c, &st, &store, &key, seen).is_err());
+    assert!(!store.has_body(&key) && !store.root().join("a1").exists(), "the account's files came back");
+    // Not removed since: kept.
+    let seen = store.removals("a1");
+    crate::graph::sync_folder(&c, &mut st, &store, "a1", "INBOX", &crate::sync::SyncOptions { window: 2, prefetch: 0, ..Default::default() })
+        .unwrap();
+    let unread = crate::sync::word_query("is:unread").unwrap();
+    assert_eq!(crate::graph::find_on_server(&c, &mut st, &store, ("a1", seen), "INBOX", &unread, 500).unwrap().1, 3);
+    assert!(crate::graph::fetch_body(&c, &st, &store, &key, seen).is_ok() && store.has_body(&key));
 }
 
 fn mail(subject: &str, id: &str) -> Vec<u8> {
@@ -188,20 +223,20 @@ fn exchange_calendars_and_contacts_sync_both_ways() {
 #[test]
 fn a_microsoft_account_without_a_mailbox_says_so_and_stops() {
     let server = serve(Data { no_mailbox: true, ..Default::default() });
-    let store = crate::fake::tests_store("graph-nomailbox");
+    let store = crate::fake::store("graph-nomailbox");
     let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
     let account = AccountConfig { id: "a1".into(), email: "me@gmail.example".into(), graph: Some(server.base.clone()), ..Default::default() };
     pool.submit(Job::Start { account, password: Some(Secret(TOKEN.into())) });
     let seen = until(&pool, "the error", |e| matches!(e, Event::Status { status: SyncStatus::Error { .. }, .. }));
     let error = seen.iter().find_map(|e| match e {
-        Event::Status { status: SyncStatus::Error { error }, .. } => Some(error.clone()),
+        Event::Status { status: SyncStatus::Error { error, .. }, .. } => Some(error.clone()),
         _ => None,
     });
     assert!(error.as_deref().is_some_and(|e| e.contains("no Outlook.com or Microsoft 365 mailbox")), "{error:?}");
-    std::thread::sleep(Duration::from_millis(1500));
+    // Once its thread waits, nothing more is asked of the server until something wakes it.
+    eventually("the account's thread waiting", || pool.idle("a1"));
     let tries = server.data.lock().unwrap().calls.len();
     assert!(tries <= 2, "asked once, not over and over: {tries} requests");
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Two regressions together. Batched GETs lacked the ImmutableId preference, so their ids
@@ -217,7 +252,7 @@ fn graph_batched_details_keep_stable_ids_and_retry_when_busy() {
         d.deliver(&inbox, raw.as_bytes(), true, &format!("2024-05-{:02}T09:00:00Z", n % 28 + 1));
     }
     let server = serve(d);
-    let store = crate::fake::tests_store("graph-batches");
+    let store = crate::fake::store("graph-batches");
     let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
     let mut st = crate::jmap::State::default();
     crate::graph::list_folders(&c, &mut st, "a1").unwrap();
@@ -242,7 +277,6 @@ fn graph_batched_details_keep_stable_ids_and_retry_when_busy() {
     let calls = server.data.lock().unwrap().calls.clone();
     assert_eq!((again.new, again.removed), (0, 0), "{calls:?}");
     assert!(!calls.iter().any(|c| c.contains("/me/messages/")), "no per-message GETs on a quiet sync: {calls:?}");
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Graph files a sent message's copy a moment after taking it: Sent Items showed it only at the
@@ -253,9 +287,9 @@ fn a_sent_message_shows_in_sent_items_soon_after() {
     d.folder("Inbox", None, Some("inbox"));
     d.folder("Sent Items", None, Some("sentitems"));
     let server = serve(d);
-    let store = crate::fake::tests_store("graph-sentsoon");
+    let store = crate::fake::store("graph-sentsoon");
     let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig { id: "a1".into(), email: "me@contoso.example".into(), graph: Some(server.base.clone()), ..Default::default() };
+    let account = account("a1", &server.base);
     pool.submit(Job::Start { account, password: Some(Secret(TOKEN.into())) });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     pool.submit(Job::Send {
@@ -268,102 +302,15 @@ fn a_sent_message_shows_in_sent_items_soon_after() {
     });
     until(&pool, "sent", |e| matches!(e, Event::Sent { .. }));
     eventually("the copy in Sent Items", || store.load_folder("a1", "Sent Items").is_ok_and(|f| f.messages.iter().any(|m| m.subject == "Poster")));
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
+/// The story every Exchange account is checked by, over Graph (small requests going in batches).
 #[test]
 fn an_exchange_account_syncs_changes_and_sends_through_graph() {
-    let mut d = Data::default();
-    let inbox = d.folder("Inbox", None, Some("inbox"));
-    d.folder("Drafts", None, Some("drafts"));
-    let sent = d.folder("Sent Items", None, Some("sentitems"));
-    let trash = d.folder("Deleted Items", None, Some("deleteditems"));
-    d.folder("Outbox", None, Some("outbox"));
-    let projects = d.folder("Projects", None, None);
-    d.folder("2024", Some(&projects), None);
-    d.replies = json!({"status": "disabled", "internalReplyMessage": ""});
-    let first = d.deliver(&inbox, &mail("Storyboard", "m1"), true, "2024-05-06T09:00:00Z");
-    let second = d.deliver(&inbox, &mail("Sound mix", "m2"), false, "2024-05-06T10:00:00Z");
-    d.deliver(&projects, &mail("Plan", "m3"), true, "2024-05-01T10:00:00Z");
+    let d = Data { replies: json!({"status": "disabled", "internalReplyMessage": ""}), ..Default::default() };
     let server = serve(d);
-    let data = server.data.clone();
-
-    let store = crate::fake::tests_store("graph-e2e");
-    let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        name: "Me".into(),
-        email: "me@contoso.example".into(),
-        username: "me@contoso.example".into(),
-        graph: Some(server.base.clone()),
-        ..Default::default()
-    };
-    assert!(!account.is_local() && account.is_api());
-
-    // A token Microsoft refuses means signing in again.
-    pool.submit(Job::Start { account: account.clone(), password: Some(Secret("expired".into())) });
-    until(&pool, "sign in again", |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
-
-    pool.submit(Job::Start { account: account.clone(), password: Some(Secret(TOKEN.into())) });
-    let seen = until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-    let folders = seen
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            Event::Folders { folders, .. } => Some(folders.clone()),
-            _ => None,
-        })
-        .unwrap();
-    let mut paths: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
-    paths.sort_unstable();
-    assert_eq!(
-        paths,
-        ["Deleted Items", "Drafts", "INBOX", "Projects", "Projects/2024", "Sent Items"],
-        "pages followed, children listed, the Outbox left out"
-    );
-    let role = |p: &str| folders.iter().find(|f| f.path == p).unwrap().role;
-    assert_eq!((role("Sent Items"), role("Deleted Items")), (mailcraft_model::FolderRole::Sent, mailcraft_model::FolderRole::Trash));
-    let inbox_folder = folders.iter().find(|f| f.path == "INBOX").unwrap();
-    assert_eq!((inbox_folder.total, inbox_folder.unread), (2, 1));
-    let st = store.load_folder("a1", "INBOX").unwrap();
-    let subjects: Vec<&str> = st.messages.iter().map(|m| m.subject.as_str()).collect();
-    assert_eq!(subjects, ["Sound mix", "Storyboard"], "newest first");
-    assert!(st.messages[1].flags.seen && !st.messages[0].flags.seen);
-    assert_eq!(st.messages[0].from.email, "zoe@contoso.example");
-    assert!(store.has_body(&st.messages[0].key), "the newest sources are downloaded");
-
-    // Open a message whose source isn't cached.
-    let key = st.messages[0].key.clone();
-    store.remove_body(&key);
-    pool.submit(Job::FetchBody { key: key.clone() });
-    until(&pool, "body", |e| matches!(e, Event::Body { key: k, raw } if *k == key && raw.starts_with(b"From:")));
-
-    // Read, flag, move: the same message keeps its number.
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::SetFlag { keys: vec![key.clone()], flag: Flag::Seen, on: true } });
-    eventually("read on the server", || data.lock().unwrap().message(&second).unwrap().read);
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::SetFlag { keys: vec![key.clone()], flag: Flag::Flagged, on: true } });
-    eventually("flagged on the server", || data.lock().unwrap().message(&second).unwrap().flagged);
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::Move { keys: vec![key.clone()], to: "Projects".into() } });
-    eventually("moved on the server", || data.lock().unwrap().message(&second).unwrap().folder == projects);
-    until(&pool, "the move shows in Projects", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "Projects"));
-    assert!(
-        store.load_folder("a1", "Projects").unwrap().messages.iter().any(|m| m.subject == "Sound mix" && m.key.uid == key.uid && m.flags.flagged)
-    );
-
-    // Folders: create inside Projects, rename and move it to the top, delete it.
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::CreateFolder { path: "Projects/Caf&AOk-".into() } });
-    eventually("created", || data.lock().unwrap().by_name("Café").is_some_and(|f| f.parent == projects));
-    until(&pool, "folder list", |e| matches!(e, Event::Folders { folders, .. } if folders.iter().any(|f| f.path == "Projects/Caf&AOk-")));
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::RenameFolder { from: "Projects/Caf&AOk-".into(), to: "Clients".into() } });
-    eventually("renamed", || data.lock().unwrap().by_name("Clients").is_some_and(|f| f.parent == ROOT));
-    until(&pool, "renamed in the list", |e| matches!(e, Event::Folders { folders, .. } if folders.iter().any(|f| f.path == "Clients")));
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::DeleteFolder { path: "Clients".into() } });
-    eventually("deleted", || data.lock().unwrap().by_name("Clients").is_none());
-
-    // Automatic replies.
-    pool.submit(Job::GetVacation { account: "a1".into() });
-    until(&pool, "replies read", |e| matches!(e, Event::Vacation { vacation: Some(v), error: None, .. } if !v.enabled));
-    let away = mailcraft_model::job::Vacation {
+    let account = AccountConfig { name: "Me".into(), username: "me@contoso.example".into(), ..account("a1", &server.base) };
+    let away = Vacation {
         enabled: true,
         subject: String::new(),
         text: "Back on Monday".into(),
@@ -372,141 +319,60 @@ fn an_exchange_account_syncs_changes_and_sends_through_graph() {
         external: Some("Out of office".into()),
         outside: "none".into(),
     };
-    pool.submit(Job::SetVacation { account: "a1".into(), vacation: away.clone() });
-    until(&pool, "replies on", |e| matches!(e, Event::Vacation { vacation: Some(v), error: None, .. } if *v == away));
-    assert_eq!(data.lock().unwrap().replies["scheduledEndDateTime"]["dateTime"], "2026-10-20T23:59:59");
-    pool.submit(Job::SetVacation { account: "a1".into(), vacation: mailcraft_model::job::Vacation { text: "refuse".into(), ..away.clone() } });
-    until(&pool, "a refused change", |e| matches!(e, Event::Vacation { vacation: Some(v), error: Some(_), .. } if *v == away));
-
-    // Empty Deleted Items; delete for good.
-    for i in 0..3 {
-        data.lock().unwrap().deliver(&trash, &mail(&format!("Old {i}"), &format!("t{i}")), true, "2024-01-01T00:00:00Z");
-    }
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::EmptyFolder { path: "Deleted Items".into() } });
-    eventually("emptied", || !data.lock().unwrap().messages.iter().any(|m| m.folder == trash));
-    let gone = store.load_folder("a1", "INBOX").unwrap().messages.iter().find(|m| m.subject == "Storyboard").unwrap().key.clone();
-    pool.submit(Job::Apply { account: "a1".into(), op: Op::Expunge { keys: vec![gone] } });
-    eventually("deleted for good", || data.lock().unwrap().message(&first).is_none());
-
-    // Send: the Bcc goes in the MIME for Exchange; Sent Items has the copy.
-    let raw = b"From: me@contoso.example\r\nTo: zoe@contoso.example\r\nSubject: e2e\r\nMessage-ID: <e2e@x>\r\n\r\nhi\r\n".to_vec();
-    let send = |id: u64, to: Vec<String>| Job::Send {
-        account: "a1".into(),
-        id,
-        raw: raw.clone(),
-        from: "me@contoso.example".into(),
-        recipients: to,
-        sent_folder: Some("Sent Items".into()),
-    };
-    pool.submit(send(7, vec!["zoe@contoso.example".into(), "boss@contoso.example".into()]));
-    until(&pool, "sent", |e| matches!(e, Event::Sent { id: 7, .. }));
-    until(&pool, "the copy in Sent", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "Sent Items"));
-    let out = String::from_utf8(data.lock().unwrap().sent.last().unwrap().clone()).unwrap();
-    assert!(out.starts_with("Bcc: boss@contoso.example\r\nFrom:"), "{out}");
-    assert!(data.lock().unwrap().messages.iter().any(|m| m.folder == sent));
-    pool.submit(send(8, vec!["nobody@contoso.example".into()]));
-    until(&pool, "refused", |e| matches!(e, Event::SendFailed { id: 8, error, .. } if error.contains("no such recipient")));
-
-    // A draft replaces its earlier copy.
-    pool.submit(Job::SaveDraft { account: "a1".into(), raw: mail("Draft one", "d1"), folder: "Drafts".into(), replaces: None });
-    until(&pool, "draft", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "Drafts"));
-    let draft = store.load_folder("a1", "Drafts").unwrap().messages.iter().find(|m| m.subject == "Draft one").unwrap().key.clone();
-    pool.submit(Job::SaveDraft { account: "a1".into(), raw: mail("Draft two", "d2"), folder: "Drafts".into(), replaces: Some(draft) });
-    eventually("one draft left", || data.lock().unwrap().messages.iter().filter(|m| m.draft).count() == 1);
-    assert!(data.lock().unwrap().calls.iter().any(|c| c.starts_with("POST /$batch")), "small requests go in batches");
-    pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
+    // A token Microsoft refuses means signing in again.
+    an_exchange_account_end_to_end("graph-e2e", account, "expired", TOKEN, &[away], &server);
 }
 
-/// A message whose source the server won't give doesn't stop the folder: the others
-/// download, and the folder syncs.
+impl Exchange for Server {
+    const TOP: &'static str = ROOT;
+    const MOVES_KEEP_IDS: bool = true;
+    const NO_SUCH_RECIPIENT: &'static str = "no such recipient";
+    fn folder(&self, name: &str, parent: Option<&str>, known: Option<&str>) -> String {
+        self.data.lock().unwrap().folder(name, parent, known)
+    }
+    fn deliver(&self, folder: &str, raw: &[u8], read: bool, at: &str) -> String {
+        self.data.lock().unwrap().deliver(folder, raw, read, at)
+    }
+    fn unreadable(&self, id: &str) {
+        self.data.lock().unwrap().unreadable.push(id.into());
+    }
+    fn message(&self, id: &str) -> Option<OnServer> {
+        let d = self.data.lock().unwrap();
+        d.message(id).map(|m| OnServer { read: m.read, flagged: m.flagged, folder: m.folder.clone() })
+    }
+    fn holds(&self, folder: &str, words: &str) -> bool {
+        self.data.lock().unwrap().messages.iter().any(|m| m.folder == folder && String::from_utf8_lossy(&m.raw).contains(words))
+    }
+    fn count(&self, folder: &str) -> usize {
+        self.data.lock().unwrap().messages.iter().filter(|m| m.folder == folder).count()
+    }
+    fn parent(&self, name: &str) -> Option<String> {
+        self.data.lock().unwrap().by_name(name).map(|f| f.parent.clone())
+    }
+    fn drafts(&self) -> usize {
+        self.data.lock().unwrap().messages.iter().filter(|m| m.draft).count()
+    }
+    fn last_sent(&self) -> Option<Vec<u8>> {
+        self.data.lock().unwrap().sent.last().cloned()
+    }
+    fn replies_are(&self, _: &Vacation) {
+        assert_eq!(self.data.lock().unwrap().replies["scheduledEndDateTime"]["dateTime"], "2026-10-20T23:59:59");
+    }
+    fn at_the_end(&self) {
+        assert!(self.data.lock().unwrap().calls.iter().any(|c| c.starts_with("POST /$batch")), "small requests go in batches");
+    }
+}
+
+/// A message whose source the server won't give doesn't stop the folder, over Graph.
 #[test]
 fn one_unreadable_message_holds_up_nothing() {
-    let mut d = Data::default();
-    let inbox = d.folder("Inbox", None, Some("inbox"));
-    let mail =
-        |s: &str| format!("From: Zoe <zoe@studio.example>\r\nTo: me@x.example\r\nSubject: {s}\r\nMessage-ID: <{s}@x>\r\n\r\nHello.\r\n").into_bytes();
-    d.deliver(&inbox, &mail("one"), false, "2026-10-01T09:00:00Z");
-    let bad = d.deliver(&inbox, &mail("two"), false, "2026-10-01T10:00:00Z");
-    d.deliver(&inbox, &mail("three"), false, "2026-10-01T11:00:00Z");
-    d.unreadable.push(bad);
-    let server = serve(d);
-    let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
-    let store = crate::fake::tests_store("graph-unreadable");
-    let mut st = crate::jmap::State::default();
-    crate::graph::list_folders(&c, &mut st, "a1").unwrap();
-    crate::graph::sync_folder(&c, &mut st, &store, "a1", "INBOX", &crate::sync::SyncOptions::default()).unwrap();
-    let fs = store.load_folder("a1", "INBOX").unwrap();
-    assert_eq!(fs.messages.len(), 3);
-    let with_body: Vec<&str> = fs.messages.iter().filter(|m| store.has_body(&m.key)).map(|m| m.subject.as_str()).collect();
-    assert_eq!(with_body, ["three", "one"], "the others downloaded");
-    let _ = std::fs::remove_dir_all(store.root());
-}
-
-/// An OAuth token Graph refuses (it ran out while the computer slept, say) is renewed from the
-/// refresh token and the work done again; only a refused refresh asks to sign in again.
-#[test]
-fn a_refused_token_is_renewed_once_before_asking_to_sign_in() {
-    // The token endpoint's three answers, in order: t1 at sign-in, t2 on the first renewal, and
-    // a refusal of the refresh token on the second.
-    let answers = [
-        ("200 OK", r#"{"access_token":"t1","expires_in":3600}"#),
-        ("200 OK", r#"{"access_token":"t2","expires_in":3600}"#),
-        ("400 Bad Request", r#"{"error":"invalid_grant"}"#),
-    ];
-    let answers = answers
-        .iter()
-        .map(|(status, json)| {
-            let mut reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n", json.len()).into_bytes();
-            reply.extend_from_slice(json.as_bytes());
-            reply
-        })
-        .collect();
-    let (oauth_base, token_requests) = crate::http::tests::serve(answers);
-    let mut p = crate::oauth::tests::local(&format!("{oauth_base}/token"));
-    p.id = "test-graph-renew".into();
-    crate::oauth::TEST_PROVIDERS.lock().unwrap().push(p);
-
-    let mut d = Data { token: Some("t1".into()), ..Default::default() };
-    let inbox = d.folder("Inbox", None, Some("inbox"));
-    d.deliver(&inbox, &mail("Before", "m1"), true, "2024-05-06T09:00:00Z");
-    let server = serve(d);
-    let store = crate::fake::tests_store("graph-renew");
-    let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@contoso.example".into(),
-        graph: Some(server.base.clone()),
-        oauth: Some("test-graph-renew".into()),
-        ..Default::default()
-    };
-    pool.submit(Job::Start { account, password: Some(Secret("r1".into())) });
-    until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-
-    // The server stops taking t1: the next sync gets t2 and goes on, without asking anything.
-    {
-        let mut d = server.data.lock().unwrap();
-        d.token = Some("t2".into());
-        d.deliver(&inbox, &mail("After", "m2"), false, "2024-05-06T10:00:00Z");
-    }
-    pool.submit(Job::SyncFolder { account: "a1".into(), folder: "INBOX".into() });
-    let has = |s: &str| store.load_folder("a1", "INBOX").is_ok_and(|f| f.messages.iter().any(|m| m.subject == s));
-    let end = Instant::now() + Duration::from_secs(20);
-    while !has("After") {
-        assert!(Instant::now() < end, "never synced with the renewed token");
-        if let Some(Event::Status { status: SyncStatus::NeedsPassword { error }, .. }) = pool.wait(Duration::from_millis(100)) {
-            panic!("asked to sign in again: {error}");
-        }
-    }
-
-    // Refused again, and the refresh token is refused too: now it's signing in again.
-    server.data.lock().unwrap().token = Some("t3".into());
-    pool.submit(Job::SyncFolder { account: "a1".into(), folder: "INBOX".into() });
-    until(&pool, "sign in again", |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
-    let seen = token_requests.join().unwrap();
-    assert!(seen.iter().all(|r| r.contains("grant_type=refresh_token&refresh_token=r1")), "{seen:?}");
-    pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
+    let server = serve(Data::default());
+    crate::fakes::exchange_e2e::one_unreadable_message_holds_up_nothing("graph-unreadable", &server, |store| {
+        let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
+        let mut st = crate::jmap::State::default();
+        crate::graph::list_folders(&c, &mut st, "a1").unwrap();
+        crate::graph::sync_folder(&c, &mut st, store, "a1", "INBOX", &crate::sync::SyncOptions::default()).unwrap();
+    });
 }
 
 /// Issue #24: a message with files comes as its text first (its files named and sized, no
@@ -523,9 +389,9 @@ fn a_message_with_files_comes_as_its_text_first() {
     );
     d.deliver(&inbox, raw.as_bytes(), false, "2024-05-06T10:00:00Z");
     let server = serve(d);
-    let store = crate::fake::tests_store("graph-text-first");
+    let store = crate::fake::store("graph-text-first");
     let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig { id: "a1".into(), email: "me@contoso.example".into(), graph: Some(server.base.clone()), ..Default::default() };
+    let account = account("a1", &server.base);
     pool.submit(Job::Start { account, password: Some(Secret(TOKEN.into())) });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     let st = store.load_folder("a1", "INBOX").unwrap();
@@ -670,4 +536,93 @@ fn reminders_answered_here_are_answered_on_graph() {
     let done: Vec<(&str, &str)> = d.reminders.iter().map(|(a, id, _)| (a.as_str(), id.as_str())).collect();
     assert_eq!(done, [("dismissReminder", "EV-one"), ("snoozeReminder", "EV-series-4")]);
     assert_eq!(d.reminders[1].2["newReminderTime"], serde_json::json!({"dateTime": "2026-11-04T08:55:00", "timeZone": "UTC"}));
+}
+
+/// What's read is what was written, whatever the reply has in it: one line with an `&` and no
+/// `<` came back `R&amp;D`, and grew by an `amp;` each time the replies were saved.
+#[test]
+fn automatic_replies_come_back_as_typed_however_often_they_are_saved() {
+    let mut d = Data::default();
+    d.folder("Inbox", None, Some("inbox"));
+    let server = serve(d);
+    let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
+    for typed in crate::exchange::REPLIES_AS_TYPED {
+        let away = Vacation { enabled: true, text: typed.into(), external: Some(format!("Outside: {typed}")), ..Default::default() };
+        c.set_vacation(&away).unwrap();
+        let once = c.vacation().unwrap();
+        assert_eq!(once, away, "read after the first save");
+        c.set_vacation(&once).unwrap();
+        assert_eq!(c.vacation().unwrap(), away, "read after the second save");
+    }
+    // A reply another program set, as a page: read as HTML.
+    server.data.lock().unwrap().replies["internalReplyMessage"] = json!("<html><body><div>Back &amp; forth</div><div>R&amp;D</div></body></html>");
+    assert_eq!(c.vacation().unwrap().text, "Back & forth\nR&D");
+}
+
+/// A delete Graph refuses (an event in someone's calendar this account may only read: 403) isn't
+/// taken for done: it's said, and its tombstone stays to be asked again. It was dropped as if
+/// the event were gone. One for something no longer there (404) is done.
+#[test]
+fn a_refused_delete_is_said_and_kept() {
+    use mailcraft_model::pim::{Pim, Tombstone, shared_calendar_id};
+    let mut d = Data { others: vec![("ben@contoso.example".into(), false)], ..Default::default() };
+    d.folder("Inbox", None, Some("inbox"));
+    d.calendars.push(("CAL1".into(), "Calendar".into()));
+    let at = |h: u32| json!({"dateTime": format!("2026-10-20T{h:02}:00:00.0000000")});
+    d.events
+        .push(json!({"id": "B1", "calendar": "user:ben@contoso.example", "iCalUId": "b1", "subject": "Ben's call", "start": at(9), "end": at(10)}));
+    let server = serve(d);
+    let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
+    let ben = shared_calendar_id("ben@contoso.example");
+    let mut pim = Pim { shared: vec!["ben@contoso.example".into()], ..Default::default() };
+    let first = crate::graph_pim::sync(&c, &pim, 1_792_000_000).unwrap();
+    let href = first.events.iter().find(|e| e.event.summary == "Ben's call").map(|e| e.href.clone()).unwrap();
+    pim.deleted = vec![
+        Tombstone { href: href.clone(), etag: String::new(), calendar: ben.clone() },
+        Tombstone { href: "contact:NOT-THERE".into(), etag: String::new(), ..Default::default() },
+    ];
+    let second = crate::graph_pim::sync(&c, &pim, 1_792_000_100).unwrap();
+    assert_eq!(second.deleted, ["contact:NOT-THERE"], "only the one that's gone");
+    assert!(second.errors.iter().any(|e| e.contains("403")), "{:?}", second.errors);
+    assert!(server.data.lock().unwrap().events.iter().any(|e| e["id"] == "B1"), "still on the server");
+}
+
+/// A delete of an id Graph can't read as one (a damaged one, or one kept from another kind of
+/// account: 400, `ErrorInvalidIdMalformed`) can never be done: it's said once and its tombstone
+/// goes, where it was refused, and said, at every sync. One with no id at all isn't asked. One
+/// refused for want of rights (403) stays, as it may be allowed later.
+#[test]
+fn a_delete_of_an_id_that_isnt_one_is_said_once() {
+    use mailcraft_model::pim::{Pim, Tombstone, shared_calendar_id};
+    let mut d = Data { others: vec![("ben@contoso.example".into(), false)], ..Default::default() };
+    d.folder("Inbox", None, Some("inbox"));
+    d.calendars.push(("CAL1".into(), "Calendar".into()));
+    let at = |h: u32| json!({"dateTime": format!("2026-10-20T{h:02}:00:00.0000000")});
+    d.events
+        .push(json!({"id": "B1", "calendar": "user:ben@contoso.example", "iCalUId": "b1", "subject": "Ben's call", "start": at(9), "end": at(10)}));
+    let server = serve(d);
+    let c = crate::graph::Client::connect(&server.base, TOKEN).unwrap();
+    let tombstone = |href: &str, calendar: &str| Tombstone { href: href.into(), etag: String::new(), calendar: calendar.into() };
+    let mut pim = Pim { shared: vec!["ben@contoso.example".into()], ..Default::default() };
+    pim.deleted = vec![
+        tombstone("MALFORMED-1", ""),
+        tombstone("contact:MALFORMED-2", ""),
+        tombstone("", ""),
+        tombstone("contact:", ""),
+        tombstone("B1", &shared_calendar_id("ben@contoso.example")),
+    ];
+    let first = crate::graph_pim::sync(&c, &pim, 1_792_000_000).unwrap();
+    assert_eq!(first.deleted, ["MALFORMED-1", "contact:MALFORMED-2", "", "contact:"], "done with, as they can never be deleted");
+    let said = |errors: &[String], what: &str| errors.iter().filter(|e| e.contains(what)).count();
+    assert_eq!((said(&first.errors, "400"), said(&first.errors, "403")), (2, 1), "{:?}", first.errors);
+    // The next sync has only the one that may yet be allowed.
+    pim.deleted.retain(|t| !first.deleted.contains(&t.href));
+    let second = crate::graph_pim::sync(&c, &pim, 1_792_000_100).unwrap();
+    assert!(second.deleted.is_empty(), "{:?}", second.deleted);
+    assert_eq!((said(&second.errors, "400"), said(&second.errors, "403")), (0, 1), "{:?}", second.errors);
+    // Allowed since: it goes.
+    server.data.lock().unwrap().others = vec![("ben@contoso.example".into(), true)];
+    let third = crate::graph_pim::sync(&c, &pim, 1_792_000_200).unwrap();
+    assert_eq!(third.deleted, ["B1"]);
+    assert!(!server.data.lock().unwrap().events.iter().any(|e| e["id"] == "B1"));
 }

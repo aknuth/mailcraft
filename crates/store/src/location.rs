@@ -108,13 +108,20 @@ pub fn cancel_move(base: &Path) {
 
 /// Whether two files hold the same bytes (read a piece at a time: data files can be large).
 fn same(a: &Path, b: &Path) -> bool {
-    let (Ok(mut fa), Ok(mut fb)) = (fs::File::open(a), fs::File::open(b)) else { return false };
+    let (Ok(fa), Ok(fb)) = (fs::File::open(a), fs::File::open(b)) else { return false };
     if fa.metadata().map(|m| m.len()).ok() != fb.metadata().map(|m| m.len()).ok() {
         return false;
     }
+    same_bytes(fa, fb)
+}
+
+/// Whether two readers give the same bytes to their ends. Each piece is read whole before the
+/// two are compared: a read may give fewer bytes than asked on one side only (a network share),
+/// which says nothing about what the files hold.
+fn same_bytes(mut a: impl Read, mut b: impl Read) -> bool {
     let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
     loop {
-        let (Ok(na), Ok(nb)) = (fa.read(&mut ba), fb.read(&mut bb)) else { return false };
+        let (Ok(na), Ok(nb)) = (fill(&mut a, &mut ba), fill(&mut b, &mut bb)) else { return false };
         if na != nb || ba.get(..na) != bb.get(..nb) {
             return false;
         }
@@ -122,6 +129,20 @@ fn same(a: &Path, b: &Path) -> bool {
             return true;
         }
     }
+}
+
+/// `buf` filled from `r`, short only at its end: how many bytes it got.
+fn fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0;
+    while let Some(rest) = buf.get_mut(got..).filter(|rest| !rest.is_empty()) {
+        match r.read(rest) {
+            Ok(0) => break,
+            Ok(n) => got = got.saturating_add(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
 }
 
 /// Carry out a move asked for (call before anything opens the data files). `Ok(Some(folder))`
@@ -138,13 +159,17 @@ pub fn apply_pending_move(base: &Path) -> Result<Option<PathBuf>, String> {
         Err(_) => Vec::new(),
     };
     let created = !to.exists();
-    let copy = || -> Result<(), String> {
+    // The files this move makes, each noted before it's written: on failure only they go, never
+    // one that was there already.
+    let mut made: Vec<PathBuf> = Vec::new();
+    let mut copy = || -> Result<(), String> {
         fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
         for src in &list {
             let dst = to.join(src.file_name().unwrap_or_default());
             if dst.exists() {
                 return Err(format!("{} is already there", dst.display()));
             }
+            made.push(dst.clone());
             fs::copy(src, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
             if !same(src, &dst) {
                 return Err(format!("{} didn't copy whole", dst.display()));
@@ -154,8 +179,8 @@ pub fn apply_pending_move(base: &Path) -> Result<Option<PathBuf>, String> {
     };
     if let Err(e) = copy() {
         // Back as it was: only what this move made goes.
-        for src in &list {
-            let _ = fs::remove_file(to.join(src.file_name().unwrap_or_default()));
+        for dst in &made {
+            let _ = fs::remove_file(dst);
         }
         if created {
             let _ = fs::remove_dir_all(&to);
@@ -178,10 +203,10 @@ pub fn apply_pending_move(base: &Path) -> Result<Option<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::scratch;
 
     fn temp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mailcraft-location-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let d = scratch(&format!("location-{name}"));
         fs::create_dir_all(&d).unwrap();
         d
     }
@@ -212,7 +237,6 @@ mod tests {
         assert!(!first.exists(), "the old folder went once empty");
         assert_eq!(pending_move(&base), None);
         assert_eq!(apply_pending_move(&base).unwrap(), None, "done once");
-        let _ = fs::remove_dir_all(t);
     }
 
     #[test]
@@ -239,6 +263,60 @@ mod tests {
         // A damaged pointer is ignored.
         fs::write(base.join(LOCATION), b"{nope").unwrap();
         assert_eq!(files_dir(&base), default_files_dir(&base));
-        let _ = fs::remove_dir_all(t);
+    }
+
+    /// Bytes given a few at a time, as a network share may: `steps` says how many each read
+    /// gives, in turn.
+    struct Short<'a> {
+        bytes: &'a [u8],
+        steps: &'a [usize],
+        at: usize,
+    }
+
+    impl Read for Short<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let step = self.steps[self.at % self.steps.len()];
+            self.at += 1;
+            let n = step.min(buf.len()).min(self.bytes.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    /// A copy read back in pieces of other sizes than the original's (a short read on one side)
+    /// is the same copy; one that differs, or is cut short, isn't. Comparing what each read gave
+    /// took the first short read for a copy that didn't come whole, and the move was undone.
+    #[test]
+    fn a_copy_read_back_in_short_pieces_is_the_same() {
+        let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let whole = |b| Short { bytes: b, steps: &[usize::MAX], at: 0 };
+        let short = |b| Short { bytes: b, steps: &[1 << 20, 4096, 1, 700_000], at: 0 };
+        assert!(same_bytes(whole(&bytes), short(&bytes)));
+        assert!(same_bytes(short(&bytes), whole(&bytes)));
+        let mut other = bytes.clone();
+        other[2_999_999] ^= 1;
+        assert!(!same_bytes(whole(&bytes), short(&other)));
+        assert!(!same_bytes(short(&bytes), whole(&bytes[..2_999_999])));
+        assert!(same_bytes(short(&[]), whole(&[])));
+    }
+
+    /// A move that stops at a file already in the target folder (put there after the move was
+    /// asked for, an older copy say) leaves that file alone, and takes back only what it copied.
+    /// The undoing removed every file of the move's names from the target, that one too.
+    #[test]
+    fn a_move_that_stops_keeps_what_was_there() {
+        let t = temp("there");
+        let (base, files, target) = (t.join("app"), t.join("C").join(FILES_FOLDER), t.join("D").join("Mail"));
+        seed(&base, &files);
+        assert_eq!(schedule_move(&base, &target).unwrap(), target);
+        // Meanwhile, an older copy of one of them turns up there.
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("old.mailcraft"), b"an older copy").unwrap();
+        assert!(apply_pending_move(&base).is_err());
+        assert_eq!(fs::read(target.join("old.mailcraft")).unwrap(), b"an older copy", "what was there stays");
+        assert!(!target.join("zoe@studio.example.mailcraft").exists(), "what the move copied goes");
+        assert_eq!(files_dir(&base), files);
+        assert!(files.join("old.mailcraft").exists() && files.join("zoe@studio.example.mailcraft").exists(), "nothing moved");
     }
 }

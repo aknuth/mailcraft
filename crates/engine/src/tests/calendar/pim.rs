@@ -2,6 +2,13 @@
 
 use super::*;
 
+mod agenda;
+mod dav_merge;
+mod deleting;
+mod huge_times;
+mod people;
+mod server_cards;
+
 #[test]
 fn calendar_events_on_this_computer() {
     let mut s = sample_session("calendar");
@@ -60,7 +67,6 @@ fn calendar_events_on_this_computer() {
     assert_eq!(r["date"], "2026-02-28", "a month on from the 31st stays in February");
     assert_eq!(s.cal_days().1 - s.cal_days().0, 42);
     assert_eq!(s.run("calendar.goto", &json!({"date": "today"})).unwrap()["date"].as_str().map(|d| d.len()), Some(10));
-    done(s);
 }
 
 /// In New York, a weekly 09:00 meeting made in October is still at 09:00 in December, after the
@@ -92,45 +98,6 @@ fn the_calendar_keeps_local_times_across_summer_time() {
 }
 
 #[test]
-fn people_in_the_address_book() {
-    let mut s = sample_session("people");
-    let all = s.run("contact.list", &json!({})).unwrap();
-    assert!(all.as_array().unwrap().len() >= 5);
-    let hits = s.run("contact.list", &json!({"query": "lantern"})).unwrap();
-    assert!(hits.as_array().unwrap().iter().all(|p| p["org"] == "Studio Lantern"));
-    let uid = s
-        .run("contact.create", &json!({"name": "Mira Chen", "emails": "mira@colour.example, mira.chen@home.example", "org": "Colour House"}))
-        .unwrap()["uid"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(s.run("contact.create", &json!({"name": "Bad", "emails": ["not an address"]})).is_err());
-    assert!(s.run("contact.create", &json!({})).is_err(), "a name or address is needed");
-    // Saved people are suggested before people only seen in mail.
-    let top: Vec<String> = s.suggest_contacts("mi", 2).into_iter().map(|c| c.address.email).collect();
-    assert!(top.contains(&"mira@colour.example".to_string()), "{top:?}");
-    s.run("contact.update", &json!({"uid": uid, "phones": ["+1 555 0101"], "title": "Colourist"})).unwrap();
-    let p = s.find_person(&uid).unwrap();
-    assert_eq!((p.card.phones[0].value.as_str(), p.card.title.as_str(), p.card.emails.len()), ("+1 555 0101", "Colourist", 2));
-    // People are lent, not copied: a card can carry megabytes of picture and files, and People
-    // lists everyone on every frame.
-    let stored = s.pim.values().flat_map(|x| &x.cards).find(|c| c.card.uid == uid).map(|c| &c.card).unwrap();
-    assert!(std::ptr::eq(p.card, stored) && s.people("Mira").iter().any(|x| std::ptr::eq(x.card, stored)));
-    s.run("contact.delete", &json!({"uid": uid})).unwrap();
-    assert!(s.find_person(&uid).is_none());
-    // The sender of a message, once.
-    let k = s.list.iter().find(|m| m.from.email == "win@prizes.example").map(|m| m.key.clone());
-    if let Some(k) = k {
-        s.run("list.open", &json!({"key": k.to_id()})).unwrap();
-        let first = s.run("contact.fromMessage", &json!({})).unwrap();
-        let second = s.run("contact.fromMessage", &json!({})).unwrap();
-        assert_eq!(first["uid"], second["uid"]);
-        assert_eq!(second["existing"], true);
-    }
-    done(s);
-}
-
-#[test]
 fn invitations_are_answered_and_sent() {
     let mut s = sample_session("invites");
     // The invitation stays in the Inbox to be answered again (moving it: answered_invites.rs).
@@ -148,7 +115,8 @@ fn invitations_are_answered_and_sent() {
     assert_eq!(method, "REPLY");
     assert!(raw.contains("PARTSTAT=ACCEPTED") && raw.contains("mailto:riley@studio.example"), "{raw}");
     assert!(raw.to_ascii_lowercase().contains("text/calendar"), "sent as a calendar part");
-    assert!(raw.contains("To: \"Ana Lima\" <ana@soundlab.example>") || raw.contains("ana@soundlab.example"));
+    let to = mailcraft_mime::parse(raw.as_bytes()).unwrap().to;
+    assert_eq!(to, [mailcraft_model::EmailAddress::new("Ana Lima", "ana@soundlab.example")], "to the organizer");
 
     // Declining takes it out of the calendar.
     s.run("invite.respond", &json!({"answer": "declined"})).unwrap();
@@ -158,7 +126,6 @@ fn invitations_are_answered_and_sent() {
     s.run("invite.respond", &json!({"answer": "tentative"})).unwrap();
     let e = s.find_event("mix@sample.mailcraft").unwrap().1.event.clone();
     assert!(e.attendees.iter().any(|a| a.email == "riley@studio.example" && a.partstat == "TENTATIVE"));
-    done(s);
 }
 
 #[test]
@@ -189,27 +156,10 @@ fn own_events_invite_and_cancel_guests() {
         partstat: "ACCEPTED".into(),
         rsvp: false,
     }];
-    let ics = mailcraft_model::ical::write(&[reply], Some("REPLY"), NOW);
-    let d = mailcraft_mime::Draft {
-        to: vec![mailcraft_model::EmailAddress::new("Riley", "riley@studio.example")],
-        subject: "Accepted: Trailer review".into(),
-        body: "Zoe accepted.".into(),
-        attachments: vec![mailcraft_mime::OutAttachment {
-            name: "invite.ics".into(),
-            mime: "text/calendar; method=REPLY".into(),
-            data: ics.into_bytes(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let raw = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new("Zoe Park", "zoe@studio.example"), NOW, "<r1@x>").unwrap();
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 999 };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(&raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, &raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let ics = mailcraft_model::ical::write(&[reply], Some("REPLY"), NOW).into_bytes();
+    let raw = calendar_mail(("Zoe Park", "zoe@studio.example"), "Accepted: Trailer review", "text/calendar; method=REPLY", ics, "<r1@x>");
+    let key = mailcraft_model::MessageKey { uid: 999, ..next_key(&s, "sample", "INBOX") };
+    let key = file_whole(&mut s, key, &raw);
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     let inv = s.invite().unwrap();
@@ -223,7 +173,6 @@ fn own_events_invite_and_cancel_guests() {
     let (method, raw) = sent_calendar(&s, "Sent", "Cancelled: Trailer review");
     assert_eq!(method, "CANCEL");
     assert!(raw.contains("STATUS:CANCELLED"));
-    done(s);
 }
 
 #[test]
@@ -342,8 +291,6 @@ fn dav_results_merge_without_losing_local_changes() {
     let p = s2.pim.get(&id2).unwrap();
     assert_eq!(p.events.iter().filter(|e| e.event.summary == "Poster review").count(), 1, "{:?}", p.events);
     assert_eq!(p.events[0].event.uid, "ical-EV1");
-    done(s);
-    done(s2);
 }
 
 #[test]
@@ -366,7 +313,7 @@ fn notes_are_written_coloured_and_deleted() {
     drop(s);
     let s = Session::open(Some(Store::open(&root).unwrap()), mailcraft_model::dates::Clock::new(NOW, 0));
     assert_eq!(s.notes("").len(), 3);
-    done(s);
+    drop(s);
 
     // An Exchange account: notes go to its Notes folder, and what the server says follows.
     let mut s = Session::open(Some(temp("notes-ews")), mailcraft_model::dates::Clock::new(NOW, 0));
@@ -377,9 +324,10 @@ fn notes_are_written_coloured_and_deleted() {
         .unwrap()
         .to_string();
     s.take_jobs();
-    let uid = s.run("note.create", &json!({"text": "Sync me"})).unwrap()["uid"].as_str().unwrap().to_string();
+    let made = s.run("note.create", &json!({"text": "Sync me"})).unwrap();
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { .. })), "asks for a sync");
     assert!(s.pim[&id].notes[0].dirty);
+    assert_eq!(made["uid"].as_str(), Some(s.pim[&id].notes[0].note.uid.as_str()), "it answers the new note's uid");
     let stored = mailcraft_model::pim::StoredNote { href: "note:X1".into(), note: s.pim[&id].notes[0].note.clone(), ..Default::default() };
     let server_copy =
         mailcraft_model::pim::StoredNote { note: mailcraft_model::pim::Note { uid: "note:X1".into(), ..stored.note.clone() }, ..stored.clone() };
@@ -393,10 +341,8 @@ fn notes_are_written_coloured_and_deleted() {
     let texts: Vec<String> = s.notes("").into_iter().map(|n| n.note.text.clone()).collect();
     assert_eq!(texts.len(), 2, "{texts:?}: the note sent isn't doubled");
     assert!(texts.contains(&"From Outlook".to_string()) && texts.contains(&"Sync me".to_string()));
-    let _ = uid;
     s.run("note.delete", &json!({"uid": "note:X2"})).unwrap();
     assert!(s.pim[&id].deleted.iter().any(|t| t.href == "note:X2"), "deleted on the server next time");
-    done(s);
 }
 
 /// Issue #1: notes sort A to Z (by their first line), by colour, or the last changed first.
@@ -420,134 +366,6 @@ fn notes_can_be_arranged() {
     assert!(s.run("note.arrange", &json!({"by": "size"})).is_err());
 }
 
-/// Issue #1: a signature goes into the message being written from the message itself.
-#[test]
-fn a_signature_goes_in_from_the_message() {
-    let mut s = sample_session("insert-signature");
-    s.run("account.setSignature", &json!({"account": "sample", "signature": ""})).unwrap();
-    s.run("mail.new", &json!({})).unwrap();
-    s.compose.as_mut().unwrap().body = "Hello there".into();
-    assert!(s.run("compose.insertSignature", &json!({})).is_err(), "no signature yet");
-    s.run("account.setSignature", &json!({"account": "sample", "signature": "Riley\nStudio"})).unwrap();
-    let r = s.run("compose.insertSignature", &json!({"at": 5})).unwrap();
-    assert_eq!(s.compose.as_ref().unwrap().body, "Hello\n-- \nRiley\nStudio\n there");
-    assert_eq!(r["end"], 23);
-    // One already there is replaced, wherever the cursor is.
-    s.run("account.setSignature", &json!({"account": "sample", "signature": "R."})).unwrap();
-    s.run("compose.insertSignature", &json!({"at": 9999})).unwrap();
-    assert_eq!(s.compose.as_ref().unwrap().body, "Hello\n-- \nR.\n there");
-    // A reply made with the old signature: that one is replaced.
-    let c = s.compose.as_mut().unwrap();
-    c.body = "Hi\n\n-- \nOld\n\n> quoted".into();
-    c.signature = "-- \nOld".into();
-    s.run("compose.insertSignature", &json!({})).unwrap();
-    assert_eq!(s.compose.as_ref().unwrap().body, "Hi\n\n-- \nR.\n\n> quoted");
-}
-
-/// Issue #1: a signature pasted from Outlook keeps its look: kept as HTML, and put into new
-/// messages, replies and Insert signature with it; its text is the plain-text twin.
-#[test]
-fn a_formatted_signature_keeps_its_look() {
-    let mut s = sample_session("formatted-signature");
-    let html = "<p class=MsoNormal><b><span style='color:#BFBFBF'>Company bv</span></b></p>\
-                <p class=MsoNormal>An street 1<br><a href=\"http://www.company.com/\">www.company.com</a></p>\
-                <p class=MsoNormal><i>Confidential.</i></p>";
-    s.run("account.setSignature", &json!({"account": "sample", "signature": "ignored", "html": html})).unwrap();
-    let config = s.default_signature("sample", false).unwrap();
-    assert_eq!(config.text, "Company bv\nAn street 1\nwww.company.com\nConfidential.");
-    assert!(!config.html.is_empty());
-    let check = |s: &Session| {
-        let c = s.compose.as_ref().unwrap();
-        let at = c.body.find("Company bv").map(|b| c.body[..b].chars().count()).unwrap();
-        let st = c.styles.style(at);
-        assert!(st.bold && st.color == Some([0xBF, 0xBF, 0xBF]), "{st:?}");
-        let link = c.body.find("www.company").map(|b| c.body[..b].chars().count()).unwrap();
-        assert_eq!(c.styles.style(link).link.as_deref(), Some("http://www.company.com/"));
-        assert!(!c.styles.style(0).bold, "the text before it stays as it was");
-        assert_eq!(c.styles.chars.len(), c.body.chars().count());
-        let html = mailcraft_mime::rich::to_html(&c.body, &c.styles);
-        assert!(html.contains("http://www.company.com/"), "{html}");
-    };
-    s.run("mail.new", &json!({})).unwrap();
-    assert!(s.compose.as_ref().unwrap().body.ends_with("-- \nCompany bv\nAn street 1\nwww.company.com\nConfidential."));
-    check(&s);
-    assert!(!s.compose_written(), "a message with only its signature has nothing written");
-    // Insert signature replaces it, keeping the look.
-    s.run("compose.insertSignature", &json!({})).unwrap();
-    check(&s);
-    s.run("compose.discard", &json!({})).ok();
-    s.compose = None;
-    let k = s.list.first().map(|m| m.key.clone()).unwrap();
-    s.run("list.open", &json!({"key": k.to_id()})).unwrap();
-    s.run("mail.reply", &json!({})).unwrap();
-    check(&s);
-    // Saved plain again, the look goes.
-    s.run("account.setSignature", &json!({"account": "sample", "signature": "R."})).unwrap();
-    assert!(s.default_signature("sample", false).unwrap().html.is_empty());
-    assert!(s.run("account.setSignature", &json!({"account": "sample", "signature": "x", "html": "<p><b>\u{0}"})).is_ok(), "junk HTML");
-}
-
-/// Issue #1: a contact's numbers keep what they are (business, home, mobile…), and its
-/// addresses and birthday are fields of their own, as in Outlook.
-#[test]
-fn contacts_keep_typed_numbers_addresses_and_birthdays() {
-    let mut s = sample_session("contact-fields");
-    let uid = s
-        .run(
-            "contact.create",
-            &json!({
-                "name": "Jos Peeters",
-                "emails": ["jos@company.example", "jos@home.example"],
-                "phones": [{"value": "+32 2 123 45 67", "kind": "work"}, {"value": "+32 490 12 34 56", "kind": "cell"}, {"value": "+32 9 765 43 21", "kind": "home"}],
-                "addresses": [{"kind": "work", "street": "An street 1", "postcode": "1000", "city": "Brussel", "country": "Belgium"}, {"kind": "home", "city": "Gent"}, {"street": " "}],
-                "birthday": "1980-02-29",
-            }),
-        )
-        .unwrap()["uid"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let c = s.find_person(&uid).unwrap().card;
-    let kinds: Vec<(&str, &str)> = c.phones.iter().map(|p| (p.kind.as_str(), p.value.as_str())).collect();
-    assert_eq!(kinds, [("work", "+32 2 123 45 67"), ("cell", "+32 490 12 34 56"), ("home", "+32 9 765 43 21")]);
-    assert_eq!(c.addresses.len(), 2, "an empty one isn't kept");
-    assert_eq!(c.addresses[0].one_line(), "An street 1, 1000 Brussel, Belgium");
-    assert_eq!(c.birthday, "1980-02-29");
-    assert_eq!(c.emails.len(), 2);
-    // Changing one thing leaves the rest; a birthday that isn't a date is refused.
-    s.run("contact.update", &json!({"uid": uid, "title": "Owner"})).unwrap();
-    assert_eq!(s.find_person(&uid).unwrap().card.phones.len(), 3);
-    assert!(s.run("contact.update", &json!({"uid": uid, "birthday": "next tuesday"})).is_err());
-    s.run("contact.update", &json!({"uid": uid, "birthday": ""})).unwrap();
-    assert!(s.find_person(&uid).unwrap().card.birthday.is_empty());
-    // Strings still work for phones (kind unknown).
-    s.run("contact.update", &json!({"uid": uid, "phones": "+1 555 0100, +1 555 0101"})).unwrap();
-    assert_eq!(s.find_person(&uid).unwrap().card.phones.len(), 2);
-}
-
-/// Issue #1: Select Names opens with the address book chosen (Outlook's "Show this address list
-/// first"), and one address book can be shown alone.
-#[test]
-fn the_address_book_opens_with_the_one_chosen() {
-    let mut s = sample_session("default-book");
-    let all = s.run("contact.addressBook", &json!({})).unwrap();
-    let people = s.run("contact.addressBook", &json!({"source": "people"})).unwrap();
-    assert!(all.as_array().unwrap().len() >= people.as_array().unwrap().len());
-    let books = s.address_books();
-    let (book, _, _) = books.first().cloned().expect("the sample has an address book");
-    assert!(s.run("contact.defaultBook", &json!({"source": "book:nobody:x"})).is_err());
-    s.run("contact.defaultBook", &json!({"source": book})).unwrap();
-    assert_eq!(s.prefs.address_book, book);
-    let mine = s.run("contact.addressBook", &json!({})).unwrap();
-    assert_eq!(mine, s.run("contact.addressBook", &json!({"source": book})).unwrap(), "it opens with the one chosen");
-    assert!(!mine.as_array().unwrap().is_empty());
-    let (account, id) = book.strip_prefix("book:").and_then(|b| b.split_once(':')).unwrap();
-    let in_book = s.people("").into_iter().filter(|p| p.account == account && p.book == id).flat_map(|p| &p.card.emails).count();
-    assert_eq!(mine.as_array().unwrap().len(), in_book);
-    let back: crate::session::Prefs = serde_json::from_value(serde_json::to_value(&s.prefs).unwrap()).unwrap();
-    assert_eq!(back.address_book, book, "kept with the settings");
-}
-
 /// Issue #1: events are drawn in their category's colour (shared with mail's categories), so a
 /// calendar isn't all one colour.
 #[test]
@@ -560,7 +378,7 @@ fn events_take_their_categorys_colour() {
     add("Pitch", json!(["clients"]));
     add("Mix", json!("Studio, Clients"));
     add("Plain", json!([]));
-    let day = mailcraft_engine_day(&s);
+    let day = crate::parse_local("2026-10-16", &s.clock).map(|(t, _)| t).unwrap();
     let item = |name: &str| s.agenda(day, day + 86_400).into_iter().find(|i| i.summary == name).unwrap();
     assert_eq!(item("Pitch").category, Some(5), "a category's own colour, whatever its case");
     let studio = item("Mix").category.unwrap();
@@ -601,32 +419,6 @@ fn calendars_can_be_hidden_and_shown_side_by_side() {
     assert_eq!(edit.category, Some(s.category_color_of("Personal")));
 }
 
-/// Issue #1: an organisation's shared contacts (Exchange public folders) can be read, not
-/// changed or deleted.
-#[test]
-fn shared_contacts_are_read_only() {
-    use mailcraft_model::pim::{BookInfo, DavSync, StoredCard};
-    let mut s = sample_session("shared-contacts");
-    let card = mailcraft_model::vcard::Card { uid: "desk".into(), name: "Front desk".into(), ..Default::default() };
-    let mut books = s.pim.get("sample").unwrap().books.clone();
-    books.push(BookInfo { id: "public:pc".into(), name: "Company contacts".into(), read_only: true, ctag: String::new() });
-    let sync = DavSync {
-        books: Some(books),
-        cards: vec![StoredCard { book: "public:pc".into(), href: "public:desk".into(), card, ..Default::default() }],
-        synced_books: vec!["public:pc".into()],
-        ..Default::default()
-    };
-    s.apply(Event::DavSynced { account: "sample".into(), sync: Box::new(sync) });
-    assert!(s.find_person("desk").is_some(), "shown with the others");
-    assert!(s.person_read_only("desk"));
-    assert!(s.run("contact.update", &json!({"uid": "desk", "name": "Reception"})).is_err());
-    assert!(s.run("contact.delete", &json!({"uid": "desk"})).is_err());
-    assert!(s.find_person("desk").is_some());
-    // New contacts go to a book that can take them.
-    let made = s.run("contact.create", &json!({"name": "New one"})).unwrap();
-    assert!(!s.person_read_only(made["uid"].as_str().unwrap()));
-}
-
 /// Reminders: an event's reminder comes due at its time, snoozes, comes back, and goes when
 /// dismissed; each occurrence of a series has its own; one without a reminder, or cancelled,
 /// never comes; a hidden calendar's still does; and bad params are refused.
@@ -655,6 +447,9 @@ fn reminders_come_snooze_and_go() {
     assert_eq!(due(&s), ["Stand-up"]);
     let key = s.due_reminders(s.clock.now)[0].key.clone();
     assert!(key.starts_with("local|") || key.contains(&standup), "{key}");
+    let listed = s.run("reminders.list", &json!({})).unwrap();
+    let listed: Vec<(&str, &str)> = listed.as_array().unwrap().iter().map(|r| (r["key"].as_str().unwrap(), r["summary"].as_str().unwrap())).collect();
+    assert_eq!(listed, [(key.as_str(), "Stand-up")], "the reminders listed are those due");
     // Snoozed five minutes: gone, then back.
     s.run("reminders.snooze", &json!({"key": key, "minutes": 5})).unwrap();
     assert!(due(&s).is_empty());
@@ -701,8 +496,6 @@ fn reminders_come_snooze_and_go() {
     for bad in [json!(-1), json!(999_999), json!("soon"), json!(true)] {
         assert!(s.run("event.update", &json!({"uid": quiet, "reminder": bad})).is_err(), "{bad}");
     }
-    assert!(s.run("reminders.list", &json!({})).unwrap().is_array());
-    done(s);
 }
 
 /// The work week: Monday to Friday of the week the day is in, moving a week at a time.
@@ -717,8 +510,16 @@ fn the_work_week_is_monday_to_friday() {
     assert_eq!((mailcraft_model::dates::day_string(d0), d1 - d0), ("2026-10-19".to_string(), 5));
     s.run("calendar.goto", &json!({"step": 1})).unwrap();
     assert_eq!(mailcraft_model::dates::day_string(s.cal_days().0), "2026-10-26");
+    // What the calendar shows is that week's: the sample's stand-up, Monday, Wednesday and Friday.
     let events = s.run("calendar.events", &json!({})).unwrap();
-    assert!(events.as_array().is_some());
+    let shown: Vec<(String, String)> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["summary"].as_str().unwrap().to_string(), mailcraft_model::dates::day_string(e["start"].as_i64().unwrap().div_euclid(86_400))))
+        .collect();
+    let standup = |day: &str| ("Team stand-up".to_string(), day.to_string());
+    assert_eq!(shown, [standup("2026-10-26"), standup("2026-10-28"), standup("2026-10-30")]);
     assert!(s.run("calendar.view", &json!({"mode": "fortnight"})).is_err());
 }
 
@@ -804,7 +605,6 @@ fn a_calendar_server_given_by_hand() {
     }
     s.run("account.dav", &json!({"account": id, "carddav": "http://localhost:5232/zoe/"})).unwrap();
     assert!(s.run("account.dav", &json!({"account": "sample", "caldav": "https://dav.example/"})).is_err());
-    done(s);
 }
 
 /// An event at the very end of time in the cache (a damaged file) doesn't stop the calendar.
@@ -823,5 +623,4 @@ fn an_event_at_the_end_of_time_is_drawn_without_overflow() {
     }
     let _ = s.agenda(i64::MAX - 100, i64::MAX);
     let _ = s.agenda(i64::MIN, i64::MIN + 100);
-    done(s);
 }

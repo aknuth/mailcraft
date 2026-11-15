@@ -21,11 +21,12 @@ pub(crate) fn color_from_name(name: &str) -> u8 {
     u8::try_from(h % 8).unwrap_or(0)
 }
 
-/// A name checked for the list: not empty, not too long, no control characters.
-fn checked_name(name: &str) -> Result<&str, CmdError> {
+/// A name checked for a list (categories, Quick Steps, Search Folders): trimmed, not empty, at
+/// most `max` characters, no control characters. `what` is what it names ("a category").
+pub(super) fn checked_name<'n>(name: &'n str, max: usize, what: &str) -> Result<&'n str, CmdError> {
     let name = name.trim();
-    if name.is_empty() || name.chars().count() > NAME_MAX || name.chars().any(char::is_control) {
-        return Err(CmdError::Params(format!("a category needs a name (up to {NAME_MAX} characters)")));
+    if name.is_empty() || name.chars().count() > max || name.chars().any(char::is_control) {
+        return Err(CmdError::Params(format!("{what} needs a name (up to {max} characters)")));
     }
     Ok(name)
 }
@@ -69,17 +70,20 @@ impl Session {
     /// Keywords on the messages in the list now that aren't categories in the list, with how
     /// many messages have each, most used first (at most 100).
     pub fn unlisted_keywords(&self) -> Vec<(String, usize)> {
-        // Drawn every frame while the dialog is open, over a list that may be long: one pass,
-        // each keyword looked at once.
+        // Over a list that may be long (the dialog keeps the answer while the list and the
+        // categories stay the same): one pass, each keyword lower-cased into the same buffer and
+        // looked at once, a new one kept.
         let listed: HashSet<String> = self.prefs.categories.iter().map(|c| c.keyword.to_ascii_lowercase()).collect();
         let mut seen: HashMap<String, (String, usize)> = HashMap::new();
+        let mut low = String::new();
         for m in &self.list {
             for k in &m.flags.keywords {
-                let low = k.to_ascii_lowercase();
-                if let Some((_, n)) = seen.get_mut(&low) {
+                low.clear();
+                low.extend(k.chars().map(|c| c.to_ascii_lowercase()));
+                if let Some((_, n)) = seen.get_mut(low.as_str()) {
                     *n += 1;
-                } else if seen.len() < 1000 && !listed.contains(&low) && !is_system_keyword(k) {
-                    seen.insert(low, (k.clone(), 1));
+                } else if seen.len() < 1000 && !listed.contains(low.as_str()) && !is_system_keyword(k) {
+                    seen.insert(low.clone(), (k.clone(), 1));
                 }
             }
         }
@@ -121,7 +125,7 @@ impl Session {
     /// Add a category to the list. Its keyword is the one given (`$label6`, or one another
     /// program uses already) or one made from the name as Thunderbird makes a tag's.
     pub fn add_category(&mut self, name: &str, color: Option<u8>, keyword: Option<&str>) -> CmdResult {
-        let name = checked_name(name)?;
+        let name = checked_name(name, NAME_MAX, "a category")?;
         if self.category(name).is_some() {
             return Err(CmdError::Params(format!("there is already a category called {name}")));
         }
@@ -150,7 +154,7 @@ impl Session {
         let old = self.prefs.categories.get(at).cloned().ok_or_else(|| CmdError::Params(format!("no category called {name}")))?;
         let new_name = match new_name {
             Some(n) => {
-                let n = checked_name(n)?;
+                let n = checked_name(n, NAME_MAX, "a category")?;
                 if self.category(n).is_some_and(|c| c.name != old.name) {
                     return Err(CmdError::Params(format!("there is already a category called {n}")));
                 }

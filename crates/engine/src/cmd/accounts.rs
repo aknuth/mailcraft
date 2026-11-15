@@ -21,10 +21,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             .params(r#"{"email": string, "password"?: string, "oauth"?: "google"|"microsoft", "deferSignIn"?: bool, "local"?: bool, "name"?: string, "username"?: string, "imapHost"?: string, "imapPort"?: number, "imapSecurity"?: "tls"|"starttls"|"none", "smtpHost"?: string, "smtpPort"?: number, "smtpSecurity"?: …, "smtpUsername"?: string and "smtpPassword"?: string (the outgoing server's own sign-in, when it isn't the incoming server's), "jmap"?: string (a JMAP session URL, instead of IMAP and SMTP), "pop"?: true (POP3 instead of IMAP: popHost, popPort, popSecurity, "popDelete"?: bool to remove mail from the server once downloaded, else a copy stays: "popKeepDays"?: number (removed that many days after downloading; 14 when not given, 0 for never), "popDeleteWithTrash"?: bool (removed once deleted here for good)), "pst"?: string (an existing Outlook data file whose mail comes in first), "ews"?: string|true (on-premises Exchange: its EWS address or server name, or true to find it with Autodiscover; username DOMAIN\\user or an address), "graph"?: true|string (Exchange Online through Microsoft Graph; signs in with Microsoft), "dav"?: string (calendars and contacts only, with no mail server: its CalDAV and CardDAV server's address; signs in as username, or the address, with password), "userAgent"?: string (with ews: the User-Agent its requests name instead of MailCraft's, for a server that lets in only clients it knows), "onlineOnly"?: bool (keep none of its mail on this computer; not for POP)}"#),
         CommandSpec::new("account.exportPst", "Export to Outlook data file", "File › Open & Export", |s, v| {
             let path = p::req_str(v, "path")?.to_string();
-            let account = match p::str(v, "account") {
-                Some(a) => a.to_string(),
-                None => s.current_account().map(|a| a.config.id.clone()).ok_or_else(|| CmdError::Params("there is no account to export".into()))?,
-            };
+            let account = account_param(s, v)?;
             s.export_pst(&account, &path)
         })
         .params(r#"{"path": string (the .pst file to write; one already there in Outlook's Unicode format or Outlook 97–2002's ANSI one, encoded or not, is added to, its messages not written twice), "account"?: string (default: the current one)}"#),
@@ -67,7 +64,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         .params(r#"{"account": string}"#),
         CommandSpec::new("account.signIn", "Sign in with the browser", "File › Accounts", |s, v| {
             let id = p::req_str(v, "account")?;
-            let config = s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))?;
+            let config = s.config_of(id)?;
             if config.oauth.is_none() {
                 // A Microsoft account signing in with a password (refused there) switches over.
                 if mailcraft_model::microsoft_password_account(&config) {
@@ -115,7 +112,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         })
         .params(r#"{"account": string, "address": string}"#),
         CommandSpec::new("account.setAddress", "Add or change an address", "File › Info › Account settings", set_address).params(
-            r#"{"account": string, "address": string (another address of the same mailbox, to send from), "name"?: string (shown on mail from it; else the account's), "replyTo"?: string (where replies to it go), "signature"?: string|null (one of the account's, for mail from it; null: the account's own)}"#,
+            r#"{"account": string, "address": string (another address of the same mailbox, to send from), "name"?: string (shown on mail from it; else the account's), "replyTo"?: string (where replies to it go), "signature"?: string|null (one of the account's, for mail from it; null: the account's own), "newMail"?: bool (new mail is written from it, not from the account's own address: one address at most)}"#,
         ),
         CommandSpec::new("account.findAddresses", "Find addresses on the server", "File › Info › Account settings", |s, v| {
             let id = account_param(s, v)?;
@@ -282,13 +279,18 @@ pub(super) fn add_account(s: &mut Session, v: &Value) -> CmdResult {
     // The outgoing server's own sign-in (IMAP or POP with SMTP).
     let mut config = config;
     let smtp_password = smtp_sign_in(v, &mut config, true)?;
+    // `pst`: an existing data file whose mail comes into the account first. Checked before the
+    // account is made: refused after, the account was there although the command failed.
+    let pst = match p::str(v, "pst").map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => Some(crate::session::data_file_path(path)?.to_string()),
+        None => None,
+    };
     let id = s.add_account(config, password)?;
     if let Some(pw) = smtp_password {
         s.keep_smtp_password(&id, pw);
     }
-    // `pst`: an existing data file whose mail comes into the account first.
-    if let Some(path) = p::str(v, "pst").map(str::trim).filter(|p| !p.is_empty()) {
-        s.attach_data_file(&id, path)?;
+    if let Some(path) = pst {
+        s.attach_data_file(&id, &path)?;
     }
     Ok(json!({"account": id}))
 }
@@ -343,13 +345,13 @@ pub(super) fn set_password(s: &mut Session, v: &Value) -> CmdResult {
     if pw.is_empty() {
         return Err(CmdError::Params("`password` is empty".into()));
     }
-    let config = s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))?;
+    let config = s.config_of(id)?;
     s.update_account(config, Some(pw.to_string()))
 }
 
 pub(super) fn update_account(s: &mut Session, v: &Value) -> CmdResult {
     let id = p::req_str(v, "account")?;
-    let mut c = s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))?;
+    let mut c = s.config_of(id)?;
     if c.is_local() && !c.is_calendar_only() {
         return Err(CmdError::Params("the sample mailbox has no server settings".into()));
     }
@@ -472,10 +474,10 @@ pub(super) fn list_accounts(s: &mut Session, _: &Value) -> CmdResult {
 /// mailbox.
 pub(super) fn set_address(s: &mut Session, v: &Value) -> CmdResult {
     let id = p::req_str(v, "account")?;
-    let mut c = s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))?;
     if s.account(id).is_some_and(|a| a.is_data_file()) {
         return Err(CmdError::Params("mail isn't sent from a data file".into()));
     }
+    let mut c = s.config_of(id)?;
     let address = p::req_str(v, "address")?;
     let mut identity =
         c.identity(address).cloned().unwrap_or_else(|| mailcraft_model::Identity { email: address.trim().to_string(), ..Default::default() });
@@ -490,6 +492,9 @@ pub(super) fn set_address(s: &mut Session, v: &Value) -> CmdResult {
         Some(Value::String(name)) => identity.signature = Some(name.clone()),
         _ => {}
     }
+    if let Some(new_mail) = p::bool(v, "newMail") {
+        identity.new_mail = new_mail;
+    }
     // An address another account is, or has, would make two accounts answer for it.
     let taken = s.accounts.iter().any(|a| a.config.id != c.id && a.config.has_address(&identity.email));
     if taken {
@@ -499,14 +504,14 @@ pub(super) fn set_address(s: &mut Session, v: &Value) -> CmdResult {
     c.set_identity(identity.clone()).map_err(CmdError::Params)?;
     let email = c.identity(&identity.email).map(|i| i.email.clone()).unwrap_or_default();
     s.update_account(c, None)?;
-    Ok(json!({ "account": id, "address": email, "added": added }))
+    Ok(json!({ "account": id, "address": email, "added": added, "newMail": identity.new_mail }))
 }
 
 /// Take an address out of those the account's mail is sent from. A message being written from
 /// it goes from the account's own.
 pub(super) fn remove_address(s: &mut Session, v: &Value) -> CmdResult {
     let id = p::req_str(v, "account")?;
-    let mut c = s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))?;
+    let mut c = s.config_of(id)?;
     let address = p::req_str(v, "address")?.trim().to_string();
     if !c.remove_identity(&address) {
         return Err(CmdError::Params(format!("{address} isn't one of this account's other addresses")));
@@ -520,7 +525,7 @@ pub(super) fn remove_address(s: &mut Session, v: &Value) -> CmdResult {
 /// mailboxes"), or remove one; the account connects again to list its folders.
 pub(super) fn shared_mailbox(s: &mut Session, v: &Value, add: bool) -> CmdResult {
     let id = p::req_str(v, "account")?;
-    let mut c = s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))?;
+    let mut c = s.config_of(id)?;
     if c.ews.is_none() {
         return Err(CmdError::Params("shared mailboxes are opened on Exchange accounts (EWS)".into()));
     }

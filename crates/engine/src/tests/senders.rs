@@ -15,13 +15,8 @@ fn deliver(s: &mut Session, n: u32, from: (&str, &str), subject: &str, headers: 
     };
     let raw = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new(from.0, from.1), NOW, &format!("<sender{n}@x>")).unwrap();
     let raw = [headers.as_bytes(), &raw].concat();
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 9300 + n };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(&raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, &raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let key = mailcraft_model::MessageKey { uid: 9300 + n, ..next_key(s, "sample", "INBOX") };
+    let key = file_whole(s, key, &raw);
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     key
@@ -71,7 +66,6 @@ fn a_known_persons_name_on_a_strange_address_is_pointed_out() {
     // A mailing list's header doesn't excuse a free-mail address.
     deliver(&mut s, 6, ("Zoe Park", "zoe1984@gmail.com"), "Listed", "List-Id: <team.lists.example>\r\n");
     assert!(warning(&s).is_some());
-    done(s);
 }
 
 #[test]
@@ -93,7 +87,6 @@ fn people_known_by_their_address_or_organisation_and_generic_names_pass() {
         deliver(&mut s, n, from, "Hello", headers);
         assert_eq!(warning(&s), None, "{from:?}");
     }
-    done(s);
 }
 
 #[test]
@@ -116,7 +109,6 @@ fn people_found_in_the_directory_count_as_known() {
     });
     deliver(&mut s, 1, ("Whitfield, Dana", "dana.whitfield.ceo@gmail.com"), "Wire", "");
     assert!(matches!(warning(&s), Some(SenderWarning::NameOfKnownPerson { known, .. }) if known == "dana.whitfield@contoso.example"));
-    done(s);
 }
 
 #[test]
@@ -147,7 +139,6 @@ fn the_list_shows_strangers_addresses() {
     s.apply(Event::FolderChanged { account: "sample".into(), folder: "Sent".into() });
     s.refresh_list();
     assert!(!shown(&mut s, "From a stranger"));
-    done(s);
 }
 
 #[test]
@@ -181,7 +172,6 @@ fn the_external_tag_marks_mail_from_outside_the_organisation() {
     // An empty list goes back to the accounts' domains.
     let r = s.run("view.externalTag", &json!({"domains": []})).unwrap();
     assert_eq!(r["organisation"], json!(["studio.example"]));
-    done(s);
 }
 
 #[test]
@@ -212,7 +202,6 @@ fn a_list_message_whose_entry_doesnt_say_so_is_known_by_its_own_header() {
     s.run("contact.create", &json!({"name": "Pat Doe", "emails": "pat@unknown.example"})).unwrap();
     s.tick();
     assert_eq!(warning(&s), None);
-    done(s);
 }
 
 #[test]
@@ -236,5 +225,47 @@ fn a_calendar_syncing_doesnt_count_the_address_book_again() {
     s.clock.now += 3600;
     s.refresh_list();
     assert_ne!(s.contacts_built, counted);
-    done(s);
+}
+
+/// The check looked at each frame follows what it's made of when nothing else says it changed:
+/// the organisation's domains set by hand, an account added.
+#[test]
+fn the_sender_check_follows_the_organisation_and_the_accounts() {
+    let mut s = sample_session("senders-follow");
+    s.prefs.external_tag = true;
+    let key = deliver(&mut s, 1, ("Dana Lee", "dana@company.example"), "Hello", "");
+    let external = |s: &mut Session| {
+        s.keep_senders_when(false);
+        let m = s.summary(&key).cloned().unwrap();
+        s.sender_marks(&m).external
+    };
+    assert!(external(&mut s), "another organisation's");
+    s.prefs.org_domains = vec!["company.example".into()];
+    assert!(!external(&mut s), "the organisation's domains set: one of them");
+    s.prefs.org_domains.clear();
+    assert!(external(&mut s));
+    s.run("account.add", &json!({"email": "me@company.example", "local": true})).unwrap();
+    assert!(!external(&mut s), "an account of that domain added");
+}
+
+/// The sender check looked at each frame with nothing changed, with five accounts and the
+/// organisation's domains set, timed. Run under the heavy lock:
+/// `cargo test --release -p mailcraft-engine --lib measure_senders_each_frame -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_senders_each_frame() {
+    let mut s = sample_session("measure-senders");
+    for n in 0..4 {
+        s.run("account.add", &json!({"email": format!("person{n}@company{n}.example"), "name": format!("Person Number {n}"), "local": true}))
+            .unwrap();
+    }
+    s.prefs.org_domains = vec!["studio.example".into(), "company0.example".into(), "company1.example".into()];
+    s.keep_senders_when(false);
+    let built = s.contacts_built;
+    let t = std::time::Instant::now();
+    for _ in 0..1_000_000 {
+        s.keep_senders_when(false);
+    }
+    println!("MEASURE the sender check looked at 1000000 times: {} ms", t.elapsed().as_millis());
+    assert_eq!(s.contacts_built, built, "nothing counted again");
 }

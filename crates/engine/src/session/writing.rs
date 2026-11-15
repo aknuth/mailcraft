@@ -35,6 +35,15 @@ pub enum SendCheck {
     Exposed { count: usize },
 }
 
+/// What a reply or forward goes with ([`Session::reply_head`]).
+struct ReplyHead {
+    account: String,
+    from: String,
+    signature: Option<mailcraft_model::Signature>,
+    encrypted: bool,
+    scheme: Option<Scheme>,
+}
+
 /// A message being written.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Compose {
@@ -74,8 +83,9 @@ pub struct Compose {
     /// replaced on the next save (the server gives it its place).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub draft_id: String,
-    /// The Bcc row is shown.
-    pub show_cc: bool,
+    /// The Bcc row is shown (`show_cc` as it was named, read still).
+    #[serde(alias = "show_cc")]
+    pub show_bcc: bool,
     /// Send as plain text only (lists written out, the rest of the formatting dropped).
     #[serde(default)]
     pub plain: bool,
@@ -227,8 +237,7 @@ impl Compose {
         // `-- ` stays text, as above every signature; the code is its next line.
         let (before, before_styles) = mime::rich::slice(&self.body, &styles, 0..start + "-- ".len());
         let (after, after_styles) = mime::rich::slice(&self.body, &styles, end..self.body.chars().count());
-        let tag = Some(self.signature_tag.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| format!("{:012x}", self.id));
-        let (code_html, code_pictures) = mime::signature_code_parts(code, &tag);
+        let (code_html, code_pictures) = mime::signature_code_parts(code, &self.signature_code_tag());
         let mut out = mime::rich::to_html(&before, &before_styles);
         // Marked, so a saved draft opened again has the code back as it was.
         out.push_str(&format!("<div class=\"{}\">{code_html}</div>", mime::SIGNATURE_CLASS));
@@ -265,7 +274,7 @@ impl Session {
         c.to = cap(&m.to);
         c.cc = cap(&m.cc);
         c.bcc = cap(&m.bcc);
-        c.show_cc |= !c.bcc.is_empty();
+        c.show_bcc |= !c.bcc.is_empty();
         c.subject = cap(&m.subject);
         if !m.body.is_empty() {
             let text = format!("{}{}", cap(&m.body), c.body);
@@ -309,6 +318,39 @@ impl Session {
         self.compose.iter().chain(self.composes.iter())
     }
 
+    /// Run `change` on every message being written, each made the current one while it runs
+    /// (what changes a message works on that one: the signature, From): those set aside first,
+    /// then the current one. Each trades places with the current one and back, so none is ever
+    /// out of both, and each stays where it was.
+    pub(crate) fn each_compose(&mut self, mut change: impl FnMut(&mut Self)) {
+        let mut i = 0;
+        while i < self.composes.len() {
+            let traded = match (self.compose.as_mut(), self.composes.get_mut(i)) {
+                (Some(current), Some(aside)) => {
+                    std::mem::swap(current, aside);
+                    true
+                }
+                _ => false,
+            };
+            if traded {
+                change(self);
+                if let (Some(current), Some(aside)) = (self.compose.as_mut(), self.composes.get_mut(i)) {
+                    std::mem::swap(current, aside);
+                }
+            } else {
+                self.compose = Some(self.composes.remove(i));
+                change(self);
+                if let Some(c) = self.compose.take() {
+                    self.composes.insert(i.min(self.composes.len()), c);
+                }
+            }
+            i += 1;
+        }
+        if self.compose.is_some() {
+            change(self);
+        }
+    }
+
     /// Message `id`, the one on screen or one set aside: news of a send may come for either.
     pub(super) fn compose_by_id(&self, id: u64) -> Option<Compose> {
         self.all_composes().chain(self.sent_away.iter()).find(|c| c.id == id).cloned()
@@ -330,42 +372,58 @@ impl Session {
             None => self.current_account().map(|a| self.sending_account(a.config.id.clone())),
         }
         .ok_or_else(|| CmdError::Disabled("add an account first".into()))?;
-        let sig = self.default_signature(&account, false);
+        // From the address the account writes its new mail from (issue #88), with its signature.
+        let from = self.account(&account).map(|a| a.config.new_mail_from().to_string()).unwrap_or_default();
+        let sig = self.signature_for(&account, &from, false);
         let id = self.fresh_id();
         let window = self.prefs.new_mail_window;
-        self.open_compose(Compose { id, account, window, ..Default::default() });
+        self.open_compose(Compose { id, account, from, window, ..Default::default() });
         self.put_signature(sig.as_ref(), None)?;
         self.compose.as_mut().ok_or_else(|| CmdError::Failed("compose".into()))
     }
 
+    /// What an answer to message `key` (`parsed`, protected as `security` says) goes with:
+    /// the account and address it's from, their signature, and whether it's encrypted, how.
+    fn reply_head(&self, key: &MessageKey, security: Option<&Security>, parsed: &Parsed) -> ReplyHead {
+        let encrypted = security.is_some_and(|s| matches!(s.lock, Some(Lock::Open { .. }))) && self.can_protect(&key.account);
+        // Answered the way it came, when the account can.
+        let came_as = security.map(|s| if s.pgp { Scheme::Pgp } else { Scheme::Smime });
+        let scheme = came_as
+            .filter(|s| encrypted && if *s == Scheme::Pgp { self.pgp_key(&key.account).is_some() } else { self.identity(&key.account).is_some() });
+        // Answered from an account that can send (not the data file it's in).
+        let account = self.sending_account(key.account.clone());
+        // From the address it was sent to, when that's one of the account's others and not its
+        // own as well (issue #81): the answer comes from where the mail went.
+        let from = self.account(&account).filter(|_| account == key.account).map(|a| &a.config).and_then(|config| {
+            let sent_to = |email: &str| parsed.to.iter().chain(&parsed.cc).any(|t| t.email.eq_ignore_ascii_case(email));
+            // One's own mail, written from one of them, is followed up from it.
+            let own = config.identity(&parsed.from.email).map(|i| i.email.clone());
+            // Sent to none of its addresses (a list's mail, a hidden copy): from the one its new
+            // mail is written from (issue #88).
+            own.or_else(|| {
+                if sent_to(&config.email) {
+                    None
+                } else {
+                    config.identities.iter().find(|i| sent_to(&i.email)).map(|i| i.email.clone()).or_else(|| Some(config.new_mail_from().to_string()))
+                }
+            })
+        });
+        let from = from.unwrap_or_default();
+        let signature = self.signature_for(&account, &from, true);
+        ReplyHead { account, from, signature, encrypted, scheme }
+    }
+
     pub fn reply_compose(&mut self, mode: ReplyMode) -> CmdResult {
         let r = self.reading.clone().ok_or_else(|| CmdError::Disabled("open a message first".into()))?;
-        let encrypted = r.security.as_ref().is_some_and(|s| matches!(s.lock, Some(Lock::Open { .. }))) && self.can_protect(&r.key.account);
-        // Answered the way it came, when the account can.
-        let came_as = r.security.as_ref().map(|s| if s.pgp { Scheme::Pgp } else { Scheme::Smime });
-        let scheme = came_as.filter(|s| {
-            encrypted && if *s == Scheme::Pgp { self.pgp_key(&r.key.account).is_some() } else { self.identity(&r.key.account).is_some() }
-        });
         // The reply's own copy (the quote's pictures are put in it), the one shown left as it is.
         let mut parsed = Arc::unwrap_or_clone(r.parsed.ok_or_else(|| CmdError::Disabled("the message is still downloading".into()))?);
         // Forwarded, its files go with it: not before they've come.
         if r.text_first && mode == ReplyMode::Forward {
             return Err(CmdError::Failed(super::STILL_COMING.into()));
         }
-        // Answered from an account that can send (not the data file it's in).
-        let account = self.sending_account(r.key.account.clone());
-        // From the address it was sent to, when that's one of the account's others and not its
-        // own as well (issue #81): the answer comes from where the mail went.
-        let from = self.account(&account).filter(|_| account == r.key.account).map(|a| &a.config).and_then(|config| {
-            let sent_to = |email: &str| parsed.to.iter().chain(&parsed.cc).any(|t| t.email.eq_ignore_ascii_case(email));
-            // One's own mail, written from one of them, is followed up from it.
-            let own = config.identity(&parsed.from.email).map(|i| i.email.clone());
-            own.or_else(|| if sent_to(&config.email) { None } else { config.identities.iter().find(|i| sent_to(&i.email)).map(|i| i.email.clone()) })
-        });
-        let from = from.unwrap_or_default();
-        let signature = self.signature_for(&account, &from, true);
+        let ReplyHead { account, from, signature, encrypted, scheme } = self.reply_head(&r.key, r.security.as_ref(), &parsed);
         let block = Self::signature_text(signature.as_ref());
-        let sig = block.strip_prefix("-- \n").unwrap_or_default();
+        let sig = block.strip_prefix(signatures::SIGNATURE_LINE).unwrap_or_default();
         let raw = self.readable_raw(&r.key);
         let original = parsed.clone();
         // The pictures in the quoted message go with it (they showed as "[picture]", issue #10).
@@ -386,8 +444,10 @@ impl Session {
         {
             // Pictures the quote shows go in it; any other, inline or not, as a file (a picture
             // sent inline beside plain text was lost).
+            let wanted: Vec<usize> = parsed.attachments.iter().map(|a| a.index).filter(|i| !quoted.contains(i)).collect();
+            let mut outs: HashMap<usize, OutAttachment> = mime::attachments_out(raw, &wanted).into_iter().collect();
             for a in parsed.attachments.iter().filter(|a| !quoted.contains(&a.index)) {
-                if let Some(out) = mime::attachment_out(raw, a.index) {
+                if let Some(out) = outs.remove(&a.index) {
                     attachments.push(OutAttachment { name: a.name.clone(), ..out });
                 }
             }
@@ -434,37 +494,69 @@ impl Session {
         let r = self.reading.clone().ok_or_else(|| CmdError::Disabled("open a message first".into()))?;
         let raw =
             self.store.as_ref().and_then(|s| s.read_body(&r.key)).ok_or_else(|| CmdError::Disabled("the message is still downloading".into()))?;
-        let out = self.reply_compose(ReplyMode::Forward)?;
-        // The signature of the account it goes from (not the data file it's in).
-        let (from, address) = self.compose.as_ref().map_or((r.key.account.clone(), String::new()), |c| (c.account.clone(), c.from.clone()));
-        let sig = self.signature_for(&from, &address, true);
-        let subject = r.parsed.as_ref().map(|p| p.subject.trim().to_string()).unwrap_or_default();
-        let name = format!("{}.eml", if subject.is_empty() { "message" } else { subject.as_str() });
-        if let Some(c) = self.compose.as_mut() {
-            c.set_text(String::new());
-            c.signature = String::new();
-            c.inline.clear();
-            c.quote = None;
-            c.attachments = vec![OutAttachment { name, mime: "message/rfc822".into(), data: raw, ..Default::default() }];
+        let parsed = r.parsed.ok_or_else(|| CmdError::Disabled("the message is still downloading".into()))?;
+        // Its files go with it: not before they've come.
+        if r.text_first {
+            return Err(CmdError::Failed(super::STILL_COMING.into()));
         }
-        self.put_signature(sig.as_ref(), None)?;
-        if let Some(id) = out.get("compose").and_then(|v| v.as_u64()) {
-            self.made_now(id);
-        }
-        Ok(out)
+        // From the account it goes from (not the data file it's in), with its signature.
+        let ReplyHead { account, from, signature, encrypted, scheme } = self.reply_head(&r.key, r.security.as_ref(), &parsed);
+        // Who it's to and its subject as a forward's (its text left out: none goes).
+        let (d, _) = mime::reply_head_doc(&parsed, ReplyMode::Forward, &self.me(&account), &self.clock, "");
+        let subject = parsed.subject.trim();
+        let name = format!("{}.eml", if subject.is_empty() { "message" } else { subject });
+        let id = self.fresh_id();
+        let mut c = Compose {
+            id,
+            account,
+            from,
+            to: addr::format_field(&d.to),
+            cc: addr::format_field(&d.cc),
+            subject: d.subject,
+            in_reply_to: d.in_reply_to,
+            references: d.references,
+            attachments: vec![OutAttachment { name, mime: "message/rfc822".into(), data: raw, ..Default::default() }],
+            mode: Some(ReplyMode::Forward),
+            source: Some(r.key),
+            sign: encrypted,
+            encrypt: encrypted,
+            scheme,
+            window: self.prefs.reply_window,
+            ..Default::default()
+        };
+        c.set_text(String::new());
+        self.open_compose(c);
+        self.put_signature(signature.as_ref(), None)?;
+        self.made_now(id);
+        Ok(serde_json::json!({ "compose": id }))
     }
 
-    pub(super) fn compose_draft(&self, c: &Compose) -> Result<mime::Draft, CmdError> {
-        let parse = |field: &str, s: &str| addr::parse_list(s).map_err(|bad| CmdError::Params(format!("{field}: not an email address: {bad}")));
+    /// `c` as it's written out: to be sent, or (`kept`) kept as a draft. Sent, every address must
+    /// read (else it's refused, saying which), its subject is trimmed and replies go where its
+    /// address has them go unless it says; kept, it may be unfinished: only the addresses that
+    /// read go, its subject as written, with its Bcc and the message it answers or forwards.
+    pub(super) fn draft_of(&self, c: &Compose, kept: bool) -> Result<mime::Draft, CmdError> {
+        let parse = |field: &str, s: &str| {
+            if kept {
+                Ok(addr::parse_valid(s))
+            } else {
+                addr::parse_list(s).map_err(|bad| CmdError::Params(format!("{field}: not an email address: {bad}")))
+            }
+        };
         let (body, html, inline) = c.bodies_with(&c.signature_code);
         // Where replies to the address it's from go, unless the message says where.
-        let replies = self.account(&c.account).and_then(|a| a.config.identity(&c.from)).map(|i| i.reply_to.as_str()).unwrap_or_default();
+        let replies = self.account(&c.account).and_then(|a| a.config.identity(&c.from)).map(|i| i.reply_to.as_str()).filter(|_| !kept);
+        let source = match (&c.source, c.mode) {
+            (Some(k), Some(ReplyMode::Forward)) if kept => format!("forward {}", k.to_id()),
+            (Some(k), Some(_)) if kept => format!("reply {}", k.to_id()),
+            _ => String::new(),
+        };
         Ok(mime::Draft {
-            reply_to: parse("Replies to", if c.reply_to.trim().is_empty() { replies } else { &c.reply_to })?,
+            reply_to: parse("Replies to", if c.reply_to.trim().is_empty() { replies.unwrap_or_default() } else { &c.reply_to })?,
             to: parse("To", &c.to)?,
             cc: parse("Cc", &c.cc)?,
             bcc: parse("Bcc", &c.bcc)?,
-            subject: c.subject.trim().to_string(),
+            subject: if kept { c.subject.clone() } else { c.subject.trim().to_string() },
             body,
             in_reply_to: c.in_reply_to.clone(),
             references: c.references.clone(),
@@ -474,8 +566,8 @@ impl Session {
             importance: c.importance,
             read_receipt: c.read_receipt,
             seven_bit: false,
-            keep_bcc: false,
-            source: String::new(),
+            keep_bcc: kept,
+            source,
         })
     }
 
@@ -531,11 +623,11 @@ impl Session {
     /// Everyone in To and Cc moved to Bcc, with the sender in To: each gets the message without
     /// seeing who else did.
     pub fn hide_recipients(&mut self) -> CmdResult {
-        let c = self.compose.as_ref().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+        let c = self.composing()?;
         // The address it's written from: the account's main one, put there for one of its
         // others, showed everyone the address the message wasn't to come from.
         let me = self.account(&c.account).map(|a| a.config.sender(&c.from).to_string()).unwrap_or_default();
-        let c = self.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+        let c = self.composing_mut()?;
         let moved: Vec<&str> = [c.to.as_str(), c.cc.as_str(), c.bcc.as_str()]
             .into_iter()
             .map(|f| f.trim().trim_end_matches(';').trim())
@@ -544,7 +636,7 @@ impl Session {
         c.bcc = moved.join("; ");
         c.to = if me.is_empty() { String::new() } else { format!("{me}; ") };
         c.cc.clear();
-        c.show_cc = true;
+        c.show_bcc = true;
         Ok(serde_json::json!({ "bcc": c.bcc }))
     }
 
@@ -556,8 +648,8 @@ impl Session {
             return Err(CmdError::Disabled("already sending".into()));
         }
         self.can_send(&c.account)?;
-        let mut d = self.compose_draft(&c)?;
-        if d.recipients().is_empty() {
+        let mut d = self.draft_of(&c, false)?;
+        if sending::no_recipient(&d) {
             return Err(CmdError::Params("add at least one recipient".into()));
         }
         if d.subject.is_empty() && !allow_empty_subject {
@@ -609,14 +701,21 @@ impl Session {
         let sent_folder = self.account(&c.account).and_then(|a| a.folder(FolderRole::Sent)).map(|f| f.path.clone());
         // Delay Delivery: into the Outbox, sent once it's time (the app has to be running then).
         if let Some(at) = c.send_after.filter(|at| *at > self.clock.now && !local) {
-            let item = OutboxItem { id: c.id, from, recipients, sent_folder, queued: self.clock.now, attempts: 0, error: None, not_before: at };
+            let item = OutboxItem {
+                id: c.id,
+                from,
+                recipients,
+                sent_folder,
+                queued: self.clock.now,
+                attempts: 0,
+                error: None,
+                not_before: at,
+                refused: false,
+            };
             let store = self.store.as_ref().ok_or_else(|| CmdError::Failed("there is nowhere to keep it".into()))?;
             store.outbox_add(&c.account, &item, &raw).map_err(|e| CmdError::Failed(format!("the Outbox couldn't keep it: {e}")))?;
             self.after_outbox_change();
-            self.finish_sent(c, false);
-            // finish_sent says "sent"; it isn't yet.
-            self.notices.pop();
-            self.notice(format!("It will be sent {}", mailcraft_model::dates::full_time(at, &self.clock)), false);
+            self.finish_sent(c, false, format!("It will be sent {}", mailcraft_model::dates::full_time(at, &self.clock)));
             return Ok(serde_json::json!({ "queued": c.id, "sendAfter": at }));
         }
         if local {
@@ -624,7 +723,7 @@ impl Session {
             if let Some(folder) = &sent_folder {
                 self.file_locally(&c.account, folder, &raw, true)?;
             }
-            self.finish_sent(c, true);
+            self.finish_sent(c, true, "Message sent".into());
             return Ok(serde_json::json!({ "sent": c.id, "local": true }));
         }
         self.jobs.push(Job::Send { account: c.account.clone(), id: c.id, raw, from, recipients, sent_folder });
@@ -633,6 +732,9 @@ impl Session {
     }
 
     pub(super) fn save_pending_marks(&self) {
+        if self.docs_unread.contains(PENDING_MARKS) {
+            return;
+        }
         let list: Vec<(u64, &MessageKey, &Flag)> = self.pending_marks.iter().map(|(id, (k, f))| (*id, k, f)).collect();
         if let Some(store) = &self.store
             && let Err(e) = store.save_doc(PENDING_MARKS, &list)
@@ -641,10 +743,10 @@ impl Session {
         }
     }
 
-    /// The compose is finished. `delivered`: the server accepted it, so the original gets its
-    /// Replied or Forwarded flag now; otherwise it sits in the Outbox and the flag is owed until
-    /// delivery.
-    pub(super) fn finish_sent(&mut self, c: &Compose, delivered: bool) {
+    /// The compose is finished, and `said` (where it went: sent, or waiting in the Outbox).
+    /// `delivered`: the server accepted it, so the original gets its Replied or Forwarded flag
+    /// now; otherwise it sits in the Outbox and the flag is owed until delivery.
+    pub(super) fn finish_sent(&mut self, c: &Compose, delivered: bool, said: String) {
         if let (Some(src), Some(mode)) = (&c.source, c.mode) {
             let flag = if mode == ReplyMode::Forward { Flag::Forwarded } else { Flag::Answered };
             if delivered {
@@ -662,6 +764,6 @@ impl Session {
         }
         self.composes.retain(|x| x.id != c.id);
         self.sent_away.retain(|x| x.id != c.id);
-        self.notice("Message sent", false);
+        self.notice(said, false);
     }
 }

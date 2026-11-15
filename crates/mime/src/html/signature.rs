@@ -27,7 +27,7 @@ pub(super) fn harmless_code(html: &str, dropped: &[&str]) -> String {
     // Inside <body>, when there is one.
     let inner = lower
         .find("<body")
-        .and_then(|b| lower.get(b..)?.find('>').map(|e| b + e + 1))
+        .and_then(|b| crate::html::tag_end(lower.as_bytes(), b + 1).map(|e| e + 1))
         .map(|start| {
             let end = lower.get(start..).and_then(|r| r.rfind("</body")).map_or(html.len(), |e| start + e);
             html.get(start..end).unwrap_or("")
@@ -36,14 +36,23 @@ pub(super) fn harmless_code(html: &str, dropped: &[&str]) -> String {
     let mut out = String::with_capacity(inner.len());
     let lower = inner.to_ascii_lowercase();
     let mut at = 0;
-    while let Some(i) = lower.get(at..).and_then(|r| r.find('<')).map(|i| at + i) {
+    while let Some(i) = lower.get(at..).and_then(|r| work::scanned(r, r.find('<'))).map(|i| at + i) {
         out.push_str(inner.get(at..i).unwrap_or(""));
         // A comment (Outlook's conditional ones among them) goes whole.
         if lower.get(i..).is_some_and(|r| r.starts_with("<!--")) {
-            at = lower.get(i..).and_then(|r| r.find("-->")).map_or(inner.len(), |e| i + e + 3);
+            at = lower.get(i..).and_then(|r| work::scanned(r, r.find("-->"))).map_or(inner.len(), |e| i + e + 3);
             continue;
         }
-        let Some(end) = lower.get(i..).and_then(|r| r.find('>')).map(|e| i + e + 1) else {
+        // A `<` no name follows is text to a browser, and none of a tag here: read as one
+        // (`<3 a="> <script>…">`), the script a browser finds in it went out with it.
+        if !lower.as_bytes().get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?')) {
+            out.push('<');
+            at = i + 1;
+            continue;
+        }
+        // Its end as a browser finds it: a `>` in a quoted value isn't it (`<img alt="a>b"
+        // onerror=…>` read as a tag ending at `a>` let its handler through as text).
+        let Some(end) = inner.get(i..).and_then(tag_end).map(|e| i + e) else {
             at = inner.len();
             break;
         };
@@ -55,78 +64,101 @@ pub(super) fn harmless_code(html: &str, dropped: &[&str]) -> String {
         }
         let name: String =
             tag.trim_start_matches(['<', '/']).chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
-        if dropped.contains(&name.as_str()) {
+        // `<noscript>` goes too: a browser that runs scripts reads what's in it as text, one that
+        // doesn't as tags, and no one reading is safe for both.
+        if dropped.contains(&name.as_str()) || name == "noscript" {
             at = end;
             // The element's content too, up to its end.
             if !tag.starts_with("</") && !tag.ends_with("/>") && !matches!(name.as_str(), "meta" | "link" | "embed") {
                 let close = format!("</{name}");
                 at = lower
                     .get(end..)
-                    .and_then(|r| r.find(&close))
-                    .and_then(|c| lower.get(end + c..)?.find('>').map(|e| end + c + e + 1))
+                    .and_then(|r| work::scanned(r, r.find(&close)))
+                    .and_then(|c| lower.get(end + c..).and_then(|r| work::scanned(r, r.find('>'))).map(|e| end + c + e + 1))
                     .unwrap_or(inner.len());
             }
             continue;
         }
         out.push_str(&harmless_tag(tag));
         at = end;
+        // What such an element holds is text to a browser, up to its end tag: read as tags
+        // (`<style><p a="</style><script>…">`), the script after that end tag went out inside
+        // a quoted value. It goes as written, less the `<` of anything a tag could start with
+        // (inside an `<svg>` a browser reads tags there).
+        if !tag.starts_with("</") && RAW_TEXT.contains(&name.as_str()) {
+            let close = raw_text_end(&lower, end, &name);
+            let text = inner.get(end..close).unwrap_or("");
+            work::steps(text.len());
+            let b = text.as_bytes();
+            out.extend(
+                text.char_indices()
+                    .filter(|(n, c)| !(*c == '<' && b.get(n + 1).is_some_and(|d| d.is_ascii_alphabetic() || *d == b'/')))
+                    .map(|(_, c)| c),
+            );
+            at = close;
+        }
     }
     out.push_str(inner.get(at..).unwrap_or(""));
     out.trim().to_string()
 }
 
-/// A tag without its `on…` attributes and with `javascript:` addresses emptied.
+/// Elements whose content a browser reads as text, not tags, up to their end tag.
+const RAW_TEXT: [&str; 6] = ["style", "textarea", "xmp", "noembed", "noframes", "plaintext"];
+
+/// Where the content of the raw-text element `name` whose tag ends at `from` ends in `lower`:
+/// at its end tag as a browser finds it (`</name` and a space, `/` or `>`), or with the code.
+fn raw_text_end(lower: &str, from: usize, name: &str) -> usize {
+    let close = format!("</{name}");
+    let mut at = from;
+    while let Some(c) = lower.get(at..).and_then(|r| work::scanned(r, r.find(&close))).map(|c| at + c) {
+        if lower.as_bytes().get(c + close.len()).is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'/' | b'>')) {
+            return c;
+        }
+        at = c + close.len();
+    }
+    lower.len()
+}
+
+/// A tag without its `on…` attributes and with `javascript:` addresses emptied. Its attributes
+/// are read as a browser reads them ([`crate::html::attributes`]): a handler after a quoted value with no
+/// space (`src="x"onerror=…`), or after a `/` (`<img/onerror=…>`), is one; and an address whose
+/// scheme comes out as `javascript:` or `vbscript:` once its character references are read and
+/// the spaces a browser drops are gone (`java&#x09;script:`) goes whole. Every `javascript:`
+/// written as it is is then emptied, as before.
 fn harmless_tag(tag: &str) -> String {
-    let lower = tag.to_ascii_lowercase();
-    if !lower.contains(" on") && !lower.contains("javascript:") && !lower.contains("\non") && !lower.contains("\ton") {
-        return tag.to_string();
-    }
-    let mut out = String::with_capacity(tag.len());
-    let chars: Vec<char> = tag.chars().collect();
-    let mut i = 0;
-    while let Some(&c) = chars.get(i) {
-        let starts_attr = c.is_whitespace()
-            && chars.get(i + 1).is_some_and(|c| c.eq_ignore_ascii_case(&'o'))
-            && chars.get(i + 2).is_some_and(|c| c.eq_ignore_ascii_case(&'n'))
-            && chars.get(i + 3).is_some_and(char::is_ascii_alphabetic);
-        if !starts_attr {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        // Skip the name, `=` and its value (quoted, or up to a space).
-        i += 1;
-        while chars.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || *c == '-') {
-            i += 1;
-        }
-        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
-            i += 1;
-        }
-        if chars.get(i) == Some(&'=') {
-            i += 1;
-            while chars.get(i).is_some_and(|c| c.is_whitespace()) {
-                i += 1;
-            }
-            match chars.get(i) {
-                Some(&q @ ('"' | '\'')) => {
-                    i += 1;
-                    while chars.get(i).is_some_and(|c| *c != q) {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                _ => {
-                    while chars.get(i).is_some_and(|c| !c.is_whitespace() && *c != '>') {
-                        i += 1;
-                    }
-                }
+    let (name_end, attrs) = crate::html::attributes(tag);
+    let value = |a: &crate::html::Attribute| tag.get(a.value.clone()).unwrap_or("");
+    let out = if tag.starts_with("</") || !attrs.iter().any(|a| a.name.starts_with("on") || hidden_script(value(a))) {
+        tag.to_string()
+    } else {
+        let mut out = String::with_capacity(tag.len());
+        out.push_str(tag.get(..name_end).unwrap_or(""));
+        for a in attrs.iter().filter(|a| !a.name.starts_with("on")) {
+            out.push(' ');
+            if hidden_script(value(a)) {
+                out.push_str(tag.get(a.span.start..a.name_end).unwrap_or(""));
+                out.push_str("=\"#\"");
+            } else {
+                out.push_str(tag.get(a.span.clone()).unwrap_or(""));
             }
         }
+        out.push_str(if tag.trim_end_matches('>').trim_end().ends_with('/') { " />" } else { ">" });
+        out
+    };
+    // Each `javascript:` emptied in one pass (`#` can't make another): lowering the tag again and
+    // moving its tail for each one was quadratic in a tag full of them.
+    const JS: &str = "javascript:";
+    let lower = out.to_ascii_lowercase();
+    work::steps(out.len());
+    let mut emptied = String::with_capacity(out.len());
+    let mut at = 0;
+    while let Some(j) = lower.get(at..).and_then(|r| work::scanned(r, r.find(JS))).map(|j| at + j) {
+        emptied.push_str(out.get(at..j).unwrap_or(""));
+        emptied.push('#');
+        at = j + JS.len();
     }
-    while let Some(j) = out.to_ascii_lowercase().find("javascript:") {
-        out.replace_range(j..j + "javascript:".len(), "#");
-    }
-    out
+    emptied.push_str(out.get(at..).unwrap_or(""));
+    emptied
 }
 
 /// A signature saved as a web page (Outlook's `.htm` signatures, a signature maker's file) as
@@ -157,7 +189,7 @@ pub fn pictures_beside(html: &str) -> String {
     let (mut last, mut from) = (0, 0);
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         from = end + 1;
         let tag = html.get(start..end).unwrap_or("");
         let Some(src) = tag_attr(tag, "src") else { continue };
@@ -186,7 +218,7 @@ pub fn code_without_pictures(code: &str) -> (String, Vec<String>) {
     let (mut last, mut from) = (0, 0);
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         from = end + 1;
         let tag = code.get(start..end).unwrap_or("");
         let Some(src) = tag_attr(tag, "src").filter(|s| s.trim().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"))) else { continue };
@@ -212,12 +244,34 @@ pub fn code_with_pictures(code: &str, pictures: &[String]) -> String {
     out
 }
 
+/// The end of every signature picture's `cid:`.
+const SIGNATURE_CID_END: &str = "@mailcraft";
+
+/// The `cid:` of a signature's picture `n` (from 1) as the signature has it:
+/// `signatureN@mailcraft`.
+pub fn signature_cid(n: usize) -> String {
+    format!("signature{n}{SIGNATURE_CID_END}")
+}
+
+/// A signature's picture `cid` ([`signature_cid`]) as it goes into one message, whose `tag` it
+/// takes: `signatureN.{tag}@mailcraft`, a `cid:` of that message's own (RFC 2392).
+pub fn message_signature_cid(cid: &str, tag: &str) -> String {
+    format!("{}.{tag}{SIGNATURE_CID_END}", cid.strip_suffix(SIGNATURE_CID_END).unwrap_or(cid))
+}
+
+/// The tag of a signature's picture in a message ([`message_signature_cid`]), or `None` for any
+/// other `cid:` (another sender's `signature.png@…` is theirs, not a signature's put in here).
+pub fn signature_cid_tag(cid: &str) -> Option<&str> {
+    let (n, tag) = cid.strip_prefix("signature")?.strip_suffix(SIGNATURE_CID_END)?.split_once('.')?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !tag.is_empty() && !tag.contains('@')).then_some(tag)
+}
+
 /// A signature's code as it goes into a message: its `data:` pictures as parts of the message,
 /// each under `cid:signatureN.{tag}@mailcraft` (a `cid:` of this message's own, RFC 2392).
 pub fn signature_code_parts(code: &str, tag: &str) -> (String, Vec<InlinePicture>) {
     let (mut html, mut pictures) = data_pictures(code);
     for p in &mut pictures {
-        let own = format!("{}.{tag}@mailcraft", p.cid.trim_end_matches("@mailcraft"));
+        let own = message_signature_cid(&p.cid, tag);
         html = html.replace(&format!("cid:{}\"", p.cid), &format!("cid:{own}\"")).replace(&format!("cid:{}'", p.cid), &format!("cid:{own}'"));
         p.cid = own;
     }
@@ -232,7 +286,7 @@ pub(super) fn cells_in_turn(html: &str) -> String {
     let mut at = 0;
     while let Some(i) = lower.get(at..).and_then(|r| r.find('<')).map(|i| at + i) {
         out.push_str(html.get(at..i).unwrap_or(""));
-        let Some(end) = lower.get(i..).and_then(|r| r.find('>')).map(|e| i + e + 1) else {
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), i + 1).map(|e| e + 1) else {
             at = i;
             break;
         };
@@ -253,4 +307,62 @@ pub(super) fn cells_in_turn(html: &str) -> String {
     }
     out.push_str(html.get(at..).unwrap_or(""));
     out
+}
+
+/// Where the tag starting `html` ends (past its `>`), as a browser finds it
+/// ([`crate::html::tag_end`]). `None`: it never ends.
+fn tag_end(html: &str) -> Option<usize> {
+    crate::html::tag_end(html.as_bytes(), 1).map(|e| e + 1)
+}
+
+/// Whether an address hides a script a browser would run where `javascript:` written as it is
+/// doesn't show it: its scheme, once its character references are read and the spaces and
+/// control characters a browser drops are gone, is `javascript:` or `vbscript:`.
+fn hidden_script(value: &str) -> bool {
+    let mut scheme = String::new();
+    let mut rest = value;
+    while scheme.len() < 16 {
+        let Some(c) = rest.chars().next() else { break };
+        let (c, len) = if c == '&' { reference(rest).unwrap_or(('&', 1)) } else { (c, c.len_utf8()) };
+        rest = rest.get(len..).unwrap_or("");
+        if c == ':' {
+            let plain = value.trim_start().to_ascii_lowercase().starts_with("javascript:");
+            return scheme == "vbscript" || (scheme == "javascript" && !plain);
+        }
+        if !(c.is_ascii_whitespace() || c.is_ascii_control()) {
+            scheme.push(c.to_ascii_lowercase());
+        }
+    }
+    false
+}
+
+/// The character a reference at the start of `s` stands for, and how long it is: numbered ones
+/// (with or without their `;`, as a browser reads them) and those a scheme can hide behind.
+fn reference(s: &str) -> Option<(char, usize)> {
+    let after = s.get(1..)?;
+    for (name, c) in [("Tab;", '\t'), ("NewLine;", '\n'), ("colon;", ':')] {
+        if after.starts_with(name) {
+            return Some((c, 1 + name.len()));
+        }
+    }
+    let num = after.strip_prefix('#')?;
+    let (hex, digits) = match num.strip_prefix(['x', 'X']) {
+        Some(h) => (true, h),
+        None => (false, num),
+    };
+    // Every digit there is, as a browser takes them (`&#00000000106;` is a `j`: cut at eight, it
+    // hid a `javascript:`); a number too large for a character is U+FFFD, as there.
+    let n = digits.bytes().take_while(|c| if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() }).count();
+    work::steps(n);
+    if n == 0 {
+        return None;
+    }
+    let written = digits.get(..n)?.trim_start_matches('0');
+    let code = match written.len() {
+        0 => 0,
+        1..=8 => u32::from_str_radix(written, if hex { 16 } else { 10 }).unwrap_or(u32::MAX),
+        _ => u32::MAX,
+    };
+    let semi = usize::from(digits.get(n..).is_some_and(|r| r.starts_with(';')));
+    Some((char::from_u32(code).unwrap_or('\u{fffd}'), 2 + usize::from(hex) + n + semi))
 }

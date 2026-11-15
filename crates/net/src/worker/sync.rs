@@ -4,6 +4,11 @@ use super::*;
 
 mod calendars;
 
+// Run once, on this thread, as [`Worker::publish_folders`] is about to write the folder list: a
+// test's way to come between deciding to write it and writing it.
+#[cfg(test)]
+thread_local!(pub(super) static BEFORE_FOLDERS_SAVED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) });
+
 /// How often a full sync says the counts of the folders it has synced, at most.
 const COUNTS_EVERY: Duration = Duration::from_secs(1);
 /// A minute of an account's own time between looks for new mail (short in tests, to see some pass).
@@ -238,7 +243,6 @@ impl Worker {
         self.folders.iter().find(|f| f.role == FolderRole::Inbox).map(|f| f.path.clone())
     }
 
-    /// The folder list, then every folder (Inbox first), staying responsive to opened messages.
     /// Refresh the folder list from the server; `false` when that failed.
     pub(super) fn relist(&mut self) -> bool {
         self.relist_as(false)
@@ -261,14 +265,21 @@ impl Worker {
             Some(Conn::Pop) => crate::pop::folders(&self.store, &id),
             None => Err(NetError::Closed("not connected".into())),
         };
-        let jmap = matches!(self.conn, Some(Conn::Jmap(_) | Conn::Graph(_) | Conn::Ews(_)));
-        if jmap {
+        let api = matches!(self.conn, Some(Conn::Jmap(_) | Conn::Graph(_) | Conn::Ews(_)));
+        if api {
             self.save_jstate();
         }
         match listed {
             Ok(mut list) => {
-                // JMAP lists the counts; IMAP's come from each folder's sync.
-                for f in list.iter_mut().filter(|_| !jmap) {
+                // The server took the token for mail (one renewed, say): a refusal from here on
+                // is a new one, and gets a fresh token again (found by a test hang: the token a
+                // renewal brought, refused before that sync was done, asked to sign in again with
+                // the refresh token never tried). POP's list is this computer's.
+                if !matches!(self.conn, Some(Conn::Pop)) {
+                    self.token_retried = false;
+                }
+                // JMAP, Graph and Exchange list the counts; IMAP's come from each folder's sync.
+                for f in list.iter_mut().filter(|_| !api) {
                     if let Some(old) = self.folders.iter().find(|o| o.path == f.path) {
                         f.unread = old.unread;
                         f.total = old.total;
@@ -286,18 +297,21 @@ impl Worker {
                 // in review: a folder renamed twice offline, listed after the first rename, lost
                 // its cache, and its mail was downloaded again). That one's looked at again at the
                 // next listing, once they're sent (found in review: one deleted on the server
-                // meanwhile kept its cache for good).
-                let waiting = self.store.load_ops(&id).unwrap_or_default().iter().any(Op::is_folder_op);
-                let here = if waiting { self.store.load_folders(&id).unwrap_or_default() } else { Vec::new() };
+                // meanwhile kept its cache for good). Changes or a list that can't be read (the
+                // disk failing) can't say which those are: every one keeps its cache till the next
+                // listing, as does one whose cache couldn't be cleared (found in review: taken for
+                // nothing waiting, they lost it all).
+                let here = self.kept_while_waiting(&id);
                 let mut gone: Vec<String> = self.folders.iter().map(|f| f.path.clone()).chain(std::mem::take(&mut self.gone_meanwhile)).collect();
                 gone.retain(|p| !list.iter().any(|f| f.path == *p));
                 gone.sort_unstable();
                 gone.dedup();
                 for path in gone {
-                    if here.iter().any(|f| f.path == path) {
+                    if here.as_ref().is_none_or(|here| here.iter().any(|f| f.path == path)) {
                         self.gone_meanwhile.push(path);
-                    } else {
-                        let _ = self.store.clear_folder(&id, &path);
+                    } else if let Err(e) = self.store.clear_folder(&id, &path) {
+                        log::warn!("{id}: a folder gone from the server keeps its cache for now: {e}");
+                        self.gone_meanwhile.push(path);
                     }
                 }
                 self.folders = list;
@@ -317,6 +331,16 @@ impl Worker {
         }
     }
 
+    /// The folders the list on disk has while changes to the folders wait to be sent (none when
+    /// none wait); `None`, said in the log, when either can't be read.
+    fn kept_while_waiting(&self, id: &str) -> Option<Vec<Folder>> {
+        let read = || -> std::result::Result<Vec<Folder>, mailcraft_store::StoreError> {
+            if self.store.load_ops(id)?.iter().any(Op::is_folder_op) { self.store.load_folders(id) } else { Ok(Vec::new()) }
+        };
+        read().inspect_err(|e| log::warn!("{id}: the folders gone from the server keep their cache for now: {e}")).ok()
+    }
+
+    /// The folder list, then every folder (Inbox first), staying responsive to opened messages.
     pub(super) fn sync_all(&mut self, rx: &Receiver<Job>) {
         let began = Instant::now();
         if !self.relist() {
@@ -376,7 +400,7 @@ impl Worker {
             self.last_full = Some(Instant::now());
             self.looked = self.last_full;
             // All of it read: a connection lost from here on is tried again soonest.
-            self.backoff = Duration::from_secs(5);
+            self.backoff = FIRST_BACKOFF;
             // Anything left from a failed attempt gets another try every full sync.
             self.flush_outbox();
             log::info!("{}: synced {} folders in {:.1} s", self.acc.id, self.folders.len(), began.elapsed().as_secs_f32());
@@ -409,20 +433,28 @@ impl Worker {
         }
     }
 
-    /// Forget the numbers of JMAP messages no longer cached (nor waiting in a change).
+    /// Forget the numbers of JMAP messages no longer cached (nor waiting in a change). Not when
+    /// the changes or a folder can't be read (the disk failing): their numbers would be lost, and
+    /// the changes never sent (found in review). The next full sync tries again.
     pub(super) fn prune_jmap_numbers(&mut self) {
         if !matches!(self.conn, Some(Conn::Jmap(_) | Conn::Graph(_) | Conn::Ews(_))) {
             return;
         }
-        let ops = self.store.load_ops(&self.acc.id).unwrap_or_default();
-        let mut keep: std::collections::HashSet<u32> = ops.iter().flat_map(|o| o.keys().iter().map(|k| k.uid).collect::<Vec<_>>()).collect();
-        for f in &self.folders {
-            if let Ok(st) = self.store.load_folder(&self.acc.id, &f.path) {
-                keep.extend(st.messages.iter().map(|m| m.key.uid));
+        let read = || -> std::result::Result<std::collections::HashSet<u32>, mailcraft_store::StoreError> {
+            let ops = self.store.load_ops(&self.acc.id)?;
+            let mut keep: std::collections::HashSet<u32> = ops.iter().flat_map(|o| o.keys().iter().map(|k| k.uid)).collect();
+            for f in &self.folders {
+                keep.extend(self.store.folder_uids(&self.acc.id, &f.path)?);
             }
+            Ok(keep)
+        };
+        match read() {
+            Ok(keep) => {
+                self.jstate.prune(&keep);
+                self.save_jstate();
+            }
+            Err(e) => log::warn!("{}: the server's message numbers are all kept for now: {e}", self.acc.id),
         }
-        self.jstate.prune(&keep);
-        self.save_jstate();
     }
 
     /// The account's folder list read again from disk (a folder made, renamed or deleted here),
@@ -431,10 +463,22 @@ impl Worker {
     /// pool said that list as it made the change on disk (a POP account's worker says it next),
     /// and this worker's lists say them from now on, so the next isn't news, and write nothing
     /// over them (found in review: said and written with this worker's counts from before, mail
-    /// read here came back unread, in the window and at the next start).
-    pub(super) fn reload_folders(&mut self) {
+    /// read here came back unread, in the window and at the next start). A list that can't be
+    /// read (the disk failing) leaves this worker's as it was, and `false` (found in review: it
+    /// was left with none, and a POP account's wrote that over the one on disk, its mail out of
+    /// reach).
+    pub(super) fn reload_folders(&mut self) -> bool {
         self.say_counts();
-        self.folders = self.store.load_folders(&self.acc.id).unwrap_or_default();
+        match self.store.load_folders(&self.acc.id) {
+            Ok(folders) => {
+                self.folders = folders;
+                true
+            }
+            Err(e) => {
+                log::warn!("{}: the folder list wasn't read again: {e}", self.acc.id);
+                false
+            }
+        }
     }
 
     /// A folder renamed here (`from` to `to`, with the folders in it): this worker's list and the
@@ -532,12 +576,17 @@ impl Worker {
     }
 
     /// The account's folders written and said as this worker has them (listed from the server);
-    /// not once it was removed (found in review: its files came back).
+    /// not once it was removed (found in review: its files came back). Written while it's kept
+    /// ([`Store::while_kept`]): a removal coming as it's written waits for it, and one just before
+    /// is seen (a look first, then the write, let one in between bring the list back).
     pub(super) fn publish_folders(&self) {
-        if self.removed() {
+        #[cfg(test)]
+        if let Some(before) = BEFORE_FOLDERS_SAVED.with(|b| b.borrow_mut().take()) {
+            before();
+        }
+        if self.store.while_kept(&self.acc.id, self.removals, || self.store.save_folders(&self.acc.id, &self.folders)).is_none() {
             return;
         }
-        let _ = self.store.save_folders(&self.acc.id, &self.folders);
         self.sink.emit(Event::Folders { account: self.id(), folders: self.folders.clone() });
     }
 
@@ -559,7 +608,7 @@ impl Worker {
             self.connect_and_sync();
         }
         let store = self.store.clone();
-        let (imap, filter, words) = (crate::sync::imap_criteria(&query), mailcraft_jmap::search_filter(&query), crate::sync::word_query(&query));
+        let asked = ServerQuery::new(&query);
         let asks = match self.conn.as_ref() {
             None => {
                 self.sink.emit(answer(Vec::new(), Some("the account isn't connected".into()), true));
@@ -569,15 +618,15 @@ impl Worker {
                 self.sink.emit(answer(Vec::new(), Some("a POP account keeps all its mail here".into()), true));
                 return;
             }
-            Some(Conn::Imap(_)) => imap.is_some(),
-            Some(Conn::Jmap(_)) => filter.is_some(),
-            Some(Conn::Graph(_) | Conn::Ews(_)) => words.is_some(),
+            Some(c) => c.asks(&asked),
         };
         if !asks {
             self.sink.emit(answer(Vec::new(), None, true));
             return;
         }
         let (mut any, mut failed) = (false, None);
+        // Nothing found is kept once the account is removed (found in review: its files came back).
+        let seen = self.removals;
         for f in folders.iter().take(200) {
             if !still() {
                 break;
@@ -593,22 +642,8 @@ impl Worker {
                 }
                 still()
             };
-            let found = match (self.conn.as_mut(), &imap, &filter, &words) {
-                (Some(Conn::Imap(c)), Some(q), _, _) => crate::sync::find_on_server(c, &store, &id, f, q, FOUND_MAX, &mut sent).map(|_| ()),
-                (Some(Conn::Jmap(c)), _, Some(q), _) => jmap::find_on_server(c, &mut self.jstate, &store, &id, f, q, FOUND_MAX).map(|(keys, new)| {
-                    sent(keys, new);
-                }),
-                (Some(Conn::Graph(c)), _, _, Some(q)) => {
-                    crate::graph::find_on_server(c, &mut self.jstate, &store, &id, f, q, FOUND_MAX).map(|(keys, new)| {
-                        sent(keys, new);
-                    })
-                }
-                (Some(Conn::Ews(c)), _, _, Some(q)) => {
-                    crate::ews::find_on_server(c, &mut self.jstate, &store, &id, f, q, FOUND_MAX).map(|(keys, new)| {
-                        sent(keys, new);
-                    })
-                }
-                _ => break,
+            let Some(found) = self.conn.as_mut().and_then(|c| c.find_on_server(&mut self.jstate, &store, (&id, seen), f, &asked, &mut sent)) else {
+                break;
             };
             if let Err(e) = found {
                 log::info!("{id}/{f}: searching the server: {e}");

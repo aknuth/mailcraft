@@ -88,22 +88,18 @@ pub(super) fn color_button(
 }
 
 /// The Message ribbon: font size, bold / italic / underline / strikethrough, colours, lists,
-/// alignment, indent, clear formatting; then names, files, links and pictures.
-/// The Message ribbon; `signatures` are the sending account's, by name (its Signature menu).
+/// alignment, indent, clear formatting; then names, files, links, pictures, the signature, the
+/// date and time, and the word count. `signatures` are the sending account's, by name (its
+/// Signature menu).
 pub(crate) fn ribbon(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, signatures: &[String], clock: &Clock, acts: &mut Vec<Action>) {
-    c.styles.fit(&c.body);
-    let n = c.body.chars().count();
-    let sel = ed.sel.start.min(n)..ed.sel.end.min(n);
-    let cur =
-        ed.typing.clone().unwrap_or_else(|| if sel.is_empty() { typing_style(&c.body, &c.styles, sel.start) } else { c.styles.style(sel.start) });
-    let para = c.styles.para(rich::lines_of(&c.body, sel.start..sel.start).0);
+    let (sel, cur, para) = ribbon_state(ed, c);
     let mut ops: Vec<Op> = Vec::new();
     wrapped_row(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         format_buttons(ui, t, c, &cur, para, &mut ops);
         sep(ui, t);
         if crate::widgets::tool_button(ui, Icon::AddressBook, "Address Book", t, !c.sending).on_hover_text(tl!("Ctrl+Shift+B")).clicked() {
-            acts.push(Action::Dialog(Dialog::select_names(c, "to")));
+            acts.push(Action::Dialog(Dialog::select_names(c, crate::dialogs::Recipients::To)));
         }
         if crate::widgets::tool_button(ui, Icon::Attach, "Attach File", t, !c.sending).clicked() {
             acts.push(Action::AttachFiles);
@@ -146,12 +142,29 @@ pub(crate) fn ribbon(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, 
         });
         // How much is written: the selection's count, or the whole message's.
         if crate::widgets::tool_button(ui, Icon::ListNumber, "Word count", t, true).clicked() {
-            let range = if sel.is_empty() { 0..n } else { sel.clone() };
-            let text: String = c.body.chars().skip(range.start).take(range.end - range.start).filter(|ch| *ch != rich::PICTURE).collect();
+            let range = if sel.is_empty() { 0..c.body.chars().count() } else { sel.clone() };
+            let text: String = chars_in(&c.body, range).filter(|ch| *ch != rich::PICTURE).collect();
             acts.push(Action::Dialog(Dialog::WordCount(count_words(&text), !sel.is_empty())));
         }
     });
     link_dialog(ui, t, ed, c);
+    apply_ops(ed, c, ops);
+}
+
+/// What a ribbon shows the buttons for: the selection (inside the text), the look there (what
+/// typing would take, with nothing selected) and its paragraph's.
+fn ribbon_state(ed: &Editor, c: &mut Compose) -> (Range<usize>, Style, rich::Para) {
+    c.styles.fit(&c.body);
+    let n = c.body.chars().count();
+    let sel = ed.sel.start.min(n)..ed.sel.end.min(n);
+    let cur =
+        ed.typing.clone().unwrap_or_else(|| if sel.is_empty() { typing_style(&c.body, &c.styles, sel.start) } else { c.styles.style(sel.start) });
+    let para = c.styles.para(line_at(&c.body, sel.start).0);
+    (sel, cur, para)
+}
+
+/// Apply what a ribbon's buttons asked for; the text gets the keyboard back when there was any.
+fn apply_ops(ed: &mut Editor, c: &mut Compose, ops: Vec<Op>) {
     let changed = !ops.is_empty();
     for op in ops {
         apply(ed, c, op);
@@ -167,13 +180,18 @@ fn format_buttons(ui: &mut Ui, t: &Tokens, c: &Compose, cur: &Style, para: rich:
     ui.add_enabled_ui(!c.plain, |ui| {
         // In the middle of the row's height, as the buttons' faces are.
         ui.allocate_ui_with_layout(vec2(0.0, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            egui::ComboBox::from_id_salt(("font-size", c.id)).width(48.0).selected_text(cur.size().to_string()).show_ui(ui, |ui| {
-                for z in rich::SIZES {
-                    if ui.selectable_label(cur.size() == z, z.to_string()).clicked() {
-                        ops.push(Op::Size(z));
+            egui::ComboBox::from_id_salt(("font-size", c.id))
+                .width(48.0)
+                .selected_text(cur.size().to_string())
+                .show_ui(ui, |ui| {
+                    for z in rich::SIZES {
+                        if ui.selectable_label(cur.size() == z, z.to_string()).clicked() {
+                            ops.push(Op::Size(z));
+                        }
                     }
-                }
-            });
+                })
+                .response
+                .accessible_name(tl!("Font size"));
         });
         ui.add_space(4.0);
         let letter = |bold: bool, italic: bool, under: bool, strike: bool| {
@@ -225,12 +243,7 @@ fn format_buttons(ui: &mut Ui, t: &Tokens, c: &Compose, cur: &Style, para: rich:
 /// pictures (issue #11: signatures were thought to be plain text, their formatting there only to
 /// paste or by its shortcuts).
 pub(crate) fn signature_bar(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, acts: &mut Vec<Action>) {
-    c.styles.fit(&c.body);
-    let n = c.body.chars().count();
-    let sel = ed.sel.start.min(n)..ed.sel.end.min(n);
-    let cur =
-        ed.typing.clone().unwrap_or_else(|| if sel.is_empty() { typing_style(&c.body, &c.styles, sel.start) } else { c.styles.style(sel.start) });
-    let para = c.styles.para(rich::lines_of(&c.body, sel.start..sel.start).0);
+    let (sel, cur, para) = ribbon_state(ed, c);
     let mut ops: Vec<Op> = Vec::new();
     wrapped_row(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -243,13 +256,7 @@ pub(crate) fn signature_bar(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Co
             acts.push(Action::SignaturePicture { paste: false });
         }
     });
-    let changed = !ops.is_empty();
-    for op in ops {
-        apply(ed, c, op);
-    }
-    if changed {
-        ed.refocus = Some(ed.sel.clone());
-    }
+    apply_ops(ed, c, ops);
 }
 
 /// The ways today's date and the time can go in: written out, as numbers, with the time, the

@@ -4,11 +4,13 @@
 //! email, and naming the address the message is from.
 
 use der::asn1::ObjectIdentifier;
-use der::{Decode, Encode, Tag, Tagged};
+use der::{Decode, Tag, Tagged};
 use sha2::Digest as _;
+use std::cell::OnceCell;
 use x509_cert::Certificate;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName};
+use x509_cert::name::Name;
 
 use crate::{Error, oids};
 
@@ -59,17 +61,22 @@ pub fn info(cert: &[u8]) -> Result<CertInfo, Error> {
     let emails = emails(&c);
     let name = name_part(&tbs.subject, oids::COMMON_NAME).or_else(|| emails.first().cloned()).unwrap_or_default();
     let issuer = name_part(&tbs.issuer, oids::COMMON_NAME).or_else(|| name_part(&tbs.issuer, oids::ORGANIZATION)).unwrap_or_default();
-    let secs = |t: &x509_cert::time::Time| i64::try_from(t.to_unix_duration().as_secs()).unwrap_or(i64::MAX);
     let fingerprint = sha2::Sha256::digest(cert).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
     Ok(CertInfo {
         name,
         emails,
         issuer,
-        not_before: secs(&tbs.validity.not_before),
-        not_after: secs(&tbs.validity.not_after),
+        not_before: secs(tbs.validity.not_before.to_unix_duration()),
+        not_after: secs(tbs.validity.not_after.to_unix_duration()),
         fingerprint,
         key: key_description(&c),
     })
+}
+
+/// A time (a certificate's, a list's, an answer's) in Unix seconds. `der`'s times end in 9999,
+/// far inside an `i64`: the fallback is never reached.
+pub(crate) fn secs(since_1970: std::time::Duration) -> i64 {
+    i64::try_from(since_1970.as_secs()).unwrap_or(i64::MAX)
 }
 
 /// The addresses a certificate is for, lower-case, each once.
@@ -89,20 +96,39 @@ pub(crate) fn emails(c: &Certificate) -> Vec<String> {
             }
         }
     }
-    out.retain(|e| !e.is_empty());
-    out.dedup();
-    let mut seen = Vec::new();
-    out.retain(|e| {
-        let new = !seen.contains(e);
-        seen.push(e.clone());
-        new
-    });
+    each_once(out)
+}
+
+/// `found`'s addresses, the empty ones left out and each kept where it first came.
+fn each_once(found: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(found.len());
+    for e in found {
+        if !e.is_empty() && !out.contains(&e) {
+            out.push(e);
+        }
+    }
     out
 }
 
-fn extension<T: for<'a> Decode<'a>>(c: &Certificate, oid: ObjectIdentifier) -> Option<T> {
+/// The extension `oid` of `c` (its first), decoded as `T`.
+pub(crate) fn extension<T: for<'a> Decode<'a>>(c: &Certificate, oid: ObjectIdentifier) -> Option<T> {
     let e = c.tbs_certificate.extensions.as_ref()?.iter().find(|e| e.extn_id == oid)?;
     T::from_der(e.extn_value.as_bytes()).ok()
+}
+
+/// A certificate's subject key identifier.
+pub(crate) fn key_id(c: &Certificate) -> Option<Vec<u8>> {
+    extension::<der::asn1::OctetString>(c, oids::SUBJECT_KEY_ID).map(|o| o.as_bytes().to_vec())
+}
+
+/// Whether an issuer and serial number (a signer's or a recipient's identifier) name `c`.
+pub(crate) fn is_named(c: &Certificate, issuer: &x509_cert::name::Name, serial: &x509_cert::serial_number::SerialNumber) -> bool {
+    *issuer == c.tbs_certificate.issuer && *serial == c.tbs_certificate.serial_number
+}
+
+/// Whether a subject key identifier (a signer's or a recipient's identifier) names `c`.
+pub(crate) fn has_key_id(c: &Certificate, id: &[u8]) -> bool {
+    key_id(c).is_some_and(|k| k == id)
 }
 
 /// The first value of an attribute in a name (`CN`, `O`…), as text.
@@ -196,7 +222,7 @@ pub(crate) fn signature_holds(
         _ => None,
     };
     let is_pss = alg.oid == oids::RSASSA_PSS;
-    let hash = if is_pss { pss_hash(alg) } else { named.or(digest) };
+    let hash = if is_pss { params_hash(alg) } else { named.or(digest) };
     let Some(hash) = hash else { return false };
     let hashed = hash.digest(message);
     let key = &spki.algorithm.oid;
@@ -237,11 +263,12 @@ pub(crate) fn signature_holds(
     false
 }
 
-/// The digest an RSASSA-PSS signature names in its parameters (SHA-1 when it names none,
-/// RFC 4055 §3.1).
-fn pss_hash(alg: &spki::AlgorithmIdentifierOwned) -> Option<Hash> {
+/// The digest RSASSA-PSS or RSAES-OAEP parameters name (SHA-1 when they name none: RFC 4055
+/// §3.1, RFC 8017 A.2.1). `None` for one that isn't known, which isn't guessed at.
+pub(crate) fn params_hash(alg: &spki::AlgorithmIdentifierOwned) -> Option<Hash> {
     use der::Reader as _;
-    // RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0] EXPLICIT HashAlgorithm DEFAULT sha1, … }
+    // RSASSA-PSS-params and RSAES-OAEP-params both begin
+    // `SEQUENCE { [0] EXPLICIT HashAlgorithm DEFAULT sha1, … }`.
     let Some(p) = alg.parameters.as_ref() else { return Some(Hash::Sha1) };
     let content = p.value();
     if content.first() != Some(&0xA0) {
@@ -288,13 +315,13 @@ pub fn newer(a: &[u8], b: &[u8], now: i64) -> bool {
 
 /// Whether a certificate (DER) is a root: issued by itself.
 pub fn self_signed(cert: &[u8]) -> bool {
-    parse(cert).is_ok_and(|c| same_name(&c.tbs_certificate.subject, &c.tbs_certificate.issuer))
+    parse(cert).is_ok_and(|c| c.tbs_certificate.subject == c.tbs_certificate.issuer)
 }
 
 /// Whether the certificate `issuer` (DER) signed `cert` (DER).
 pub(crate) fn issued_by(cert: &[u8], issuer: &[u8]) -> bool {
     match (parse(cert), parse(issuer)) {
-        (Ok(c), Ok(i)) => same_name(&i.tbs_certificate.subject, &c.tbs_certificate.issuer) && issued(cert, &c, &i),
+        (Ok(c), Ok(i)) => i.tbs_certificate.subject == c.tbs_certificate.issuer && issued(cert, &c, &i),
         _ => false,
     }
 }
@@ -306,22 +333,18 @@ fn issued(cert: &[u8], c: &Certificate, issuer: &Certificate) -> bool {
     signature_holds(&issuer.tbs_certificate.subject_public_key_info, &c.signature_algorithm, None, tbs, sig)
 }
 
-fn same_name(a: &x509_cert::name::Name, b: &x509_cert::name::Name) -> bool {
-    matches!((a.to_der(), b.to_der()), (Ok(x), Ok(y)) if x == y)
-}
-
 fn is_ca(c: &Certificate) -> bool {
     extension::<BasicConstraints>(c, oids::BASIC_CONSTRAINTS).is_some_and(|b| b.ca)
 }
 
 pub(crate) fn in_date(c: &Certificate, now: i64) -> Result<(), Problem> {
     let v = &c.tbs_certificate.validity;
-    let secs = |t: &x509_cert::time::Time| i64::try_from(t.to_unix_duration().as_secs()).unwrap_or(i64::MAX);
-    if now < secs(&v.not_before) {
-        return Err(Problem::NotYetValid(secs(&v.not_before)));
+    let (from, until) = (secs(v.not_before.to_unix_duration()), secs(v.not_after.to_unix_duration()));
+    if now < from {
+        return Err(Problem::NotYetValid(from));
     }
-    if now > secs(&v.not_after) {
-        return Err(Problem::Expired(secs(&v.not_after)));
+    if now > until {
+        return Err(Problem::Expired(until));
     }
     Ok(())
 }
@@ -333,12 +356,14 @@ const CHAIN_MAX: usize = 8;
 /// `roots` through `others` (the certificates the message carried), every certificate on it in
 /// date and the ones above it authorities, made for email, and for that address. Empty: trusted.
 pub fn check(signer: &[u8], others: &[Vec<u8>], roots: &[Vec<u8>], now: i64, from: &str) -> Result<Vec<Problem>, Error> {
-    check_with_path(signer, others, roots, now, from).map(|(p, _)| p)
+    let roots: Vec<&[u8]> = roots.iter().map(Vec::as_slice).collect();
+    check_with_path(signer, others, &roots, now, from).map(|(p, _)| p)
 }
 
 /// [`check`], and the chain it found: the signer first, each certificate's issuer after it, up to
-/// the trusted root when there is one (what revocation is checked along).
-pub fn check_with_path(signer: &[u8], others: &[Vec<u8>], roots: &[Vec<u8>], now: i64, from: &str) -> Result<(Vec<Problem>, Vec<Vec<u8>>), Error> {
+/// the trusted root when there is one (what revocation is checked along). The roots are borrowed
+/// (a system's hundred and more, and the ones the user imported, aren't copied for each message).
+pub fn check_with_path(signer: &[u8], others: &[Vec<u8>], roots: &[&[u8]], now: i64, from: &str) -> Result<(Vec<Problem>, Vec<Vec<u8>>), Error> {
     let leaf = parse(signer)?;
     let mut path = vec![signer.to_vec()];
     let mut problems = Vec::new();
@@ -358,14 +383,12 @@ pub fn check_with_path(signer: &[u8], others: &[Vec<u8>], roots: &[Vec<u8>], now
     if let Err(p) = in_date(&leaf, now) {
         problems.push(p);
     }
-    // The chain: up, issuer by issuer, to a root this computer trusts.
-    let pool: Vec<(&Vec<u8>, Certificate, bool)> = others
-        .iter()
-        .map(|d| (d, false))
-        .chain(roots.iter().map(|d| (d, true)))
-        .filter_map(|(d, root)| parse(d).ok().map(|c| (d, c, root)))
-        .collect();
-    let is_root = |d: &[u8]| roots.iter().any(|r| r.as_slice() == d);
+    // The chain: up, issuer by issuer, to a root this computer trusts. A system has a hundred
+    // roots or more: each one's subject alone is read, and the whole certificate only for one
+    // whose subject is the issuer looked for (once, however often it's asked for).
+    let pool: Vec<(&[u8], Option<Name>, OnceCell<Option<Certificate>>)> =
+        others.iter().map(Vec::as_slice).chain(roots.iter().copied()).map(|d| (d, subject_of(d), OnceCell::new())).collect();
+    let is_root = |d: &[u8]| roots.contains(&d);
     let mut current: (Vec<u8>, Certificate) = (signer.to_vec(), leaf);
     let mut trusted = is_root(signer);
     for _ in 0..CHAIN_MAX {
@@ -373,10 +396,14 @@ pub fn check_with_path(signer: &[u8], others: &[Vec<u8>], roots: &[Vec<u8>], now
             break;
         }
         let (der_now, c) = &current;
-        let up = pool.iter().find(|(d, cand, _)| {
-            d.as_slice() != der_now.as_slice() && same_name(&cand.tbs_certificate.subject, &c.tbs_certificate.issuer) && issued(der_now, c, cand)
+        let up = pool.iter().find_map(|(d, subject, whole)| {
+            if *d == der_now.as_slice() || subject.as_ref() != Some(&c.tbs_certificate.issuer) {
+                return None;
+            }
+            let cand = whole.get_or_init(|| parse(d).ok()).as_ref()?;
+            (cand.tbs_certificate.subject == c.tbs_certificate.issuer && issued(der_now, c, cand)).then_some((d, cand))
         });
-        let Some((d, cand, _)) = up else { break };
+        let Some((d, cand)) = up else { break };
         // A root is one of `roots` however it was reached: messages often carry the root too.
         let root = is_root(d);
         if !root && !is_ca(cand) {
@@ -388,11 +415,32 @@ pub fn check_with_path(signer: &[u8], others: &[Vec<u8>], roots: &[Vec<u8>], now
             problems.push(p);
         }
         trusted = root;
-        path.push((*d).clone());
-        current = ((*d).clone(), cand.clone());
+        path.push(d.to_vec());
+        current = (d.to_vec(), cand.clone());
     }
     if !trusted {
         problems.push(Problem::UnknownIssuer);
     }
     Ok((problems, path))
+}
+
+/// The subject of a certificate (DER), read without the rest of it: as reading the whole one
+/// gives it, when that can be read.
+fn subject_of(cert: &[u8]) -> Option<Name> {
+    use der::Reader as _;
+    let mut r = der::SliceReader::new(cert).ok()?;
+    for _ in 0..2 {
+        // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { … } … }
+        if der::Header::decode(&mut r).ok()?.tag != Tag::Sequence {
+            return None;
+        }
+    }
+    // version [0] EXPLICIT (absent for v1), serialNumber, signature, issuer, validity, subject.
+    if r.peek_tag().ok()? == (Tag::ContextSpecific { constructed: true, number: der::TagNumber::N0 }) {
+        r.tlv_bytes().ok()?;
+    }
+    for _ in 0..4 {
+        r.tlv_bytes().ok()?;
+    }
+    Name::decode(&mut r).ok()
 }

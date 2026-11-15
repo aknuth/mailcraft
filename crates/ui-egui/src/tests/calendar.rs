@@ -2,7 +2,12 @@
 
 use super::*;
 
+mod dates;
+mod lists;
 mod meetings;
 mod pim;
+mod reminders;
+mod repeat;
+mod search;
 mod tasks;
 mod todo_bar;

@@ -4,7 +4,7 @@
 
 use mailcraft_model::ical::{self, Attendee, CalEvent, Privacy, ShowAs};
 
-use super::invite_placing::{OWN, arrive, found, imap_session, parts};
+use super::invite_placing::{OWN, account_parts, arrive, found, imap_session};
 use super::*;
 
 const ROOM: &str = "https://meet.example.edu/rooms/abc-def-ghi";
@@ -59,7 +59,6 @@ fn private_show_as_and_a_meeting_on_one_event() {
     }
     let hits = s.run("calendar.search", &json!({"query": "-is:private review"})).unwrap();
     assert!(!hits.as_array().unwrap().iter().any(|h| h["uid"] == uid.as_str()));
-    done(s);
 }
 
 /// Outlook's invitation with a meeting (`CONFERENCE`), sent tentative but meant busy, arriving
@@ -112,7 +111,7 @@ fn an_outlook_meeting_held_then_accepted() {
         assert!(!ics.contains(gone), "{gone} in {ics}");
     }
     found(&mut s, &id, Vec::new());
-    let p = parts(&s, &id, "plan@studio.example");
+    let p = account_parts(&s, &id, "plan@studio.example");
     assert_eq!(p.len(), 1, "{p:?}");
     let ev = &p[0].event;
     assert_eq!(p[0].calendar, OWN);
@@ -124,5 +123,4 @@ fn an_outlook_meeting_held_then_accepted() {
     let hits = s.run("calendar.search", &json!({"query": format!("is:private {ROOM}")})).unwrap();
     assert_eq!(hits.as_array().map(Vec::len), Some(1), "{hits}");
     assert_eq!(hits[0]["showAs"], "busy");
-    done(s);
 }

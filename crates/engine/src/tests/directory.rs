@@ -68,7 +68,6 @@ fn an_exchange_account_names_the_user_agent_it_is_given() {
         .unwrap()
         .to_string();
     assert_eq!(s.account(&imap).unwrap().config.user_agent, None);
-    done(s);
 }
 
 /// The directory is asked as a name is typed (three letters or more), once at a time; a list of
@@ -139,6 +138,15 @@ fn the_directory_is_asked_again_once_its_answer_is_old() {
     });
     assert_eq!(s.address_book("directory", "dana").len(), 1);
     assert!(s.directory_errors("dana").iter().any(|e| e.contains("riley@contoso.example") && e.contains("403")));
+    // Asked again half a minute on, as when no one was found (it waited five minutes, as if
+    // those kept were its answer).
+    s.clock.now += 29;
+    s.address_book("directory", "dana");
+    assert!(asked(&mut s).is_empty());
+    s.clock.now += 2;
+    s.address_book("directory", "dana");
+    assert_eq!(asked(&mut s), ["dana"], "a failure is fresh for half a minute");
+    assert_eq!(s.address_book("directory", "dana").len(), 1, "who was found before still shows");
 
     // Refresh: everything forgotten, the address books read again, the next search asked.
     let rev = s.directory.rev;
@@ -162,7 +170,6 @@ fn the_directory_is_asked_again_once_its_answer_is_old() {
         s.clock.now += 1;
     }
     assert!(s.directory.answers.len() <= 200, "{}", s.directory.answers.len());
-    done(s);
 }
 
 /// Issue #9 (follow-up): someone known only by an address, or by its user part, shows with the
@@ -184,7 +191,6 @@ fn the_directory_names_people_known_only_by_their_address() {
     assert_eq!(all.iter().filter(|a| a.email.eq_ignore_ascii_case("john.doe@contoso.example")).count(), 1, "listed once");
     let suggested: Vec<mailcraft_model::EmailAddress> = s.suggest_contacts("contoso", 8).into_iter().map(|c| c.address).collect();
     assert_eq!(name(&suggested, "john.doe@contoso.example").as_deref(), Some("John Doe"), "{suggested:?}");
-    done(s);
 }
 
 /// Issue #9, online: an Exchange Online account searches its directory too, once the user allows it. An
@@ -237,5 +243,4 @@ fn exchange_online_asks_for_permission_to_search_its_directory() {
     // A personal Microsoft account has no organisation directory to search.
     let personal = s.run("account.add", &json!({"email": "zoe@outlook.com", "graph": true})).unwrap()["account"].as_str().unwrap().to_string();
     assert!(!s.directory_accounts().contains(&personal));
-    done(s);
 }

@@ -6,6 +6,7 @@
 //! deflated entries) and a tag scanner read just the parts a preview needs. Everything here comes
 //! from mail, so sizes, counts and nesting are capped and nothing can panic.
 
+use std::borrow::Cow;
 use std::io::Read;
 
 /// Largest archive read, and largest part unpacked from it.
@@ -17,6 +18,10 @@ const MAX_ROWS: usize = 500;
 const MAX_COLS: usize = 40;
 const MAX_SHEETS: usize = 20;
 const MAX_SLIDES: usize = 200;
+/// Relationships of a workbook or presentation followed (a sheet's or a slide's among them).
+const MAX_RELATIONSHIPS: usize = 10_000;
+/// Most paragraphs read from one slide.
+const MAX_SLIDE_PARAS: usize = 400;
 
 /// A preview of an Office file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,16 +47,27 @@ pub struct Run {
     pub italic: bool,
 }
 
+/// The kinds of Office file this previews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A Word document (`.docx`, `.docm`).
+    Word,
+    /// An Excel workbook (`.xlsx`, `.xlsm`).
+    Excel,
+    /// A PowerPoint presentation (`.pptx`, `.pptm`).
+    PowerPoint,
+}
+
 /// The kind of Office file a name (or type) is, when it's one this can preview.
-pub fn kind(name: &str, mime: &str) -> Option<&'static str> {
+pub fn kind(name: &str, mime: &str) -> Option<Kind> {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     let m = mime.to_ascii_lowercase();
     if ext == "docx" || ext == "docm" || m.contains("wordprocessingml") {
-        Some("docx")
+        Some(Kind::Word)
     } else if ext == "xlsx" || ext == "xlsm" || m.contains("spreadsheetml") {
-        Some("xlsx")
+        Some(Kind::Excel)
     } else if ext == "pptx" || ext == "pptm" || m.contains("presentationml") {
-        Some("pptx")
+        Some(Kind::PowerPoint)
     } else {
         None
     }
@@ -64,9 +80,9 @@ pub fn preview(name: &str, mime: &str, data: &[u8]) -> Option<Preview> {
     }
     let zip = Zip::new(data)?;
     match kind(name, mime)? {
-        "docx" => document(&String::from_utf8_lossy(&zip.read("word/document.xml")?)),
-        "xlsx" => workbook(&zip),
-        _ => slides(&zip),
+        Kind::Word => document(&String::from_utf8_lossy(&zip.read("word/document.xml")?)),
+        Kind::Excel => workbook(&zip),
+        Kind::PowerPoint => slides(&zip),
     }
 }
 
@@ -87,11 +103,13 @@ struct Zip<'a> {
 }
 
 fn u16_at(d: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([*d.get(at)?, *d.get(at + 1)?]))
+    let b = d.get(at..at.checked_add(2)?)?;
+    Some(u16::from_le_bytes([*b.first()?, *b.get(1)?]))
 }
 
 fn u32_at(d: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes([*d.get(at)?, *d.get(at + 1)?, *d.get(at + 2)?, *d.get(at + 3)?]))
+    let b = d.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
 }
 
 impl<'a> Zip<'a> {
@@ -99,23 +117,25 @@ impl<'a> Zip<'a> {
         // The end of central directory record: within the last 64 KiB (its comment), last first.
         let from = data.len().saturating_sub(22 + 65_535);
         let eocd = (from..=data.len().saturating_sub(22)).rev().find(|&i| data.get(i..i + 4) == Some(&b"PK\x05\x06"[..]))?;
-        let count = usize::from(u16_at(data, eocd + 10)?);
-        let mut at = usize::try_from(u32_at(data, eocd + 16)?).ok()?;
+        // Offsets from the file's 32-bit fields, added checked (a `usize` is 32 bits on wasm).
+        let count = usize::from(u16_at(data, eocd.checked_add(10)?)?);
+        let mut at = usize::try_from(u32_at(data, eocd.checked_add(16)?)?).ok()?;
         let mut entries = Vec::with_capacity(count.min(4096));
         for _ in 0..count.min(4096) {
-            if data.get(at..at + 4) != Some(&b"PK\x01\x02"[..]) {
+            let field = |n: usize| at.checked_add(n);
+            if data.get(at..field(4)?) != Some(&b"PK\x01\x02"[..]) {
                 break;
             }
-            let method = u16_at(data, at + 10)?;
-            let compressed = usize::try_from(u32_at(data, at + 20)?).ok()?;
-            let size = u64::from(u32_at(data, at + 24)?);
-            let name_len = usize::from(u16_at(data, at + 28)?);
-            let extra = usize::from(u16_at(data, at + 30)?);
-            let comment = usize::from(u16_at(data, at + 32)?);
-            let local = usize::try_from(u32_at(data, at + 42)?).ok()?;
-            let name = String::from_utf8_lossy(data.get(at + 46..at + 46 + name_len)?).replace('\\', "/");
+            let method = u16_at(data, field(10)?)?;
+            let compressed = usize::try_from(u32_at(data, field(20)?)?).ok()?;
+            let size = u64::from(u32_at(data, field(24)?)?);
+            let name_len = usize::from(u16_at(data, field(28)?)?);
+            let extra = usize::from(u16_at(data, field(30)?)?);
+            let comment = usize::from(u16_at(data, field(32)?)?);
+            let local = usize::try_from(u32_at(data, field(42)?)?).ok()?;
+            let name = String::from_utf8_lossy(data.get(field(46)?..field(46)?.checked_add(name_len)?)?).replace('\\', "/");
             entries.push(Entry { name, method, compressed, size, local });
-            at = at.checked_add(46 + name_len + extra + comment)?;
+            at = at.checked_add(46)?.checked_add(name_len)?.checked_add(extra)?.checked_add(comment)?;
         }
         Some(Zip { data, entries })
     }
@@ -127,10 +147,12 @@ impl<'a> Zip<'a> {
             return None;
         }
         let d = self.data;
-        if d.get(e.local..e.local + 4) != Some(&b"PK\x03\x04"[..]) {
+        if d.get(e.local..e.local.checked_add(4)?) != Some(&b"PK\x03\x04"[..]) {
             return None;
         }
-        let start = e.local + 30 + usize::from(u16_at(d, e.local + 26)?) + usize::from(u16_at(d, e.local + 28)?);
+        let name_len = usize::from(u16_at(d, e.local.checked_add(26)?)?);
+        let extra = usize::from(u16_at(d, e.local.checked_add(28)?)?);
+        let start = e.local.checked_add(30)?.checked_add(name_len)?.checked_add(extra)?;
         let raw = d.get(start..start.checked_add(e.compressed)?)?;
         match e.method {
             0 => Some(raw.to_vec()),
@@ -151,90 +173,73 @@ impl<'a> Zip<'a> {
 // ----- XML -----
 
 /// An XML piece: a start tag (its name, attributes and whether it closes itself), an end tag, or
-/// text (entities decoded).
+/// text (entities decoded; borrowed when it has none).
 #[derive(Debug, PartialEq, Eq)]
 enum Tok<'a> {
     Start { name: &'a str, attrs: &'a str, empty: bool },
     End(&'a str),
-    Text(String),
+    Text(Cow<'a, str>),
 }
 
-/// The XML split into tags and text; comments, declarations and processing instructions left
-/// out.
-fn tokens(xml: &str) -> Vec<Tok<'_>> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while !rest.is_empty() && out.len() < 2_000_000 {
-        match rest.find('<') {
-            Some(0) => {
-                let Some(close) = rest.find('>') else { break };
-                let tag = rest.get(1..close).unwrap_or_default();
-                rest = rest.get(close + 1..).unwrap_or_default();
-                if tag.starts_with('?') || tag.starts_with('!') {
-                    continue;
-                }
-                if let Some(name) = tag.strip_prefix('/') {
-                    out.push(Tok::End(name.trim()));
-                    continue;
-                }
-                let empty = tag.ends_with('/');
-                let tag = tag.trim_end_matches('/');
-                let (name, attrs) = tag.split_once(|c: char| c.is_whitespace()).unwrap_or((tag, ""));
-                out.push(Tok::Start { name, attrs, empty });
-            }
-            Some(i) => {
-                out.push(Tok::Text(unescape(rest.get(..i).unwrap_or_default())));
-                rest = rest.get(i..).unwrap_or_default();
-            }
-            None => {
-                out.push(Tok::Text(unescape(rest)));
-                break;
-            }
-        }
-    }
-    out
+/// Most pieces read from one part.
+const MAX_TOKENS: usize = 2_000_000;
+
+/// The XML split into tags and text, a piece at a time, so that a reader that has what it shows
+/// stops there; comments, declarations and processing instructions left out.
+struct Tokens<'a> {
+    rest: &'a str,
+    given: usize,
 }
 
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(rest.get(..i).unwrap_or_default());
-        rest = rest.get(i..).unwrap_or_default();
-        let Some(end) = rest.find(';').filter(|e| *e <= 10) else {
-            out.push('&');
-            rest = rest.get(1..).unwrap_or_default();
-            continue;
-        };
-        let ent = rest.get(1..end).unwrap_or_default();
-        let ch = match ent {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            _ => ent
-                .strip_prefix("#x")
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse().ok()))
-                .and_then(char::from_u32),
-        };
-        match ch {
-            Some(c) => {
-                out.push(c);
-                rest = rest.get(end + 1..).unwrap_or_default();
-            }
-            None => {
-                out.push('&');
-                rest = rest.get(1..).unwrap_or_default();
-            }
+fn tokens(xml: &str) -> Tokens<'_> {
+    Tokens { rest: xml, given: 0 }
+}
+
+impl<'a> Iterator for Tokens<'a> {
+    type Item = Tok<'a>;
+
+    fn next(&mut self) -> Option<Tok<'a>> {
+        while !self.rest.is_empty() && self.given < MAX_TOKENS {
+            let rest = self.rest;
+            let tok = match rest.find('<') {
+                Some(0) => {
+                    let Some(close) = rest.find('>') else {
+                        self.rest = "";
+                        return None;
+                    };
+                    let tag = rest.get(1..close).unwrap_or_default();
+                    self.rest = rest.get(close + 1..).unwrap_or_default();
+                    if tag.starts_with('?') || tag.starts_with('!') {
+                        continue;
+                    }
+                    match tag.strip_prefix('/') {
+                        Some(name) => Tok::End(name.trim()),
+                        None => {
+                            let empty = tag.ends_with('/');
+                            let tag = tag.trim_end_matches('/');
+                            let (name, attrs) = tag.split_once(|c: char| c.is_whitespace()).unwrap_or((tag, ""));
+                            Tok::Start { name, attrs, empty }
+                        }
+                    }
+                }
+                Some(i) => {
+                    self.rest = rest.get(i..).unwrap_or_default();
+                    Tok::Text(unescape(rest.get(..i).unwrap_or_default()))
+                }
+                None => {
+                    self.rest = "";
+                    Tok::Text(unescape(rest))
+                }
+            };
+            self.given += 1;
+            return Some(tok);
         }
+        None
     }
-    out.push_str(rest);
-    out
+}
+
+fn unescape(s: &str) -> Cow<'_, str> {
+    crate::html::decode_xml_refs(s)
 }
 
 /// An attribute's value (`name="value"`), by its name without a prefix.
@@ -258,6 +263,71 @@ fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+/// The parts the package's `main` part lists in its `element`s, in order, each by its `r:id`
+/// followed through `rels` (a target under `dir`, or from the package's root with a `/`), with
+/// the element's `name` when it has one; the first `most` of them. Empty when there are no
+/// relationships to follow: the format ties a sheet or a slide to its part so, not by the
+/// part's number.
+fn in_order(zip: &Zip<'_>, main: &str, rels: &str, element: &str, dir: &str, most: usize) -> Vec<(Option<String>, String)> {
+    let Some(rels) = zip.read(rels) else { return Vec::new() };
+    // Each relationship's part by its id (the first of an id, as it was found), looked up once
+    // for each element: looked for through all of them, a file of thousands of each was read
+    // through thousands of times.
+    let mut targets: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for t in tokens(&String::from_utf8_lossy(&rels)) {
+        if targets.len() >= MAX_RELATIONSHIPS {
+            break;
+        }
+        if let Tok::Start { name, attrs, .. } = t
+            && local(name) == "Relationship"
+            && let (Some(id), Some(target)) = (attr(attrs, "Id"), attr(attrs, "Target"))
+        {
+            let target = unescape(target);
+            let part = match target.strip_prefix('/') {
+                Some(from_root) => from_root.to_string(),
+                None => format!("{dir}{target}"),
+            };
+            targets.entry(id.to_string()).or_insert(part);
+        }
+    }
+    let Some(x) = zip.read(main) else { return Vec::new() };
+    let mut out = Vec::new();
+    for t in tokens(&String::from_utf8_lossy(&x)) {
+        if out.len() >= most {
+            break;
+        }
+        if let Tok::Start { name, attrs, .. } = t
+            && local(name) == element
+            && let Some(id) = prefixed_attr(attrs, "id")
+            && let Some(part) = targets.get(id)
+        {
+            out.push((attr(attrs, "name").map(|n| unescape(n).into_owned()), part.clone()));
+        }
+    }
+    out
+}
+
+/// [`attr`] for a name with a prefix only (`r:id`, not a plain `id` beside it).
+fn prefixed_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = attrs;
+    while let Some(eq) = rest.find('=') {
+        let key = rest.get(..eq).unwrap_or_default().trim();
+        let key = key.rsplit(char::is_whitespace).next().unwrap_or(key);
+        let after = rest.get(eq + 1..).unwrap_or_default().trim_start();
+        let quote = after.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let body = after.get(1..).unwrap_or_default();
+        let close = body.find(quote)?;
+        if key.split_once(':').is_some_and(|(_, local)| local == name) {
+            return body.get(..close);
+        }
+        rest = body.get(close + 1..).unwrap_or_default();
+    }
+    None
+}
+
 /// A tag's name without its prefix (`w:p` → `p`).
 fn local(name: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
@@ -270,13 +340,29 @@ fn on(attrs: &str) -> bool {
 
 // ----- Word -----
 
+/// A Word table being read: nested tables flatten into the cell of the outer one.
+#[derive(Default)]
+struct OpenTable {
+    rows: Vec<Vec<String>>,
+    /// The row being read.
+    row: Vec<String>,
+    /// The cell's text so far.
+    cell: String,
+}
+
+/// A Word paragraph being read.
+#[derive(Default)]
+struct OpenPara {
+    runs: Vec<Run>,
+    heading: bool,
+    list: bool,
+}
+
 fn document(xml: &str) -> Option<Preview> {
     let mut blocks = Vec::new();
-    // Inside a table: its rows, the row being read, the cell's text; nested tables flatten into
-    // the cell of the outer one.
-    let mut table: Option<(Vec<Vec<String>>, Vec<String>, String)> = None;
+    let mut table: Option<OpenTable> = None;
     let mut depth = 0usize;
-    let mut para: Option<(Vec<Run>, bool, bool)> = None;
+    let mut para: Option<OpenPara> = None;
     let mut run = Run::default();
     let mut in_text = false;
     for t in tokens(xml) {
@@ -288,20 +374,20 @@ fn document(xml: &str) -> Option<Preview> {
                 "tbl" if !empty => {
                     depth += 1;
                     if depth == 1 {
-                        table = Some((Vec::new(), Vec::new(), String::new()));
+                        table = Some(OpenTable::default());
                     }
                 }
                 "tr" if depth == 1 && !empty => {
                     if let Some(tb) = table.as_mut() {
-                        tb.1.clear();
+                        tb.row.clear();
                     }
                 }
                 "tc" if depth == 1 && !empty => {
                     if let Some(tb) = table.as_mut() {
-                        tb.2.clear();
+                        tb.cell.clear();
                     }
                 }
-                "p" if !empty => para = Some((Vec::new(), false, false)),
+                "p" if !empty => para = Some(OpenPara::default()),
                 "p" => {
                     if table.is_none() {
                         blocks.push(Block::Paragraph { runs: Vec::new(), heading: false, list: false });
@@ -310,12 +396,12 @@ fn document(xml: &str) -> Option<Preview> {
                 "pStyle" => {
                     let v = attr(attrs, "val").unwrap_or_default().to_ascii_lowercase();
                     if let Some(p) = para.as_mut() {
-                        p.1 = v.starts_with("heading") || v == "title" || v.starts_with("berschrift") || v.starts_with("titre");
+                        p.heading = v.starts_with("heading") || v == "title" || v.starts_with("berschrift") || v.starts_with("titre");
                     }
                 }
                 "numPr" => {
                     if let Some(p) = para.as_mut() {
-                        p.2 = true;
+                        p.list = true;
                     }
                 }
                 "r" if !empty => run = Run::default(),
@@ -334,41 +420,41 @@ fn document(xml: &str) -> Option<Preview> {
                     if let Some(p) = para.as_mut()
                         && !run.text.is_empty()
                     {
-                        p.0.push(std::mem::take(&mut run));
+                        p.runs.push(std::mem::take(&mut run));
                     }
                 }
                 "p" => {
-                    let Some((runs, heading, list)) = para.take() else { continue };
+                    let Some(OpenPara { runs, heading, list }) = para.take() else { continue };
                     match table.as_mut() {
                         Some(tb) => {
-                            if !tb.2.is_empty() {
-                                tb.2.push('\n');
+                            if !tb.cell.is_empty() {
+                                tb.cell.push('\n');
                             }
-                            tb.2.extend(runs.iter().map(|r| r.text.as_str()));
+                            tb.cell.extend(runs.iter().map(|r| r.text.as_str()));
                         }
                         None => blocks.push(Block::Paragraph { runs, heading, list }),
                     }
                 }
                 "tc" if depth == 1 => {
                     if let Some(tb) = table.as_mut()
-                        && tb.1.len() < MAX_COLS
+                        && tb.row.len() < MAX_COLS
                     {
-                        let cell = std::mem::take(&mut tb.2);
-                        tb.1.push(cell);
+                        let cell = std::mem::take(&mut tb.cell);
+                        tb.row.push(cell);
                     }
                 }
                 "tr" if depth == 1 => {
                     if let Some(tb) = table.as_mut()
-                        && tb.0.len() < MAX_ROWS
+                        && tb.rows.len() < MAX_ROWS
                     {
-                        let row = std::mem::take(&mut tb.1);
-                        tb.0.push(row);
+                        let row = std::mem::take(&mut tb.row);
+                        tb.rows.push(row);
                     }
                 }
                 "tbl" => {
                     depth = depth.saturating_sub(1);
                     if depth == 0
-                        && let Some((rows, _, _)) = table.take()
+                        && let Some(OpenTable { rows, .. }) = table.take()
                     {
                         blocks.push(Block::Table(rows));
                     }
@@ -420,18 +506,29 @@ fn workbook(zip: &Zip<'_>) -> Option<Preview> {
             }
         }
     }
-    // The sheets' names, in order.
+    // The sheets as the workbook lists them, each followed to its part.
+    let listed = in_order(zip, "xl/workbook.xml", "xl/_rels/workbook.xml.rels", "sheet", "xl/", MAX_SHEETS);
+    let mut sheets = Vec::new();
+    for (n, (name, part)) in listed.into_iter().enumerate() {
+        let Some(x) = zip.read(&part) else { continue };
+        let name = name.filter(|s| !s.is_empty()).unwrap_or_else(|| format!("Sheet{}", n + 1));
+        sheets.push((name, sheet(&String::from_utf8_lossy(&x), &shared)));
+    }
+    if !sheets.is_empty() {
+        return Some(Preview::Workbook(sheets));
+    }
+    // A package without its relationships, or whose relationships lead to no part that reads:
+    // its parts by number, its names in order.
     let mut names = Vec::new();
     if let Some(x) = zip.read("xl/workbook.xml") {
         for t in tokens(&String::from_utf8_lossy(&x)) {
             if let Tok::Start { name, attrs, .. } = t
                 && local(name) == "sheet"
             {
-                names.push(attr(attrs, "name").map(unescape).unwrap_or_default());
+                names.push(attr(attrs, "name").map(|n| unescape(n).into_owned()).unwrap_or_default());
             }
         }
     }
-    let mut sheets = Vec::new();
     for n in 1..=MAX_SHEETS {
         let part = format!("xl/worksheets/sheet{n}.xml");
         if !zip.has(&part) {
@@ -467,12 +564,17 @@ fn sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
         match t {
             Tok::Start { name, attrs, empty } => match local(name) {
                 "row" => {
-                    row_no = attr(attrs, "r").and_then(|r| r.parse::<usize>().ok()).unwrap_or(row_no + 1);
+                    row_no = attr(attrs, "r").and_then(|r| r.parse::<usize>().ok()).unwrap_or_else(|| row_no.saturating_add(1));
+                    // Rows come in order (Excel takes a sheet whose rows don't for damaged): the rest are
+                    // past what's shown.
+                    if row_no > MAX_ROWS {
+                        break;
+                    }
                     next_col = 0;
                 }
                 "c" => {
                     let (r, c) = attr(attrs, "r").and_then(cell_ref).unwrap_or((row_no.saturating_sub(1), next_col));
-                    next_col = c + 1;
+                    next_col = c.saturating_add(1);
                     at = if empty { None } else { Some((r, c, attr(attrs, "t").unwrap_or_default().to_string())) };
                     value.clear();
                 }
@@ -497,7 +599,6 @@ fn sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
                                 "FALSE".into()
                             }
                         }
-                        "e" => value.clone(),
                         _ => value.clone(),
                     };
                     if shown.is_empty() {
@@ -526,11 +627,17 @@ fn sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
 
 fn slides(zip: &Zip<'_>) -> Option<Preview> {
     let mut out = Vec::new();
-    for n in 1..=MAX_SLIDES {
-        let part = format!("ppt/slides/slide{n}.xml");
-        if !zip.has(&part) {
-            break;
-        }
+    // As the presentation lists them, each followed to its part; without its relationships, or
+    // when they lead to no part there is, by number.
+    let mut parts: Vec<String> = in_order(zip, "ppt/presentation.xml", "ppt/_rels/presentation.xml.rels", "sldId", "ppt/", MAX_SLIDES)
+        .into_iter()
+        .map(|(_, p)| p)
+        .filter(|p| zip.has(p))
+        .collect();
+    if parts.is_empty() {
+        parts = (1..=MAX_SLIDES).map(|n| format!("ppt/slides/slide{n}.xml")).take_while(|p| zip.has(p)).collect();
+    }
+    for part in parts.into_iter().take(MAX_SLIDES) {
         let Some(x) = zip.read(&part) else { continue };
         let mut paras = Vec::new();
         let mut cur: Option<String> = None;
@@ -556,10 +663,11 @@ fn slides(zip: &Zip<'_>) -> Option<Preview> {
                 Tok::End(name) => match local(name) {
                     "t" => in_t = false,
                     "p" => {
-                        if let Some(c) = cur.take().filter(|c| !c.trim().is_empty())
-                            && paras.len() < 400
-                        {
+                        if let Some(c) = cur.take().filter(|c| !c.trim().is_empty()) {
                             paras.push(c);
+                            if paras.len() >= MAX_SLIDE_PARAS {
+                                break;
+                            }
                         }
                     }
                     _ => {}
@@ -572,127 +680,4 @@ fn slides(zip: &Zip<'_>) -> Option<Preview> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A zip of these parts, stored (no compression), as a test archive.
-    pub(crate) fn zip(parts: &[(&str, &str)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut dir = Vec::new();
-        for (name, body) in parts {
-            let local = u32::try_from(out.len()).unwrap();
-            let len = u32::try_from(body.len()).unwrap();
-            out.extend_from_slice(b"PK\x03\x04");
-            out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
-            out.extend_from_slice(&[0, 0]);
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(body.as_bytes());
-            dir.extend_from_slice(b"PK\x01\x02");
-            dir.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-            dir.extend_from_slice(&[0, 0, 0, 0]);
-            dir.extend_from_slice(&len.to_le_bytes());
-            dir.extend_from_slice(&len.to_le_bytes());
-            dir.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
-            dir.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-            dir.extend_from_slice(&local.to_le_bytes());
-            dir.extend_from_slice(name.as_bytes());
-        }
-        let at = u32::try_from(out.len()).unwrap();
-        let n = u16::try_from(parts.len()).unwrap();
-        out.extend_from_slice(&dir);
-        out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&u32::try_from(dir.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&at.to_le_bytes());
-        out.extend_from_slice(&[0, 0]);
-        out
-    }
-
-    #[test]
-    fn a_word_document() {
-        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
-            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Plan &amp; budget</w:t></w:r></w:p>
-            <w:p><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Bold </w:t></w:r><w:r><w:rPr><w:i/><w:b w:val="0"/></w:rPr><w:t>then italic</w:t></w:r></w:p>
-            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p><w:p><w:r><w:t>more</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
-            <w:p/></w:body></w:document>"#;
-        let p = preview("plan.docx", "", &zip(&[("word/document.xml", doc)])).unwrap();
-        let Preview::Document(b) = p else { panic!("not a document") };
-        assert_eq!(b.len(), 3, "{b:?}");
-        assert!(matches!(&b[0], Block::Paragraph { runs, heading: true, .. } if runs[0].text == "Plan & budget"));
-        let Block::Paragraph { runs, .. } = &b[1] else { panic!() };
-        assert_eq!((runs[0].bold, runs[1].bold, runs[1].italic, runs[0].text.as_str()), (true, false, true, "Bold "));
-        assert_eq!(b[2], Block::Table(vec![vec!["A1".into(), "B1\nmore".into()]]));
-    }
-
-    #[test]
-    fn a_workbook_and_slides() {
-        let wb = r#"<workbook><sheets><sheet name="Costs &amp; days" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
-        let ss = r#"<sst><si><t>Item</t></si><si><r><t>Pos</t></r><r><t>ter</t></r></si></sst>"#;
-        let s1 = r#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1"><v>42</v></c></row><row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2" t="b"><v>1</v></c><c r="D2" t="inlineStr"><is><t>here</t></is></c></row></sheetData></worksheet>"#;
-        let p = preview("x.xlsx", "", &zip(&[("xl/workbook.xml", wb), ("xl/sharedStrings.xml", ss), ("xl/worksheets/sheet1.xml", s1)])).unwrap();
-        let Preview::Workbook(sheets) = p else { panic!() };
-        assert_eq!(sheets[0].0, "Costs & days");
-        assert_eq!(
-            sheets[0].1,
-            vec![vec!["Item".to_string(), String::new(), "42".into()], vec!["Poster".into(), "TRUE".into(), String::new(), "here".into()]]
-        );
-        let slide = r#"<p:sld><p:txBody><a:p><a:r><a:t>Title</a:t></a:r></a:p><a:p><a:r><a:t>Point one</a:t></a:r><a:br/><a:r><a:t>two</a:t></a:r></a:p></p:txBody></p:sld>"#;
-        let p = preview("deck.pptx", "", &zip(&[("ppt/slides/slide1.xml", slide), ("ppt/slides/slide2.xml", "<p:sld/>")])).unwrap();
-        assert_eq!(p, Preview::Slides(vec![vec!["Title".into(), "Point one\ntwo".into()], vec![]]));
-    }
-
-    #[test]
-    fn deflated_parts_as_office_writes_them() {
-        use std::io::Write;
-        let body = "<w:p><w:r><w:t>Compressed hello</w:t></w:r></w:p>".repeat(50);
-        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(body.as_bytes()).unwrap();
-        let packed = enc.finish().unwrap();
-        // The stored archive, its one entry swapped for the deflated bytes (method 8).
-        let name = "word/document.xml";
-        let mut out = Vec::new();
-        out.extend_from_slice(b"PK\x03\x04\x14\0\0\0\x08\0\0\0\0\0\0\0\0\0");
-        out.extend_from_slice(&u32::try_from(packed.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&[0, 0]);
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&packed);
-        let at = u32::try_from(out.len()).unwrap();
-        let mut dir = Vec::new();
-        dir.extend_from_slice(b"PK\x01\x02\x14\0\x14\0\0\0\x08\0\0\0\0\0\0\0\0\0");
-        dir.extend_from_slice(&u32::try_from(packed.len()).unwrap().to_le_bytes());
-        dir.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
-        dir.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
-        dir.extend_from_slice(&[0; 12]);
-        dir.extend_from_slice(&0u32.to_le_bytes());
-        dir.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&dir);
-        out.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
-        out.extend_from_slice(&u32::try_from(dir.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&at.to_le_bytes());
-        out.extend_from_slice(&[0, 0]);
-        let Some(Preview::Document(b)) = preview("a.docx", "", &out) else { panic!("unreadable") };
-        assert_eq!(b.len(), 50);
-    }
-
-    #[test]
-    fn junk_is_no_preview() {
-        assert_eq!(preview("a.docx", "", b"not a zip"), None);
-        assert_eq!(preview("a.docx", "", &zip(&[("other.xml", "<x/>")])), None);
-        assert_eq!(preview("a.txt", "", &zip(&[("word/document.xml", "<x/>")])), None);
-        // Truncated anywhere: nothing panics.
-        let good = zip(&[("word/document.xml", "<w:p><w:r><w:t>hi</w:t></w:r></w:p>")]);
-        for n in 0..good.len() {
-            let _ = preview("a.docx", "", &good[..n]);
-        }
-        assert_eq!(unescape("a &lt;b&gt; &#65;&#x42; &bogus; &"), "a <b> AB &bogus; &");
-        assert_eq!(cell_ref("AB12"), Some((11, 27)));
-        assert_eq!(cell_ref("1"), None);
-    }
-}
+mod tests;

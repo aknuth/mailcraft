@@ -2,7 +2,7 @@
 //! its notes and tasks. Accounts whose server offers CalDAV / CardDAV sync them (see `net::dav`);
 //! the others, and the sample mailbox, keep a calendar and an address book on this computer.
 
-use mailcraft_model::dates::{civil_from_days, days_from_civil};
+use mailcraft_model::dates::{civil_from_days, day_string, days_from_civil, weekday_index};
 use mailcraft_model::ical::{self, CalEvent};
 use mailcraft_model::pim::{LOCAL, Pim, StoredCard, StoredEvent, Tombstone};
 use mailcraft_model::vcard::Card;
@@ -107,6 +107,8 @@ pub struct Person<'a> {
     pub account: &'a str,
     pub book: &'a str,
     pub card: &'a Card,
+    /// Its place among its account's cards (`Pim::cards`), to find it again without a search.
+    pub at: usize,
 }
 
 /// A calendar colour of this or above is an account's colour ([`Session::calendar_color`]).
@@ -135,7 +137,7 @@ impl Session {
     }
 
     pub(crate) fn save_pim(&mut self, account: &str) {
-        self.contacts = None;
+        self.drop_contacts();
         self.pim_revision = self.pim_revision.wrapping_add(1);
         // What couldn't be read isn't written over with what's shown in its place.
         if self.pim_unread.contains(account) {
@@ -156,8 +158,10 @@ impl Session {
         })
     }
 
-    /// The account new events and people go to: the one on screen, else the first.
-    fn pim_account(&self, wanted: Option<&str>) -> Result<String, CmdError> {
+    /// The account a command acts on: the one it names (`wanted`), which must be one, else the
+    /// one on screen, else the first. The rule each command taking an `account` follows (copies
+    /// of it took any name, or refused with other words).
+    pub(crate) fn account_or_shown(&self, wanted: Option<&str>) -> Result<String, CmdError> {
         match wanted {
             Some(a) if self.account(a).is_some() => Ok(a.to_string()),
             Some(a) => Err(CmdError::Params(format!("no account `{a}`"))),
@@ -176,7 +180,7 @@ impl Session {
     /// or the weeks of the month.
     pub fn cal_days(&self) -> (i64, i64) {
         let d = self.cal_day();
-        let monday = |x: i64| x - (x + 3).rem_euclid(7);
+        let monday = |x: i64| x - i64::from(weekday_index(x));
         match self.cal_mode {
             CalMode::Day => (d, d + 1),
             CalMode::WorkWeek => (monday(d), monday(d) + 5),
@@ -218,8 +222,7 @@ impl Session {
             }
         };
         self.cal_day = Some(d);
-        let (y, m, dd) = civil_from_days(d);
-        Ok(serde_json::json!({"date": format!("{y:04}-{m:02}-{dd:02}"), "mode": self.cal_mode}))
+        Ok(serde_json::json!({"date": day_string(d), "mode": self.cal_mode}))
     }
 
     /// The key a calendar is shown or hidden under (`Prefs::hidden_calendars`).
@@ -255,14 +258,7 @@ impl Session {
     pub fn agenda(&self, from: i64, to: i64) -> Vec<AgendaItem> {
         // Every address of the accounts' (their others too: an invitation to one needs its
         // answer like any).
-        let mine: Vec<String> = self
-            .accounts
-            .iter()
-            .flat_map(|a| {
-                let others = a.config.identities.iter().map(|i| i.email.to_ascii_lowercase());
-                [a.config.email.to_ascii_lowercase(), a.config.username.to_ascii_lowercase()].into_iter().chain(others).collect::<Vec<_>>()
-            })
-            .collect();
+        let mine = self.my_addresses();
         let mut out = Vec::new();
         for (account, p) in &self.pim {
             let Some(acc) = self.account(account) else { continue };
@@ -277,7 +273,8 @@ impl Session {
                     if start >= to || end.max(start.saturating_add(1)) <= from {
                         continue;
                     }
-                    let needs_reply = e.attendees.iter().any(|a| mine.contains(&a.email.to_ascii_lowercase()) && a.partstat == "NEEDS-ACTION");
+                    let needs_reply = e.attendees.iter().any(|a| a.partstat == "NEEDS-ACTION" && super::invite::is_mine(&a.email, &mine));
+                    let (privacy, show_as) = ical::showing(e);
                     out.push(AgendaItem {
                         account: account.clone(),
                         calendar: cal.id.clone(),
@@ -293,8 +290,8 @@ impl Session {
                         category: e.categories.first().map(|c| self.category_color_of(c)),
                         status: e.status.clone(),
                         needs_reply,
-                        privacy: ical::privacy(e),
-                        show_as: ical::show_as(e),
+                        privacy,
+                        show_as,
                         task: false,
                     });
                 }
@@ -326,7 +323,7 @@ impl Session {
 
     /// Add an event; returns its uid. Events in a server calendar are sent there.
     pub fn create_event(&mut self, account: Option<&str>, calendar: Option<&str>, mut e: CalEvent) -> CmdResult {
-        let account = self.pim_account(account)?;
+        let account = self.account_or_shown(account)?;
         check_event(&e)?;
         if e.uid.trim().is_empty() {
             e.uid = self.new_uid();
@@ -353,8 +350,7 @@ impl Session {
 
     /// Change an event (all of its occurrences).
     pub fn update_event(&mut self, uid: &str, change: impl FnOnce(&mut CalEvent)) -> CmdResult {
-        let (account, _) =
-            self.find_event(uid).map(|(a, e)| (a.to_string(), e.calendar.clone())).ok_or_else(|| CmdError::Params(format!("no event `{uid}`")))?;
+        let account = self.find_event(uid).map(|(a, _)| a.to_string()).ok_or_else(|| CmdError::Params(format!("no event `{uid}`")))?;
         let p = self.pim_mut(&account);
         let Some(stored) = p.events.iter_mut().find(|e| e.event.uid == uid && e.event.recurrence_id.is_none()) else {
             return Err(CmdError::Params(format!("no event `{uid}`")));
@@ -387,29 +383,31 @@ impl Session {
         if p.calendars.iter().any(|c| c.id == calendar && c.read_only) {
             return Err(CmdError::Params("this calendar can't be changed".into()));
         }
-        let mut remote = false;
-        match occurrence {
-            Some(at) if p.events.iter().any(|e| e.event.uid == uid && e.event.rrule.is_some()) => {
-                // One occurrence: an exception on the rule, and any changed instance goes.
-                p.events.retain(|e| !(e.event.uid == uid && e.event.recurrence_id == Some(at)));
+        let series = p.events.iter().any(|e| e.event.uid == uid && e.event.rrule.is_some());
+        // A series that keeps as many occurrences taken out as it can: this one would stay, so
+        // it isn't said to be deleted (nor its guests told it's off).
+        if let Some(at) = occurrence
+            && series
+            && super::invite::exceptions_full(p, uid, at)
+        {
+            return Err(CmdError::Failed("too many occurrences of this series are deleted to delete another: delete the series".into()));
+        }
+        // As declining or a cancellation takes them out: a changed occurrence that's an item of
+        // its own on the server is deleted there, and each item once.
+        let remote = match occurrence {
+            Some(at) if series => {
+                let remote = super::invite::drop_occurrence(p, uid, at);
                 if let Some(m) = p.events.iter_mut().find(|e| e.event.uid == uid && e.event.recurrence_id.is_none()) {
-                    if !m.event.exdates.contains(&at) {
-                        m.event.exdates.push(at);
-                    }
                     m.event.sequence = m.event.sequence.saturating_add(1);
-                    remote = m.calendar != LOCAL;
-                    m.dirty |= remote;
                 }
+                remote
             }
             _ => {
                 let gone: Vec<StoredEvent> = p.events.iter().filter(|e| e.event.uid == uid).cloned().collect();
-                for g in gone.iter().filter(|g| !g.href.is_empty()) {
-                    remote = true;
-                    p.deleted.push(Tombstone { href: g.href.clone(), etag: g.etag.clone(), calendar: g.calendar.clone() });
-                }
                 p.events.retain(|e| e.event.uid != uid);
+                super::invite::delete_items(p, &gone)
             }
-        }
+        };
         self.after_pim_change(&account, remote);
         Ok(serde_json::json!({"deleted": uid}))
     }
@@ -429,22 +427,46 @@ impl Session {
 
     /// Everyone in the address books matching a search, by name.
     pub fn people(&self, query: &str) -> Vec<Person<'_>> {
+        let q = mailcraft_model::vcard::CardSearch::new(query);
         let mut out: Vec<Person<'_>> = self
             .pim
             .iter()
-            .flat_map(|(a, p)| p.cards.iter().filter(|c| c.card.matches(query)).map(|c| Person { account: a, book: &c.book, card: &c.card }))
+            .flat_map(|(a, p)| {
+                p.cards.iter().enumerate().filter(|(_, c)| c.card.matches_search(&q)).map(|(at, c)| Person {
+                    account: a,
+                    book: &c.book,
+                    card: &c.card,
+                    at,
+                })
+            })
             .collect();
         out.sort_by_cached_key(|p| p.card.display().to_lowercase());
         out
     }
 
+    /// The contact someone is saved as, by their address (of several, the first by name, as
+    /// [`Session::people`] lists them). The reading pane asks it of each name above a message
+    /// on every frame: searching the address book for each took milliseconds.
+    pub fn contact_by_address(&self, email: &str) -> Option<&Card> {
+        let email = email.trim();
+        if email.is_empty() {
+            return None;
+        }
+        let has = |c: &&Card| c.emails.iter().any(|e| e.value.eq_ignore_ascii_case(email));
+        let mut found = self.pim.values().flat_map(|p| p.cards.iter().map(|c| &c.card)).filter(has);
+        let first = found.next()?;
+        Some(found.fold(first, |best, c| if c.display().to_lowercase() < best.display().to_lowercase() { c } else { best }))
+    }
+
     pub fn find_person(&self, uid: &str) -> Option<Person<'_>> {
-        self.pim.iter().find_map(|(a, p)| p.cards.iter().find(|c| c.card.uid == uid).map(|c| Person { account: a, book: &c.book, card: &c.card }))
+        self.pim.iter().find_map(|(a, p)| {
+            p.cards.iter().enumerate().find(|(_, c)| c.card.uid == uid).map(|(at, c)| Person { account: a, book: &c.book, card: &c.card, at })
+        })
     }
 
     /// Add someone; returns their uid.
     pub fn create_card(&mut self, account: Option<&str>, mut card: Card) -> CmdResult {
-        let account = self.pim_account(account)?;
+        let account = self.account_or_shown(account)?;
         check_card(&card)?;
         if card.uid.trim().is_empty() {
             card.uid = self.new_uid();
@@ -503,6 +525,8 @@ impl Session {
 pub struct NoteRef<'a> {
     pub account: &'a str,
     pub note: &'a mailcraft_model::pim::Note,
+    /// Its place among its account's notes (`Pim::notes`), to find it again without a search.
+    pub at: usize,
 }
 
 impl Session {
@@ -512,7 +536,7 @@ impl Session {
     /// Address Book): read with the account's own, read-only, once the server shows it.
     pub fn open_shared_calendar(&mut self, account: Option<&str>, email: &str) -> CmdResult {
         let account = match account {
-            Some(a) => self.pim_account(Some(a))?,
+            Some(a) => self.account_or_shown(Some(a))?,
             None => self
                 .accounts
                 .iter()
@@ -567,7 +591,11 @@ impl Session {
             .pim
             .iter()
             .flat_map(|(a, p)| {
-                p.notes.iter().filter(|n| q.is_empty() || n.note.text.to_lowercase().contains(&q)).map(|n| NoteRef { account: a, note: &n.note })
+                p.notes.iter().enumerate().filter(|(_, n)| q.is_empty() || n.note.text.to_lowercase().contains(&q)).map(|(at, n)| NoteRef {
+                    account: a,
+                    note: &n.note,
+                    at,
+                })
             })
             .collect();
         // A note's title is its first line, compared without case.
@@ -595,7 +623,7 @@ impl Session {
 
     /// A new note; returns its uid.
     pub fn create_note(&mut self, account: Option<&str>, text: &str, color: Option<u8>) -> CmdResult {
-        let account = self.pim_account(account)?;
+        let account = self.account_or_shown(account)?;
         let note = mailcraft_model::pim::Note {
             uid: self.new_uid(),
             text: cap_note(text),
@@ -678,7 +706,7 @@ fn check_event(e: &CalEvent) -> Result<(), CmdError> {
     if e.end < e.start {
         return Err(CmdError::Params("the event ends before it starts".into()));
     }
-    if e.end - e.start > 366 * 86_400 {
+    if e.end.saturating_sub(e.start) > 366 * 86_400 {
         return Err(CmdError::Params("an event can last a year at most".into()));
     }
     Ok(())
@@ -696,13 +724,17 @@ fn check_card(c: &Card) -> Result<(), CmdError> {
     Ok(())
 }
 
+/// Unix seconds a time given to a command must stay within, either side of 1970 (about 12,000
+/// years): a calendar's sums with times past it overflow.
+pub(crate) const MAX_SECONDS: i64 = 400_000_000_000;
+
 /// A local date (`YYYY-MM-DD`, all day) or date and time (`YYYY-MM-DDTHH:MM`, seconds after it
-/// or not, a space for the `T` or not), or Unix seconds, as (Unix seconds, all day). `offset` is
-/// the local UTC offset; all-day dates come back at UTC midnight (as events keep them).
+/// or not, a space for the `T` or not), or Unix seconds, as (Unix seconds, all day), read in
+/// `clock`'s time zone; all-day dates come back at UTC midnight (as events keep them).
 pub fn parse_local(s: &str, clock: &Clock) -> Option<(i64, bool)> {
     let s = s.trim();
     if let Ok(n) = s.parse::<i64>() {
-        return (n.abs() < 400_000_000_000).then_some((n, false));
+        return (-MAX_SECONDS..MAX_SECONDS).contains(&n).then_some((n, false));
     }
     let num = |a: usize, b: usize| s.get(a..b).filter(|x| x.bytes().all(|c| c.is_ascii_digit())).and_then(|x| x.parse::<i64>().ok());
     let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
@@ -727,9 +759,4 @@ pub fn parse_local(s: &str, clock: &Clock) -> Option<(i64, bool)> {
         _ => return None,
     }
     Some((clock.utc(day * 86_400 + h * 3600 + mi * 60), false))
-}
-
-/// The time to judge old answers by: `t` when it's a real time.
-fn now_or(t: i64) -> i64 {
-    t.max(0)
 }

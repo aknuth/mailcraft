@@ -1,13 +1,28 @@
 use super::*;
-use mailcraft_model::{EmailAddress, Flags};
+use crate::data_files::pst_bytes::{block_at, block_ends, crc, seal};
+use crate::data_files::scratch::scratch;
+use crate::data_files::test_data::{filetime, plain_message};
+use mailcraft_model::{EmailAddress, Flags, MessageKey};
 use mailcraft_pst::{
-    Message, PstFile, PstStore,
+    Message, PstFile, PstFolder, PstStore,
     write::{self, SpecialFolder as Special},
 };
 use mailcraft_store::FolderState;
 use std::collections::BTreeMap;
 
 const NONE: &FollowUpDays = &FollowUpDays { due: BTreeMap::new(), done: BTreeMap::new() };
+
+/// A big file's byte at `at`, the `n`th file's: not one repeated block, which a writer might
+/// keep once.
+fn big_byte(n: usize, at: usize) -> u8 {
+    let x = (at as u64).wrapping_add(n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (x >> 56) as u8
+}
+
+/// The `n`th big file's `len` bytes ([`big_byte`]).
+fn big_file(n: usize, len: usize) -> Vec<u8> {
+    (0..len).map(|at| big_byte(n, at)).collect()
+}
 
 /// A data file's named property: its ID, by its property set's data1 (PSETID_Task's is
 /// 0x00062003) and LID, as the writer's own reader reads the file's map.
@@ -22,11 +37,14 @@ fn named_id(path: &Path, set: u32, lid: u32) -> Option<u16> {
     })
 }
 
-/// The properties `ids` of the message with `subject` in the folder at `names` of a data file.
-fn props_of(path: &Path, names: &[&str], subject: &str, ids: &[u16]) -> Vec<Option<mailcraft_pst::PropertyValue>> {
-    let pst = PstFile::open(path).unwrap();
-    let store = PstStore::read(Rc::new(pst)).unwrap();
-    let any: Rc<PstStore> = store.clone();
+/// The data file at `path`, as the writer's own reader reads it (with no limit on a value).
+fn read_file(path: &Path) -> Rc<PstStore> {
+    PstStore::read(Rc::new(PstFile::open(path).unwrap())).unwrap()
+}
+
+/// The folder at `names` of the data file `any`: each a folder's display name, from the top of
+/// the file's folders.
+fn folder_at(any: &Rc<PstStore>, names: &[&str]) -> Rc<PstFolder> {
     let mut folder = any.open_folder(any.ipm_subtree().unwrap()).unwrap();
     for name in names {
         let table = folder.hierarchy_table().unwrap().clone();
@@ -34,24 +52,37 @@ fn props_of(path: &Path, names: &[&str], subject: &str, ids: &[u16]) -> Vec<Opti
             .rows_matrix()
             .filter_map(|row| any.open_folder(row.id()).ok())
             .find(|f| f.properties().display_name().is_ok_and(|n| n == *name))
-            .unwrap();
+            .unwrap_or_else(|| panic!("no folder {name} in {names:?}"));
     }
-    for row in folder.contents_table().unwrap().rows_matrix() {
-        let entry = row.id();
-        let m = Message::read(store.clone(), entry).unwrap();
-        if m.properties().get(0x0037).and_then(crate::pst::text_of).as_deref() == Some(subject) {
-            return ids.iter().map(|id| m.properties().get(*id).cloned()).collect();
-        }
-    }
-    panic!("no {subject} in {names:?}")
+    folder
+}
+
+/// The messages in `folder` of the data file `any`, in the order it lists them.
+fn messages_in(any: &Rc<PstStore>, folder: &PstFolder) -> Vec<Rc<Message>> {
+    folder.contents_table().unwrap().rows_matrix().map(|row| Message::read(any.clone(), row.id()).unwrap()).collect()
+}
+
+/// A message's subject as the file has it; empty when it has none.
+fn subject_of(m: &Message) -> String {
+    m.properties().get(0x0037).and_then(crate::pst::text_of).unwrap_or_default()
+}
+
+/// The message with `subject` in the folder at `names` of the data file `any`.
+fn message_at(any: &Rc<PstStore>, names: &[&str], subject: &str) -> Rc<Message> {
+    let folder = folder_at(any, names);
+    messages_in(any, &folder).into_iter().find(|m| subject_of(m) == subject).unwrap_or_else(|| panic!("no {subject} in {names:?}"))
+}
+
+/// The properties `ids` of the message with `subject` in the folder at `names` of a data file.
+fn props_of(path: &Path, names: &[&str], subject: &str, ids: &[u16]) -> Vec<Option<mailcraft_pst::PropertyValue>> {
+    let m = message_at(&read_file(path), names, subject);
+    ids.iter().map(|id| m.properties().get(*id).cloned()).collect()
 }
 
 #[test]
 fn an_account_round_trips_through_a_data_file() {
     use mailcraft_pst::PropertyValue as V;
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export");
     let store = Store::open(dir.join("cache")).unwrap();
     let mk = |folder: &str, uid: u32, subject: &str, with_file: bool, flags: Flags, edit: &dyn Fn(&mut mime::Draft)| {
         let mut d = mime::Draft {
@@ -170,7 +201,19 @@ fn an_account_round_trips_through_a_data_file() {
     let done = export(&store, "a1", "Riley's mail", &file, &days, &mut |_| ticks += 1).unwrap();
     assert_eq!(
         done,
-        Exported { messages: 7, skipped: 1, already: 0, events: 1, occurrences: 0, tasks: 1, notes: 0, contacts: 1, pim_already: 0, pim_replaced: 0 }
+        Exported {
+            messages: 7,
+            skipped: 1,
+            folders_skipped: 0,
+            already: 0,
+            events: 1,
+            occurrences: 0,
+            tasks: 1,
+            notes: 0,
+            contacts: 1,
+            pim_already: 0,
+            pim_replaced: 0
+        }
     );
     // The calendar is inside it too: nothing beside it.
     assert!(!dir.join("Out Calendar.ics").exists() && !dir.join("Out Contacts.vcf").exists());
@@ -192,7 +235,7 @@ fn an_account_round_trips_through_a_data_file() {
     let task_due = named_id(&file, 0x0006_2003, 0x8105).unwrap();
     let task_start = named_id(&file, 0x0006_2003, 0x8104).unwrap();
     let flag_request = named_id(&file, 0x0006_2008, 0x8530).unwrap();
-    let day = (20_000 * 86_400 + 11_644_473_600) * 10_000_000;
+    let day = filetime(20_000 * 86_400);
     let got =
         props_of(&file, &["Inbox"], "Plan — café", &[task_due, task_start, flag_request, 0x1095, 0x0E2B, 0x0C1E, 0x0065, 0x0036, 0x0E06, 0x0039]);
     assert!(matches!(got[0], Some(V::Time(t)) if t == day), "{:?}", got[0]);
@@ -287,29 +330,15 @@ fn an_account_round_trips_through_a_data_file() {
     let empty = dir.join("Empty.pst");
     assert!(export(&store, "nobody", "x", &empty, NONE, &mut |_| {}).is_err());
     assert!(!empty.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A file added to keeps its own special folders: the account's Sent mail goes into the folder
 /// it records, whatever its name, and none of its own is recorded in its place.
 #[test]
 fn an_export_uses_the_special_folders_a_file_has() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-special-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-special");
     let file = dir.join("Theirs.pst");
-    let theirs = NewMessage {
-        subject: "Theirs",
-        sender_name: "Ana",
-        sender_email: "ana@example.com",
-        recipients: &[],
-        body: "Kept.",
-        html_body: None,
-        message_id: "<theirs@example.com>",
-        delivery_time: 133_485_408_000_000_000,
-        message_class: "IPM.Note",
-        properties: &[],
-    };
+    let theirs = plain_message("Theirs", "<theirs@example.com>");
     write::create_with(&file, &["Gesendete Elemente"], &theirs, &[]).unwrap();
     write::set_special_folder(&file, Special::SentItems, &["Gesendete Elemente"]).unwrap();
 
@@ -331,7 +360,6 @@ fn an_export_uses_the_special_folders_a_file_has() {
     let theirs = folders.iter().find(|f| f.path == "Gesendete Elemente").unwrap();
     assert_eq!((theirs.role, theirs.total), (FolderRole::Sent, 2), "{folders:?}");
     assert!(!folders.iter().any(|f| f.path == "Sent Items"), "{folders:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// MS-PST 5.1's permutation (`mpbbCrypt`'s first 256 bytes), which encodes a data block's bytes.
@@ -349,37 +377,18 @@ const PERMUTE: [u8; 256] = [
     0xA2, 0x01, 0xF7, 0x2E, 0xBC, 0x24, 0x68, 0x75, 0x0D, 0xFE, 0xBA, 0x2F, 0xB5, 0xD0, 0xDA, 0x3D,
 ];
 
-/// MS-PST's CRC: CRC-32's table, started at 0 and not inverted at the end.
-fn crc(data: &[u8]) -> u32 {
-    let mut c = 0u32;
-    for &b in data {
-        c ^= u32::from(b);
-        for _ in 0..8 {
-            c = if c & 1 == 1 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
-        }
-    }
-    c
-}
-
 /// Encode a data file the writer made the way Outlook encodes its own by default: every data
-/// block's bytes permuted (internal blocks never are), found from the 16-byte trailers that end
-/// blocks on 64-byte boundaries, with their CRCs, and the header's `bCryptMethod` (0x201) set
-/// to permute, with the CRC over the header (0x20C, of the 516 bytes from 8).
+/// block's bytes permuted (internal blocks never are), block by block in the file's order, each
+/// one's CRC made right, and the header's `bCryptMethod` (0x201) set to permute, with the CRC
+/// over the header (0x20C, of the 516 bytes from 8).
 fn permute_encode(path: &Path) {
     let mut f = std::fs::read(path).unwrap();
-    let u32_at = |f: &[u8], at: usize| u32::from_le_bytes(f[at..at + 4].try_into().unwrap());
-    for end in (64..=f.len()).step_by(64) {
-        let size = usize::from(u16::from_le_bytes([f[end - 16], f[end - 15]]));
-        let bid = u64::from_le_bytes(f[end - 8..end].try_into().unwrap());
-        let Some(start) = end.checked_sub((size + 16).div_ceil(64) * 64) else { continue };
-        if size == 0 || size > 8176 || bid & 2 != 0 || crc(&f[start..start + size]) != u32_at(&f, end - 12) {
-            continue;
-        }
+    for end in block_ends(f.len()) {
+        let Some((_, (start, size))) = block_at(&f, end).filter(|(bid, _)| bid & 2 == 0) else { continue };
         for b in &mut f[start..start + size] {
             *b = PERMUTE[usize::from(*b)];
         }
-        let c = crc(&f[start..start + size]);
-        f[end - 12..end - 8].copy_from_slice(&c.to_le_bytes());
+        seal(&mut f, (start, size));
     }
     f[0x201] = 1;
     let c = crc(&f[8..8 + 516]);
@@ -391,24 +400,10 @@ fn permute_encode(path: &Path) {
 /// it already has isn't written twice, it stays encoded, and the import reads it all back.
 #[test]
 fn an_export_adds_to_an_encoded_data_file() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-encoded-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-encoded");
     let file = dir.join("Outlook.pst");
-    let theirs = |subject, message_id| NewMessage {
-        subject,
-        sender_name: "Ana",
-        sender_email: "ana@example.com",
-        recipients: &[],
-        body: "Kept as it was.",
-        html_body: None,
-        message_id,
-        delivery_time: 133_485_408_000_000_000,
-        message_class: "IPM.Note",
-        properties: &[],
-    };
-    write::create_with(&file, &["Inbox"], &theirs("Theirs", "<theirs@example.com>"), &[]).unwrap();
-    write::append_message(&file, &["Inbox"], &theirs("Both", "<m1@example.com>"), &[]).unwrap();
+    write::create_with(&file, &["Inbox"], &plain_message("Theirs", "<theirs@example.com>"), &[]).unwrap();
+    write::append_message(&file, &["Inbox"], &plain_message("Both", "<m1@example.com>"), &[]).unwrap();
     permute_encode(&file);
 
     let store = Store::open(dir.join("cache")).unwrap();
@@ -433,7 +428,6 @@ fn an_export_adds_to_an_encoded_data_file() {
     let mut subjects: Vec<String> = back.load_folder("b1", "INBOX").unwrap().messages.iter().map(|m| m.subject.clone()).collect();
     subjects.sort();
     assert_eq!(subjects, ["Both", "Ours", "Theirs"]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A data file whose name-to-ID map can't take names (here: its bucket count is 0) is still
@@ -441,37 +435,19 @@ fn an_export_adds_to_an_encoded_data_file() {
 #[test]
 fn an_export_adds_to_a_file_whose_name_map_is_damaged() {
     use mailcraft_pst::PropertyValue as V;
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-name-map-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-name-map");
     let file = dir.join("Theirs.pst");
-    let theirs = NewMessage {
-        subject: "Theirs",
-        sender_name: "Ana",
-        sender_email: "ana@example.com",
-        recipients: &[],
-        body: "Kept.",
-        html_body: None,
-        message_id: "<theirs@example.com>",
-        delivery_time: 133_485_408_000_000_000,
-        message_class: "IPM.Note",
-        properties: &[],
-    };
+    let theirs = plain_message("Theirs", "<theirs@example.com>");
     write::create_with(&file, &["Inbox"], &theirs, &[]).unwrap();
     // The map's PidTagNameidBucketCount record (its ID 0x0001, PtypInteger32) set to 0, in the
     // one block that has it, its CRC made right.
     let mut f = std::fs::read(&file).unwrap();
     let mut patched = 0;
-    for end in (64..=f.len()).step_by(64) {
-        let size = usize::from(u16::from_le_bytes([f[end - 16], f[end - 15]]));
-        let Some(start) = end.checked_sub((size + 16).div_ceil(64) * 64) else { continue };
-        if size == 0 || size > 8176 || crc(&f[start..start + size]) != u32::from_le_bytes(f[end - 12..end - 8].try_into().unwrap()) {
-            continue;
-        }
+    for end in block_ends(f.len()) {
+        let Some((_, (start, size))) = block_at(&f, end) else { continue };
         let Some(at) = f[start..start + size].windows(8).position(|w| w[..4] == [1, 0, 3, 0] && w[4..] != [0, 0, 0, 0]) else { continue };
         f[start + at + 4..start + at + 8].copy_from_slice(&0u32.to_le_bytes());
-        let c = crc(&f[start..start + size]);
-        f[end - 12..end - 8].copy_from_slice(&c.to_le_bytes());
+        seal(&mut f, (start, size));
         patched += 1;
     }
     assert_eq!(patched, 1);
@@ -498,16 +474,13 @@ fn an_export_adds_to_a_file_whose_name_map_is_damaged() {
     assert!(status.is_some());
     let back = Store::open(dir.join("back")).unwrap();
     assert_eq!(crate::pst::import(&file, &back, "b1", &mut |_| {}).unwrap().messages, 3);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An Outlook 97–2002 file that is only a header (damaged) says it can't be read, before
 /// anything is written.
 #[test]
 fn a_damaged_ansi_data_file_says_it_cant_be_read() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-ansi-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-ansi");
     let file = dir.join("Old.pst");
     let mut head = b"!BDN\0\0\0\0SM".to_vec();
     head.extend_from_slice(&14u16.to_le_bytes());
@@ -515,7 +488,6 @@ fn a_damaged_ansi_data_file_says_it_cant_be_read() {
     std::fs::write(&file, &head).unwrap();
     assert!(ids_in(&file).is_err_and(|e| e.contains("can't be read")));
     assert_eq!(std::fs::read(&file).unwrap(), head);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A follow-up marked complete goes into the file as Outlook keeps one (status complete, when,
@@ -525,9 +497,7 @@ fn a_damaged_ansi_data_file_says_it_cant_be_read() {
 fn a_completed_follow_up_round_trips() {
     use mailcraft_model::organize::{FOLLOW_UP_DOC, FOLLOW_UP_DONE_DOC};
     use mailcraft_pst::PropertyValue as V;
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-complete-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-complete");
     let store = Store::open(dir.join("cache")).unwrap();
     let complete = Flags { seen: true, keywords: vec![mailcraft_model::FOLLOW_UP_COMPLETE.into()], ..Default::default() };
     let flagged = Flags { flagged: true, ..Default::default() };
@@ -554,7 +524,7 @@ fn a_completed_follow_up_round_trips() {
     let days = FollowUpDays { due: due.clone(), done };
     assert_eq!(export(&store, "a1", "Done", &path, &days, &mut |_| {}).unwrap().messages, 2);
 
-    let midnight = |day: i64| (day * 86_400 + 11_644_473_600) * 10_000_000;
+    let midnight = |day: i64| filetime(day * 86_400);
     let [status, when, icon, to_do] = props_of(&path, &["Inbox"], "Done", &[0x1090, 0x1091, 0x1095, 0x0E2B]).try_into().unwrap();
     assert!(matches!(status, Some(V::Integer32(1))), "{status:?}");
     assert!(matches!(when, Some(V::Time(t)) if t == midnight(20_390)), "{when:?}");
@@ -574,13 +544,14 @@ fn a_completed_follow_up_round_trips() {
     let done_back: BTreeMap<String, i64> = back.load_account_doc("b1", FOLLOW_UP_DONE_DOC).unwrap();
     assert_eq!(done_back, BTreeMap::from([("done@studio.example".to_string(), 20_390)]), "only the completed one's");
     drop((store, back));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 mod ansi;
 mod big;
 mod calendar;
 mod kinds;
+mod loops;
 mod pim;
 mod pinned;
 mod replace;
+mod unreadable;

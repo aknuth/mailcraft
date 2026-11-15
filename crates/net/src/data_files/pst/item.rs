@@ -1,5 +1,7 @@
 //! An item as read from the file: its properties, recipients and attachments.
 
+use mailcraft_model::thread;
+
 use super::props::{Val, clean_name, code_page, is_address, one_off_address, read, val};
 use super::*;
 
@@ -132,24 +134,22 @@ pub(super) fn message_class(m: &Message, code_page: u32) -> String {
 }
 
 /// An item from a message read outside a data file ([`Loose`]), its attached messages items too,
-/// down to [`MAX_NESTING`] levels (those past it are left out).
-pub(super) fn loose_item(m: &Loose<'_>, named: &crate::pst_pim::Named, depth: usize) -> Item {
+/// down to [`MAX_NESTING`] levels (those past it are left out). Its files' bytes are moved in.
+pub(super) fn loose_item(m: Loose<'_>, named: &crate::pst_pim::Named, depth: usize) -> Item {
     fn find<'a>(list: &[(u16, Val<'a>)], id: u16) -> Option<Val<'a>> {
         list.iter().find(|(i, _)| *i == id).map(|(_, v)| v.clone())
     }
-    let files: Vec<File> = m
-        .files
-        .iter()
+    let Loose { props, recipients, files } = m;
+    let files: Vec<File> = files
+        .into_iter()
         .filter_map(|f| match f {
-            LooseFile::Data { name, mime, cid, data } => {
-                Some(File::Data { name: name.clone(), mime: mime.clone(), cid: cid.clone(), data: data.clone() })
-            }
-            LooseFile::Message(inner) if depth + 1 < MAX_NESTING => Some(File::Message(Box::new(loose_item(inner, named, depth + 1)))),
+            LooseFile::Data { name, mime, cid, data } => Some(File::Data { name, mime, cid, data }),
+            LooseFile::Message(inner) if depth + 1 < MAX_NESTING => Some(File::Message(Box::new(loose_item(*inner, named, depth + 1)))),
             LooseFile::Message(_) => None,
         })
         .collect();
-    let rows: Vec<_> = m.recipients.iter().map(|r| move |id: u16| find(r, id)).collect();
-    item_of(&|id| find(&m.props, id), &rows, files, named)
+    let rows: Vec<_> = recipients.iter().map(|r| move |id: u16| find(r, id)).collect();
+    item_of(&|id| find(&props, id), &rows, files, named)
 }
 
 /// An item from its properties (`p`) and its recipients' (one getter per recipient).
@@ -162,9 +162,8 @@ pub(super) fn item_of<'a>(
     let s = |id: u16| p(id).and_then(Val::into_text).unwrap_or_default();
     let charset_unsupported = files.iter().any(|f| matches!(f, File::Message(m) if m.charset_unsupported));
     let mut it = Item { class: s(0x001A), files, charset_unsupported, ..Default::default() };
-    let class = it.class.to_ascii_lowercase();
-    let pim = ["ipm.contact", "ipm.distlist", "ipm.appointment", "ipm.schedule.meeting", "ipm.task", "ipm.stickynote", "ipm.activity", EXCEPTION];
-    if pim.iter().any(|c| class.starts_with(c)) {
+    let class = Class::of(&it.class);
+    if class.has_pim_properties() {
         it.extra = Some(crate::pst_pim::extract(p, named));
     }
     // A subject may start with a prefix marker (0x01, length); control characters in the rest
@@ -181,7 +180,39 @@ pub(super) fn item_of<'a>(
     it.from = EmailAddress::new(name(&[0x0C1A, 0x0042]), email(&[0x5D01, 0x0C1F, 0x5D02, 0x0065]));
     it.date = [0x0E06, 0x0039, 0x3007].iter().find_map(|id| p(*id).and_then(|v| v.time())).unwrap_or(0);
     it.received = p(0x0E06).and_then(|v| v.time()).unwrap_or(0);
-    it.body = s(0x1000);
+    bodies_into(&mut it, p, class, named);
+    it.message_id = message_ids(&s(0x1035)).into_iter().next().unwrap_or_default();
+    it.in_reply_to = message_ids(&s(0x1042)).into_iter().next().unwrap_or_default();
+    it.references = message_ids(&s(0x1039));
+    it.headers = s(0x007D);
+    // PidTagImportance: 0 low, 1 normal, 2 high.
+    it.importance = match p(0x0017) {
+        Some(Val::Int(0)) => -1,
+        Some(Val::Int(2)) => 1,
+        _ => 0,
+    };
+    // A conversation index is a 22-byte header and 5-byte blocks (MS-OXOMSG 2.2.1.3): kept
+    // whole blocks only, at most as many as threading reads (one with more it reads as none).
+    if let Some(Val::Bin(b)) = p(0x0071)
+        && b.len() >= 22
+    {
+        let blocks = ((b.len() - 22) / 5).min(thread::MAX_INDEX_BLOCKS);
+        it.thread_index = b.get(..22 + blocks * 5).unwrap_or_default().to_vec();
+    }
+    it.thread_topic = s(0x0070);
+    it.sensitivity = match p(0x0036) {
+        Some(Val::Int(n @ 1..=3)) => u8::try_from(n).unwrap_or(0),
+        _ => 0,
+    };
+    flags_into(&mut it, p, named);
+    recipients_into(&mut it, recipients);
+    it
+}
+
+/// Its text: the plain text, the HTML (in its code page), or else the RTF's; a sharing
+/// invitation's lines before them.
+fn bodies_into<'a>(it: &mut Item, p: &dyn Fn(u16) -> Option<Val<'a>>, class: Class, named: &crate::pst_pim::Named) {
+    it.body = p(0x1000).and_then(Val::into_text).unwrap_or_default();
     it.html = p(0x1013).and_then(|v| match v {
         Val::Bin(b) => {
             // PidTagInternetCodepage.
@@ -200,35 +231,17 @@ pub(super) fn item_of<'a>(
     {
         // PidTagRtfInSync: false when the plain text was changed after the RTF.
         let in_sync = !matches!(p(0x0E1F), Some(Val::Bool(false)));
-        rtf_into(&mut it, rtf, in_sync);
+        rtf_into(it, rtf, in_sync);
     }
     // A sharing invitation says what it shares, whatever its own text says.
-    if class.starts_with("ipm.sharing") {
+    if class == Class::Sharing {
         crate::pst_pim::put_before(&crate::pst_pim::sharing_lines(p, named), &mut it.body, &mut it.html);
     }
-    it.message_id = message_ids(&s(0x1035)).into_iter().next().unwrap_or_default();
-    it.in_reply_to = message_ids(&s(0x1042)).into_iter().next().unwrap_or_default();
-    it.references = message_ids(&s(0x1039));
-    it.headers = s(0x007D);
-    // PidTagImportance: 0 low, 1 normal, 2 high.
-    it.importance = match p(0x0017) {
-        Some(Val::Int(0)) => -1,
-        Some(Val::Int(2)) => 1,
-        _ => 0,
-    };
-    // A conversation index is a 22-byte header and 5-byte blocks (MS-OXOMSG 2.2.1.3): kept
-    // whole blocks only, at most MAX_THREAD_BLOCKS of them.
-    if let Some(Val::Bin(b)) = p(0x0071)
-        && b.len() >= 22
-    {
-        let blocks = ((b.len() - 22) / 5).min(MAX_THREAD_BLOCKS);
-        it.thread_index = b.get(..22 + blocks * 5).unwrap_or_default().to_vec();
-    }
-    it.thread_topic = s(0x0070);
-    it.sensitivity = match p(0x0036) {
-        Some(Val::Int(n @ 1..=3)) => u8::try_from(n).unwrap_or(0),
-        _ => 0,
-    };
+}
+
+/// Its flags as the list shows them (read, a draft, flagged or done, answered, forwarded), its
+/// categories as keywords, its follow-up's days and its pin.
+fn flags_into<'a>(it: &mut Item, p: &dyn Fn(u16) -> Option<Val<'a>>, named: &crate::pst_pim::Named) {
     let flags = match p(0x0E07) {
         Some(Val::Int(n)) => n,
         _ => 0,
@@ -272,6 +285,11 @@ pub(super) fn item_of<'a>(
     if matches!(named.pinned().and_then(p), Some(Val::Bool(true))) {
         it.flags.set_keyword(mailcraft_model::PINNED, true);
     }
+}
+
+/// Its recipients, as To, Cc and Bcc; a meeting's organizer and each guest's answer go to its
+/// calendar properties.
+fn recipients_into<'a>(it: &mut Item, recipients: &[impl Fn(u16) -> Option<Val<'a>>]) {
     let headers = super::rebuild::usable_headers(&it.headers);
     for row in recipients {
         let get = |id: u16| row(id).and_then(Val::into_text).unwrap_or_default();
@@ -311,7 +329,6 @@ pub(super) fn item_of<'a>(
             _ => it.to.push(a),
         }
     }
-    it
 }
 
 /// A flag's due day from its time (100 ns since 1601, at the day's midnight as Outlook keeps
@@ -320,7 +337,7 @@ pub(super) fn item_of<'a>(
 /// 4501-01-01, "no date", among them).
 pub(super) fn due_day(v: &Val<'_>) -> Option<i64> {
     let Val::Time(t) = v else { return None };
-    let seconds = t.checked_div(10_000_000)?.checked_sub(11_644_473_600)?;
+    let seconds = t.checked_div(10_000_000)?.checked_sub(crate::data_files::outlook::EPOCH_1601)?;
     let day = seconds.checked_add(43_200)?.div_euclid(86_400);
     mailcraft_model::organize::FOLLOW_UP_DAYS.contains(&day).then_some(day)
 }
@@ -329,7 +346,7 @@ pub(super) fn due_day(v: &Val<'_>) -> Option<i64> {
 /// [`FOLLOW_UP_DAYS`](mailcraft_model::organize::FOLLOW_UP_DAYS).
 pub(super) fn moment_day(v: &Val<'_>) -> Option<i64> {
     let Val::Time(t) = v else { return None };
-    let day = t.checked_div(10_000_000)?.checked_sub(11_644_473_600)?.div_euclid(86_400);
+    let day = t.checked_div(10_000_000)?.checked_sub(crate::data_files::outlook::EPOCH_1601)?.div_euclid(86_400);
     mailcraft_model::organize::FOLLOW_UP_DAYS.contains(&day).then_some(day)
 }
 
@@ -360,8 +377,8 @@ fn rtf_into(it: &mut Item, compressed: &[u8], in_sync: bool) {
 
 /// The message ids in a References or In-Reply-To value as the file keeps it: every `<…>` when
 /// there is one (`<a><b>`, `<a>,<b>`, `<a> , <b>`), else the words between spaces and commas;
-/// without their brackets, each at most [`MAX_ID`] bytes; the last [`MAX_IDS`], as threading
-/// keeps them.
+/// without their brackets, each at most [`MAX_ID`] bytes; the last
+/// [`MAX_REFERENCES`](thread::MAX_REFERENCES), as threading keeps them.
 pub(super) fn message_ids(s: &str) -> Vec<String> {
     let words: Vec<&str> = if s.contains('<') {
         s.split('<').skip(1).filter_map(|w| w.split_once('>').map(|(id, _)| id)).collect()
@@ -373,8 +390,8 @@ pub(super) fn message_ids(s: &str) -> Vec<String> {
         id.truncate(end);
         id
     };
-    let mut ids: Vec<String> = words.into_iter().map(|w| cap(mailcraft_model::thread::norm_id(w))).filter(|id| !id.is_empty()).collect();
-    ids.drain(..ids.len().saturating_sub(MAX_IDS));
+    let mut ids: Vec<String> = words.into_iter().map(|w| cap(thread::norm_id(w))).filter(|id| !id.is_empty()).collect();
+    ids.drain(..ids.len().saturating_sub(thread::MAX_REFERENCES));
     ids
 }
 
@@ -412,8 +429,7 @@ pub(super) fn attachment(a: &Attachment, code_page: u32, class: &str, top: bool)
 /// and bytes, in an item of class `class`; `None` for any other attachment. One past the cap is
 /// counted as too big (it is hidden, so it would otherwise go unsaid).
 pub(super) fn photo<'a>(p: &dyn Fn(u16) -> Option<Val<'a>>, class: &str, data: &[u8]) -> Option<Got> {
-    let contact = class.get(..11).is_some_and(|c| c.eq_ignore_ascii_case("ipm.contact"));
-    if !contact || !matches!(p(0x7FFF), Some(Val::Bool(true))) {
+    if Class::of(class) != Class::Contact || !matches!(p(0x7FFF), Some(Val::Bool(true))) {
         return None;
     }
     if data.len() > MAX_ATTACHMENT {
@@ -421,7 +437,7 @@ pub(super) fn photo<'a>(p: &dyn Fn(u16) -> Option<Val<'a>>, class: &str, data: &
         return Some(Got::Left(SkipReason::AttachmentTooBig));
     }
     let s = |id: u16| p(id).and_then(Val::into_text).unwrap_or_default();
-    let mime = Some(s(0x370E)).filter(|m| !m.is_empty()).unwrap_or_else(|| mime::mime_from_name(&name_of(&s)).to_string());
+    let mime = mime_or_from_name(s(0x370E), &name_of(&s));
     Some(Got::Photo(mime, data.to_vec()))
 }
 
@@ -464,16 +480,94 @@ pub(super) fn from_row<'a>(e: &io::Error, p: &dyn Fn(u16) -> Option<Val<'a>>, cl
 /// A message's other hidden files are: Outlook hides some files a message carries, and leaving
 /// them out lost them.
 fn hidden<'a>(p: &dyn Fn(u16) -> Option<Val<'a>>, class: &str, top: bool) -> bool {
-    let is = |prefix: &str| class.get(..prefix.len()).is_some_and(|c| c.eq_ignore_ascii_case(prefix));
+    let class = Class::of(class);
     let occurrence = matches!(p(0x7FFD), Some(Val::Int(f)) if f & 0x2 != 0)
-        || ((is("ipm.schedule.meeting") || is("ipm.appointment")) && matches!(p(0x3705), Some(Val::Int(5))));
-    let exception = occurrence && !(top && is("ipm.appointment"));
-    matches!(p(0x7FFE), Some(Val::Bool(true))) && p(0x3712).and_then(Val::into_text).is_none_or(|c| c.is_empty()) && (is("ipm.contact") || exception)
+        || (matches!(class, Class::Meeting | Class::Appointment) && matches!(p(0x3705), Some(Val::Int(5))));
+    let exception = occurrence && !(top && class == Class::Appointment);
+    matches!(p(0x7FFE), Some(Val::Bool(true)))
+        && p(0x3712).and_then(Val::into_text).is_none_or(|c| c.is_empty())
+        && (class == Class::Contact || exception)
 }
 
 /// The class of an appointment's changed occurrence, an attached message of it (MS-OXOCAL
 /// 2.2.10.1.1), lower case.
 pub(super) const EXCEPTION: &str = "ipm.ole.class.{00061055-0000-0000-c000-000000000046}";
+
+/// What an Outlook item is, by its class (PidTagMessageClass, read by its start, in any case):
+/// the one place classes are told apart. Each is mail, a contact, calendar item, task, note or
+/// journal entry ([`Class::is_pim`]), or neither; some have their calendar properties read
+/// ([`Class::has_pim_properties`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Class {
+    Contact,
+    ContactGroup,
+    Appointment,
+    Task,
+    StickyNote,
+    Journal,
+    /// A meeting request, cancellation or answer (`IPM.Schedule.Meeting…`).
+    Meeting,
+    /// Another `IPM.Schedule…` message.
+    Schedule,
+    /// A task request or its answer (`IPM.TaskRequest…`): mail, but a task where tasks are kept.
+    TaskRequest,
+    /// An appointment's changed occurrence ([`EXCEPTION`]).
+    Exception,
+    /// A sharing invitation (`IPM.Sharing…`).
+    Sharing,
+    /// A message, a report, a post (an RSS feed's among them), a document or a recall; an item
+    /// with no class.
+    Mail,
+    Other,
+}
+
+impl Class {
+    pub(super) fn of(class: &str) -> Class {
+        // A task request before a task, a meeting before the rest of the schedule's.
+        const STARTS: [(&str, Class); 17] = [
+            ("ipm.contact", Class::Contact),
+            ("ipm.distlist", Class::ContactGroup),
+            ("ipm.appointment", Class::Appointment),
+            ("ipm.taskrequest", Class::TaskRequest),
+            ("ipm.task", Class::Task),
+            ("ipm.stickynote", Class::StickyNote),
+            ("ipm.activity", Class::Journal),
+            ("ipm.schedule.meeting", Class::Meeting),
+            ("ipm.schedule", Class::Schedule),
+            (EXCEPTION, Class::Exception),
+            ("ipm.sharing", Class::Sharing),
+            ("ipm.note", Class::Mail),
+            ("report.", Class::Mail),
+            ("ipm.post", Class::Mail),
+            ("ipm.document", Class::Mail),
+            ("ipm.outlook.recall", Class::Mail),
+            ("ipm.recall", Class::Mail),
+        ];
+        if class.is_empty() {
+            return Class::Mail;
+        }
+        STARTS.iter().find(|(start, _)| class.get(..start.len()).is_some_and(|c| c.eq_ignore_ascii_case(start))).map_or(Class::Other, |(_, c)| *c)
+    }
+
+    /// A contact, contact group, calendar item, task, note or journal entry: it goes to the
+    /// address book, calendar, tasks or notes wherever it's found.
+    pub(super) fn is_pim(self) -> bool {
+        matches!(self, Class::Contact | Class::ContactGroup | Class::Appointment | Class::Task | Class::StickyNote | Class::Journal)
+    }
+
+    /// Mail: meeting messages and task requests too (appointments, contacts and tasks in a mail
+    /// folder aren't).
+    pub(super) fn is_mail(self) -> bool {
+        matches!(self, Class::Mail | Class::Meeting | Class::Schedule | Class::TaskRequest | Class::Sharing)
+    }
+
+    /// Whether its calendar and contact properties are read: those of what [`Class::is_pim`] is, a
+    /// meeting message's (its invitation), a changed occurrence's and a task request's (a task
+    /// in a folder of tasks).
+    pub(super) fn has_pim_properties(self) -> bool {
+        self.is_pim() || matches!(self, Class::Meeting | Class::Exception | Class::TaskRequest)
+    }
+}
 
 /// By reference, by reference resolved, by reference only, or by web reference
 /// (PidTagAttachMethod 2, 3, 4, 7): a path or an address, not the file.
@@ -503,7 +597,7 @@ pub(super) struct Link {
 impl Link {
     /// Its file, read (`data`).
     pub(super) fn file(self, data: Vec<u8>) -> Got {
-        let mime = Some(self.mime).filter(|m| !m.is_empty()).unwrap_or_else(|| mime::mime_from_name(&self.name).to_string());
+        let mime = mime_or_from_name(self.mime, &self.name);
         Got::File(File::Data { name: self.name, mime, cid: self.cid, data })
     }
 
@@ -539,9 +633,9 @@ pub(super) fn link_of<'a>(p: &dyn Fn(u16) -> Option<Val<'a>>, class: &str) -> Go
         return Got::Left(SkipReason::AttachmentLink);
     }
     let web = matches!(p(0x3705), Some(Val::Int(7)));
-    let given = [s(0x3707), s(0x3704), s(0x3001)].into_iter().find(|n| !n.trim().is_empty());
+    let given = given_name(&s);
     // The file's own name, else the path's last part.
-    let leaf = path.rsplit(['\\', '/']).next().filter(|l| !l.trim().is_empty()).map(str::to_string);
+    let leaf = Some(mailcraft_model::file_name(&path)).filter(|l| !l.trim().is_empty()).map(str::to_string);
     let name = given.or(leaf).unwrap_or_else(|| "attachment".into());
     let name: String = name.chars().map(|c| if c.is_control() { ' ' } else { c }).take(MAX_LINK_NAME).collect();
     let cap = if super::lanes::is_pim(class) { super::out::MAX_PIM_FILE } else { MAX_ATTACHMENT };
@@ -653,9 +747,20 @@ pub(super) fn local_path(path: &str) -> bool {
     absolute && craft_docpath::resolve_absolute(path, None).is_ok()
 }
 
-/// A file's name: its long name, its short one, then its display name.
-fn name_of(s: &dyn Fn(u16) -> String) -> String {
-    [s(0x3707), s(0x3704), s(0x3001)].into_iter().find(|n| !n.is_empty()).unwrap_or_else(|| "attachment".into())
+/// A file's name as its attachment's properties (`s`, text) give it: its long name, its short
+/// one, then its display name, the first that isn't blank. A data file's, and a `.msg` file's.
+pub(crate) fn given_name(s: &dyn Fn(u16) -> String) -> Option<String> {
+    [0x3707, 0x3704, 0x3001].into_iter().map(s).find(|n| !n.trim().is_empty())
+}
+
+/// A file's name ([`given_name`]), or "attachment" when it gives none.
+pub(super) fn name_of(s: &dyn Fn(u16) -> String) -> String {
+    given_name(s).unwrap_or_else(|| "attachment".into())
+}
+
+/// A file's type: the one its attachment states, else the one its name says.
+fn mime_or_from_name(stated: String, name: &str) -> String {
+    if stated.is_empty() { mime::mime_from_name(name).to_string() } else { stated }
 }
 
 /// A table's rows as property maps.

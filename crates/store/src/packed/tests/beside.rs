@@ -45,7 +45,6 @@ fn an_opened_files_copy_is_kept_beside_it_and_found_again() {
     std::fs::create_dir_all(&docs).unwrap();
     let pst = docs.join("Archive.pst");
     std::fs::write(&pst, b"!BDN not really a pst").unwrap();
-    // Another file of that name beside it, not MailCraft's.
     let s = Store::open_packed(t.join("app"), t.join("MailCraft Files")).unwrap();
     s.save_accounts(&[account("a1", "Archive.pst")]).unwrap();
 
@@ -88,18 +87,35 @@ fn an_opened_files_copy_is_kept_beside_it_and_found_again() {
     std::fs::write(docs.join("Notes.mailcraft"), b"someone else's file").unwrap();
     assert_eq!(s.copy_beside(&other).unwrap().path, docs.join("Notes (2).mailcraft"));
     assert_eq!(std::fs::read(docs.join("Notes.mailcraft")).unwrap(), b"someone else's file", "left as it was");
-    // A file named from where MailCraft runs is in that folder; one whose folder isn't there to
-    // write goes with the others.
-    let b = s.copy_beside(std::path::Path::new("Archive.pst")).unwrap();
-    let here = std::env::current_dir().unwrap();
-    assert!(!b.elsewhere && b.path == here.join("Archive.mailcraft"), "{b:?}");
-    assert!(!here.join("Archive.mailcraft-probe").exists());
+    // A file named from where MailCraft runs is in that folder: asked by a process of its own,
+    // run from a scratch folder (this one's is the crate's source), which only looks there.
+    let here = t.join("here");
+    std::fs::create_dir_all(&here).unwrap();
+    let env = [("MC_CHILD_DIR", t.display().to_string())];
+    let out = command("packed::tests::beside::named_from_where_it_runs", &env).current_dir(&here).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && text.contains("beside where it runs"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_dir(&here).unwrap().count(), 0, "nothing left there");
+    // One whose folder isn't there to write goes with the others.
     let b = s.copy_beside(&t.join("gone").join("Archive.pst")).unwrap();
     assert!(b.elsewhere, "{b:?}");
     // A cache that doesn't keep data files has nowhere to put one.
     assert_eq!(Store::memory().copy_beside(&pst), None);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// Run by [`an_opened_files_copy_is_kept_beside_it_and_found_again`] from `here` in the folder
+/// it names: a file named from there has its copy there.
+#[test]
+#[ignore = "run by an_opened_files_copy_is_kept_beside_it_and_found_again"]
+fn named_from_where_it_runs() {
+    let Some(t) = std::env::var_os("MC_CHILD_DIR").map(std::path::PathBuf::from) else { return };
+    let here = std::env::current_dir().unwrap();
+    assert_eq!(here.canonicalize().unwrap(), t.join("here").canonicalize().unwrap(), "run from the scratch folder");
+    let s = Store::open_packed(t.join("child"), t.join("Child Files")).unwrap();
+    let b = s.copy_beside(std::path::Path::new("Archive.pst")).unwrap();
+    assert!(!b.elsewhere && b.path == here.join("Archive.mailcraft"), "{b:?}");
+    println!("beside where it runs");
 }
 
 /// A file whose folder can't be made a file in (here, a disc taken out: the folder isn't there
@@ -118,7 +134,6 @@ fn a_folder_gone_has_the_copy_go_with_the_others() {
     assert_eq!(s.data_file("a1").unwrap(), t.join("MailCraft Files").join("Old.mailcraft"));
     assert!(!t.join("disc").exists(), "nothing was made where the file was");
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A folder that can't be written (read-only here): the copy goes with the other data files,
@@ -144,7 +159,6 @@ fn a_folder_that_cant_be_written_has_the_copy_go_with_the_others() {
     }
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 #[test]
@@ -224,7 +238,6 @@ fn a_file_read_again_adds_what_it_has_new_and_keeps_what_was_done_here() {
     let again = s.merge_from("a1", &fresh, "r").unwrap();
     assert_eq!((again.messages, again.notes), (0, 0));
     drop((s, fresh));
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Trying the folder leaves nothing at the copy's name, even when a crash came between making
@@ -242,7 +255,6 @@ fn trying_the_folder_never_takes_the_copys_name() {
     assert_eq!((b.path, b.elsewhere), (docs.join("Fresh.mailcraft"), false));
     assert!(!docs.join("Fresh.mailcraft").exists() && !docs.join("Fresh.mailcraft-probe").exists());
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A copy found beside the file is passed over when it can't be written (read-only here), and
@@ -281,7 +293,6 @@ fn a_copy_found_is_taken_only_when_it_can_be_written_and_wanted() {
     perms.set_readonly(false);
     std::fs::set_permissions(&copy, perms).unwrap();
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// An item with no Message-ID of its own has one made up by the import, naming the account and
@@ -306,7 +317,6 @@ fn a_message_with_no_message_id_of_its_own_isnt_doubled_or_brought_back() {
     assert_eq!(ids(&s, "a1", "Drafts"), ["pst.a1.0badcafe.22@mailcraft.invalid", "pst.reread.12345678.23@mailcraft.invalid"]);
     assert_eq!(s.merge_from("a1", &fresh, "reread").unwrap().messages, 0);
     drop((s, fresh));
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// What came in is noted as an import stops part-way too, beside what was noted before: a message
@@ -330,7 +340,6 @@ fn what_came_in_before_a_pause_stays_noted() {
     assert_eq!(s.merge_from("a1", &fresh, "r").unwrap().messages, 1);
     assert_eq!(ids(&s, "a1", "INBOX"), ["three@x", "two@x"]);
     drop((s, fresh));
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// An account with no note of what came in from its file (opened before MailCraft kept one), or
@@ -351,7 +360,6 @@ fn no_note_of_what_came_in_refuses_a_read_again() {
     assert!(s.has_seen("a1"), "a damaged note is left where it is");
     assert_eq!(ids(&s, "a1", "INBOX"), ["one@x"], "nothing added");
     drop((s, fresh));
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A copy says which data folder it's an account of: another data folder finding it with the
@@ -384,7 +392,9 @@ fn a_copy_is_its_data_folders_and_another_is_told() {
     // Its own data folder (MailCraft started again on it) sees it as its own.
     let again = Store::open_packed(&one, t.join("Files 1")).unwrap();
     assert_eq!(again.data_folder_id(), Some(id1.clone()), "the same id, read back");
-    // Named by the first as a1's: not one of its to place again.
+    // Named by the first as a1's: not one of its to place again, but the next name for one.
+    let b = again.copy_beside(&pst).unwrap();
+    assert_eq!((b.path, b.found), (docs.join("Archive (2).mailcraft"), None));
     drop(again);
 
     // Taken over: the second's now, and held by it as the first sees it.
@@ -426,7 +436,6 @@ fn a_copy_is_its_data_folders_and_another_is_told() {
     let f = s3.copy_beside(&pst).unwrap().found.unwrap();
     assert_eq!((f.owner.as_str(), f.held), (id2.as_str(), false));
     drop(s3);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Taken over by another data folder, the copy is never opened by the one that had it, which
@@ -475,7 +484,6 @@ fn a_copy_taken_over_isnt_opened_by_the_folder_that_had_it() {
     let s2 = Store::open_packed(&two, t.join("Files 2")).unwrap();
     assert_eq!(s2.load_folders("b1").unwrap().len(), 1);
     drop(s2);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A copy's record naming a data folder that isn't on this computer's own drives (a share, a
@@ -528,7 +536,6 @@ fn an_owner_on_a_share_is_never_looked_at() {
     let f = s2.copy_beside(&pst).unwrap().found.unwrap();
     assert_eq!((f.owner_path.as_str(), f.held), (r"\\host.invalid\share\MailCraft", true));
     drop(s2);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A data folder's id file that isn't one is set aside, and a new id made; never fatal.
@@ -554,7 +561,6 @@ fn a_damaged_data_folder_id_is_set_aside() {
     assert!(s.load_folders("a1").unwrap().len() == 1);
     assert!(s.data_folder_id().is_some() && other.join("datafolder.json.damaged").is_dir());
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// The fuzz target's input: its seeds, and junk of every kind, read as a data folder's files.

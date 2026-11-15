@@ -24,13 +24,17 @@ use crate::space::{LOW_SPACE, Space};
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// The compactions running, by account, and the jobs waiting for one to give its file back.
-#[derive(Default)]
 pub(super) struct Compacts {
     running: HashMap<String, CompactCtl>,
     held: HashMap<String, Vec<Job>>,
-    /// The drive asked for room (a test's, else the computer's own).
-    #[cfg(test)]
-    pub(super) space: Option<Arc<dyn Space>>,
+    /// The drive asked for room: the computer's own (a test may give its own).
+    pub(super) space: Arc<dyn Space>,
+}
+
+impl Default for Compacts {
+    fn default() -> Self {
+        Compacts { running: HashMap::new(), held: HashMap::new(), space: Arc::new(crate::space::Drives) }
+    }
 }
 
 /// A compaction: how it's stopped, whether it has the file to itself now, and its thread.
@@ -70,8 +74,8 @@ struct Run {
 impl Pool {
     /// Measure an account's data file, on a thread of its own (a cold one takes a moment).
     pub(super) fn data_file_health(&mut self, account: String) {
-        let (store, sink) = (self.store.clone(), self.sink.clone());
-        let spawned = std::thread::Builder::new().name("mail-health".into()).spawn(move || {
+        let (store, sink, asked) = (self.store.clone(), self.sink.clone(), account.clone());
+        let spawned = super::routing::spawn("mail-health", move || {
             let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.data_file_health(&account)));
             let (health, error) = match measured {
                 Ok(Ok(h)) => (h.map(Box::new), None),
@@ -80,8 +84,11 @@ impl Pool {
             };
             sink.emit(Event::DataFileHealth { account, health, error });
         });
+        // Answered all the same: who asked (the idle policy) waits for this account's answer.
         if let Err(e) = spawned {
             log::warn!("data file health: {e}");
+            let error = Some(format!("the data file couldn't be measured: {e}"));
+            self.sink.emit(Event::DataFileHealth { account: asked, health: None, error });
         }
     }
 
@@ -101,10 +108,7 @@ impl Pool {
             return self.sink.emit(Event::Compacted { account, report: Box::new(report) });
         }
         let (cancel, exclusive) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-        #[cfg(test)]
-        let space = self.compacts.space.clone().unwrap_or_else(|| Arc::new(crate::space::Drives));
-        #[cfg(not(test))]
-        let space: Arc<dyn Space> = Arc::new(crate::space::Drives);
+        let space = self.compacts.space.clone();
         let run = Run {
             store: self.store.clone(),
             sink: self.sink.clone(),

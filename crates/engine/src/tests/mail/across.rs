@@ -96,7 +96,6 @@ fn mail_moves_from_a_server_into_a_data_file() {
     // It comes again (the reading pane asked too): nothing more.
     s.apply(Event::Body { key: second, raw: SECOND.to_vec() });
     assert_eq!(held(&s, &file, "Kept").len(), 2);
-    done(s);
 }
 
 /// Copied: it's in both, nothing asked of the server but the source of one not here. One that
@@ -126,7 +125,24 @@ fn mail_copies_into_a_data_file_and_stays_where_it_was() {
     let r = s.run("mail.move", &json!({"folder": "INBOX", "account": file})).unwrap();
     assert_eq!(r["moved"].as_u64(), Some(1), "{r}");
     assert_eq!((held(&s, &file, "Kept").len(), held(&s, &file, "INBOX").len()), (0, 2));
-    done(s);
+}
+
+/// More than can wait for their downloads at once, with more than a batch that are here:
+/// refused, and the sources of those here, written as they were read, taken away again (no list
+/// names them).
+#[test]
+fn a_copy_refused_leaves_no_source_behind() {
+    let (store, mut s, local) = data_files_to_copy("across-refused", 1001, 501, "Hi.");
+    let e = s.run("mail.copy", &json!({"account": local, "folder": "INBOX"})).unwrap_err();
+    assert!(e.to_string().contains("pick fewer"), "{e}");
+    assert!(held(&s, &local, "INBOX").is_empty());
+    let left: Vec<u32> =
+        (1..=1001).filter(|&uid| store.has_body(&MessageKey { account: local.clone(), folder: "INBOX".into(), validity: 1, uid })).collect();
+    assert!(left.is_empty(), "{} sources no list names", left.len());
+    let jobs = s.take_jobs();
+    assert!(s.transfers.is_empty() && jobs.is_empty(), "nothing asked for: {jobs:?}");
+    drop(s);
+    drop(store);
 }
 
 /// Into a folder on a server: the network layer is asked to upload a copy, and what was moved
@@ -211,7 +227,6 @@ fn mail_goes_into_a_folder_on_a_server_once_its_copy_is_there() {
     assert_eq!(s.transfers.len(), 2);
     s.run("account.remove", &json!({"account": server})).unwrap();
     assert!(s.transfers.is_empty());
-    done(s);
 }
 
 /// Found in review. A move the network layer never answered (its connection ended first) kept
@@ -262,7 +277,6 @@ fn a_move_never_answered_is_forgotten_and_what_is_put_in_an_inbox_did_not_arrive
     s.apply(Event::Body { key: second.clone(), raw: SECOND.to_vec() });
     assert!(store.load_folder(&server, "INBOX").unwrap().messages.iter().any(|m| m.key == second), "not moved after all that time");
     assert_eq!(held(&s, &file, "Kept").len(), 1);
-    done(s);
 }
 
 /// Found in review. Moved to the folder it's in (Archive pressed in Archive), a message gave
@@ -271,7 +285,7 @@ fn a_move_never_answered_is_forgotten_and_what_is_put_in_an_inbox_did_not_arrive
 /// after: it's dropped, and what was done before it is undone.
 #[test]
 fn nothing_moved_leaves_the_message_open_and_an_undo_that_cant_be_done_is_dropped() {
-    let (mut s, _file, server, [first, _second]) = two_accounts("across-undo");
+    let (mut s, _file, _server, [first, _second]) = two_accounts("across-undo");
     s.run("list.open", &json!({"key": first.to_id()})).unwrap();
     let r = s.run("mail.move", &json!({"folder": "INBOX"})).unwrap();
     assert_eq!(r["moved"], 0);
@@ -291,6 +305,76 @@ fn nothing_moved_leaves_the_message_open_and_an_undo_that_cant_be_done_is_droppe
     // The one before it is undone now.
     let undone = s.run("edit.undo", &json!({})).unwrap();
     assert_ne!(undone["undone"], json!("move"), "{undone}");
-    let _ = server;
-    done(s);
+}
+
+/// Data files as the app keeps them: an account kept on this computer with an empty Inbox, and
+/// a server account whose Inbox, open and all selected, has `here` messages with their sources
+/// (`text` each) and `listed` more not downloaded. Returns the store, the session and the local
+/// account.
+fn data_files_to_copy(name: &str, here: u32, listed: u32, text: &str) -> (Store, Session, String) {
+    let dir = scratch(name);
+    let store = Store::open_packed(dir.join("cache"), dir.join("files")).unwrap();
+    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
+    let local = s.run("account.add", &json!({"email": "ben@example.org", "local": true})).unwrap()["account"].as_str().unwrap().to_string();
+    s.apply(Event::Folders { account: local.clone(), folders: vec![folder(&local, "INBOX", FolderRole::Inbox)] });
+    let server = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
+    s.apply(Event::Folders { account: server.clone(), folders: vec![folder(&server, "INBOX", FolderRole::Inbox)] });
+    let (mut messages, mut bodies) = (Vec::new(), Vec::new());
+    for uid in 1..=here.saturating_add(listed) {
+        let key = MessageKey { account: server.clone(), folder: "INBOX".into(), validity: 9, uid };
+        let raw =
+            format!("From: Ana <ana@x.example>\r\nTo: zoe@example.org\r\nSubject: Note {uid}\r\nMessage-ID: <{uid}@x.example>\r\n\r\n{text}\r\n");
+        if uid <= here {
+            messages.push(mailcraft_mime::summary_from_full(raw.as_bytes(), key.clone(), Flags::default(), 0, NOW).into());
+            bodies.push((key, Store::prepare(store.packs(&server), raw.into_bytes())));
+        } else {
+            messages.push(mailcraft_mime::summary_from_header(raw.as_bytes(), key, Flags::default(), 0, NOW).into());
+        }
+    }
+    store.write_prepared(bodies, true).unwrap();
+    let st =
+        mailcraft_store::FolderState { validity: 9, uid_next: here.saturating_add(listed).saturating_add(1), highest_modseq: 0, messages, window: 0 };
+    store.save_folder(&server, "INBOX", &st).unwrap();
+    s.apply(Event::FolderChanged { account: server.clone(), folder: "INBOX".into() });
+    s.run("folder.open", &json!({"account": server, "folder": "INBOX"})).unwrap();
+    s.run("list.selectAll", &json!({})).unwrap();
+    assert_eq!(s.selection.len(), (here + listed) as usize);
+    s.take_jobs();
+    (store, s, local)
+}
+
+/// 5,000 messages of about 4 KB copied from a server account into a folder of an account kept on
+/// this computer, in data files as the app keeps them, timed. Run under the heavy lock:
+/// `cargo test -p mailcraft-engine --lib measure_copy_many -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn measure_copy_many() {
+    let filler = "Some words of a long note, kept to see a copy's cost. ".repeat(70);
+    let (store, mut s, local) = data_files_to_copy("measure-copy", 5000, 0, &filler);
+    let t = std::time::Instant::now();
+    let r = s.run("mail.copy", &json!({"account": local, "folder": "INBOX"})).unwrap();
+    println!("MEASURE copy 5000 into a data file: {} ms ({r})", t.elapsed().as_millis());
+    assert_eq!(held(&s, &local, "INBOX").len(), 5000);
+    drop(s);
+    drop(store);
+}
+
+/// A folder named in modified UTF-7 on the server (`Entw&APw-rfe`) is named as the user knows it
+/// when mail couldn't go there, as when it went.
+#[test]
+fn a_failed_copy_names_the_folder_as_shown() {
+    let (mut s, _, server, [first, _]) = two_accounts("across-folder-name");
+    let folders = vec![
+        folder(&server, "INBOX", FolderRole::Inbox),
+        folder(&server, "Trash", FolderRole::Trash),
+        folder(&server, "Entw&APw-rfe", FolderRole::default()),
+    ];
+    s.apply(Event::Folders { account: server.clone(), folders });
+    s.run("list.select", &json!({"key": first.to_id()})).unwrap();
+    assert_eq!(s.run("mail.copy", &json!({"folder": "Entw&APw-rfe", "account": server})).unwrap()["sending"], 1);
+    s.take_jobs();
+    let failed = vec![(first, "the mailbox is full".into())];
+    s.apply(Event::CopiesFiled { account: server.clone(), folder: "Entw&APw-rfe".into(), done: vec![], failed, moved: false });
+    let said = s.notices.last().map(|n| n.text.clone()).unwrap_or_default();
+    assert!(said.contains("copied to Entwürfe") && !said.contains("&APw-"), "{said}");
 }

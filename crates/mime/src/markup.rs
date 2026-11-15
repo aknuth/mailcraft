@@ -16,11 +16,18 @@
 //! Bare web addresses become links. Everything else is text: `<`, `&` and quotes are escaped, so
 //! nothing typed can turn into markup the recipient's client would run.
 
+use crate::html::escaped;
+
 /// The rule above the original in a reply or forward (as Outlook writes it in plain text).
 pub const RULE: &str = "________________________________";
 
+/// The label of who sent the original, first in its header under a rule.
+pub const FROM_LABEL: &str = "From:";
+/// The label of when it was sent, right after.
+pub const SENT_LABEL: &str = "Sent:";
+
 /// The labels of the original's header under a rule.
-const HEADER_LABELS: [&str; 6] = ["From:", "Sent:", "Date:", "To:", "Cc:", "Subject:"];
+const HEADER_LABELS: [&str; 6] = [FROM_LABEL, SENT_LABEL, "Date:", "To:", "Cc:", "Subject:"];
 
 /// The length of the header label a line starts with (`From:`…), if it does.
 pub fn header_label(line: &str) -> Option<usize> {
@@ -111,13 +118,42 @@ fn is_url_start(s: &str) -> bool {
     s.starts_with("https://") || s.starts_with("http://")
 }
 
-fn safe_url(u: &str) -> bool {
-    let l = u.to_ascii_lowercase();
-    (l.starts_with("https://") || l.starts_with("http://") || l.starts_with("mailto:")) && !u.contains(['"', '<', '>', ' '])
+/// What an address can't hold to be written as a link.
+const NOT_IN_URL: [char; 4] = ['"', '<', '>', ' '];
+
+/// Whether an address starts as a link's may: `https:`, `http:` or `mailto:`, in any case. Its
+/// start alone is lower-cased (all of a long one was, for each `[` before it).
+pub(crate) fn safe_scheme(u: &str) -> bool {
+    let head = u.char_indices().nth(8).map_or(u, |(at, _)| u.get(..at).unwrap_or(u)).to_ascii_lowercase();
+    head.starts_with("https://") || head.starts_with("http://") || head.starts_with("mailto:")
+}
+
+/// Where `needle` next is in `line` at or after `from`, by what an earlier search (`seen`: where
+/// it searched from, what it found) already knows: what it found still holds from any place
+/// before it, and nothing found holds from any later place. Each mark's close was looked for to
+/// the end of the line from every opening mark, and a line of `[` (or of unclosed `*`) took
+/// time in its length squared.
+fn next_of(line: &str, needle: &str, seen: &mut (usize, Option<usize>), from: usize) -> Option<usize> {
+    next_by(line, |r| r.find(needle), seen, from)
+}
+
+/// [`next_of`], what's looked for found by `find`.
+fn next_by(line: &str, find: impl Fn(&str) -> Option<usize>, seen: &mut (usize, Option<usize>), from: usize) -> Option<usize> {
+    if from >= seen.0 && seen.1.is_none_or(|at| at >= from) {
+        return seen.1;
+    }
+    let at = line.get(from..).and_then(|r| mailcraft_model::work::scanned(r, find(r))).map(|a| from + a);
+    *seen = (from, at);
+    at
 }
 
 /// Split a line into inline pieces. Unclosed marks stay as text.
 pub fn inlines<'a>(line: &'a str) -> Vec<Inline<'a>> {
+    // The closes looked for, and what was last found of each ([`next_of`]); then, for links, a
+    // `]`, a `)` and what an address can't hold (found in review: a line of links whose address
+    // never ends, `[a](` again and again, looked for the `)` to the end of the line from each).
+    const CLOSES: [&str; 5] = ["**", "~~", "`", "*", "]("];
+    let mut seen = [(usize::MAX, None); 8];
     let mut out = Vec::new();
     let mut text_start = 0;
     let mut i = 0;
@@ -132,44 +168,51 @@ pub fn inlines<'a>(line: &'a str) -> Vec<Inline<'a>> {
     while i < bytes.len() {
         let rest = line.get(i..).unwrap_or("");
         // Delimited spans: (open, close, constructor).
-        let pair = |open: &str, close: &str| -> Option<(usize, usize)> {
+        let mut pair = |open: &str, close: usize| -> Option<(usize, usize)> {
             let body = rest.strip_prefix(open)?;
             if body.starts_with(' ') || body.is_empty() {
                 return None;
             }
-            let end = body.find(close)?;
+            let from = i + open.len();
+            let end = next_of(line, CLOSES.get(close)?, seen.get_mut(close)?, from)? - from;
             (end > 0).then_some((open.len(), end))
         };
-        let matched: Option<(Inline<'a>, usize)> = if let Some((o, e)) = pair("**", "**") {
+        let matched: Option<(Inline<'a>, usize)> = if let Some((o, e)) = pair("**", 0) {
             Some((Inline::Bold(&rest[o..o + e]), o + e + 2))
-        } else if let Some((o, e)) = pair("~~", "~~") {
+        } else if let Some((o, e)) = pair("~~", 1) {
             Some((Inline::Strike(&rest[o..o + e]), o + e + 2))
-        } else if let Some((o, e)) = pair("`", "`") {
+        } else if let Some((o, e)) = pair("`", 2) {
             Some((Inline::Code(&rest[o..o + e]), o + e + 1))
-        } else if let Some((o, e)) = pair("*", "*").filter(|_| !rest.starts_with("**")) {
+        } else if let Some((o, e)) = pair("*", 3).filter(|_| !rest.starts_with("**")) {
             // Not inside a word (`a*b*c` stays text).
             let before_ok = i == 0 || line[..i].chars().last().is_some_and(|c| !c.is_alphanumeric());
             before_ok.then(|| (Inline::Italic(&rest[o..o + e]), o + e + 1))
         } else if rest.starts_with("![") || rest.starts_with('[') {
             let pic = rest.starts_with("![");
             let open = if pic { 2 } else { 1 };
-            rest.get(open..).and_then(|r| r.find("](").map(|t| (r, t))).and_then(|(r, t)| {
-                let text = &r[..t];
-                let after = &r[t + 2..];
-                let end = after.find(')')?;
-                let url = &after[..end];
-                let used = open + t + 2 + end + 1;
-                if text.contains(']') {
+            let from = i + open;
+            let t = seen.get_mut(4).and_then(|s| next_of(line, "](", s, from)).map(|at| at - from);
+            rest.get(open..).zip(t).and_then(|(r, t)| {
+                // Where its `](` is, and its address starts and ends, in the line.
+                let close = from + t;
+                let url_from = close + 2;
+                let url_end = next_of(line, ")", seen.get_mut(6)?, url_from)?;
+                // No `]` in its text: the first after its `[` is its `](`'s.
+                if next_of(line, "]", seen.get_mut(5)?, from)? < close {
                     return None;
                 }
+                let (text, url) = (r.get(..t)?, line.get(url_from..url_end)?);
+                let used = open + t + 2 + url.len() + 1;
                 if pic {
                     url.starts_with("cid:").then_some((Inline::Picture { alt: text, src: url }, used))
                 } else {
-                    safe_url(url).then_some((Inline::Link { text, url }, used))
+                    let clean = next_by(line, |r| r.find(NOT_IN_URL), seen.get_mut(7)?, url_from).is_none_or(|bad| bad >= url_end);
+                    (safe_scheme(url) && clean).then_some((Inline::Link { text, url }, used))
                 }
             })
         } else if is_url_start(rest) && (i == 0 || line[..i].ends_with([' ', '(', '\t'])) {
-            let end = rest.find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"').unwrap_or(rest.len());
+            let end = mailcraft_model::work::scanned(rest, rest.find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"'))
+                .unwrap_or(rest.len());
             let url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
             (url.len() > 8).then_some((Inline::Url(url), url.len()))
         } else {
@@ -201,22 +244,18 @@ pub fn has_formatting(text: &str) -> bool {
     })
 }
 
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
 fn inline_html(line: &str) -> String {
     let mut s = String::new();
     for p in inlines(line) {
         match p {
-            Inline::Text(t) => s.push_str(&esc(t)),
+            Inline::Text(t) => s.push_str(&escaped(t)),
             Inline::Bold(t) => s.push_str(&format!("<b>{}</b>", inline_html(t))),
             Inline::Italic(t) => s.push_str(&format!("<i>{}</i>", inline_html(t))),
             Inline::Strike(t) => s.push_str(&format!("<s>{}</s>", inline_html(t))),
-            Inline::Code(t) => s.push_str(&format!("<code>{}</code>", esc(t))),
-            Inline::Link { text, url } => s.push_str(&format!("<a href=\"{}\">{}</a>", esc(url), inline_html(text))),
-            Inline::Url(u) => s.push_str(&format!("<a href=\"{0}\">{0}</a>", esc(u))),
-            Inline::Picture { alt, src } => s.push_str(&format!("<img src=\"{}\" alt=\"{}\" style=\"max-width:100%\">", esc(src), esc(alt))),
+            Inline::Code(t) => s.push_str(&format!("<code>{}</code>", escaped(t))),
+            Inline::Link { text, url } => s.push_str(&format!("<a href=\"{}\">{}</a>", escaped(url), inline_html(text))),
+            Inline::Url(u) => s.push_str(&format!("<a href=\"{0}\">{0}</a>", escaped(u))),
+            Inline::Picture { alt, src } => s.push_str(&format!("<img src=\"{}\" alt=\"{}\" style=\"max-width:100%\">", escaped(src), escaped(alt))),
         }
     }
     s
@@ -282,7 +321,7 @@ pub fn to_html(text: &str) -> String {
                 let label = header.get(n).copied().unwrap_or(false).then(|| header_label(line)).flatten();
                 out.push_str(&match (b, label) {
                     (Block::SigDash, _) => "-- ".to_string(),
-                    (_, Some(l)) => format!("<b>{}</b>{}", esc(&line[..l]), inline_html(&line[l..])),
+                    (_, Some(l)) => format!("<b>{}</b>{}", escaped(&line[..l]), inline_html(&line[l..])),
                     _ => inline_html(content),
                 });
                 para_lines += 1;
@@ -332,6 +371,148 @@ pub fn pictures(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether an address will do for a link, as [`inlines`] read it before it was read once.
+    fn safe_url(u: &str) -> bool {
+        let l = u.to_ascii_lowercase();
+        (l.starts_with("https://") || l.starts_with("http://") || l.starts_with("mailto:")) && !u.contains(['"', '<', '>', ' '])
+    }
+
+    proptest::proptest! {
+        /// [`safe_scheme`], which the rich text's links and a `winmail.dat`'s take too, says
+        /// what their own copies said: the whole address lower-cased, its start compared.
+        #[test]
+        fn one_scheme_check_for_every_link(u in "(https?://|HTTP://|Mailto:|ftp://|java|)[a-zA-Z:/É ]{0,10}") {
+            let l = u.to_ascii_lowercase();
+            let theirs = l.starts_with("https://") || l.starts_with("http://") || l.starts_with("mailto:");
+            proptest::prop_assert_eq!(safe_scheme(&u), theirs);
+        }
+    }
+
+    /// [`inlines`] as it was, searching the line from every mark: what it reads, the new one
+    /// must read too.
+    fn by_search<'a>(line: &'a str) -> Vec<Inline<'a>> {
+        let mut out = Vec::new();
+        let mut text_start = 0;
+        let mut i = 0;
+        let bytes = line.as_bytes();
+        let flush = |out: &mut Vec<Inline<'a>>, from: usize, to: usize| {
+            if to > from
+                && let Some(t) = line.get(from..to)
+            {
+                out.push(Inline::Text(t));
+            }
+        };
+        while i < bytes.len() {
+            let rest = line.get(i..).unwrap_or("");
+            // Delimited spans: (open, close, constructor).
+            let pair = |open: &str, close: &str| -> Option<(usize, usize)> {
+                let body = rest.strip_prefix(open)?;
+                if body.starts_with(' ') || body.is_empty() {
+                    return None;
+                }
+                let end = body.find(close)?;
+                (end > 0).then_some((open.len(), end))
+            };
+            let matched: Option<(Inline<'a>, usize)> = if let Some((o, e)) = pair("**", "**") {
+                Some((Inline::Bold(&rest[o..o + e]), o + e + 2))
+            } else if let Some((o, e)) = pair("~~", "~~") {
+                Some((Inline::Strike(&rest[o..o + e]), o + e + 2))
+            } else if let Some((o, e)) = pair("`", "`") {
+                Some((Inline::Code(&rest[o..o + e]), o + e + 1))
+            } else if let Some((o, e)) = pair("*", "*").filter(|_| !rest.starts_with("**")) {
+                // Not inside a word (`a*b*c` stays text).
+                let before_ok = i == 0 || line[..i].chars().last().is_some_and(|c| !c.is_alphanumeric());
+                before_ok.then(|| (Inline::Italic(&rest[o..o + e]), o + e + 1))
+            } else if rest.starts_with("![") || rest.starts_with('[') {
+                let pic = rest.starts_with("![");
+                let open = if pic { 2 } else { 1 };
+                rest.get(open..).and_then(|r| r.find("](").map(|t| (r, t))).and_then(|(r, t)| {
+                    let text = &r[..t];
+                    let after = &r[t + 2..];
+                    let end = after.find(')')?;
+                    let url = &after[..end];
+                    let used = open + t + 2 + end + 1;
+                    if text.contains(']') {
+                        return None;
+                    }
+                    if pic {
+                        url.starts_with("cid:").then_some((Inline::Picture { alt: text, src: url }, used))
+                    } else {
+                        safe_url(url).then_some((Inline::Link { text, url }, used))
+                    }
+                })
+            } else if is_url_start(rest) && (i == 0 || line[..i].ends_with([' ', '(', '\t'])) {
+                let end = rest.find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"').unwrap_or(rest.len());
+                let url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
+                (url.len() > 8).then_some((Inline::Url(url), url.len()))
+            } else {
+                None
+            };
+            match matched {
+                Some((piece, used)) => {
+                    flush(&mut out, text_start, i);
+                    out.push(piece);
+                    i += used;
+                    text_start = i;
+                }
+                None => {
+                    // Next character (UTF-8 safe).
+                    i += rest.chars().next().map_or(1, char::len_utf8);
+                }
+            }
+        }
+        flush(&mut out, text_start, bytes.len());
+        out
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn marks_read_as_they_did(line in r"[\[\]()*~`abhtps :/.!]{0,40}") {
+            proptest::prop_assert_eq!(inlines(&line), by_search(&line));
+        }
+    }
+
+    /// Long lines of opening marks that never close (pasted, or quoted in a reply): links and
+    /// pictures whose address never ends among them, and links that all end at one address that
+    /// won't do.
+    fn open_marks() -> [String; 8] {
+        [
+            "[".repeat(200_000),
+            "[]".repeat(100_000),
+            "*a".repeat(100_000),
+            "`".to_string() + &"~~a".repeat(60_000),
+            "[a](".repeat(50_000),
+            "![a](".repeat(40_000),
+            "[".repeat(200_000) + "](javascript:x)",
+            "[a](https://x y".repeat(12_000) + ")",
+        ]
+    }
+
+    /// A long line of opening marks that never close reads at once: each looked for its close to
+    /// the end of the line, in time its length squared. The bytes looked through are counted,
+    /// held in proportion to the line whatever the machine's load.
+    #[test]
+    fn a_line_of_open_marks_reads_at_once() {
+        for line in open_marks() {
+            let pieces = mailcraft_model::work::linear(line.len(), || inlines(&line));
+            assert!(!pieces.is_empty());
+        }
+        // What does close reads as it did.
+        assert_eq!(inlines("[[a](https://x.example)"), vec![Inline::Link { text: "[a", url: "https://x.example" }]);
+        assert_eq!(inlines("*a **b** c*"), vec![Inline::Italic("a "), Inline::Italic("b"), Inline::Text("* c*")]);
+    }
+
+    /// How long those lines take: `cargo test --release -p mailcraft-mime --lib how_long_open_marks_take -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run in release"]
+    fn how_long_open_marks_take() {
+        for line in open_marks() {
+            let started = std::time::Instant::now();
+            let _ = inlines(&line);
+            println!("MEASURE a line of {} KB of {:?}: {} ms", line.len() / 1024, &line[..4], started.elapsed().as_millis());
+        }
+    }
 
     #[test]
     fn inline_marks() {

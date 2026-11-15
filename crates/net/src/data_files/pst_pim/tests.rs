@@ -94,6 +94,37 @@ fn recurrence_patterns_become_rules() {
     assert!(recurrence(&huge, start).is_none());
 }
 
+/// A damaged pattern's day of the month, days of the week or which of them is no rule: RFC 5545
+/// has no day 0, no `BYDAY` without a day and no 0th, and Outlook writes a day 1 to 31, days as
+/// the bits 0 to 6 and which of them 1 to 5.
+#[test]
+fn a_damaged_pattern_s_days_are_no_rule() {
+    let first = minutes(2026, 10, 5);
+    let start = days_from_civil(2026, 10, 5) * 86_400 + 7 * 3600;
+    let rule =
+        |frequency, pattern, period, specific: &[u32]| recurrence(&blob(frequency, pattern, period, specific, (0x2023, 0), &[], &[], first), start);
+    for (frequency, pattern, period, specific) in [
+        (0x200B, 0x0001, 1, &[0][..]),
+        (0x200B, 0x0001, 1, &[0x80]),
+        (0x200C, 0x0002, 1, &[0]),
+        (0x200C, 0x0002, 1, &[32]),
+        (0x200C, 0x0002, 1, &[u32::MAX]),
+        (0x200C, 0x0003, 1, &[0b010_0000, 0]),
+        (0x200C, 0x0003, 1, &[0b010_0000, 6]),
+        (0x200C, 0x0003, 1, &[0x3E, 0]),
+        (0x200C, 0x0003, 1, &[0, 2]),
+        (0x200C, 0x0003, 1, &[0x100, 2]),
+        (0x200D, 0x0003, 12, &[0, 2]),
+        (0x200D, 0x0003, 12, &[0b010_0000, 0]),
+    ] {
+        assert_eq!(rule(frequency, pattern, period, specific), None, "{frequency:x} {pattern:x} {specific:?}");
+    }
+    // Each edge that is a day still is one.
+    assert_eq!(rule(0x200C, 0x0002, 1, &[1]).unwrap().0, "FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=1");
+    assert_eq!(rule(0x200C, 0x0003, 1, &[0x7F, 1]).unwrap().0, "FREQ=MONTHLY;INTERVAL=1;BYDAY=SU,MO,TU,WE,TH,FR,SA;BYSETPOS=1");
+    assert_eq!(rule(0x200B, 0x0001, 1, &[0b100_0000]).unwrap().0, "FREQ=WEEKLY;INTERVAL=1;BYDAY=SA");
+}
+
 /// A named start or end of a type that is not a time leaves the event without one: it does not
 /// fall back to the plain start and end properties.
 #[test]
@@ -495,7 +526,7 @@ fn a_request_carries_its_changed_occurrences() {
 
 /// Unix seconds as a FILETIME value.
 fn filetime(t: i64) -> Val<'static> {
-    Val::Time((t + 11_644_473_600) * 10_000_000)
+    Val::Time(crate::data_files::test_data::filetime(t))
 }
 
 /// A task's own properties (MS-OXOTASK) come in: status, percent (a fraction, as a double),
@@ -559,11 +590,10 @@ fn a_task_s_text_can_t_smuggle_lines_into_its_to_do() {
     assert_eq!((t.uid.as_str(), t.title.as_str(), t.notes.as_str()), ("u1", "Task", "Notes"));
     assert_eq!(t.rrule.as_deref(), Some("FREQ=DAILY"));
     assert_eq!(t.extra, ["X-KEEP:1"]);
-    let mut out = String::new();
-    mailcraft_model::ical::write_task(&t, 0, &mut out);
+    let out = mailcraft_model::ical::write_calendar(&[], std::slice::from_ref(&t), 0);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.iter().filter(|l| l.starts_with("UID:")).collect::<Vec<_>>(), [&"UID:u1"]);
-    assert!(!out.contains("VEVENT") && !out.contains("VCALENDAR") && out.matches("END:VTODO").count() == 1, "{out}");
+    assert!(!out.contains("VEVENT") && out.matches("VCALENDAR").count() == 2 && out.matches("END:VTODO").count() == 1, "{out}");
     // A component it begins is kept whole, and held to what a to-do keeps.
     let many: String = (0..1_500).map(|i| format!("X-L:{i}\r\n")).collect();
     let body = format!("BEGIN:VTODO\r\nX-MAILCRAFT-REST:1\r\nBEGIN:X-PART\r\nX-IN:1\r\nEND:X-PART\r\n{many}END:VTODO");

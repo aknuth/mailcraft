@@ -16,10 +16,6 @@ use super::*;
 /// How long [`Edits::flush`] waits for the changes before it to be on disk.
 const FLUSH_WAIT: Duration = Duration::from_secs(10);
 
-/// The thread each change was made on, by account (tests).
-#[cfg(test)]
-pub(super) static APPLIED_ON: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
-
 enum Edit {
     /// A change to make, and the account's thread to wake after (none when it isn't running);
     /// how many times the account had been removed when it was made ([`Store::while_kept`]).
@@ -41,26 +37,27 @@ impl Edits {
     /// Make `op` in the cache and queue it for the server, after the changes before it; on this
     /// thread when there's no other to make it on.
     pub(super) fn send(&mut self, store: &Store, sink: &Sink, account: String, op: Op, wake: Option<Sender<Job>>) {
-        if self.tx.is_none() {
-            self.start(store, sink);
-        }
         // The account's files go at once on the window's thread when it's removed, before the
         // pool hears of it: a change queued before that isn't made after.
         let seen = store.removals(&account);
-        let edit = Edit::Apply { account, op, wake, seen };
-        let edit = match self.tx.as_ref() {
-            Some(tx) => match tx.send(edit) {
-                Ok(()) => return,
-                // Ended (it never should): started again with the next one.
-                Err(mpsc::SendError(edit)) => {
-                    self.tx = None;
-                    edit
-                }
-            },
-            None => edit,
-        };
-        if let Edit::Apply { account, op, wake, seen } = edit {
+        if let Some(Edit::Apply { account, op, wake, seen }) = self.hand_over(store, sink, Edit::Apply { account, op, wake, seen }) {
             apply(store, sink, &account, op, wake, seen);
+        }
+    }
+
+    /// Hand `edit` to the thread, started if it isn't; given back when there's none to take it.
+    fn hand_over(&mut self, store: &Store, sink: &Sink, edit: Edit) -> Option<Edit> {
+        if self.tx.is_none() {
+            self.start(store, sink);
+        }
+        let Some(tx) = self.tx.as_ref() else { return Some(edit) };
+        match tx.send(edit) {
+            Ok(()) => None,
+            // Ended (it never should): started again with the next one.
+            Err(mpsc::SendError(edit)) => {
+                self.tx = None;
+                Some(edit)
+            }
         }
     }
 
@@ -100,21 +97,7 @@ impl Edits {
 
     /// Put message files into a folder of an account on this computer, after the changes before.
     pub(super) fn file(&mut self, store: &Store, sink: &Sink, account: String, folder: String, paths: Vec<String>) {
-        if self.tx.is_none() {
-            self.start(store, sink);
-        }
-        let edit = Edit::File { account, folder, paths };
-        let edit = match self.tx.as_ref() {
-            Some(tx) => match tx.send(edit) {
-                Ok(()) => return,
-                Err(mpsc::SendError(edit)) => {
-                    self.tx = None;
-                    edit
-                }
-            },
-            None => edit,
-        };
-        if let Edit::File { account, folder, paths } = edit {
+        if let Some(Edit::File { account, folder, paths }) = self.hand_over(store, sink, Edit::File { account, folder, paths }) {
             super::imports::filing::file_here(store, sink, &account, &folder, &paths);
         }
     }
@@ -141,10 +124,6 @@ impl Edits {
 /// Make the change in the cache, queue it for the server and wake the account's thread to send
 /// it; each folder it changed is said to have changed. Nothing, for an account removed since.
 fn apply(store: &Store, sink: &Sink, account: &str, op: Op, wake: Option<Sender<Job>>, seen: u64) {
-    #[cfg(test)]
-    if let Ok(mut on) = APPLIED_ON.lock() {
-        on.push((account.to_string(), std::thread::current().name().map(str::to_string)));
-    }
     let made = store.while_kept(account, seen, || make(store, sink, account, &op));
     if made.is_none() {
         log::info!("{account}: a change to mail dropped, the account removed");
@@ -159,9 +138,13 @@ fn apply(store: &Store, sink: &Sink, account: &str, op: Op, wake: Option<Sender<
 fn make(store: &Store, sink: &Sink, account: &str, op: &Op) {
     match store.apply_op(account, op) {
         Ok(changed) => {
+            // A list that can't be read isn't said: said empty, the account would show no folders
+            // until the next listing, and a folder open would be left for the Inbox.
             if op.is_folder_op() {
-                let folders = store.load_folders(account).unwrap_or_default();
-                sink.emit(Event::Folders { account: account.to_string(), folders });
+                match store.load_folders(account) {
+                    Ok(folders) => sink.emit(Event::Folders { account: account.to_string(), folders }),
+                    Err(e) => log::warn!("{account}: the folders couldn't be read again: {e}"),
+                }
             }
             if let Err(e) = store.add_op(account, op.clone()) {
                 sink.emit(Event::Notice { account: account.to_string(), message: e.to_string() });

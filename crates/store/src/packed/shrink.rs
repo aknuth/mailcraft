@@ -29,12 +29,11 @@
 //! made without it.
 
 use std::collections::BTreeSet;
-use std::ops::Bound;
 use std::time::{Duration, Instant};
 
 use mailcraft_model::job::{PACE_ONE, Work, compact_ms, next_pace};
 
-use super::compact::{BIGGEST, compress, count};
+use super::compact::{BIGGEST, Next, batch_after, compress, count};
 use super::*;
 use crate::Shrunk;
 
@@ -70,7 +69,7 @@ impl Taken<'_> {
     /// The file open again for everyone, as it is.
     fn give_back(mut self) {
         if let Some(db) = self.db.take() {
-            Packs::lock(&self.packs.open).dbs.insert(self.account.to_string(), Arc::new(db));
+            lock(&self.packs.open).dbs.insert(self.account.to_string(), Arc::new(db));
         }
     }
 }
@@ -80,7 +79,7 @@ impl Drop for Taken<'_> {
         // Not given back (an error, a panic, or a copy put in its place): closed, opened again
         // when next asked for (after a panic the database writes nothing, and it's checked then).
         if let Some(db) = self.db.take() {
-            Packs::lock(&self.packs.open).caches.remove(self.account);
+            lock(&self.packs.open).caches.remove(self.account);
             drop(db);
         }
     }
@@ -91,7 +90,7 @@ struct Journaling<'a>(&'a Packs, &'a str);
 
 impl Drop for Journaling<'_> {
     fn drop(&mut self) {
-        Packs::lock(&self.0.copying).remove(self.1);
+        lock(&self.0.copying).remove(self.1);
     }
 }
 
@@ -132,17 +131,9 @@ fn kept_bytes<P>(key: &str, v: &[u8], pieces: Option<&P>) -> io::Result<Option<V
 where
     P: ReadableTable<(&'static str, u32), &'static [u8]>,
 {
-    let Some(len) = pieced_len(v) else { return Ok(Some(v.to_vec())) };
-    let Some(pieces) = pieces else { return Ok(None) };
-    let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0).min(8 << 20));
-    for item in pieces.range((key, 0)..=(key, u32::MAX)).map_err(disk)? {
-        let (_, piece) = item.map_err(disk)?;
-        if (out.len() as u64).saturating_add(piece.value().len() as u64) > len {
-            return Ok(None);
-        }
-        out.extend_from_slice(piece.value());
-    }
-    Ok((out.len() as u64 == len).then_some(out))
+    let mut out = Vec::with_capacity(kept_room(v));
+    let len = kept_of(key, v, pieces, |piece| out.extend_from_slice(piece))?;
+    Ok(len.map(|_| out))
 }
 
 /// The files of a copy's batch, as kept, and where it got to.
@@ -180,26 +171,14 @@ fn put_copied(t: &mut Tables<'_>, files: &[(String, Vec<u8>)]) -> io::Result<()>
 fn read_copy_batch(db: &Database, after: Option<&str>) -> io::Result<CopyBatch> {
     let mut b = CopyBatch::default();
     let tx = db.begin_read().map_err(disk)?;
-    let files = match tx.open_table(FILES) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(CopyBatch { end: true, ..b }),
-        Err(e) => return Err(disk(e)),
-    };
-    let pieces = match tx.open_table(PIECES) {
-        Ok(t) => Some(t),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(e) => return Err(disk(e)),
-    };
-    let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+    let Some(files) = files_of(&tx).map_err(disk)? else { return Ok(CopyBatch { end: true, ..b }) };
+    let pieces = pieces_of(&tx).map_err(disk)?;
     let mut bytes = 0usize;
-    for item in files.range::<&str>((lower, Bound::Unbounded)).map_err(disk)? {
-        let (k, v) = item.map_err(disk)?;
-        let (key, v) = (k.value(), v.value());
+    let (last, end) = batch_after(&files, after, |key, v| {
         let kept = usize::try_from(pieced_len(v).unwrap_or(v.len() as u64)).unwrap_or(usize::MAX);
         if b.files.len() >= COPY_FILES || (!b.files.is_empty() && bytes.saturating_add(kept) > COPY_BYTES) {
-            return Ok(b);
+            return Ok(Next::Full);
         }
-        b.last = Some(key.to_string());
         b.looked_bytes = b.looked_bytes.saturating_add(kept as u64);
         match kept_bytes(key, v, pieces.as_ref())? {
             Some(file) => {
@@ -208,9 +187,9 @@ fn read_copy_batch(db: &Database, after: Option<&str>) -> io::Result<CopyBatch> 
             }
             None => b.damaged = b.damaged.saturating_add(1),
         }
-    }
-    b.end = true;
-    Ok(b)
+        Ok(Next::Took)
+    })?;
+    Ok(CopyBatch { last, end, ..b })
 }
 
 /// Every batch a copy of `db` would read, as many as it takes (the fuzz target's), with how
@@ -233,6 +212,58 @@ fn to_compress(key: &str, kept: &[u8]) -> bool {
     kept.len() >= DEFLATE_MIN && kept.len() as u64 <= BIGGEST && !kept.starts_with(DEFLATED) && !key.starts_with(SEARCH)
 }
 
+/// How copying a data file's batches ended ([`Packs::copy_batches`]).
+enum Copied {
+    /// Every file is in the copy.
+    All,
+    /// Stopped by whoever asked for it.
+    Stopped,
+    /// The account's data file is gone (the account removed).
+    Gone,
+}
+
+/// The keys `journal` noted as written to the data file `db` (had to itself) while it was copied,
+/// copied again into `new` (those gone, removed from it): what `db`'s `META` has, to carry over.
+fn replay_journal(db: &Database, new: &Database, journal: &Journal) -> io::Result<Meta> {
+    let tx = db.begin_read().map_err(disk)?;
+    let files = tx.open_table(FILES).map_err(disk)?;
+    let pieces = pieces_of(&tx).map_err(disk)?;
+    let (mut now, mut gone) = (Vec::new(), Vec::new());
+    for key in &journal.keys {
+        match files.get(key.as_str()).map_err(disk)? {
+            Some(v) => match kept_bytes(key, v.value(), pieces.as_ref())? {
+                Some(kept) => now.push((key.clone(), kept)),
+                None => return Err(damaged_refused(1)),
+            },
+            None => gone.push(key),
+        }
+    }
+    write_copy(new, |t| {
+        put_copied(t, &now)?;
+        for key in gone {
+            t.remove(key)?;
+        }
+        Ok(())
+    })?;
+    read_meta(&tx)
+}
+
+/// The copy `new` sealed, and on the disk: everything in it is kept as this build keeps it, with
+/// what recompressing counted in the old file (its `meta`) carried over, and whose it is.
+fn seal_copy(new: &Database, meta: &Meta) -> io::Result<()> {
+    let mut tx = new.begin_write().map_err(disk)?;
+    tx.set_quick_repair(true);
+    let counted = [(DEFLATE, DEFLATE_NOW), (PACE, meta.pace), (STAYED_RAW, meta.stayed_raw), (SAVED, meta.saved), (PASSED, meta.passed)];
+    let counted: Vec<(&str, [u8; 8])> = counted.iter().map(|(k, v)| (*k, v.to_le_bytes())).collect();
+    let mut values: Vec<(&str, &[u8])> = counted.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+    // Still the account of the data folder it was.
+    if let Some(owner) = &meta.owner {
+        values.push((OWNER, owner.as_slice()));
+    }
+    write_meta(&tx, &values)?;
+    tx.commit().map_err(disk)
+}
+
 /// A write transaction of the copy `db`, not waited for to the disk (the seal at its end is).
 fn write_copy(db: &Database, f: impl FnOnce(&mut Tables<'_>) -> io::Result<()>) -> io::Result<()> {
     let mut tx = db.begin_write().map_err(disk)?;
@@ -247,12 +278,12 @@ fn write_copy(db: &Database, f: impl FnOnce(&mut Tables<'_>) -> io::Result<()>) 
 impl Packs {
     /// Whether `account`'s data file is being copied: what's written to it is noted.
     pub(super) fn copying(&self, account: &str) -> bool {
-        Packs::lock(&self.copying).contains_key(account)
+        lock(&self.copying).contains_key(account)
     }
 
     /// `keys` were written to `account`'s data file while it's copied.
     pub(super) fn copied_again(&self, account: &str, keys: Vec<String>) {
-        if let Some(j) = Packs::lock(&self.copying).get_mut(account) {
+        if let Some(j) = lock(&self.copying).get_mut(account) {
             j.keys.extend(keys);
             if j.keys.len() > JOURNAL_MAX {
                 j.full = true;
@@ -285,7 +316,7 @@ impl Packs {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(held) => {
-                    Packs::lock(&self.open).dbs.insert(account.to_string(), held);
+                    lock(&self.open).dbs.insert(account.to_string(), held);
                     return Err(io::Error::new(io::ErrorKind::ResourceBusy, "the data file is in use; try again in a moment"));
                 }
             }
@@ -302,7 +333,7 @@ impl Packs {
         let before = fs::metadata(&path)?.len();
         let pace = read_meta(&db.begin_read().map_err(disk)?)?.pace;
         #[cfg(test)]
-        if let Some(hook) = Packs::lock(&self.compact_hook).as_ref() {
+        if let Some(hook) = lock(&self.compact_hook).as_ref() {
             hook()?;
         }
         db.compact().map_err(other)?;
@@ -341,108 +372,88 @@ impl Packs {
         }
         // What's written from here on is noted. The writer taken once after: a write that began
         // before and didn't see it has committed by then, and the copy reads what it wrote.
-        if Packs::lock(&self.copying).insert(account.to_string(), Journal::default()).is_some() {
+        if lock(&self.copying).insert(account.to_string(), Journal::default()).is_some() {
             return Err(io::Error::new(io::ErrorKind::ResourceBusy, "the data file is being copied already"));
         }
         let _journaling = Journaling(self, account);
         drop(db.begin_write().map_err(disk)?);
-        let mut work = count(&db, None)?;
+        let work = count(&db, None)?;
         drop(db);
         let new = Database::builder().set_cache_size(CACHE).create(&copy.path).map_err(other)?;
+        let cancelled = Shrunk { before, after: before, elapsed_ms: 0, cancelled: true, ..Shrunk::default() };
+        match self.copy_batches(account, &new, work, go_on)? {
+            Copied::All => {}
+            Copied::Stopped => return Ok(Some(cancelled)),
+            Copied::Gone => return Ok(None),
+        }
+        // The rest with the file to itself: what was written meanwhile copied again, the copy
+        // sealed, closed and put in its place.
+        if !swap() {
+            return Ok(Some(cancelled));
+        }
+        let Some(mut taken) = self.take(account)? else { return Ok(None) };
+        let journal = lock(&self.copying).get_mut(account).map(std::mem::take).unwrap_or_default();
+        if journal.full {
+            taken.give_back();
+            return Err(io::Error::other("too much was written to the data file while it was copied; it's tried again later"));
+        }
+        let Some(db) = taken.db.take() else { return Ok(None) };
+        let meta = replay_journal(&db, &new, &journal)?;
+        seal_copy(&new, &meta)?;
+        drop(new);
+        drop(db);
+        self.swap_in(account, &mut copy, &path, taken)?;
+        let after = fs::metadata(&path)?.len();
+        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Some(Shrunk { before, after, elapsed_ms, copied: true, ..Shrunk::default() }))
+    }
+
+    /// Every file of `account`'s data file copied into `new`, a batch at a time, with the file let
+    /// go of between them; `go_on` hears how far it has come (out of `work`) before each.
+    fn copy_batches(&self, account: &str, new: &Database, mut work: Work, go_on: &mut dyn FnMut(Work) -> bool) -> io::Result<Copied> {
         let (mut after, mut damaged) = (None::<String>, 0u64);
         loop {
             if !go_on(work) {
-                return Ok(Some(Shrunk { before, after: before, elapsed_ms: 0, cancelled: true, ..Shrunk::default() }));
+                return Ok(Copied::Stopped);
             }
             // Let go of between batches: a removal, or a write from the window, goes first.
-            let Some(db) = self.db(account, false)? else { return Ok(None) };
+            let Some(db) = self.db(account, false)? else { return Ok(Copied::Gone) };
             let batch = read_copy_batch(&db, after.as_deref())?;
             drop(db);
             damaged = damaged.saturating_add(batch.damaged);
             if damaged > 0 {
                 return Err(damaged_refused(damaged));
             }
-            write_copy(&new, |t| put_copied(t, &batch.files))?;
+            write_copy(new, |t| put_copied(t, &batch.files))?;
             work.done = work.done.saturating_add(batch.files.len() as u64).saturating_add(batch.damaged).min(work.total);
             work.bytes_done = work.bytes_done.saturating_add(batch.looked_bytes).min(work.bytes_total);
             if batch.last.is_some() {
                 after = batch.last;
             }
             if batch.end {
-                break;
+                return Ok(Copied::All);
             }
             std::thread::yield_now();
         }
-        // The rest with the file to itself: what was written meanwhile copied again, the copy
-        // sealed, closed and put in its place.
-        if !swap() {
-            return Ok(Some(Shrunk { before, after: before, elapsed_ms: 0, cancelled: true, ..Shrunk::default() }));
-        }
-        let Some(mut taken) = self.take(account)? else { return Ok(None) };
-        let journal = Packs::lock(&self.copying).get_mut(account).map(std::mem::take).unwrap_or_default();
-        if journal.full {
-            taken.give_back();
-            return Err(io::Error::other("too much was written to the data file while it was copied; it's tried again later"));
-        }
-        let Some(db) = taken.db.take() else { return Ok(None) };
-        let meta = {
-            let tx = db.begin_read().map_err(disk)?;
-            let files = tx.open_table(FILES).map_err(disk)?;
-            let pieces = match tx.open_table(PIECES) {
-                Ok(t) => Some(t),
-                Err(redb::TableError::TableDoesNotExist(_)) => None,
-                Err(e) => return Err(disk(e)),
-            };
-            let (mut now, mut gone) = (Vec::new(), Vec::new());
-            for key in &journal.keys {
-                match files.get(key.as_str()).map_err(disk)? {
-                    Some(v) => match kept_bytes(key, v.value(), pieces.as_ref())? {
-                        Some(kept) => now.push((key.clone(), kept)),
-                        None => return Err(damaged_refused(1)),
-                    },
-                    None => gone.push(key),
-                }
-            }
-            write_copy(&new, |t| {
-                put_copied(t, &now)?;
-                for key in gone {
-                    t.remove(key)?;
-                }
-                Ok(())
-            })?;
-            read_meta(&tx)?
-        };
-        // Everything in it is kept as this build keeps it (what recompressing counted in the old
-        // file carried over); sealed, and on the disk.
-        let mut tx = new.begin_write().map_err(disk)?;
-        tx.set_quick_repair(true);
-        let counted = [(DEFLATE, DEFLATE_NOW), (PACE, meta.pace), (STAYED_RAW, meta.stayed_raw), (SAVED, meta.saved), (PASSED, meta.passed)];
-        let counted: Vec<(&str, [u8; 8])> = counted.iter().map(|(k, v)| (*k, v.to_le_bytes())).collect();
-        let mut values: Vec<(&str, &[u8])> = counted.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-        // Still the account of the data folder it was.
-        if let Some(owner) = &meta.owner {
-            values.push((OWNER, owner.as_slice()));
-        }
-        write_meta(&tx, &values)?;
-        tx.commit().map_err(disk)?;
-        drop(new);
-        drop(db);
+    }
+
+    /// The copy at `copy` put in the place of `account`'s data file at `path` (had to itself:
+    /// `taken`, let go of once it's there), and measured.
+    fn swap_in(&self, account: &str, copy: &mut CopyFile, path: &Path, taken: Taken<'_>) -> io::Result<()> {
         // A test's: something holding the file as it's put in place.
         #[cfg(test)]
-        if let Some(hook) = Packs::lock(&self.compact_hook).as_ref() {
+        if let Some(hook) = lock(&self.compact_hook).as_ref() {
             hook()?;
         }
-        crate::atomic::rename(&copy.path, &path)?;
+        crate::atomic::rename(&copy.path, path)?;
         copy.kept = true;
-        crate::atomic::sync_folder_of(&path);
+        crate::atomic::sync_folder_of(path);
         drop(taken);
         // What the new file has over what it keeps is the least it can have.
         if let Err(e) = self.compacted(account) {
             log::warn!("{account}: its data file was copied, but what it has over its mail wasn't measured: {e}");
         }
-        let after = fs::metadata(&path)?.len();
-        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(Some(Shrunk { before, after, elapsed_ms, copied: true, ..Shrunk::default() }))
+        Ok(())
     }
 
     /// Copies left by compactions that didn't end (a crash), removed: the data files they were of
@@ -461,7 +472,7 @@ impl Packs {
                 }
             }
         }
-        let beside: Vec<PathBuf> = Packs::lock(&self.names).values().map(Path::new).filter(|p| p.is_absolute()).map(copy_path).collect();
+        let beside: Vec<PathBuf> = lock(&self.names).values().map(Path::new).filter(|p| p.is_absolute()).map(copy_path).collect();
         for copy in beside {
             if fs::symlink_metadata(&copy).is_ok_and(|m| m.is_file()) {
                 remove(&copy);

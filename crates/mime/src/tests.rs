@@ -1,3 +1,24 @@
+use super::*;
+use mailcraft_model::dates::Clock;
+use util::{PNG_1X1, key};
+
+mod data_urls;
+mod draft_source;
+mod importance;
+pub(crate) mod index_text;
+mod kept_cid;
+mod one_parse;
+mod parts_listed;
+mod percent;
+mod previews;
+mod reactions;
+mod reply_layout;
+mod report;
+mod report_status;
+mod signature_code;
+mod text_attach;
+pub(crate) mod util;
+
 /// An HTML body's links read whole from its `href`s: a 900-character Teams link that the
 /// text's footnote wraps (it came out cut at 395), quoted either way or not, with entities,
 /// once each; nothing that isn't a web address, and nothing runaway.
@@ -31,50 +52,16 @@ fn a_teams_invitations_join_link_survives_as_text() {
     assert!(event.links().contains(&"https://aka.ms/JoinTeamsMeeting".to_string()), "{text}");
 }
 
-use super::*;
-use mailcraft_model::dates::Clock;
-
-mod draft_source;
-mod importance;
-pub(crate) mod index_text;
-mod kept_cid;
-mod one_parse;
-mod parts_listed;
-mod reactions;
-mod reply_layout;
-mod report;
-mod report_status;
-mod signature_code;
-mod text_attach;
-
-/// Issue #11 (#16's test): a signature's pictures are written into the HTML kept with the account, and come
-/// back from it as pictures of its text, with its look; pictures from the web, kinds a signature
-/// can't hold, and broken ones don't.
+/// Issue #41: HTML laid out in tables reads as text without box-drawing rules around each
+/// table, and its preview keeps one block's words apart from the next's.
 #[test]
-fn a_signatures_pictures_go_into_its_html_and_back() {
-    let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 250];
-    let (text, mut styles) = rich::from_markup("**Riley Moreno**\nStudio Lantern");
-    let mut text = text;
-    rich::splice(&mut text, &mut styles, 0..0, "\u{FFFC}\n", &rich::Styles::plain("\u{FFFC}\n"));
-    styles.restyle(&text, 0..1, |s| rich::Style { picture: Some("logo@x".into()), ..s.clone() });
-    let pictures = vec![InlinePicture { cid: "logo@x".into(), name: "logo.png".into(), mime: "image/png".into(), data: png.clone() }];
-    let html = embed_pictures(&rich::to_html(&text, &styles), &pictures);
-    assert!(html.contains("<img src=\"data:image/png;base64,iVBORwECA/o=\"") && !html.contains("cid:"), "{html}");
-    let (back, back_styles, back_pictures) = signature_html(&html);
-    assert_eq!(back, text);
-    assert_eq!(back_pictures.len(), 1);
-    assert_eq!((back_pictures[0].mime.as_str(), &back_pictures[0].data), ("image/png", &png));
-    assert_eq!(back_styles.style(0).picture.as_deref(), Some(back_pictures[0].cid.as_str()));
-    assert!(back_styles.style(2).bold, "the name stays bold");
-    // What a signature can't keep.
-    let others =
-        "<p>Hi<img src=\"https://x.example/t.png\"><img src=\"data:image/svg+xml;base64,PHN2Zz4=\"><img src=\"data:image/png;base64,***\"></p>";
-    let (t, _, p) = signature_html(others);
-    assert_eq!((t.as_str(), p.len()), ("Hi", 0));
-    // As before, without pictures: the same text and look as pasting it.
-    let plain = "<p><b>Riley</b> · <a href=\"https://studio.example/\">studio</a></p>";
-    let (t, s, p) = signature_html(plain);
-    assert_eq!((t, s, p.len()), (pasted_html(plain).0, pasted_html(plain).1, 0));
+fn tables_read_as_text_without_rules() {
+    let raw = b"From: news@studio.example\r\nSubject: x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+<table><tr><td>BANNER</td></tr></table><table><tr><td><p><b>First</b> block</p></td></tr></table>\r\n";
+    let p = parse(raw).unwrap();
+    assert!(!p.text.chars().any(|c| ('\u{2500}'..='\u{257F}').contains(&c)), "{:?}", p.text);
+    let s = summary_from_header(raw, key(), Flags::default(), 0, 0);
+    assert_eq!(s.preview, "BANNER First block");
 }
 
 /// Issue #1: a signature copied from Outlook (Word's HTML on the clipboard, only the copied
@@ -169,10 +156,6 @@ Content-Transfer-Encoding: base64\r\n\
 iVBORw0KGgo=\r\n\
 --B--\r\n";
 
-fn key() -> MessageKey {
-    MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid: 9 }
-}
-
 #[test]
 fn summary_fields() {
     let s = summary_from_header(SIMPLE, key(), Flags::default(), 321, 5);
@@ -257,7 +240,10 @@ fn rich_html_keeps_formatting_links_and_pictures() {
     assert_eq!((h[0][0].text.as_str(), h[0][0].heading), ("Big news", 2));
     assert!(h.iter().flatten().any(|s| s.heading == 0 && s.text.starts_with('#')), "{h:?}");
     // A picture without a description keeps its place (shown once the web is allowed).
-    assert_eq!(remote_images(&r), ["https://t.example/p.gif"]);
+    assert_eq!(
+        r.iter().flatten().filter_map(|s| s.image.as_deref()).filter(|i| i.starts_with("https://")).collect::<Vec<_>>(),
+        ["https://t.example/p.gif"]
+    );
     assert!(all.iter().filter(|s| s.image.is_some()).all(|s| !s.text.contains(PICTURE_MARK)));
     assert!(html_to_rich("").is_empty());
     let p = parse(MULTI).unwrap();
@@ -267,7 +253,8 @@ fn rich_html_keeps_formatting_links_and_pictures() {
         html_images("<IMG alt=x SRC='https://a.example/1.png?x=1&amp;y=2'><img src=cid:k@x><img src=\"cid:k@x\"><img>"),
         vec!["https://a.example/1.png?x=1&y=2".to_string(), "cid:k@x".to_string()]
     );
-    assert_eq!(remote_images(&html_to_rich("<img src=\"https://a.example/x.png\" alt=\"Map\">")), vec!["https://a.example/x.png".to_string()]);
+    let map = html_to_rich("<img src=\"https://a.example/x.png\" alt=\"Map\">");
+    assert_eq!(map.iter().flatten().filter_map(|s| s.image.as_deref()).collect::<Vec<_>>(), ["https://a.example/x.png"]);
     assert!(parse(SIMPLE).unwrap().rich.is_empty(), "plain mail has no rich body");
 }
 
@@ -353,6 +340,10 @@ fn build_round_trips() {
     assert_eq!((p2.date, p2.subject.as_str(), p2.text.trim()), (1_792_000_000, d.subject.as_str(), "Hi Ann,\nhere it is."));
     assert_eq!(String::from_utf8_lossy(&later).matches("Date:").count(), 1);
     assert_eq!(with_date(b"no header block", 5), b"no header block".to_vec());
+    // A folded `date :` in a header of bare LFs: replaced whole, its line end kept; one in the
+    // body isn't touched.
+    let lf = with_date(b"Subject: x\ndate :Mon,\n 1 Jan 2024 00:00:00 +0000\nTo: a@b\n\nDate: body", 0);
+    assert_eq!(String::from_utf8_lossy(&lf), "Subject: x\nDate: Thu, 1 Jan 1970 00:00:00 +0000\nTo: a@b\n\nDate: body");
     let rich = Draft {
         html: Some("<p>Hi <b>Ann</b><img src=\"cid:pic@x\"></p>".into()),
         inline: vec![InlinePicture { cid: "pic@x".into(), name: "pic.png".into(), mime: "image/png".into(), data: vec![9, 9] }],
@@ -382,8 +373,9 @@ fn build_round_trips() {
 #[test]
 fn build_writes_the_same_bytes_as_before() {
     let digest = |raw: &[u8]| {
-        let kept = raw.split_inclusive(|b| *b == b'\n').filter(|l| !l.starts_with(b"X-Mailer:"));
-        kept.flatten().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+        let mut h = mailcraft_model::hash::Fnv::new();
+        raw.split_inclusive(|b| *b == b'\n').filter(|l| !l.starts_with(b"X-Mailer:")).for_each(|l| h.add(l));
+        h.value()
     };
     let all_bytes: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
     let d = Draft {
@@ -630,8 +622,10 @@ fn pictures_carry_the_size_the_message_sets() {
     assert!(odd.width.is_none() && odd.height == Some(4000), "nonsense is left out or held to 4000: {odd:?}");
 }
 
-/// Issue #11: a signature keeps its pictures with it, written into its HTML, and they come back
-/// as pictures in its text at their widths; what isn't a picture, or is too big, is left out.
+/// Issue #11 (#16's test): a signature keeps its pictures with it, written into the HTML kept
+/// with the account, and they come back as pictures in its text, at their widths and with its
+/// look; what isn't a picture, is too big or is on the web is left out, and a signature without
+/// pictures reads as pasting it does.
 #[test]
 fn a_signature_keeps_its_pictures() {
     let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4, 5];
@@ -644,18 +638,35 @@ fn a_signature_keeps_its_pictures() {
     assert!(html.contains("src=\"data:image/png;base64,iVBORwECAwQF\"") && !html.contains("cid:"), "{html}");
     let (t, s, pictures) = signature_html(&html);
     assert_eq!(t, text);
-    assert!(s.style(0).bold);
+    assert!(s.style(0).bold, "the name stays bold");
     let p = s.style(11);
     assert_eq!((p.picture.as_deref(), p.picture_width), (Some("signature1@mailcraft"), Some(120)));
     assert_eq!(pictures.len(), 1);
-    assert_eq!((pictures[0].data.clone(), pictures[0].mime.as_str()), (png, "image/png"));
+    assert_eq!((pictures[0].cid.as_str(), pictures[0].mime.as_str(), &pictures[0].data), ("signature1@mailcraft", "image/png", &png));
+    // A signature that starts with its picture: the picture is its first character still.
+    let (mut text, mut styles) = rich::from_markup("**Riley Moreno**\nStudio Lantern");
+    rich::splice(&mut text, &mut styles, 0..0, "\u{FFFC}\n", &rich::Styles::plain("\u{FFFC}\n"));
+    styles.restyle(&text, 0..1, |s| rich::Style { picture: Some("logo@x".into()), ..s.clone() });
+    let pic = InlinePicture { cid: "logo@x".into(), name: "logo.png".into(), mime: "image/png".into(), data: png.clone() };
+    let html = embed_pictures(&rich::to_html(&text, &styles), &[pic]);
+    assert!(html.contains("<img src=\"data:image/png;base64,iVBORwECAwQF\"") && !html.contains("cid:"), "{html}");
+    let (back, back_styles, back_pictures) = signature_html(&html);
+    assert_eq!(back, text);
+    assert_eq!(back_pictures.len(), 1);
+    assert_eq!((back_pictures[0].mime.as_str(), &back_pictures[0].data), ("image/png", &png));
+    assert_eq!(back_styles.style(0).picture.as_deref(), Some(back_pictures[0].cid.as_str()));
+    assert!(back_styles.style(2).bold && !back_styles.style(0).bold, "the name stays bold");
     // Not pictures, too big, or on the web: left out; the text stays.
     let big = "A".repeat(SIGNATURE_PICTURE_MAX / 3 * 4 + 400);
     let odd = format!(
-        "<p>Hi<img src=\"data:image/svg+xml;base64,PHN2Zz4=\"><img src=\"data:image/png;base64,{big}\"><img src=\"https://x.example/a.png\"><img src=\"data:image/png;base64,!!!\">\u{E002}</p>"
+        "<p>Hi<img src=\"data:image/svg+xml;base64,PHN2Zz4=\"><img src=\"data:image/png;base64,{big}\"><img src=\"https://x.example/a.png\"><img src=\"data:image/png;base64,!!!\">\u{E002}\u{E005}</p>"
     );
     let (t, _, pictures) = signature_html(&odd);
     assert_eq!((t.as_str(), pictures.len()), ("Hi", 0));
+    // As before, without pictures: the same text and look as pasting it.
+    let plain = "<p><b>Riley</b> · <a href=\"https://studio.example/\">studio</a></p>";
+    let (t, s, p) = signature_html(plain);
+    assert_eq!((t, s, p.len()), (pasted_html(plain).0, pasted_html(plain).1, 0));
 }
 
 /// Issue #11: a signature copied from Word or Outlook with its logo: Word writes the picture into
@@ -663,8 +674,7 @@ fn a_signature_keeps_its_pictures() {
 /// pointing at a file of its own); the picture comes along, at the size it was given there.
 #[test]
 fn a_logo_copied_from_word_comes_along() {
-    let png = crate::smime::base64(&[0x89, b'P', b'N', b'G', 9, 9]);
-    let png = String::from_utf8(png).unwrap();
+    let png = mailcraft_model::base64::encode(&[0x89, b'P', b'N', b'G', 9, 9]);
     let html = format!(
         "<html><body><!--StartFragment--><p class=MsoNormal><span style='mso-no-proof:yes'><!--[if gte vml 1]><v:shape \
          style='width:135pt;height:40.5pt'><v:imagedata src=\"file:///C:/Users/x/AppData/Local/Temp/msohtmlclip1/01/clip_image001.png\" \
@@ -721,7 +731,7 @@ fn east_asian_mail_reads() {
 /// with it; one on the web by its address (never loaded); a tracking picture left out.
 #[test]
 fn a_reply_quotes_every_picture() {
-    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let png = PNG_1X1;
     let raw = format!(
         "From: Zoe <zoe@studio.example>\r\nTo: riley@studio.example\r\nSubject: Frames\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
 --R\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
@@ -730,7 +740,7 @@ fn a_reply_quotes_every_picture() {
 --R\r\nContent-Type: image/png\r\nContent-Location: frame2.png\r\nContent-Transfer-Encoding: base64\r\n\r\n{png}\r\n--R--\r\n"
     );
     let mut p = parse(raw.as_bytes()).unwrap();
-    let (pictures, used) = quoted_pictures(&mut p, raw.as_bytes());
+    let (pictures, used, _) = quoted_pictures_given(&mut p, raw.as_bytes());
     assert_eq!(used, [0, 1]);
     assert_eq!(pictures.len(), 3, "{pictures:?}");
     assert_eq!(pictures[0].cid, "a@x");
@@ -746,5 +756,21 @@ fn a_reply_quotes_every_picture() {
     // Twice the same picture: one copy.
     let twice = raw.replace("<img src=\"frame2.png\">", "<img src=\"cid:a@x\">");
     let mut p = parse(twice.as_bytes()).unwrap();
-    assert_eq!(quoted_pictures(&mut p, twice.as_bytes()).0.len(), 2);
+    assert_eq!(quoted_pictures_given(&mut p, twice.as_bytes()).0.len(), 2);
+}
+
+/// MEASURE: the formatted lines of HTML made of many fragments of one format (#289): bold words
+/// and links of one address, each its own fragment, merged with the one before.
+#[test]
+#[ignore = "a measurement"]
+fn measure_rich_fragments() {
+    let line = "<b>word</b> ".repeat(60) + &"<a href=\"https://links.example/a/rather/long/address?with=query&and=more\">link</a> ".repeat(60);
+    let html = format!("<p>{line}</p>").repeat(400);
+    let _ = html_to_rich(&html);
+    let start = std::time::Instant::now();
+    let mut spans = 0;
+    for _ in 0..5 {
+        spans += html_to_rich(&html).iter().map(Vec::len).sum::<usize>();
+    }
+    println!("MEASURE rich_fragments {} KB: {:.1} ms each ({spans} spans)", html.len() / 1024, start.elapsed().as_secs_f64() * 1000.0 / 5.0);
 }

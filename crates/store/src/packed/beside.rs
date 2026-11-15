@@ -17,7 +17,7 @@ const TRIES: u32 = 100;
 const NOTE_MAX: usize = 64 << 20;
 /// The import's note in a data file, and the account's folder list.
 const NOTE: &str = "import.json";
-const FOLDERS: &str = "folders.json";
+const FOLDERS: &str = crate::FOLDERS;
 /// Added to a copy's name for the file made to try its folder.
 const PROBE: &str = "-probe";
 
@@ -49,7 +49,7 @@ impl Packs {
         if dir.to_str().is_none() {
             return elsewhere;
         }
-        let held: HashSet<String> = Packs::lock(&self.names).values().map(|n| same_key(&self.dir.join(n))).collect();
+        let held: HashSet<String> = lock(&self.names).values().map(|n| same_key(&self.dir.join(n))).collect();
         for i in 1..=TRIES {
             let name = if i == 1 { format!("{stem}.{EXTENSION}") } else { format!("{stem} ({i}).{EXTENSION}") };
             let path = dir.join(name);
@@ -82,15 +82,13 @@ impl Packs {
             }
             if let (Some(account), Some(p)) = (take, path.to_str()) {
                 {
-                    let mut names = Packs::lock(&self.names);
+                    let mut names = lock(&self.names);
                     // Another account's since it was looked at: the next name.
                     if names.values().any(|n| same_key(&self.dir.join(n)) == same_key(&path)) {
                         continue;
                     }
                     names.insert(account.to_string(), p.to_string());
-                    if let Ok(json) = serde_json::to_vec_pretty(&*names) {
-                        let _ = write_atomic(&self.root.join(NAMES), &json);
-                    }
+                    super::names::save(&self.root, &names);
                 }
                 // Taken on: this folder's from now on (a copy made new says so as it's made).
                 if found.as_ref().is_some_and(|f| !f.ours)
@@ -145,7 +143,7 @@ fn note_of(path: &Path, source: &str) -> Option<Found> {
     let (owner, owner_path) = owner_of(&tx);
     let src = note.get("source")?;
     let noted = src.get("path")?.as_str()?;
-    if !noted.rsplit(['/', '\\']).next().is_some_and(|n| n.eq_ignore_ascii_case(source)) {
+    if !mailcraft_model::file_name(noted).eq_ignore_ascii_case(source) {
         return None;
     }
     let account = read(FOLDERS)

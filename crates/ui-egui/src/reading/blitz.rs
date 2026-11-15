@@ -285,7 +285,7 @@ pub(crate) fn message_pdf(s: &Session, st: &UiState) -> Option<Result<Vec<u8>, S
         let mut paint = |top: f32, h: f32| page.paint(top, h).ok();
         let fonts = fonts.as_ref().map(|(r, b)| mailcraft_engine::print::Fonts { regular: r, bold: b.as_deref() });
         let drawn = mailcraft_engine::print::Drawn { width: PRINT_WIDTH as f32, height, paint: &mut paint };
-        mailcraft_engine::print::pdf_with(&doc, fonts, Some(drawn))
+        Ok(mailcraft_engine::print::pdf_with(&doc, fonts, Some(drawn)))
     };
     let made = std::thread::Builder::new()
         .name("print-page".into())

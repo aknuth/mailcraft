@@ -38,7 +38,33 @@ fn a_calendar_only_account_starts_with_its_server_and_no_mail_one() {
     again.set_work_offline(true);
     assert_eq!(again.account(&id).unwrap().status, mailcraft_model::SyncStatus::Offline);
     assert!(again.account(&local).is_some());
-    done(again);
+}
+
+/// Issue #86: it has no mailbox, so the folder pane doesn't show it (several of them filled the
+/// pane with accounts that open to nothing); it's still an account, with its place among the
+/// calendars. A mailbox moved up or down moves past the mailbox shown next to it.
+#[test]
+fn it_is_no_mailbox_in_the_folder_pane() {
+    let mut s = sample_session("calendar-only-pane");
+    let zoe = add(&mut s);
+    let mail =
+        s.run("account.add", &json!({"email": "riley@example.net", "password": "pw", "imapHost": "127.0.0.1", "imapPort": 1})).unwrap()["account"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let keys = |sections: Vec<crate::PaneSection>| sections.into_iter().map(|x| x.key).collect::<Vec<_>>();
+    assert_eq!(keys(s.pane_sections()), ["sample".to_string(), zoe.clone(), mail.clone()], "an account like the others");
+    assert_eq!(keys(s.mail_sections()), ["sample".to_string(), mail.clone()], "with no mailbox to show");
+    // Up one place is above the sample mailbox, not above the account that isn't shown.
+    assert_eq!(s.run("folderPane.move", &json!({"key": mail, "by": -1})).unwrap()["position"], 0);
+    assert_eq!(keys(s.mail_sections()), [mail.clone(), "sample".to_string()]);
+    assert_eq!(s.run("folderPane.move", &json!({"key": mail, "by": 1})).unwrap()["position"], 1);
+    assert_eq!(keys(s.mail_sections()), ["sample".to_string(), mail.clone()]);
+    assert_eq!(keys(s.pane_sections()).len(), 3, "none is lost in the moving");
+    // Itself, it moves among all the accounts (its calendars are listed in that order).
+    s.run("folderPane.move", &json!({"key": zoe, "by": -5})).unwrap();
+    assert_eq!(keys(s.pane_sections()).first(), Some(&zoe));
+    assert_eq!(keys(s.mail_sections()), ["sample".to_string(), mail]);
 }
 
 #[test]
@@ -58,7 +84,6 @@ fn what_it_needs_is_asked_for() {
         add(&mut s, json!({"email": "zo@example.org", "username": "z\no","password": "pw", "dav": SERVER})).is_some_and(|e| e.contains("user name"))
     );
     assert!(add(&mut s, json!({"email": "zoe@example.org", "password": "pw", "dav": SERVER})).is_some_and(|e| e.contains("already")));
-    done(s);
 }
 
 #[test]
@@ -90,9 +115,8 @@ fn its_calendar_and_contacts_go_to_its_server() {
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { account } if *account == id)), "the server hears of a new event");
     assert_eq!(s.pim[&id].events.iter().map(|e| e.calendar.as_str()).collect::<Vec<_>>(), [cal.as_str()]);
     s.run("contact.create", &json!({"name": "Ana Lee", "account": id})).unwrap();
-    assert!(s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { account } if *account == id)), "nor of a new contact");
+    assert!(s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { account } if *account == id)), "and of a new contact");
     assert_eq!(s.pim[&id].cards.iter().map(|c| c.book.as_str()).collect::<Vec<_>>(), [book.as_str()]);
-    done(s);
 }
 
 #[test]
@@ -123,7 +147,6 @@ fn its_server_and_sign_in_can_change_but_not_go() {
     // Removed, the keychain's password goes with it (the pool's `Remove`).
     s.run("account.remove", &json!({"account": id})).unwrap();
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::Remove { account } if *account == id)));
-    done(s);
 }
 
 /// Meetings with no mail to send their invitations with: a server that schedules (Nextcloud)
@@ -159,6 +182,5 @@ fn a_meetings_invitations_go_through_a_server_that_schedules() {
         } else {
             assert!(not_sent, "said it couldn't go: {:?}", s.notices);
         }
-        done(s);
     }
 }

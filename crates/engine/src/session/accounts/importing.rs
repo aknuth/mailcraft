@@ -28,6 +28,18 @@ const FINISHED_MAX: usize = 8;
 /// `imports.json` read back: at most this many rows, a path at most this long.
 const SOURCES_MAX: usize = 1024;
 const PATH_MAX: usize = 4096;
+
+/// A data file's path as given: trimmed, there, and not too long.
+pub(crate) fn data_file_path(path: &str) -> Result<&str, CmdError> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(CmdError::Params("`path` is required".into()));
+    }
+    if path.len() > PATH_MAX {
+        return Err(CmdError::Params("`path` is too long".into()));
+    }
+    Ok(path)
+}
 /// An account removed while it imports goes once the import says it's thrown away. When that
 /// never comes (a reader stuck on a slow drive), it goes anyway after this many events; the
 /// engine reads no clock.
@@ -100,15 +112,23 @@ impl Imports {
     }
 }
 
-/// A path as compared for "the same file": `\` and `/` alike, case ignored.
+/// A path as compared for "the same file": `\` and `/` alike, case ignored on Windows and
+/// macOS, whose file systems mostly ignore it (elsewhere `Archive.pst` and `archive.pst` are
+/// two files).
 fn same_path(a: &str, b: &str) -> bool {
-    let norm = |p: &str| p.trim().replace('\\', "/").to_lowercase();
+    let norm = |p: &str| {
+        let p = p.trim().replace('\\', "/");
+        if FOLDS_CASE { p.to_lowercase() } else { p }
+    };
     norm(a) == norm(b)
 }
 
-/// The file's name at the end of a path.
+/// Whether this system's file names ignore case (`Archive.pst` is `archive.pst`).
+const FOLDS_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// The file's name at the end of a path, kept.
 fn file_name(path: &str) -> String {
-    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+    mailcraft_model::file_name(path).to_string()
 }
 
 impl Session {
@@ -338,13 +358,7 @@ impl Session {
     /// folder still there is refused, and the user told which, unless `take_over`: it's then this
     /// folder's.
     pub fn import_pst(&mut self, path: &str, again: bool, changes: Option<Changes>, take_over: bool) -> CmdResult {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(CmdError::Params("`path` is required".into()));
-        }
-        if path.len() > PATH_MAX {
-            return Err(CmdError::Params("`path` is too long".into()));
-        }
+        let path = data_file_path(path)?;
         let key = self.facts_for(path).map(|f| f.record_key.clone()).unwrap_or_default();
         if !again && let Some(a) = self.duplicate_of(path, &key, None) {
             if changes == Some(Changes::Read) {
@@ -402,13 +416,7 @@ impl Session {
     /// Bring an existing data file's mail into a new account before it first connects (Outlook's
     /// "use an existing data file" for POP accounts).
     pub fn attach_data_file(&mut self, account: &str, path: &str) -> CmdResult {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(CmdError::Params("`path` is required".into()));
-        }
-        if path.len() > PATH_MAX {
-            return Err(CmdError::Params("`path` is too long".into()));
-        }
+        let path = data_file_path(path)?;
         if self.account(account).is_none() {
             return Err(CmdError::Params(format!("no account `{account}`")));
         }
@@ -425,13 +433,7 @@ impl Session {
     /// Look at a data file before importing it: asked once (`again`: once more), answered when
     /// the network side has looked, with the account it's already open as, if any.
     pub fn inspect_data_file(&mut self, path: &str, again: bool) -> CmdResult {
-        let path = path.trim();
-        if path.is_empty() {
-            return Err(CmdError::Params("`path` is required".into()));
-        }
-        if path.len() > PATH_MAX {
-            return Err(CmdError::Params("`path` is too long".into()));
-        }
+        let path = data_file_path(path)?;
         let known = self.importing.inspected.iter().position(|(p, _)| p == path);
         match known.and_then(|i| self.importing.inspected.get(i)).map(|(_, f)| f.clone()) {
             Some(Some(facts)) if !again => {
@@ -664,7 +666,7 @@ impl Session {
             p.ensure_defaults();
             self.pim.insert(account.to_string(), p);
             self.pim_unread.remove(account);
-            self.contacts = None;
+            self.drop_contacts();
             self.pim_revision = self.pim_revision.wrapping_add(1);
         }
     }

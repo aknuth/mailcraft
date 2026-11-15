@@ -5,43 +5,8 @@ use std::time::{Duration, Instant};
 
 use redb::{ReadableDatabase, ReadableTable};
 
+use super::measure::{ms, percentile, spread};
 use super::*;
-
-/// This test binary again, running only `test` (an ignored one that does nothing unless `env`
-/// is set): a process that can be killed part-way. What it prints starts on the test harness's
-/// own line.
-pub(super) fn child(test: &str, env: &[(&str, String)]) -> std::process::Child {
-    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--ignored", "--exact", test, "--nocapture", "--test-threads=1"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().unwrap()
-}
-
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
-}
-
-/// (median, mean, 90th percentile) in ms.
-fn spread(mut v: Vec<f64>) -> (f64, f64, f64) {
-    v.sort_by(f64::total_cmp);
-    let at = |q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
-    (at(0.5), v.iter().sum::<f64>() / v.len().max(1) as f64, at(0.9))
-}
-
-pub(super) fn inbox(uid: u32) -> MessageKey {
-    MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid }
-}
-
-/// A data store with account `a1`, at `t`.
-fn packed_store(t: &std::path::Path) -> Store {
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
-    s
-}
 
 /// Sources of every kind: text, a big text one, noise that doesn't compress (one in pieces), a
 /// tiny one, and one that is only just too small to compress.
@@ -92,7 +57,6 @@ fn prepared_sources_read_back_as_written() {
     assert_eq!(s.read_body(&inbox(2)), Some(sources(7)[2].clone()));
     assert_eq!(s.read_body(&inbox(101)), Some(sources(8)[1].clone()));
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A file kept in pieces written over (by a smaller one in pieces, then a whole one) leaves none
@@ -102,7 +66,7 @@ fn overwriting_a_file_in_pieces_leaves_no_old_pieces() {
     let t = temp("overwrite-pieces");
     let s = packed_store(&t);
     let pieces_of = |s: &Store, key: &str| -> usize {
-        let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+        let packs = packs(s);
         let db = packs.db("a1", false).unwrap().unwrap();
         let tx = db.begin_read().unwrap();
         let table = tx.open_table(crate::packed::PIECES).unwrap();
@@ -123,7 +87,6 @@ fn overwriting_a_file_in_pieces_leaves_no_old_pieces() {
     assert_eq!(pieces_of(&s, &inside), 0);
     assert_eq!(s.read_body(&inbox(1)).unwrap(), b"Subject: small now\r\n\r\nx");
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A batch that didn't wait for the disk is made durable by the next write that does, and by the
@@ -154,7 +117,6 @@ fn a_batch_not_waited_for_is_kept_by_the_next_durable_write() {
     mem.write_prepared(vec![(inbox(1), Store::prepare(false, raw[1].clone()))], false).unwrap();
     mem.seal("a1").unwrap();
     assert_eq!(mem.read_body(&inbox(1)).as_ref(), Some(&raw[1]));
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// The sources of batch `n` of [`killed_during_write_bodies`]: one in pieces among text ones.
@@ -196,7 +158,6 @@ fn a_crash_during_write_bodies_keeps_what_was_committed() {
             }
         }
         drop(s);
-        let _ = std::fs::remove_dir_all(&t);
     }
 }
 
@@ -208,7 +169,7 @@ fn killed_during_write_bodies() {
     let seed: u64 = std::env::var("MC_CHILD_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let s = Store::open_packed(dir.join("app"), dir.join("Files")).unwrap();
     for n in 0..u32::MAX {
-        s.write_bodies(&crash_batch(n)).unwrap();
+        s.write_bodies(crash_batch(n)).unwrap();
         println!("done {n}");
         // The clock starts once the file is open and written: the kill lands among the writes.
         if n == 0 {
@@ -254,7 +215,6 @@ fn a_data_file_is_sealed_once_quiet_and_when_asked() {
         let (repairs, there) = repairs_on_open(&t, &file);
         assert!(there, "{mode}: the write was lost");
         assert_eq!(repairs == 0, sealed, "{mode}: {repairs} repairs");
-        let _ = std::fs::remove_dir_all(&t);
     }
 }
 
@@ -288,7 +248,7 @@ fn killed_after_a_write() {
 fn a_checkpoint_and_its_batch_are_one_sealed_commit() {
     let t = temp("checkpoint");
     let s = packed_store(&t);
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     let mut uid = 1000u32;
     s.write_prepared(background_batch(&mut uid), false).unwrap();
     assert!(packs.seals.undurable("a1").0 > 0 && packs.seals.waiting_for("a1"));
@@ -300,7 +260,6 @@ fn a_checkpoint_and_its_batch_are_one_sealed_commit() {
     assert!(keys.iter().all(|k| s.has_body(k)));
     assert_eq!(s.load_account_doc::<serde_json::Value>("a1", "import.json").unwrap(), serde_json::json!({"next": 7}));
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A sealed commit (a search index's meta) clears only the writes before it: one that came in as
@@ -309,7 +268,7 @@ fn a_checkpoint_and_its_batch_are_one_sealed_commit() {
 fn a_sealed_commit_leaves_a_later_write_waiting_for_its_seal() {
     let t = temp("sealed-race");
     let s = packed_store(&t);
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     let at = Instant::now();
     packs.seals.written_at("a1", at.checked_sub(Duration::from_millis(5)).unwrap_or(at));
     packs.seals.sealed("a1", at);
@@ -318,7 +277,49 @@ fn a_sealed_commit_leaves_a_later_write_waiting_for_its_seal() {
     packs.seals.sealed("a1", at);
     assert!(packs.seals.waiting_for("a1"), "a write after the seal began lost its seal");
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// A seal asked for (an import's end) leaves nothing waiting for the thread to seal again once
+/// quiet; a write after it waits for its own.
+#[test]
+fn a_seal_asked_for_is_not_made_again_once_quiet() {
+    let t = temp("asked-seal");
+    let s = packed_store(&t);
+    let packs = packs(&s);
+    s.write_body(&inbox(1), b"Subject: x\r\n\r\nx").unwrap();
+    assert!(packs.seals.waiting_for("a1"));
+    s.seal("a1").unwrap();
+    assert!(!packs.seals.waiting_for("a1"), "sealed, yet still due for another seal");
+    s.write_body(&inbox(2), b"Subject: y\r\n\r\ny").unwrap();
+    assert!(packs.seals.waiting_for("a1"), "a write after the seal waits for its own");
+    drop(s);
+}
+
+/// When the sealing thread can't be started (the system has no more threads), writes go on, and
+/// starting it isn't tried again for each one: once a while has passed, when it starts.
+#[test]
+fn a_sealing_thread_that_cant_start_isnt_tried_on_every_write() {
+    use crate::packed::commit::{NO_THREAD, STARTS_TRIED};
+    let t = temp("seal-no-thread");
+    NO_THREAD.set(true);
+    STARTS_TRIED.set(0);
+    let s = packed_store(&t);
+    let write = |uid| s.write_prepared(vec![(inbox(uid), Store::prepare(true, b"Subject: x\r\n\r\nx".to_vec()))], false).unwrap();
+    for uid in 1..=5 {
+        write(uid);
+    }
+    let packs = packs(&s);
+    assert_eq!(STARTS_TRIED.get(), 1, "tried once, not for every write");
+    assert!(!packs.seals.thread_running() && packs.seals.waiting_for("a1"), "written, not sealed");
+    // A while later, it's tried again, and starts.
+    NO_THREAD.set(false);
+    write(6);
+    assert_eq!(STARTS_TRIED.get(), 1, "not yet");
+    packs.seals.thread_failed(Duration::from_secs(61));
+    write(7);
+    assert_eq!(STARTS_TRIED.get(), 2);
+    assert!(packs.seals.thread_running());
+    drop(s);
 }
 
 /// An account removed lets go of its data file for good: a seal under way ends first (it held the
@@ -328,7 +329,7 @@ fn a_data_file_let_go_is_not_held_by_a_seal() {
     let t = temp("let-go");
     let s = packed_store(&t);
     s.write_prepared(vec![(inbox(1), Store::prepare(true, b"Subject: x\r\n\r\nx".to_vec()))], false).unwrap();
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     assert!(packs.seals.waiting_for("a1"));
     packs.seals.pretend_sealing(Some("a1"));
     let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -347,7 +348,6 @@ fn a_data_file_let_go_is_not_held_by_a_seal() {
     assert!(!packs.seals.waiting_for("a1"), "a seal still waits for a file let go of");
     drop(redb::Database::create(&file).expect("nothing holds it open"));
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Batch `n` of [`killed_after_batches`]: 2 MiB that doesn't compress.
@@ -372,7 +372,6 @@ fn a_long_run_of_batches_is_made_durable() {
         }
     }
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// The child of [`a_long_run_of_batches_is_made_durable`]: 40 MiB in batches not waited for, then
@@ -409,10 +408,9 @@ fn only_writes_from_the_window_are_timed_for_the_writer() {
         s.write_body(&inbox(1), format!("Subject: x\r\n\r\nread {i}").as_bytes()).unwrap();
     }
     writer.join().unwrap();
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     assert_eq!(packs.seals.waits.lock().unwrap().len(), 20, "only the writes from the window are timed");
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// What a data file has waiting for the disk is counted exactly: each batch adds what it keeps, a
@@ -424,7 +422,7 @@ fn only_writes_from_the_window_are_timed_for_the_writer() {
 fn what_waits_for_the_disk_is_counted_and_capped() {
     let t = temp("undurable-count");
     let s = packed_store(&t);
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     let mut uid = 1000u32;
     s.write_body(&inbox(0), b"Subject: x\r\n\r\nx").unwrap();
     assert_eq!(packs.seals.undurable("a1").0, 0);
@@ -467,7 +465,6 @@ fn what_waits_for_the_disk_is_counted_and_capped() {
     s.seal("a1").unwrap();
     assert_eq!(packs.seals.undurable("a1").0, 0);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Bringing in a MailCraft data file writes as an import does: in batches of at most
@@ -478,13 +475,13 @@ fn a_data_file_brought_in_goes_in_short_batches() {
     let t = temp("bring-in-batches");
     let old = packed_store(&t);
     let raw: Vec<(MessageKey, Vec<u8>)> = (0..24u32).map(|i| (inbox(i), noise(700 << 10, u64::from(i) + 11))).collect();
-    old.write_bodies(&raw).unwrap();
+    old.write_bodies(raw.clone()).unwrap();
     let file = old.data_file("a1").unwrap();
     drop(old);
     let s = Store::open_packed(t.join("new"), t.join("New Files")).unwrap();
     s.save_accounts(&[account("b2", "ana@example.org")]).unwrap();
     s.import_data_file("b2", &file).unwrap();
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     let (now, peak, biggest) = packs.seals.undurable("b2");
     assert_eq!(now, 0, "sealed at the end");
     assert!(biggest > 0 && biggest <= crate::BACKGROUND_COMMIT, "a batch of {biggest} bytes");
@@ -494,7 +491,6 @@ fn a_data_file_brought_in_goes_in_short_batches() {
         assert_eq!(s.read_body(&mine).as_ref(), Some(r));
     }
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Writes from the window (a message marked read: a small durable commit) while another thread
@@ -528,7 +524,7 @@ fn a_write_from_the_window_waits_little_for_a_background_writer() {
         })
     };
     std::thread::sleep(Duration::from_millis(100));
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     packs.seals.waits.lock().unwrap().clear();
     let mut whole = Vec::new();
     for i in 0..100u32 {
@@ -539,10 +535,10 @@ fn a_write_from_the_window_waits_little_for_a_background_writer() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let batches = writer.join().unwrap();
-    let waits: Vec<f64> = packs.seals.waits.lock().unwrap().drain(..).map(ms).collect();
+    let mut waits: Vec<f64> = packs.seals.waits.lock().unwrap().drain(..).map(ms).collect();
     assert_eq!(waits.len(), 100, "only the writes from the window are timed");
     let (wait, write) = (spread(waits.clone()), spread(whole.clone()));
-    let (wait99, write99) = (p99(waits), p99(whole));
+    let (wait99, write99) = (percentile(&mut waits, 0.99), percentile(&mut whole, 0.99));
     eprintln!(
         "{batches} background batches; waits for the writer: median {:.1} ms, p99 {wait99:.1} ms; whole writes: median {:.1} ms, p99 {write99:.1} ms",
         wait.0, write.0
@@ -551,7 +547,6 @@ fn a_write_from_the_window_waits_little_for_a_background_writer() {
     assert!(wait99 <= 60.0, "a write from the window waited {wait99:.1} ms for the writer (p99)");
     assert!(write99 <= 250.0, "a write from the window took {write99:.1} ms (p99)");
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// What a write from the window costs when background batches as far as the cap haven't gone to
@@ -586,7 +581,6 @@ fn a_write_from_the_window_writes_out_little_of_a_backlog() {
     );
     assert!(after.0 <= 60.0, "a write after the batches took {:.1} ms (median)", after.0);
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A background batch of [`crate::BACKGROUND_COMMIT`]: noise, kept as it is (what each batch holds
@@ -599,12 +593,6 @@ fn background_batch(uid: &mut u32) -> Vec<(MessageKey, crate::Prepared)> {
             (inbox(*uid), Store::prepare(true, one.clone()))
         })
         .collect()
-}
-
-/// The 99th percentile of `v`.
-fn p99(mut v: Vec<f64>) -> f64 {
-    v.sort_by(f64::total_cmp);
-    v.get((v.len() * 99 / 100).saturating_sub(1)).copied().unwrap_or(0.0)
 }
 
 /// One commit of `items` (as kept) into `db`, timed.

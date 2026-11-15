@@ -10,23 +10,8 @@ const LATIN: &[u8] = b"Caf\xe9 au lait\r\n\x93quoted\x94 costs \xa35\r\nlast lin
 
 /// Base64 in lines of 76.
 fn base64(data: &[u8]) -> String {
-    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for (i, chunk) in data.chunks(3).enumerate() {
-        if i > 0 && i % 19 == 0 {
-            out.push_str("\r\n");
-        }
-        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-        for k in 0..4 {
-            if k <= chunk.len() {
-                out.push(char::from(ABC[(n >> (18 - 6 * k) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    let text = encodify::base64::STANDARD.encode(data);
+    text.as_bytes().chunks(76).map(String::from_utf8_lossy).collect::<Vec<_>>().join("\r\n")
 }
 
 /// Quoted-printable with every byte that isn't plain ASCII escaped (line ends too), in lines
@@ -46,7 +31,6 @@ fn quoted_printable(data: &[u8]) -> String {
     out
 }
 
-/// A message with a short text body and these parts after it, each `(headers, body)`.
 /// Found in review: a file with a Content-ID and nothing on how it's shown (as some invoicing
 /// programs attach a PDF) was taken for a picture in the text: counted (the paperclip), and
 /// then listed nowhere. It's a file. A picture like that is still the text's.
@@ -59,13 +43,9 @@ fn a_file_with_a_content_id_is_still_a_file() {
     let p = parse(&raw).unwrap();
     let listed: Vec<(&str, bool)> = p.attachments.iter().map(|a| (a.name.as_str(), a.inline)).collect();
     assert_eq!(listed, [("invoice.pdf", false), ("logo.png", true)]);
-    // An address written without quotes is whole.
-    assert_eq!(
-        crate::html_images("<img src=https://x.example/a/b.png width=1><img src=cid:logo@x /><img src=https://x.example/c.png/>"),
-        ["https://x.example/a/b.png", "cid:logo@x", "https://x.example/c.png"]
-    );
 }
 
+/// A message with a short text body and these parts after it, each `(headers, body)`.
 fn message(parts: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut raw = b"From: Sam <sam@studio.example>\r\nTo: Lee <lee@studio.example>\r\nSubject: Files\r\nMIME-Version: 1.0\r\n\
         Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n--b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHere.\r\n"
@@ -165,7 +145,7 @@ fn other_text_files_are_what_they_were() {
     assert_eq!(attachment_data(&raw, 2).as_deref(), Some(&b"@@not base64@@"[..]));
 }
 
-/// A file moved out of its parse ([`attachment_data_moved`], for big files) is what
+/// A file moved out of its parse ([`attachments_moved`], for big files) is what
 /// [`attachment_data`] copies out: a decoded file, a file sent as it is, a text file, an attached
 /// message, an empty file; and nothing for an attachment the message doesn't have.
 #[test]
@@ -181,11 +161,16 @@ fn a_file_moved_out_of_its_parse_is_the_file() {
     ]);
     let p = parse(&raw).unwrap();
     assert_eq!(p.attachments.len(), 5, "{:?}", p.attachments);
+    let moved = |index: usize| {
+        let mut out = None;
+        attachments_moved(&raw, &[index], &mut |_, data| out = Some(data));
+        out
+    };
     for a in &p.attachments {
-        assert_eq!(attachment_data_moved(&raw, a.index), attachment_data(&raw, a.index), "{}", a.name);
+        assert_eq!(moved(a.index), attachment_data(&raw, a.index), "{}", a.name);
     }
-    assert_eq!(attachment_data_moved(&raw, 0).as_deref(), Some(&bin[..]));
-    assert_eq!(attachment_data_moved(&raw, 9), None);
+    assert_eq!(moved(0).as_deref(), Some(&bin[..]));
+    assert_eq!(moved(9), None);
     // All of them from one parse, each once: an index asked twice, and one it doesn't have.
     let mut all = Vec::new();
     attachments_moved(&raw, &[4, 0, 3, 1, 2, 0, 9], &mut |index, data| all.push((index, data)));

@@ -72,6 +72,7 @@
 	Edit rule	ルールを編集
 	Email address	メール アドレス
 	Enter the password for {email}.	{email} のパスワードを入力してください。
+	Enter the password for {email}, which signs in as {user}.	{email} のパスワードを入力してください。サインインには {user} を使います。
 	Favorites	お気に入り
 	Feb	2月
 	File	ファイル
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	開いたメッセージを既読にする
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	送信者はまだいません。
-	Not available: the sample mailbox has no server.	利用できません: サンプル メールボックスにはサーバーがありません。
+	Not available: this mailbox has no server.	利用できません: このメールボックスにはサーバーがありません。
 	Not available: {error}	利用できません: {error}
 	On	オン
 	On from {from}	{from} からオン
@@ -843,7 +844,8 @@ month	May	5月
 	Formatted	書式あり
 	HTML code	HTML コード
 	From a file…	ファイルから…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	ほかで作った署名の HTML を貼り付けるか、Web ページとして保存した署名 (Outlook の .htm) を開きます。書かれたとおりに送信され、作成中のメッセージにはその文字が表示されます。
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	ほかで作った署名の HTML を貼り付けるか、Web ページとして保存した署名 (Outlook の .htm) を開きます。書かれたとおりに送信され、作成中もそのとおりに表示されます。
+	Your signature as it will be sent. To change it, pick Signature above the message.	送信されるとおりの署名です。変更するには、メッセージの上にある［署名］を選びます。
 	{name} can't be read as a signature	{name} は署名として読み込めません
 	All contacts	すべての連絡先
 	Always open with this address book	常にこのアドレス帳で開く
@@ -935,6 +937,9 @@ month	May	5月
 	Name on mail from it	このアドレスから送るメールの名前
 	Replies go to	返信先
 	(the account's own)	(アカウントの署名)
+	Write new mail from this address	新しいメールをこのアドレスから書く
+	A new message starts from this address, not from {email}. Pick another in From as ever.	新しいメッセージは {email} ではなく、このアドレスから始まります。これまでどおり［差出人］で別のアドレスを選べます。
+	{address} (new mail)	{address}（新しいメール）
 	Add…	追加…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	フォルダーはこのアカウントの下に表示されます。Exchange サーバーでのアクセス権が必要です。フル アクセス権のあるメールボックスは自動的に開きます。
 	Mailboxes you have full access to open by themselves.	フル アクセス権のあるメールボックスは自動的に開きます。
@@ -1103,6 +1108,7 @@ month	May	5月
 	Check before sending	送信前の確認
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} は {like} のアドレスに見えますが、そうではありません。正しいアドレスですか?
 	{n} people who may not know each other will all see each other's addresses.	互いに知らないかもしれない {n} 人全員に、ほかの人のアドレスが見えます。
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	宛先に確認すべき点が見つかりましたが、表示できません。送信する前に宛先を確認してください。
 	Put everyone in Bcc	全員を BCC に入れる
 	Each of them gets the message without seeing who else did; you're in To	各自がほかに誰が受け取ったかを見ずにメッセージを受け取ります。あなたは宛先に入ります
 	Open links without their tracking	追跡を外してリンクを開く
@@ -1442,6 +1448,7 @@ month	May	5月
 	Calendar and contacts couldn't be read: changes to them won't be saved	カレンダーと連絡先を読み込めませんでした。変更は保存されません
 	Your rules couldn't be read: changes to them won't be saved	ルールを読み込めませんでした。変更は保存されません
 	Snoozed mail couldn't be read: changes to it won't be saved	再通知に設定したメールを読み込めませんでした。変更は保存されません
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	送信トレイで待機中の返信がどのメールへの返信かを読み込めませんでした。そのメールは返信済みと表示されないことがあります
 	Checking your data file	データ ファイルを確認しています
 	Opening your mail…	メールを開いています…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} は前回正しく閉じられませんでした。MailCraft が確認しています。大きなファイルでは 1、2 分かかることがあります。
@@ -1459,6 +1466,8 @@ month	May	5月
 	Some results may be missing: still indexing	一部の結果が表示されていない可能性があります: インデックス作成中
 	Some long messages were searched only in part	一部の長いメッセージは途中までしか検索されていません
 	Couldn't read the date “{value}”	日付「{value}」を読み取れませんでした
+	Couldn't read “{value}”	「{value}」を読み取れませんでした
+	Part of a long search was left out	長い検索の一部は使われませんでした
 	Received after	受信日 (以降)
 	Received before	受信日 (以前)
 	About {h} h {m} min left	残り約 {h} 時間 {m} 分
@@ -1705,3 +1714,7 @@ month	May	5月
 	Nothing to do	することはありません
 	Nothing in the next 7 days	今後 7 日間の予定はありません
 	Show the calendar, what's coming up and your tasks beside the mail	メールの横に予定表、今後の予定、タスクを表示します
+	Read / Unread (Ctrl+Q / Ctrl+U)	既読 / 未読 (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	{name} をダウンロードできませんでした: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	ウィンドウで問題が起きたため、実行中の処理を中止しました。MailCraft はそのまま使えます。発生した場所はログに記録されています。
+	Font size	フォントサイズ

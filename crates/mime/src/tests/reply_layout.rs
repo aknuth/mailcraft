@@ -57,7 +57,7 @@ fn a_reply_quotes_a_table_layout_cleanly() {
 /// Pictures a reply carries on are found in the layout too.
 #[test]
 fn quoted_pictures_reach_the_layout() {
-    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let png = PNG_1X1;
     let html = CARD.replace("cid:logo@x", "logo.png");
     let raw = format!(
         "From: Morgan <morgan@mill.example>\r\nTo: sam@studio.example\r\nSubject: Invoice\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
@@ -66,7 +66,7 @@ fn quoted_pictures_reach_the_layout() {
     );
     let mut p = parse(raw.as_bytes()).unwrap();
     assert!(!p.layout.is_empty());
-    let (pictures, _) = quoted_pictures(&mut p, raw.as_bytes());
+    let (pictures, _, _) = quoted_pictures_given(&mut p, raw.as_bytes());
     let cid = pictures.first().map(|q| q.cid.clone()).unwrap_or_default();
     assert!(!cid.is_empty(), "{pictures:?}");
     let (d, styles) = reply_doc(&p, ReplyMode::Forward, &[], &Clock::default(), "");

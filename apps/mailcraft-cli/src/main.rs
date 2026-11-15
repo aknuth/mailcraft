@@ -1,29 +1,6 @@
 //! MailCraft on the command line.
 //!
-//! ```text
-//! mailcraft-cli [--data DIR] <command>
-//!   sample                         create the local sample mailbox in DIR
-//!   accounts                       list accounts and folders
-//!   add --email E [--name N] [--username U] [--imap HOST:PORT] [--smtp HOST:PORT]
-//!       [--imap-security tls|starttls|none] [--smtp-security tls|starttls|none]
-//!       [--jmap SESSION-URL]   (a JMAP account instead of IMAP and SMTP)
-//!                                  add an account (servers guessed from the address)
-//!   test [--account ID]            sign in to IMAP and list the folders
-//!   sync [--account ID]            download new mail into the cache
-//!   list [--account ID] [--folder PATH] [--limit N]
-//!   read KEY                       print a message (KEY from `list`)
-//!   search QUERY                   search the cache (from:, subject:, has:attachment…)
-//!   send --to ADDR --subject S --body TEXT [--account ID] [--attach FILE] [--signature NAME|none]
-//!        [--from ID|ADDRESS]        (From changed to that account, or to one of an account's
-//!                                   addresses, after the message is made)
-//!   commands                       every engine command, as JSON
-//!   run ID [JSON]                  run an engine command against the cache (its changes
-//!                                  to mail go to the server with the next `sync`)
-//!   --version                      print the version
-//! ```
-//!
-//! Passwords are read from `MAILCRAFT_PASSWORD` or asked for on the terminal; the CLI never
-//! stores them.
+//! Its commands and options are in `help.txt`, which `mailcraft-cli --help` prints.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::io::{BufRead, Write};
@@ -52,17 +29,81 @@ macro_rules! errln {
     }};
 }
 
+mod commands;
+
+use commands::call;
+
 struct Args {
     rest: Vec<String>,
 }
 
+/// The options that take no value. A switch was taken as the others, and swallowed what followed
+/// it (`source --headers KEY` lost its KEY).
+const SWITCHES: [&str; 6] = ["--headers", "--checked", "--help", "-h", "--version", "-V"];
+
+/// The options that take the word after them, whatever it starts with (`--body "--Riley"`).
+const OPTIONS: [&str; 20] = [
+    "--data",
+    "--email",
+    "--name",
+    "--username",
+    "--imap",
+    "--smtp",
+    "--imap-security",
+    "--smtp-security",
+    "--jmap",
+    "--account",
+    "--timeout",
+    "--folder",
+    "--limit",
+    "--to",
+    "--cc",
+    "--subject",
+    "--body",
+    "--signature",
+    "--from",
+    "--attach",
+];
+
+/// Whether `a` is one of the CLI's options or switches.
+fn is_known(a: &str) -> bool {
+    OPTIONS.contains(&a) || SWITCHES.contains(&a)
+}
+
+/// Whether `a` is written as an option (`--to`), not as a value that starts with dashes
+/// (`-- Riley`, a signature's).
+fn is_option(a: &str) -> bool {
+    a.strip_prefix("--").is_some_and(|n| n.starts_with(|c: char| c.is_ascii_alphabetic()))
+}
+
 impl Args {
+    /// Every option is one the CLI has, and each that takes a value has one: one given none took
+    /// the next option for it (`--to --subject x` sent to "--subject"). A value is the word after
+    /// its option, dashes or not; only another option's name there says it was left out.
+    fn check(&self) -> Result<(), String> {
+        let mut it = self.rest.iter();
+        while let Some(a) = it.next() {
+            if OPTIONS.contains(&a.as_str()) {
+                if !it.next().is_some_and(|v| !is_known(v)) {
+                    return Err(format!("{a} needs a value"));
+                }
+            } else if is_option(a) && !SWITCHES.contains(&a.as_str()) {
+                return Err(format!("no option {a} (see --help)"));
+            }
+        }
+        Ok(())
+    }
     fn opt(&self, name: &str) -> Option<String> {
         self.rest.iter().position(|a| a == name).and_then(|i| self.rest.get(i + 1)).cloned()
     }
-    /// A switch given (`--headers`); it goes after the positional arguments.
+    /// A switch given (`--headers`), anywhere among the arguments.
     fn flag(&self, name: &str) -> bool {
         self.rest.iter().any(|a| a == name)
+    }
+    /// The number given with `name`, else `default`. One that isn't a number is an error: it was
+    /// dropped for the default without a word.
+    fn number(&self, name: &str, default: u64) -> Result<u64, String> {
+        self.opt(name).map_or(Ok(default), |v| v.trim().parse().map_err(|_| format!("{name} takes a number, not {v:?}")))
     }
     fn positional(&self, n: usize) -> Option<String> {
         let mut skip = false;
@@ -72,8 +113,8 @@ impl Args {
                 skip = false;
                 continue;
             }
-            if a.starts_with("--") {
-                skip = true;
+            if is_known(a) {
+                skip = OPTIONS.contains(&a.as_str());
                 continue;
             }
             if i == n {
@@ -135,7 +176,7 @@ fn drive(s: &mut Session, pool: &mut Pool, timeout: Duration, mut done: impl FnM
                 SyncStatus::Syncing { folder } => errln!("updating {}…", mailcraft_engine::model::utf7::decode(folder)),
                 SyncStatus::Online { .. } => errln!("up to date"),
                 SyncStatus::NeedsPassword { error } => errln!("sign-in failed: {error}"),
-                SyncStatus::Error { error } => errln!("error: {error}"),
+                SyncStatus::Error { error, .. } => errln!("error: {error}"),
                 SyncStatus::Offline => {}
             },
             Event::Notice { message, .. } => errln!("note: {message}"),
@@ -169,15 +210,6 @@ fn start(s: &mut Session, store: &Store, account: &str) -> Result<Pool, String> 
 
 fn print(v: &Value) {
     outln!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
-}
-
-/// `--version`: the version, plus the commit and date of release builds (packaging/common.sh).
-fn version_line() -> String {
-    let v = format!("mailcraft-cli {}", env!("CARGO_PKG_VERSION"));
-    match (option_env!("MAILCRAFT_BUILD_SHA"), option_env!("MAILCRAFT_BUILD_DATE")) {
-        (Some(sha), Some(date)) if !sha.is_empty() => format!("{v} ({}, {date})", sha.get(..9).unwrap_or(sha)),
-        _ => v,
-    }
 }
 
 /// The data files sealed as the command ends ([`Store::seal_all`]), so they reopen at once.
@@ -215,10 +247,17 @@ fn run() -> Result<(), String> {
     // `args()` panics on an argument that isn't Unicode (a file name in another encoding).
     let raw: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     if raw.iter().any(|a| a == "--version" || a == "-V") {
-        outln!("{}", version_line());
+        // The version, plus the commit and date of release builds (packaging/common.sh).
+        outln!("{}", mailcraft_engine::version_line("mailcraft-cli"));
         return Ok(());
     }
     let args = Args { rest: raw };
+    args.check()?;
+    if args.flag("--help") || args.flag("-h") {
+        // Before the data folder is opened: the help needs none.
+        outln!("{}", include_str!("help.txt"));
+        return Ok(());
+    }
     let root =
         args.opt("--data").map(std::path::PathBuf::from).or_else(mailcraft_engine::store::default_root).ok_or("no data folder: pass --data DIR")?;
     // The same data files as the app: in Documents\MailCraft Files (or where they were moved),
@@ -243,7 +282,7 @@ fn run() -> Result<(), String> {
     // out empty (found testing issue #20).
     for a in &s.accounts {
         if let Err(e) = store.load_folders(&a.config.id)
-            && e.to_string().contains("another copy of MailCraft")
+            && e.is_open_elsewhere()
         {
             // The data file's own words, without the file inside it that was asked for.
             let e = e.to_string();
@@ -251,330 +290,16 @@ fn run() -> Result<(), String> {
         }
     }
     match cmd.as_str() {
-        "accounts" => print(&s.run("account.list", &json!({})).map_err(|e| e.to_string())?),
+        "accounts" => print(&call(&mut s, "account.list", &json!({}))?),
         "commands" => print(&s.registry().describe()),
-        "add" => {
-            let email = args.opt("--email").ok_or("--email is required")?;
-            let mut p = json!({"email": email});
-            for (flag, key) in [
-                ("--name", "name"),
-                ("--username", "username"),
-                ("--imap-security", "imapSecurity"),
-                ("--smtp-security", "smtpSecurity"),
-                ("--jmap", "jmap"),
-            ] {
-                if let Some(v) = args.opt(flag) {
-                    p[key] = json!(v);
-                }
-            }
-            // No servers given: look them up (the domain's autoconfig, the ISP database, DNS).
-            if args.opt("--imap").is_none() && args.opt("--smtp").is_none() && args.opt("--jmap").is_none() {
-                match mailcraft_net::autoconfig::discover(&email) {
-                    Some(f) => {
-                        errln!("settings found: {}", f.source);
-                        p["imapHost"] = json!(f.config.imap.host);
-                        p["imapPort"] = json!(f.config.imap.port);
-                        p["imapSecurity"] = json!(f.config.imap.security.code());
-                        p["smtpHost"] = json!(f.config.smtp.host);
-                        p["smtpPort"] = json!(f.config.smtp.port);
-                        p["smtpSecurity"] = json!(f.config.smtp.security.code());
-                        if args.opt("--username").is_none() {
-                            p["username"] = json!(f.config.username);
-                        }
-                    }
-                    None => errln!("no published settings for this domain: guessing (check with `accounts`)"),
-                }
-            }
-            for (flag, host, port) in [("--imap", "imapHost", "imapPort"), ("--smtp", "smtpHost", "smtpPort")] {
-                if let Some(v) = args.opt(flag) {
-                    let (h, n) = v.rsplit_once(':').ok_or(format!("{flag} wants HOST:PORT"))?;
-                    p[host] = json!(h);
-                    p[port] = json!(n.parse::<u16>().map_err(|_| format!("{flag}: bad port"))?);
-                }
-            }
-            // The CLI never stores passwords: `test`, `sync` and `send` ask each time.
-            p["deferSignIn"] = json!(true);
-            let r = s.run("account.add", &p).map_err(|e| e.to_string())?;
-            print(&r);
-            print(&s.run("account.list", &json!({})).map_err(|e| e.to_string())?);
-        }
-        "test" | "sync" => {
-            let account = pick_account(&s, &args)?;
-            let mut pool = start(&mut s, &store, &account)?;
-            let test = cmd == "test";
-            let timeout = Duration::from_secs(args.opt("--timeout").and_then(|t| t.parse().ok()).unwrap_or(if test { 60 } else { 900 }));
-            let mut folders_seen = false;
-            drive(&mut s, &mut pool, timeout, |e| match e {
-                Event::Folders { folders, .. } if test && !folders_seen => {
-                    folders_seen = true;
-                    outln!("signed in; {} folders:", folders.len());
-                    for f in folders {
-                        outln!("  {:<10} {}", f.role.code(), mailcraft_engine::model::utf7::decode(&f.path));
-                    }
-                    Some(Ok(()))
-                }
-                Event::Status { status: SyncStatus::Online { .. }, .. } => Some(Ok(())),
-                Event::Status { status: SyncStatus::NeedsPassword { error }, .. } => Some(Err(format!("sign-in failed: {error}"))),
-                _ => None,
-            })?;
-            if !test {
-                print(&s.run("account.list", &json!({})).map_err(|e| e.to_string())?);
-            }
-        }
-        "list" => {
-            if let Some(folder) = args.opt("--folder") {
-                let account = pick_account(&s, &args)?;
-                s.run("folder.open", &json!({"account": account, "folder": folder})).map_err(|e| e.to_string())?;
-            } else if let Some(a) = args.opt("--account") {
-                let inbox = s
-                    .account(&a)
-                    .and_then(|x| x.folder(mailcraft_engine::model::FolderRole::Inbox))
-                    .map(|f| f.path.clone())
-                    .unwrap_or_else(|| "INBOX".into());
-                s.run("folder.open", &json!({"account": a, "folder": inbox})).map_err(|e| e.to_string())?;
-            }
-            let limit = args.opt("--limit").and_then(|l| l.parse::<u64>().ok()).unwrap_or(30);
-            let r = s.run("list.messages", &json!({"limit": limit})).map_err(|e| e.to_string())?;
-            outln!("{} ({} messages)", r["view"].as_str().unwrap_or(""), r["total"]);
-            for m in r["messages"].as_array().into_iter().flatten() {
-                let mark = if m["unread"].as_bool() == Some(true) { "●" } else { " " };
-                let flag = if m["flagged"].as_bool() == Some(true) {
-                    "⚑"
-                } else if m["complete"].as_bool() == Some(true) {
-                    "✓"
-                } else {
-                    " "
-                };
-                let att = if m["attachments"].as_bool() == Some(true) { "📎" } else { "  " };
-                let when = full_time(m["date"].as_i64().unwrap_or(0), &s.clock);
-                // Who it's from doesn't add up, or it's from outside the organisation (issue #29).
-                let check = if m["senderWarning"].as_bool() == Some(true) { "⚠ " } else { "" };
-                let external = if m["external"].as_bool() == Some(true) { " [External]" } else { "" };
-                outln!(
-                    "{mark}{flag}{att} {when}  {check}{:<28}  {}{external}",
-                    m["from"].as_str().unwrap_or(""),
-                    m["subject"].as_str().unwrap_or("")
-                );
-                let cats: Vec<&str> = m["categories"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                if !cats.is_empty() {
-                    outln!("      categories: {}", cats.join(", "));
-                }
-                outln!("      key: {}", m["key"].as_str().unwrap_or(""));
-            }
-        }
-        "read" => {
-            let key = args.positional(1).ok_or("read KEY")?;
-            let k = mailcraft_engine::model::MessageKey::from_id(&key).ok_or("bad key")?;
-            s.open_view(mailcraft_engine::View::Folder { account: k.account.clone(), folder: k.folder.clone() });
-            let mut r = s.run("message.read", &json!({"key": key})).map_err(|e| e.to_string())?;
-            if r.get("pending").is_some() {
-                // Not cached: download it.
-                let mut pool = start(&mut s, &store, &k.account)?;
-                pool.submit(Job::FetchBody { key: k.clone() });
-                drive(&mut s, &mut pool, Duration::from_secs(120), |e| match e {
-                    Event::Body { key, .. } if *key == k => Some(Ok(())),
-                    Event::BodyFailed { key, error } if *key == k => Some(Err(error.clone())),
-                    _ => None,
-                })?;
-                r = s.run("message.read", &json!({})).map_err(|e| e.to_string())?;
-            }
-            let external = if r["external"].as_bool() == Some(true) { " [External]" } else { "" };
-            outln!("From:    {}{external}", r["from"].as_str().unwrap_or(""));
-            if let Some(w) = r.get("warning").filter(|w| !w.is_null()) {
-                outln!("Careful: {}", sender_warning_text(w));
-            }
-            outln!("To:      {}", r["to"].as_str().unwrap_or(""));
-            if r["cc"].as_str().is_some_and(|c| !c.is_empty()) {
-                outln!("Cc:      {}", r["cc"].as_str().unwrap_or(""));
-            }
-            outln!("Date:    {}", full_time(r["date"].as_i64().unwrap_or(0), &s.clock));
-            outln!("Subject: {}", r["subject"].as_str().unwrap_or(""));
-            for a in r["attachments"].as_array().into_iter().flatten() {
-                outln!("Attached: [{}] {} ({}, {} bytes)", a["index"], a["name"].as_str().unwrap_or(""), a["mime"].as_str().unwrap_or(""), a["size"]);
-            }
-            outln!("\n{}", r["text"].as_str().unwrap_or(""));
-        }
-        "source" => {
-            // A message as it came, headers and all (issue #27): what View message source shows.
-            let key = args.positional(1).ok_or("source KEY")?;
-            let k = mailcraft_engine::model::MessageKey::from_id(&key).ok_or("bad key")?;
-            s.open_view(mailcraft_engine::View::Folder { account: k.account.clone(), folder: k.folder.clone() });
-            let params = json!({"key": key, "headers": args.flag("--headers")});
-            let mut r = s.run("message.source", &params).map_err(|e| e.to_string())?;
-            if r["pending"].as_bool() == Some(true) {
-                // Not cached: download it (its text first, from Exchange, isn't it).
-                let mut pool = start(&mut s, &store, &k.account)?;
-                pool.submit(Job::FetchBody { key: k.clone() });
-                drive(&mut s, &mut pool, Duration::from_secs(300), |e| match e {
-                    Event::Body { key, raw } if *key == k && !mailcraft_engine::mime::is_text_first(raw) => Some(Ok(())),
-                    Event::BodyFailed { key, error } if *key == k => Some(Err(error.clone())),
-                    _ => None,
-                })?;
-                r = s.run("message.source", &params).map_err(|e| e.to_string())?;
-            }
-            if let Some(e) = r["error"].as_str() {
-                return Err(e.to_string());
-            }
-            let _ = write!(std::io::stdout(), "{}", r["text"].as_str().unwrap_or(""));
-            if r["truncated"].as_bool() == Some(true) {
-                errln!("(only the start of {} bytes is shown)", r["size"]);
-            }
-        }
-        "search" => {
-            let q = args.positional(1).ok_or("search QUERY")?;
-            let r = s.run("search.run", &json!({"query": q})).map_err(|e| e.to_string())?;
-            outln!("{} results", r["results"]);
-            let r = s.run("list.messages", &json!({"limit": 50})).map_err(|e| e.to_string())?;
-            for m in r["messages"].as_array().into_iter().flatten() {
-                outln!(
-                    "{}  {:<28}  {}\n      key: {}",
-                    full_time(m["date"].as_i64().unwrap_or(0), &s.clock),
-                    m["from"].as_str().unwrap_or(""),
-                    m["subject"].as_str().unwrap_or(""),
-                    m["key"].as_str().unwrap_or("")
-                );
-            }
-        }
-        "send" => {
-            let account = pick_account(&s, &args)?;
-            s.run("mail.new", &json!({"account": account})).map_err(|e| e.to_string())?;
-            let body = args.opt("--body").unwrap_or_default();
-            // The account's signature stays under the text, as in a new message in the app (it
-            // was dropped): `--signature NAME` picks another of its signatures, `none` none.
-            let signature = args.opt("--signature");
-            let below =
-                if signature.as_deref() == Some("none") { String::new() } else { s.compose.as_ref().map(|c| c.body.clone()).unwrap_or_default() };
-            s.run("compose.update", &json!({"to": args.opt("--to").ok_or("--to is required")?, "cc": args.opt("--cc").unwrap_or_default(), "subject": args.opt("--subject").unwrap_or_default(), "body": format!("{body}{below}")}))
-                .map_err(|e| e.to_string())?;
-            match signature.as_deref() {
-                Some("none") => {}
-                // Put in again: its look and pictures, which the text above doesn't carry.
-                None if below.trim().is_empty() => {}
-                None => drop(s.run("compose.insertSignature", &json!({})).map_err(|e| e.to_string())?),
-                Some(name) => drop(s.run("compose.insertSignature", &json!({"name": name})).map_err(|e| e.to_string())?),
-            }
-            // Sent from another account (From changed): its signature takes the first one's place.
-            // Or from one of an account's addresses (issue #81), given as the address.
-            let account = match args.opt("--from") {
-                Some(from) if from.contains('@') => {
-                    let of = s.accounts.iter().find(|a| a.config.has_address(&from)).map(|a| a.config.id.clone());
-                    let of = of.ok_or_else(|| format!("{from} isn't an address of any account"))?;
-                    s.run("compose.update", &json!({"account": of, "from": from})).map_err(|e| e.to_string())?;
-                    of
-                }
-                Some(from) => {
-                    s.run("compose.update", &json!({"account": from})).map_err(|e| e.to_string())?;
-                    from
-                }
-                None => account,
-            };
-            if let Some(f) = args.opt("--attach") {
-                s.run("compose.attach", &json!({"path": f})).map_err(|e| e.to_string())?;
-            }
-            let local = s.account(&account).is_some_and(|a| a.is_local());
-            if local {
-                print(&s.run("compose.send", &json!({"allowEmptySubject": true, "checked": args.flag("--checked")})).map_err(|e| e.to_string())?);
-                return Ok(());
-            }
-            let mut pool = start(&mut s, &store, &account)?;
-            let sending = s.run("compose.send", &json!({"allowEmptySubject": true, "checked": args.flag("--checked")})).map_err(|e| e.to_string())?;
-            // Held to be looked at again (an address that looks like another, many people shown
-            // each other's addresses): said at once. It waited out the three minutes unsaid.
-            if let Some(checks) = sending.get("check") {
-                return Err(format!("not sent: it's held to be checked first ({checks}); send it with --checked once it's been looked at"));
-            }
-            // Being signed or encrypted first, then sent under the same number: waited for by
-            // that (it was sent, and "timed out" said three minutes later, for a script to
-            // send it again).
-            let me = sending["sending"].as_u64().or_else(|| sending["protecting"].as_u64());
-            // This message's word only: one waiting in the Outbox goes out as the account connects,
-            // and its word ended the wait before this one was sent (issue #19's testing).
-            drive(&mut s, &mut pool, Duration::from_secs(180), |e| match e {
-                Event::Sent { id, .. } if Some(*id) == me => Some(Ok(())),
-                Event::SendFailed { id, error, .. } if Some(*id) == me => Some(Err(error.clone())),
-                Event::Protected { id, error: Some(error), .. } if Some(*id) == me => {
-                    Some(Err(format!("it couldn't be signed or encrypted: {error}")))
-                }
-                // Kept in the Outbox to go later (it waited there unsaid until the time ran out).
-                Event::Queued { id, error, .. } if Some(*id) == me => Some(Err(format!("not sent yet, kept in the Outbox: {error}"))),
-                _ => None,
-            })?;
-            outln!("sent");
-            // The copy in Sent Items is filed after the message goes (issue #19: the CLI stopped
-            // before, and none was kept): wait for it, or for word it couldn't be.
-            let mut sent = s.account(&account).and_then(|a| a.folder(mailcraft_engine::model::FolderRole::Sent)).map(|f| f.path.clone());
-            let filed = drive(&mut s, &mut pool, Duration::from_secs(60), |e| match e {
-                Event::Folders { folders, .. } => {
-                    if let Some(f) = folders.iter().find(|f| f.role == mailcraft_engine::model::FolderRole::Sent) {
-                        sent = Some(f.path.clone());
-                    }
-                    None
-                }
-                Event::FolderChanged { folder, .. } if sent.as_deref() == Some(folder.as_str()) => Some(Ok(())),
-                Event::Notice { message, .. } if message.contains("no copy was saved") => Some(Err(message.clone())),
-                _ => None,
-            });
-            match (filed, s.account(&account).and_then(|a| a.folder(mailcraft_engine::model::FolderRole::Sent))) {
-                (Ok(()), Some(f)) => outln!("a copy is in {}", mailcraft_engine::model::utf7::decode(&f.path)),
-                (Ok(()), None) => {}
-                (Err(e), _) => errln!("note: {e}"),
-            }
-        }
-        "run" => {
-            let id = args.positional(1).ok_or("run ID [JSON]")?;
-            let params: Value = match args.positional(2) {
-                Some(p) => serde_json::from_str(&p).map_err(|e| format!("params: {e}"))?,
-                None => json!({}),
-            };
-            print(&s.run(&id, &params).map_err(|e| e.to_string())?);
-            // Calendars subscribed to by their links (issue #7) are read now, needing no account's
-            // sign-in: what came of each is said.
-            let jobs = s.take_jobs();
-            let jobs = data_file_jobs(&mut s, &store, jobs);
-            let (calendars, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|j| matches!(j, Job::FetchCalendar { .. }));
-            if !calendars.is_empty() {
-                let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
-                let mut waiting: Vec<String> = calendars
-                    .iter()
-                    .filter_map(|j| if let Job::FetchCalendar { calendar, .. } = j { Some(calendar.clone()) } else { None })
-                    .collect();
-                for j in calendars {
-                    pool.submit(j);
-                }
-                let end = Instant::now() + Duration::from_secs(120);
-                while !waiting.is_empty() && Instant::now() < end {
-                    let Some(e) = pool.wait(Duration::from_millis(250)) else { continue };
-                    if let Event::CalendarFetched { account, calendar, error, unchanged, .. } = &e {
-                        waiting.retain(|c| c != calendar);
-                        let (account, calendar) = (account.clone(), calendar.clone());
-                        let (error, unchanged) = (error.clone(), *unchanged);
-                        s.apply(e);
-                        let events = s.pim.get(&account).map_or(0, |p| p.events.iter().filter(|x| x.calendar == calendar).count());
-                        let name = s
-                            .pim
-                            .get(&account)
-                            .and_then(|p| p.calendars.iter().find(|c| c.id == calendar))
-                            .map(|c| c.name.clone())
-                            .unwrap_or_default();
-                        match error {
-                            Some(e) => errln!("{name}: couldn't be read: {e}"),
-                            None if unchanged => errln!("{name}: unchanged, {events} event(s)"),
-                            None => errln!("{name}: read, {events} event(s)"),
-                        }
-                    }
-                }
-                if !waiting.is_empty() {
-                    errln!("{} calendar(s) didn't answer in time", waiting.len());
-                }
-            }
-            let (queued, other) = keep_changes(&store, jobs)?;
-            if queued > 0 {
-                errln!("{queued} change(s) queued for the server: `sync` sends them");
-            }
-            if other > 0 {
-                errln!("{other} other network job(s) skipped: they run in the app");
-            }
-        }
+        "add" => commands::add(&mut s, &args)?,
+        "test" | "sync" => commands::sync(&mut s, &store, &args, cmd == "test")?,
+        "list" => commands::list(&mut s, &args)?,
+        "read" => commands::read(&mut s, &store, &args)?,
+        "source" => commands::source(&mut s, &store, &args)?,
+        "search" => commands::search(&mut s, &args)?,
+        "send" => commands::send(&mut s, &store, &args)?,
+        "run" => commands::run_command(&mut s, &store, &args)?,
         _ => {
             outln!("{}", include_str!("help.txt"));
         }
@@ -651,10 +376,7 @@ fn main() -> ExitCode {
 /// open on the folder layout (`--sample`, or its data files failing to open) aren't brought in:
 /// it's closed first, as for a data file it has open.
 fn open_store(root: &std::path::Path, files: &std::path::Path) -> Result<Store, String> {
-    Store::open_packed(root, files).map_err(|e| {
-        let e = e.to_string();
-        if e.contains("open in another copy of MailCraft") { format!("{e}: close MailCraft first") } else { e }
-    })
+    Store::open_packed(root, files).map_err(|e| if e.is_open_elsewhere() { format!("{e}: close MailCraft first") } else { e.to_string() })
 }
 
 /// A sender warning (`message.read`'s `warning`) said in a line.
@@ -676,6 +398,67 @@ mod tests {
     use super::*;
     use mailcraft_engine::model::job::Op;
     use mailcraft_engine::model::{Flag, MessageKey};
+
+    fn args(a: &[&str]) -> Args {
+        Args { rest: a.iter().map(|s| s.to_string()).collect() }
+    }
+
+    /// Every option the CLI reads is in the help it prints (`--jmap`, `--cc` and `--timeout`
+    /// weren't).
+    #[test]
+    fn the_help_names_every_option() {
+        let help = include_str!("help.txt");
+        for name in OPTIONS.iter().chain(&SWITCHES) {
+            assert!(name.len() <= 2 || help.contains(name), "{name} isn't in help.txt");
+        }
+    }
+
+    /// A switch anywhere takes no value; an option given none is said; a number that isn't one
+    /// is an error rather than the default.
+    #[test]
+    fn options_and_switches_are_told_apart() {
+        let a = args(&["source", "--headers", "a1:1:7:INBOX"]);
+        assert_eq!((a.positional(0).as_deref(), a.positional(1).as_deref(), a.flag("--headers")), (Some("source"), Some("a1:1:7:INBOX"), true));
+        let a = args(&["send", "--checked", "--to", "zoe@studio.example", "--body", "-- Riley"]);
+        assert!(a.check().is_ok());
+        assert_eq!((a.opt("--to").as_deref(), a.opt("--body").as_deref(), a.flag("--checked")), (Some("zoe@studio.example"), Some("-- Riley"), true));
+        assert_eq!(args(&["send", "--to", "--subject", "x"]).check(), Err("--to needs a value".into()));
+        assert_eq!(args(&["list", "--limit"]).check(), Err("--limit needs a value".into()));
+        assert_eq!(args(&["send", "--to", "--checked"]).check(), Err("--to needs a value".into()));
+        assert_eq!(args(&["list", "--limit", "5"]).number("--limit", 30), Ok(5));
+        assert_eq!(args(&["list"]).number("--limit", 30), Ok(30));
+        assert!(args(&["list", "--limit", "two"]).number("--limit", 30).is_err());
+    }
+
+    /// A value is the word after its option, whatever it starts with: one that began with two
+    /// dashes and a letter was refused as an option without a value. The switches for the help
+    /// take none, and an option the CLI doesn't have is said.
+    #[test]
+    fn a_value_may_start_with_dashes() {
+        let a = args(&["send", "--to", "zoe@studio.example", "--subject", "--force is deprecated", "--body", "--Riley"]);
+        assert_eq!(a.check(), Ok(()));
+        assert_eq!((a.opt("--subject").as_deref(), a.opt("--body").as_deref()), (Some("--force is deprecated"), Some("--Riley")));
+        assert_eq!((a.positional(0).as_deref(), a.positional(1)), (Some("send"), None));
+        let a = args(&["search", "--data", "--mine", "from:zoe"]);
+        assert_eq!((a.check(), a.opt("--data").as_deref(), a.positional(1).as_deref()), (Ok(()), Some("--mine"), Some("from:zoe")));
+        for help in ["--help", "-h"] {
+            let a = args(&[help]);
+            assert_eq!((a.check(), a.flag(help), a.positional(0)), (Ok(()), true, None));
+        }
+        assert_eq!(args(&["list", "--limt", "5"]).check(), Err("no option --limt (see --help)".into()));
+    }
+
+    /// Every option the CLI reads is one `check` knows, with or without a value.
+    #[test]
+    fn every_option_read_is_known() {
+        for src in [include_str!("main.rs"), include_str!("commands.rs"), include_str!("commands/send.rs")] {
+            for (i, _) in src.match_indices("opt(\"--").chain(src.match_indices("number(\"--")).chain(src.match_indices("flag(\"--")) {
+                let name: String = src[i..].chars().skip_while(|c| *c != '-').take_while(|c| *c == '-' || c.is_ascii_alphanumeric()).collect();
+                assert!(is_known(&name), "{name} isn't in OPTIONS or SWITCHES");
+                assert_eq!(src[i..].starts_with("flag("), SWITCHES.contains(&name.as_str()), "{name}");
+            }
+        }
+    }
 
     /// A change made with `run` waits for `sync` instead of being dropped.
     #[test]

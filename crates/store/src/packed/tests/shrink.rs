@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use redb::ReadableDatabase;
 use std::time::{Duration, Instant};
 
-use super::compact::{Kept, kept_compressed, old_store, packs, read_back};
+use super::compact::{Kept, kept_compressed, old_store, read_back};
 use super::*;
 use crate::packed::health::{DEFLATE_NOW, PASSED, SAVED, STAYED_RAW, read_meta, write_meta};
 use crate::packed::shrink::{copy_path, is_copy};
@@ -16,8 +16,7 @@ use crate::packed::shrink::{copy_path, is_copy};
 /// A data store at `t` whose account `a1` keeps 40 messages of 64 KiB that don't compress, of
 /// which 30 are then deleted: room to give back.
 fn with_deleted_mail(t: &std::path::Path) -> (Store, Vec<MessageKey>) {
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(t);
     let key = |uid: u32| MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid };
     for uid in 1..=40 {
         s.write_body(&key(uid), &noise(64 << 10, u64::from(uid))).unwrap();
@@ -53,7 +52,6 @@ fn deleted_mails_room_goes_back_to_the_drive_in_place() {
     assert_eq!(s.read_body(&kept[0]).unwrap(), b"Subject: again\r\n\r\nx");
     assert!(s.compact_data_file("nobody").unwrap().is_none(), "an account with no data file");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 #[test]
@@ -63,17 +61,16 @@ fn a_compaction_that_fails_leaves_the_file_to_be_opened_again() {
     let before = read_back(&s);
     let p = packs(&s);
     let open_before = p.db("a1", false).unwrap().unwrap();
-    *crate::packed::Packs::lock(&p.compact_hook) = Some(Box::new(|| Err(std::io::Error::other("the drive went away"))));
+    *crate::packed::lock(&p.compact_hook) = Some(Box::new(|| Err(std::io::Error::other("the drive went away"))));
     drop(open_before);
     let e = s.compact_data_file("a1").unwrap_err();
     assert!(e.to_string().contains("the drive went away"), "{e}");
-    assert!(!crate::packed::Packs::lock(&p.open).dbs.contains_key("a1"), "closed, not given back");
-    *crate::packed::Packs::lock(&p.compact_hook) = None;
+    assert!(!crate::packed::lock(&p.open).dbs.contains_key("a1"), "closed, not given back");
+    *crate::packed::lock(&p.compact_hook) = None;
     assert_eq!(read_back(&s), before, "opened again as it was");
     assert_eq!(s.read_body(&kept[1]).unwrap(), noise(64 << 10, 2));
     assert!(s.compact_data_file("a1").unwrap().is_some(), "and compacts next time");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 #[test]
@@ -87,7 +84,7 @@ fn the_account_waits_for_a_compaction_in_place() {
     // after this. (Its thread's own clock after it returns can come later than a waiting read's.)
     let hook_done = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
     let done = hook_done.clone();
-    *crate::packed::Packs::lock(&p.compact_hook) = Some(Box::new(move || {
+    *crate::packed::lock(&p.compact_hook) = Some(Box::new(move || {
         let _ = started.lock().unwrap().send(());
         std::thread::sleep(Duration::from_millis(300));
         *done.lock().unwrap() = Some(Instant::now());
@@ -119,7 +116,6 @@ fn the_account_waits_for_a_compaction_in_place() {
         assert!(read_at >= done_at && removed_at >= done_at, "they waited for it");
         assert!(gone.is_some_and(|f| f.exists()), "removed after, its data file kept");
     });
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// What a data file from before (attachments kept raw) holds: base64 that compresses, raw.
@@ -171,7 +167,6 @@ fn a_copy_takes_the_files_place_with_what_was_written_meanwhile() {
     assert!(health.recompressed && !health.recompress_stopped, "{health:?}");
     assert!(!copy_path(&file).exists(), "the copy took its place");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 #[test]
@@ -198,7 +193,6 @@ fn a_stopped_copy_leaves_the_file_as_it_was() {
     // Writes after it aren't noted for a copy any more.
     assert!(!packs(&s).copying("a1"));
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 #[test]
@@ -216,7 +210,6 @@ fn a_copy_a_crash_left_is_removed_as_the_files_open() {
     assert!(!copy_path(&file).exists(), "removed");
     assert!(t.join("Files").join("other.compacting").exists(), "only a data file's copy");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// What recompressing counted in the old file (`META`) is carried into the copy, and a file kept
@@ -259,7 +252,6 @@ fn a_copy_keeps_what_was_counted_and_compresses_what_was_moved_meanwhile() {
     assert_eq!((meta.deflate, meta.stayed_raw, meta.saved, meta.passed), (DEFLATE_NOW, 5, 6, 7), "{meta:?}");
     drop(db);
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// A data file with a file in pieces that don't add up isn't copied (the copy would be without
@@ -276,7 +268,6 @@ fn a_copy_of_a_file_with_damage_is_refused() {
     assert_eq!((std::fs::metadata(&file).unwrap().len(), read_back(&s)), (len, want));
     assert!(!copy_path(&file).exists(), "the copy is thrown away");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// Saying no just before the end has the file to itself stops the copy: thrown away.
@@ -291,50 +282,63 @@ fn a_copy_stopped_at_the_swap_is_thrown_away() {
     assert!(!copy_path(&file).exists());
     assert_eq!(read_back(&s), want);
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// Another program holding the data file for a moment as the copy is put in its place (an
-/// antivirus scan as it's closed): the rename is tried again, and the copy isn't lost.
+/// antivirus scan as it's closed): the rename is refused, tried again, and the copy isn't lost.
+/// The file is let go of once the rename has been seen refused (not after a time: under load,
+/// the retries could run out first), so a rename that isn't tried again fails here every time.
 #[cfg(windows)]
 #[test]
 fn a_copy_is_put_in_place_while_something_holds_the_file_a_moment() {
     use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::{Arc, Mutex};
     let t = temp("shrink-copy-held");
     let s = old_store(&t, &bloated());
     let file = s.data_file("a1").unwrap();
     let want = read_back(&s);
-    let held = file.clone();
-    *crate::packed::Packs::lock(&packs(&s).compact_hook) = Some(Box::new(move || {
+    let (held, holder) = (Arc::new(Mutex::new(None::<std::fs::File>)), file.clone());
+    let holding = held.clone();
+    *crate::packed::lock(&packs(&s).compact_hook) = Some(Box::new(move || {
         // Shared with nobody: a rename over it is refused until it's let go of.
-        let f = std::fs::File::options().read(true).share_mode(0).open(&held)?;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            drop(f);
-        });
+        *holding.lock().unwrap() = Some(std::fs::File::options().read(true).share_mode(0).open(&holder)?);
         Ok(())
     }));
-    let shrunk = s.copy_data_file("a1", &mut |_| true, &mut || true).unwrap().unwrap();
-    *crate::packed::Packs::lock(&packs(&s).compact_hook) = None;
+    let refused = Arc::new(Mutex::new(0usize));
+    let (seen, let_go) = (refused.clone(), held.clone());
+    crate::atomic::RENAME_REFUSED.set(Some(Box::new(move || {
+        *seen.lock().unwrap() += 1;
+        drop(let_go.lock().unwrap().take());
+    })));
+    let shrunk = s.copy_data_file("a1", &mut |_| true, &mut || true);
+    crate::atomic::RENAME_REFUSED.set(None);
+    *crate::packed::lock(&packs(&s).compact_hook) = None;
+    drop(held.lock().unwrap().take());
+    let shrunk = shrunk.unwrap().unwrap();
+    assert!(*refused.lock().unwrap() >= 1, "refused while held, then put in place");
     assert!(shrunk.copied, "{shrunk:?}");
     assert_eq!(read_back(&s), want);
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// A read from the window's thread ([`crate::no_waiting`]) of a file a compaction has to itself
 /// fails at once ("being compacted") rather than waiting; a write from it waits its turn, and
-/// another thread's read waits too.
+/// another thread's read waits too. The compaction is held until the read has come back: one
+/// that waited for it would come back only once the hold gave up, a minute on.
 #[test]
 fn the_windows_thread_isnt_kept_waiting_by_a_compaction() {
     let t = temp("shrink-no-waiting");
     let (s, kept) = with_deleted_mail(&t);
     let p = packs(&s);
     let (started, start) = mpsc::channel();
-    let started = std::sync::Mutex::new(started);
-    *crate::packed::Packs::lock(&p.compact_hook) = Some(Box::new(move || {
-        let _ = started.lock().unwrap().send(());
-        std::thread::sleep(Duration::from_millis(400));
+    let (go, held) = mpsc::channel::<()>();
+    let let_go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (hold, was_let_go) = (std::sync::Mutex::new((started, held)), let_go.clone());
+    *crate::packed::lock(&p.compact_hook) = Some(Box::new(move || {
+        let hold = hold.lock().unwrap();
+        if hold.0.send(()).is_ok() && hold.1.recv_timeout(Duration::from_secs(60)).is_ok() {
+            was_let_go.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }));
     std::thread::scope(|scope| {
@@ -345,24 +349,22 @@ fn the_windows_thread_isnt_kept_waiting_by_a_compaction() {
         start.recv().unwrap();
         let window = scope.spawn(|| {
             crate::no_waiting();
-            let asked = Instant::now();
             let e = p.read(&s.body_path(&kept[0]));
-            let refused_in = asked.elapsed();
+            let _ = go.send(());
             // A write waits its turn.
             s.write_body(&kept[1], b"Subject: w\r\n\r\nx").unwrap();
-            (e, refused_in, Instant::now())
+            (e, Instant::now())
         });
-        let (e, refused_in, wrote_at) = window.join().unwrap();
+        let (e, wrote_at) = window.join().unwrap();
         let done_at = compacting.join().unwrap();
+        assert!(let_go.load(std::sync::atomic::Ordering::SeqCst), "the read waited for the compaction");
         let e = e.unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
         assert!(e.to_string().contains("being compacted"), "{e}");
-        assert!(refused_in < Duration::from_millis(200), "at once: {refused_in:?}");
         assert!(wrote_at >= done_at, "the write waited for it");
     });
-    *crate::packed::Packs::lock(&p.compact_hook) = None;
+    *crate::packed::lock(&p.compact_hook) = None;
     assert_eq!(s.read_body(&kept[1]).unwrap(), b"Subject: w\r\n\r\nx");
-    assert!(crate::packed::Packs::lock(&p.open).taken.is_empty(), "given back");
+    assert!(crate::packed::lock(&p.open).taken.is_empty(), "given back");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }

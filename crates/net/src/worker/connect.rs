@@ -2,13 +2,94 @@
 
 use super::*;
 
+/// What Microsoft says when it took an OAuth token but won't open the mailbox over IMAP ("User is
+/// authenticated but not connected").
+const MICROSOFT_NOT_CONNECTED: &str = "authenticated but not connected";
+
+/// Whether a server's refusal is Microsoft's [`MICROSOFT_NOT_CONNECTED`].
+fn microsoft_not_connected(said: &str) -> bool {
+    said.to_ascii_lowercase().contains(MICROSOFT_NOT_CONNECTED)
+}
+
+/// The connections made again at once with a renewed OAuth token, lately. A refusal after the
+/// server took a token gets a fresh one each time ([`Worker::failed`]); a server that takes every
+/// token for its folder list and refuses it for what comes next would have a new token asked
+/// for, and a connection made, without a pause and without end. So only so many go at once.
+#[derive(Default)]
+pub(super) struct Renewals(VecDeque<Instant>);
+
+/// How many connections a renewed token makes again at once within [`RENEWALS_WITHIN`]; each
+/// one past that waits until the oldest of them is that long ago.
+const RENEWALS_AT_ONCE: usize = 3;
+const RENEWALS_WITHIN: Duration = Duration::from_secs(10 * 60);
+
+impl Renewals {
+    /// A token was renewed at `now`: when its connection is made (`now`, or later).
+    fn connect_at(&mut self, now: Instant) -> Instant {
+        while self.0.front().is_some_and(|t| now.saturating_duration_since(*t) >= RENEWALS_WITHIN) {
+            self.0.pop_front();
+        }
+        let at = match self.0.front() {
+            Some(oldest) if self.0.len() >= RENEWALS_AT_ONCE => {
+                let at = oldest.checked_add(RENEWALS_WITHIN).unwrap_or(now).max(now);
+                self.0.pop_front();
+                at
+            }
+            _ => now,
+        };
+        self.0.push_back(at);
+        at
+    }
+}
+
+/// Renewals go at once a few times, then no faster than [`RENEWALS_AT_ONCE`] in
+/// [`RENEWALS_WITHIN`], however long the server goes on refusing; and at once again after a quiet
+/// while.
+#[test]
+fn renewed_tokens_connect_at_once_only_so_often() {
+    let start = Instant::now();
+    let mut r = Renewals::default();
+    let mut now = start;
+    let mut made = Vec::new();
+    // A server refusing each token a second after it took it, for an hour.
+    while now.saturating_duration_since(start) < Duration::from_secs(60 * 60) {
+        let at = r.connect_at(now);
+        made.push(at.saturating_duration_since(start).as_secs());
+        now = at + Duration::from_secs(1);
+    }
+    assert_eq!(made.get(..4), Some(&[0, 1, 2, 600][..]), "{made:?}");
+    assert!(made.len() <= 6 * RENEWALS_AT_ONCE + 1, "{} connections in an hour: {made:?}", made.len());
+    assert!(r.0.len() <= RENEWALS_AT_ONCE);
+    // Left alone for the while, the next is at once.
+    let later = now + RENEWALS_WITHIN + RENEWALS_WITHIN;
+    assert_eq!(r.connect_at(later), later);
+}
+
+/// Where a test has autodiscovery ask (its fake server), and what it does once the server is
+/// found, before it's kept: its way to come between them. Taken once, on this thread.
+type InTest = (Option<String>, Option<Box<dyn FnOnce()>>);
+
+#[cfg(test)]
+thread_local!(pub(super) static AUTODISCOVER_IN_TEST: std::cell::RefCell<InTest> = const { std::cell::RefCell::new((None, None)) });
+
+/// Where autodiscovery asks: the usual addresses (`AUTODISCOVER_IN_TEST` in a test).
+#[cfg(test)]
+fn autodiscover_in_test() -> InTest {
+    AUTODISCOVER_IN_TEST.with(|a| std::mem::take(&mut *a.borrow_mut()))
+}
+
+#[cfg(not(test))]
+fn autodiscover_in_test() -> InTest {
+    (None, None)
+}
+
 impl Worker {
     /// What to sign in with: the password, or for OAuth accounts a current access token
     /// (refreshed from the stored refresh token when needed).
     pub(super) fn secret(&mut self) -> Result<String> {
         // Held while refreshing: the account's other connection waits for the new token rather
         // than refreshing with the same old one.
-        let mut auth = self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut auth = Auth::held(&self.auth);
         let Some(id) = self.acc.oauth.clone() else { return Ok(auth.secret.clone()) };
         if let Some(t) = &auth.access
             && !t.expired()
@@ -52,7 +133,7 @@ impl Worker {
 
     /// Drop the access token the server refused and fetch a new one with the refresh token.
     pub(super) fn renew_token(&mut self) -> Result<String> {
-        self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner).access = None;
+        Auth::held(&self.auth).access = None;
         let t = self.secret()?;
         self.use_token(&t);
         Ok(t)
@@ -68,7 +149,7 @@ impl Worker {
 
     /// What Microsoft's sign-in granted (its scopes), when known.
     pub(super) fn granted(&self) -> String {
-        self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner).access.as_ref().map(|t| t.granted.clone()).unwrap_or_default()
+        Auth::held(&self.auth).access.as_ref().map(|t| t.granted.clone()).unwrap_or_default()
     }
 
     /// Note a failure; drop the connection when it is unusable.
@@ -77,30 +158,38 @@ impl Worker {
         match e {
             // Microsoft took the token but won't open the mailbox: nothing to retry until changed.
             NetError::Auth(m) | NetError::Bad(m) | NetError::No(m)
-                if self.acc.oauth.as_deref() == Some("microsoft") && m.to_ascii_lowercase().contains("authenticated but not connected") =>
+                if self.acc.oauth.as_deref() == Some("microsoft") && microsoft_not_connected(&m) =>
             {
                 self.conn = None;
                 self.auth_failed = true;
-                self.status(SyncStatus::Error { error: microsoft_imap_closed(&self.acc.email, self.acc.oauth_user.as_deref()) });
+                self.status(NetError::MailboxClosed(microsoft_imap_closed(&self.acc.email, self.acc.oauth_user.as_deref())).status());
             }
             // Microsoft's servers refuse passwords from mail apps: asking for it again only loops.
             NetError::Auth(m) if mailcraft_model::microsoft_password_account(&self.acc) => {
                 self.conn = None;
                 self.auth_failed = true;
-                self.status(SyncStatus::Error { error: format!("{MICROSOFT_NO_PASSWORDS} ({m})") });
+                self.status(SyncStatus::Error { error: format!("{MICROSOFT_NO_PASSWORDS} ({m})"), kind: FailureKind::MicrosoftNoPasswords });
             }
             // An OAuth token refused (expired early, revoked by a password change elsewhere, or
             // taken before the computer slept): a fresh one from the refresh token, then the
-            // connection again, once. Only a refused refresh, or a fresh token refused too,
-            // means signing in again.
+            // connection again, once. Only a refused refresh, or a fresh token refused too
+            // before the server took it for mail (its folders listed), means signing in again;
+            // a renewal the sign-in service fails is tried again later.
             NetError::Auth(m) if self.acc.oauth.is_some() && !self.token_retried => {
                 log::info!("{}: token refused ({m}); refreshing it", self.acc.id);
                 self.token_retried = true;
                 match self.renew_token() {
                     Ok(_) => {
                         self.conn = None;
-                        self.next_attempt = Instant::now();
-                        self.status(SyncStatus::Connecting);
+                        // At once, unless tokens are being refused one after another.
+                        let now = Instant::now();
+                        self.next_attempt = self.renewals.connect_at(now);
+                        if self.next_attempt > now {
+                            let said = format!("the server keeps refusing the sign-in it is given ({m}); trying again in a while");
+                            self.status(NetError::Refused(said).status());
+                        } else {
+                            self.status(SyncStatus::Connecting);
+                        }
                     }
                     Err(e) => self.failed(e),
                 }
@@ -112,12 +201,17 @@ impl Worker {
             }
             e if e.is_fatal() => {
                 self.conn = None;
-                self.next_attempt = Instant::now() + self.backoff;
-                self.backoff = (self.backoff * 2).min(Duration::from_secs(300));
-                self.status(SyncStatus::Error { error: e.to_string() });
+                self.back_off();
+                self.status(e.status());
             }
             e => self.notice(e.to_string()),
         }
+    }
+
+    /// Not connecting again for the wait, which doubles for the next time (five minutes at most).
+    fn back_off(&mut self) {
+        self.next_attempt = Instant::now() + self.backoff;
+        self.backoff = (self.backoff * 2).min(Duration::from_secs(300));
     }
 
     pub(super) fn connect(&mut self) -> Result<()> {
@@ -134,7 +228,7 @@ impl Worker {
     fn open(&mut self) -> Result<()> {
         self.status(SyncStatus::Connecting);
         let secret = self.secret()?;
-        let user = if self.acc.username.is_empty() { self.acc.email.clone() } else { self.acc.username.clone() };
+        let user = self.acc.login_name().to_string();
         if let Some(url) = &self.acc.graph {
             self.conn = Some(Conn::Graph(crate::graph::Client::connect(url, &secret)?));
             self.signed_in();
@@ -149,10 +243,23 @@ impl Worker {
         if let Some(url) = &self.acc.ews {
             // `autodiscover`: found the first time, then kept.
             let url = if url == crate::ews::AUTODISCOVER {
-                let kept: String = self.store.load_account_doc(&self.acc.id, "ews.json").unwrap_or_default();
+                // One that can't be read is found again (and kept anew: it's only the address).
+                let kept: String = self.store.load_account_doc(&self.acc.id, "ews.json").unwrap_or_else(|e| {
+                    log::warn!("{}: the Exchange server found before couldn't be read: {e}", self.acc.id);
+                    String::new()
+                });
                 if kept.is_empty() {
-                    let found = crate::ews::autodiscover_as(&self.acc.email, &user, &secret, None, self.acc.user_agent.as_deref())?;
-                    let _ = self.store.save_account_doc(&self.acc.id, "ews.json", &found);
+                    let (base, then) = autodiscover_in_test();
+                    let found = crate::ews::autodiscover_as(&self.acc.email, &user, &secret, base.as_deref(), self.acc.user_agent.as_deref())?;
+                    if let Some(then) = then {
+                        then();
+                    }
+                    // Not once the account was removed (as autodiscovery went on): its files would
+                    // come back.
+                    let kept = self.store.while_kept(&self.acc.id, self.removals, || self.store.save_account_doc(&self.acc.id, "ews.json", &found));
+                    if let Some(Err(e)) = kept {
+                        log::warn!("{}: the Exchange server found isn't kept, and is looked for again next time: {e}", self.acc.id);
+                    }
                     found
                 } else {
                     kept
@@ -189,7 +296,7 @@ impl Worker {
     /// again every five seconds for good, the folders after that one never read.
     fn signed_in(&mut self) {
         if self.main.is_some() {
-            self.backoff = Duration::from_secs(5);
+            self.backoff = FIRST_BACKOFF;
         }
     }
 
@@ -203,7 +310,7 @@ impl Worker {
         let m = match c.login_xoauth2(user, token) {
             Ok(()) => return Ok(c),
             Err(NetError::Auth(m) | NetError::Bad(m) | NetError::No(m))
-                if self.acc.oauth.as_deref() == Some("microsoft") && m.to_ascii_lowercase().contains("not connected") =>
+                if self.acc.oauth.as_deref() == Some("microsoft") && microsoft_not_connected(&m) =>
             {
                 m
             }
@@ -217,7 +324,7 @@ impl Worker {
                 return Ok(c);
             }
         }
-        Err(NetError::Refused(microsoft_imap_closed(&self.acc.email, other)))
+        Err(NetError::MailboxClosed(microsoft_imap_closed(&self.acc.email, other)))
     }
 
     /// A connection that couldn't be made is never tried again at once (that looped, showing
@@ -233,15 +340,14 @@ impl Worker {
             e @ NetError::Later(_) => {
                 log::warn!("{}: {e}", self.acc.id);
                 self.conn = None;
-                self.next_attempt = Instant::now() + self.backoff;
-                self.backoff = (self.backoff * 2).min(Duration::from_secs(300));
-                self.status(SyncStatus::Error { error: e.to_string() });
+                self.back_off();
+                self.status(e.status());
             }
             e => {
                 log::warn!("{}: {e}", self.acc.id);
                 self.conn = None;
                 self.auth_failed = true;
-                self.status(SyncStatus::Error { error: e.to_string() });
+                self.status(e.status());
             }
         }
     }
@@ -275,26 +381,30 @@ impl Worker {
     }
 }
 
-/// The waits workers began before connecting again after a connection failed, for the tests to
-/// count rather than time: by the store's folder and the account.
+/// The account's main threads (not their second connections) that have ended, for the tests to
+/// wait on rather than time: by the store's folder and the account.
 #[cfg(test)]
-pub(crate) mod waits {
+pub(crate) mod ended {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
     use mailcraft_store::Store;
 
-    static BEGUN: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+    static ENDED: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
 
-    /// `account`'s worker over `store` began a wait to connect again.
-    pub(crate) fn began(store: &Store, account: &str) {
-        if let Ok(mut b) = BEGUN.lock() {
-            b.push((store.root().to_path_buf(), account.to_string()));
+    /// Noted as a main thread ends, by being dropped.
+    pub(crate) struct Ending(pub(crate) PathBuf, pub(crate) String);
+
+    impl Drop for Ending {
+        fn drop(&mut self) {
+            if let Ok(mut e) = ENDED.lock() {
+                e.push((std::mem::take(&mut self.0), std::mem::take(&mut self.1)));
+            }
         }
     }
 
-    /// The waits to connect again `account`'s workers over `store` have begun.
-    pub(crate) fn begun(store: &Store, account: &str) -> usize {
-        BEGUN.lock().map_or(0, |b| b.iter().filter(|(root, a)| root == store.root() && a == account).count())
+    /// How many of `account`'s main threads over `store` have ended.
+    pub(crate) fn count(store: &Store, account: &str) -> usize {
+        ENDED.lock().map_or(0, |e| e.iter().filter(|(root, a)| root == store.root() && a == account).count())
     }
 }

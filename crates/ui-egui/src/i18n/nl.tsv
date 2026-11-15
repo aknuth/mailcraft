@@ -72,6 +72,7 @@
 	Edit rule	Regel bewerken
 	Email address	E-mailadres
 	Enter the password for {email}.	Voer het wachtwoord voor {email} in.
+	Enter the password for {email}, which signs in as {user}.	Voer het wachtwoord in voor {email}, dat zich aanmeldt als {user}.
 	Favorites	Favorieten
 	Feb	feb
 	File	Bestand
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	Berichten als gelezen markeren bij openen
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Nog geen afzenders.
-	Not available: the sample mailbox has no server.	Niet beschikbaar: het voorbeeldpostvak heeft geen server.
+	Not available: this mailbox has no server.	Niet beschikbaar: dit postvak heeft geen server.
 	Not available: {error}	Niet beschikbaar: {error}
 	On	Aan
 	On from {from}	Aan vanaf {from}
@@ -842,7 +843,8 @@ month	May	mei
 	Formatted	Opgemaakt
 	HTML code	HTML-code
 	From a file…	Uit een bestand…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	Plak de HTML van een elders gemaakte handtekening, of open er een die als webpagina is opgeslagen (.htm van Outlook). Ze wordt verzonden zoals ze geschreven is; tijdens het schrijven toont een bericht haar tekst.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	Plak de HTML van een elders gemaakte handtekening, of open er een die als webpagina is opgeslagen (.htm van Outlook). Ze wordt verzonden zoals ze geschreven is, en zo ook getoond terwijl u schrijft.
+	Your signature as it will be sent. To change it, pick Signature above the message.	Uw handtekening zoals ze wordt verzonden. Kies Handtekening boven het bericht om ze te wijzigen.
 	{name} can't be read as a signature	{name} kan niet als handtekening worden gelezen
 	All contacts	Alle contactpersonen
 	Always open with this address book	Altijd met dit adresboek openen
@@ -934,6 +936,9 @@ month	May	mei
 	Name on mail from it	Naam op e-mail vanaf dit adres
 	Replies go to	Antwoorden gaan naar
 	(the account's own)	(die van het account)
+	Write new mail from this address	Nieuwe berichten vanaf dit adres schrijven
+	A new message starts from this address, not from {email}. Pick another in From as ever.	Een nieuw bericht begint vanaf dit adres, niet vanaf {email}. Bij Van kiest u zoals altijd een ander.
+	{address} (new mail)	{address} (nieuwe berichten)
 	Add…	Toevoegen…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	De mappen verschijnen onder dit account. U hebt er toegang toe nodig op de Exchange-server; postvakken waartoe u volledige toegang hebt, worden vanzelf geopend.
 	Mailboxes you have full access to open by themselves.	Postvakken waartoe u volledige toegang hebt, worden vanzelf geopend.
@@ -1102,6 +1107,7 @@ month	May	mei
 	Check before sending	Controleren voor verzenden
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} lijkt een adres bij {like}, maar is het niet. Is het het juiste adres?
 	{n} people who may not know each other will all see each other's addresses.	{n} mensen die elkaar misschien niet kennen, zien allemaal elkaars adres.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	Er is bij de ontvangers iets gevonden om na te kijken, maar het kan niet worden getoond. Kijk ze na voordat je verzendt.
 	Put everyone in Bcc	Iedereen in Bcc zetten
 	Each of them gets the message without seeing who else did; you're in To	Ieder krijgt het bericht zonder te zien wie nog meer; u staat in Aan
 	Open links without their tracking	Koppelingen openen zonder tracking
@@ -1441,6 +1447,7 @@ month	May	mei
 	Calendar and contacts couldn't be read: changes to them won't be saved	Agenda en contactpersonen konden niet worden gelezen: wijzigingen daarin worden niet opgeslagen
 	Your rules couldn't be read: changes to them won't be saved	Je regels konden niet worden gelezen: wijzigingen daarin worden niet opgeslagen
 	Snoozed mail couldn't be read: changes to it won't be saved	Uitgestelde e-mail kon niet worden gelezen: wijzigingen daarin worden niet opgeslagen
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	Waarop de antwoorden in Postvak UIT antwoorden, kon niet worden gelezen: die e-mail wordt mogelijk niet als beantwoord gemarkeerd
 	Checking your data file	Uw gegevensbestand wordt gecontroleerd
 	Opening your mail…	Uw e-mail wordt geopend…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} is de vorige keer niet goed afgesloten. MailCraft controleert het bestand; bij een groot bestand kan dat een minuut of twee duren.
@@ -1458,6 +1465,8 @@ month	May	mei
 	Some results may be missing: still indexing	Er kunnen resultaten ontbreken: nog bezig met indexeren
 	Some long messages were searched only in part	Sommige lange berichten zijn maar gedeeltelijk doorzocht
 	Couldn't read the date “{value}”	De datum “{value}” kon niet worden gelezen
+	Couldn't read “{value}”	“{value}” kon niet worden gelezen
+	Part of a long search was left out	Een deel van een lange zoekopdracht is weggelaten
 	Received after	Ontvangen na
 	Received before	Ontvangen voor
 	About {h} h {m} min left	Nog ongeveer {h} u {m} min
@@ -1704,3 +1713,7 @@ month	May	mei
 	Nothing to do	Niets te doen
 	Nothing in the next 7 days	Niets in de komende 7 dagen
 	Show the calendar, what's coming up and your tasks beside the mail	De agenda, wat eraan komt en uw taken naast de e-mail weergeven
+	Read / Unread (Ctrl+Q / Ctrl+U)	Gelezen / Ongelezen (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	{name} kon niet worden gedownload: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Er ging iets mis in het venster, en wat het aan het doen was, is gestopt. MailCraft gaat door; het logboek zegt waar het gebeurde.
+	Font size	Lettergrootte

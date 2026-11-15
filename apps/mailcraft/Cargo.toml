@@ -27,8 +27,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 iana-time-zone = "0.1"
 # Native file dialogs (attach, save as).
 rfd = "0.17"
-# Open attachments with the system's default app.
-open = "5"
 # Pictures pasted into a message.
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 # Desktop notifications for new mail (toasts, Notification Center, freedesktop notifications).
@@ -44,6 +42,11 @@ keyring = "4.2"
 [build-dependencies]
 # Icon + VERSIONINFO for mailcraft.exe; build.rs only uses it when the target is Windows.
 winresource = "0.1"
+
+# Open attachments with the system's default app. (On Windows that's the shell itself:
+# `desktop::shell_open`.)
+[target.'cfg(not(windows))'.dependencies]
+open = "5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Notifications under MailCraft's name: its app id's name and icon, per user (`toast.rs`).
@@ -83,6 +86,10 @@ x11rb = "0.14"
 raw-window-handle = "0.6"
 # Opening the window through XWayland (`display.rs`); the version eframe uses, so it's built once.
 winit = { version = "0.30", default-features = false, features = ["x11"] }
+# Whether X11's libraries are there before the window is put on XWayland (`display.rs`): the
+# packages only recommend them. The versions winit's X11 backend opens them with.
+x11-dl = "2.21"
+xkbcommon-dl = { version = "0.4.2", features = ["x11"] }
 # The desktop's dark or light preference (the freedesktop portal, `appearance.rs`): winit reports
 # no theme here. zbus comes in through AccessKit already; this only makes it direct.
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }

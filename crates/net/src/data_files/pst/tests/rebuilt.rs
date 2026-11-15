@@ -4,6 +4,7 @@
 use super::super::item::{File, Item};
 use super::super::rebuild::{message, summary_of, to_raw};
 use super::*;
+use crate::fakes::random::noise;
 
 fn key() -> MessageKey {
     MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid: 1 }
@@ -80,20 +81,28 @@ fn a_summary_is_placed_by_delivery_and_keeps_the_conversation() {
     assert_eq!(summary(Item { date: 5, body: "b".into(), ..Default::default() }).thread_own, 0);
 }
 
+/// Attached messages with no id of their own each get one made from the item's, numbered in
+/// turn: two side by side came out with the same Message-ID (and an attached meeting with the
+/// other's calendar uid).
+#[test]
+fn attached_messages_without_ids_get_ids_of_their_own() {
+    let attached = |subject: &str| File::Message(Box::new(Item { subject: subject.into(), body: "Inside.".into(), ..Default::default() }));
+    let item = Item { subject: "Two inside".into(), body: "See both.".into(), files: vec![attached("One"), attached("Two")], ..Default::default() };
+    let raw = to_raw(item, "item@pst.invalid").unwrap();
+    let p = mime::parse(&raw).unwrap();
+    let inner: Vec<usize> = (0..p.attachments.len()).filter(|i| p.attachments[*i].mime == "message/rfc822").collect();
+    assert_eq!(inner.len(), 2);
+    let ids: Vec<String> =
+        mime::attachments_data(&raw, &inner, 1 << 20, 1 << 20).into_iter().map(|(_, data)| mime::parse(&data).unwrap().message_id).collect();
+    assert_eq!(ids, ["item@pst.invalid.1", "item@pst.invalid.2"]);
+}
+
 /// A received message's header is put back in the built source's own buffer without doubling
 /// it: the source waits in its import batch in that buffer, and a file that won't compress is
 /// stored as it is.
 #[test]
 fn the_original_header_goes_back_without_doubling_the_source() {
-    let mut x = 0x9e37_79b9_7f4a_7c15u64;
-    let data: Vec<u8> = (0..2 << 20)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect();
+    let data = noise(2 << 20, 0x9e37_79b9_7f4a_7c15);
     let received = "Received: from relay.example.com by mx.example.org; Mon, 1 Jan 2024 00:00:00 +0000\r\n".repeat(80);
     let item = Item {
         headers: format!("{received}From: Ana <ana@example.com>\r\nSubject: Scans\r\nContent-Type: multipart/mixed\r\n"),

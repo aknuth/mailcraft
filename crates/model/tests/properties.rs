@@ -37,9 +37,10 @@ fn advanced() -> impl Strategy<Value = Advanced> {
     })
 }
 
-/// Text a person types into a card's field: any characters, lines included.
+/// Text a person types into a card's field: any characters, lines and tabs included, but the
+/// control characters a vCard can't hold (RFC 6350 §3.3: they're left out when it's written).
 fn field() -> impl Strategy<Value = String> {
-    "[^\r\u{0}]{0,40}".prop_map(|s| s.trim().to_string())
+    "[^\u{0}-\u{8}\u{b}-\u{1f}\u{7f}]{0,40}".prop_map(|s| s.trim().to_string())
 }
 
 fn typed(value: &'static str) -> impl Strategy<Value = Typed> {
@@ -49,7 +50,7 @@ fn typed(value: &'static str) -> impl Strategy<Value = Typed> {
 fn card() -> impl Strategy<Value = Card> {
     (
         "[a-z0-9-]{1,20}",
-        "[^\r\n\u{0}]{0,30}".prop_filter("a name", |s| !s.trim().is_empty()).prop_map(|s| s.trim().to_string()),
+        "[^\u{0}-\u{8}\u{a}-\u{1f}\u{7f}]{0,30}".prop_filter("a name", |s| !s.trim().is_empty()).prop_map(|s| s.trim().to_string()),
         (field(), field(), field(), field(), field()),
         prop::collection::vec(typed(r"[a-z0-9.+-]{1,10}@[a-z]{1,8}\.[a-z]{2,3}"), 0..3),
         prop::collection::vec(typed(r"\+?[0-9 ]{3,15}"), 0..3),
@@ -79,7 +80,7 @@ fn card() -> impl Strategy<Value = Card> {
                 .filter(|a| !a.is_empty())
                 .collect(),
             birthday: birthday.to_string(),
-            extra: Vec::new(),
+            ..Default::default()
         })
 }
 
@@ -146,8 +147,8 @@ proptest! {
         // Only the parts the query looks in, folded: the same answer.
         let some = SummaryText::for_query(&m, &query);
         prop_assert_eq!(query.eval(&Doc { summary: &m, summary_text: &some, awaiting: false, files: None, text: &q.as_str() }), whole);
-        let _ = (query.text_words(), query.index_words(), query.needs_text());
-        prop_assert!(query.index_words().iter().all(|w| !w.is_empty()));
+        let _ = (query.text_words(), query.needs_text());
+        prop_assert!(query.text_words().iter().all(|(_, w, _)| !w.is_empty()));
     }
 
     /// Accents typed alone, a field's value or not, ask the index for no empty word (which would
@@ -155,7 +156,6 @@ proptest! {
     #[test]
     fn marks_alone_are_no_words(marks in r"[\u{300}-\u{36f}\u{345}]{1,6}", field in "|from:|to:|subject:|body:|attachment:", subject in "[a-zA-Zà-ÿ ]{0,30}") {
         let query = Query::parse(&format!("{field}{marks}"));
-        prop_assert!(query.index_words().iter().all(|w| !w.is_empty()));
         prop_assert!(query.text_words().iter().all(|(_, w, _)| !w.is_empty()));
         let m = mailcraft_model::Summary { subject, ..Default::default() };
         let st = SummaryText::of(&m);
@@ -168,7 +168,10 @@ proptest! {
         let text = vcard::write(&c);
         let back = vcard::parse(&text);
         prop_assert_eq!(back.len(), 1, "{}", text);
-        prop_assert_eq!(&back[0], &c, "{}", text);
+        // The card, its lines kept as written beside it ([`Card::as_written`]); written again,
+        // the same text.
+        prop_assert_eq!(&Card { as_written: Default::default(), ..back[0].clone() }, &c, "{}", text);
+        prop_assert_eq!(vcard::write(&back[0]), text);
     }
 
     /// Any folder name survives IMAP's modified UTF-7, and the wire form is ASCII.
@@ -180,9 +183,15 @@ proptest! {
     }
 
     /// An online meeting added to any event and taken out again leaves its place and notes as
-    /// they were (issue #25), and the event written and read back in between still has it.
+    /// they were (issue #25), and the event written and read back in between still has it. (The
+    /// control characters iCalendar can't hold, but HTAB and line breaks, are left out when it's
+    /// written: RFC 5545 §3.1.)
     #[test]
-    fn an_online_meeting_comes_out_as_it_went_in(notes in "[^\r\u{0}]{0,80}", place in "[^\r\n\u{0}]{0,30}", code in "[0-9-]{0,12}") {
+    fn an_online_meeting_comes_out_as_it_went_in(
+        notes in "[^\u{0}-\u{8}\u{b}-\u{1f}\u{7f}]{0,80}",
+        place in "[^\u{0}-\u{8}\u{a}-\u{1f}\u{7f}]{0,30}",
+        code in "[0-9-]{0,12}",
+    ) {
         let room = ical::MeetingRoom::new("Room", "https://meet.example.edu/rooms/abc-def-ghi", &code, "").unwrap();
         let before = ical::CalEvent { uid: "u".into(), description: notes.clone(), location: place.clone(), start: 1_800_000_000, end: 1_800_003_600, ..Default::default() };
         let mut e = before.clone();
@@ -193,6 +202,20 @@ proptest! {
         prop_assert_eq!(back.description.as_str(), notes.trim_end());
         prop_assert_eq!(back.location.trim(), place.trim());
         prop_assert!(back.conferences().is_empty());
+    }
+
+    /// Whatever an event's uid and texts hold, what's written holds no control character but
+    /// HTAB and its line ends, and its uid read back is the one a uid read is kept as: what a
+    /// server stores is what's kept here and looked for.
+    #[test]
+    fn a_written_event_holds_only_what_a_line_may(uid in r"[\u{0}-\u{7f}]{1,30}", text in r"[\u{0}-\u{7f}]{0,60}") {
+        prop_assume!(!ical::stored_uid(&uid).is_empty());
+        let e = ical::CalEvent { uid: uid.clone(), summary: text.clone(), location: text.clone(), start: 1_800_000_000, end: 1_800_003_600, ..Default::default() };
+        let written = ical::write_for_server(std::slice::from_ref(&e), 1_800_000_000);
+        prop_assert!(!written.split("\r\n").any(|l| l.contains(|c: char| !ical::allowed(c))), "{:?}", written);
+        let back = ical::parse(&written, 0).events;
+        prop_assert_eq!(back.len(), 1);
+        prop_assert_eq!(&back[0].uid, &ical::stored_uid(&uid));
     }
 
     /// iCalendar text values: escaped and unescaped, the same text.

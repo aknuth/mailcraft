@@ -96,8 +96,8 @@ fn attachments<'a>(m: &'a Owned, h: &'a Held<'a>) -> Vec<NewAttachment<'a>> {
     out
 }
 
-/// Write `batch` into `folder` of the file at `path` (in `format`), made with the first message
-/// unless it's `created`.
+/// Write `batch` into `folder` of the file at `path`, made with the first message unless it's
+/// `created`.
 pub(super) fn write(path: &Path, folder: &[&str], batch: &[Owned], created: &mut bool) -> Result<(), String> {
     let held: Vec<Held<'_>> = batch.iter().map(|m| held(m, true)).collect();
     let files: Vec<Vec<NewAttachment<'_>>> = batch.iter().zip(&held).map(|(m, h)| attachments(m, h)).collect();
@@ -134,16 +134,15 @@ pub(super) fn write(path: &Path, folder: &[&str], batch: &[Owned], created: &mut
     Ok(())
 }
 
-/// Add `batch` to the file at `path` (in `format`). A file whose name-to-ID map can't take names
-/// (damaged, or made by a program that keeps it some other way) gets the batch without its named
-/// properties: the mail goes in, without its follow-up text, due days and categories, and the log
-/// says why.
+/// Add `batch` to the file at `path`. A file whose name-to-ID map can't take names (damaged, or
+/// made by a program that keeps it some other way) gets the batch without its named properties:
+/// the mail goes in, without its follow-up text, due days and categories, and the log says why.
 pub(super) fn append(path: &Path, folder: &[&str], batch: &[BatchMessage<'_>]) -> Result<(), String> {
     let Err(e) = write::append(path, folder, batch) else { return Ok(()) };
     let named = |p: &NewProperty<'_>| matches!(p.key, PropertyKey::Named(..));
     // The writer says so before it writes any of the batch's messages (their folder may be made
     // by then, and stays).
-    if !e.to_string().starts_with("name-to-ID map") || !batch.iter().any(|m| m.message.properties.iter().any(named)) {
+    if !write::NamesRefused::is(&e) || !batch.iter().any(|m| m.message.properties.iter().any(named)) {
         return Err(e.to_string());
     }
     log::info!("the data file's name-to-ID map can't be added to ({e}): mail written without its flags' text, due days and categories");

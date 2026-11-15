@@ -105,7 +105,7 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::r
             ui.set_width(420.0);
             let unlock = path.is_empty() && data.is_none();
             title(ui, t, if unlock { "Unlock certificate" } else { "Import certificate" });
-            let file = path.rsplit(['/', '\\']).next().unwrap_or(path.as_str()).to_string();
+            let file = mailcraft_engine::model::file_name(path);
             // Kept unlocked between visits (gap 7): the password is kept, sealed, after all.
             let kept = s.jmap_only && s.smime_settings(account).keep_unlocked;
             let ask = if unlock && kept {
@@ -154,7 +154,7 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::r
         Dialog::PgpKey { account, path, passphrase } => {
             ui.set_width(420.0);
             title(ui, t, "Import OpenPGP key");
-            let file = path.rsplit(['/', '\\']).next().unwrap_or(path.as_str()).to_string();
+            let file = mailcraft_engine::model::file_name(path);
             let ask = tf!("The passphrase {file} is locked with (none, if it has none):", file = file);
             ui.add(egui::Label::new(RichText::new(ask).color(t.dim)).wrap());
             ui.add_space(8.0);
@@ -315,11 +315,10 @@ fn held_keys(ui: &mut Ui, s: &Session, t: &Tokens, acts: &mut Vec<Action>, accou
     for (i, k) in search.keys.iter().enumerate() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let info = mailcraft_engine::smime::cert::info(&k.cert).ok();
             ui.vertical(|ui| {
                 ui.label(RichText::new(&k.label).color(t.text));
-                if let Some(info) = &info {
-                    let who = info.emails.first().cloned().unwrap_or_else(|| info.name.clone());
+                if let Some(info) = search.info(i) {
+                    let who = info.emails.first().unwrap_or(&info.name);
                     ui.label(RichText::new(format!("{who} · {} · {}", info.issuer, info.key)).color(t.faint).small());
                 }
             });

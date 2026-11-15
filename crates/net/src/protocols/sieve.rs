@@ -9,7 +9,7 @@
 //!
 //! Server input is hostile: lines and literals are capped.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 
 use mailcraft_model::job::{Vacation, is_day};
 use mailcraft_model::{Security, ServerConfig};
@@ -37,10 +37,38 @@ pub struct Client<S: Read + Write> {
     caps: Vec<(String, String)>,
 }
 
-/// A token of a response line: an atom, or a string (quoted or literal).
-fn tokens<S: Read + Write>(io: &mut BufReader<S>, first: &str) -> Result<Vec<String>> {
+/// A token of a response line: an atom, a string (quoted or literal), or either inside the
+/// parentheses of a response code (`NO (QUOTA/MAXSIZE) "…"`, RFC 5804 §1.3).
+#[derive(Debug, PartialEq, Eq)]
+enum Tok {
+    Atom(String),
+    Str(String),
+    Code(String),
+}
+
+impl Tok {
+    fn text(self) -> String {
+        match self {
+            Tok::Atom(s) | Tok::Str(s) | Tok::Code(s) => s,
+        }
+    }
+}
+
+/// A response line's tokens, the literals it announces read too.
+fn tokens<S: Read + Write>(io: &mut BufReader<S>, first: &str) -> Result<Vec<Tok>> {
     let mut out = Vec::new();
     let mut line = first.to_string();
+    // How deep in a response code's parentheses (they may hold strings, and a literal).
+    let mut depth = 0usize;
+    let tok = |depth: usize, s: String, quoted: bool| {
+        if depth > 0 {
+            Tok::Code(s)
+        } else if quoted {
+            Tok::Str(s)
+        } else {
+            Tok::Atom(s)
+        }
+    };
     loop {
         let mut chars = line.char_indices().peekable();
         let mut literal: Option<usize> = None;
@@ -60,7 +88,7 @@ fn tokens<S: Read + Write>(io: &mut BufReader<S>, first: &str) -> Result<Vec<Str
                             Some((_, c)) => s.push(c),
                         }
                     }
-                    out.push(s);
+                    out.push(tok(depth, s, true));
                 }
                 '{' => {
                     let rest = line.get(i + 1..).unwrap_or("");
@@ -68,7 +96,8 @@ fn tokens<S: Read + Write>(io: &mut BufReader<S>, first: &str) -> Result<Vec<Str
                     literal = Some(n.parse().map_err(|_| NetError::Protocol("ManageSieve: bad literal".into()))?);
                     break;
                 }
-                '(' | ')' => {}
+                '(' => depth = depth.saturating_add(1),
+                ')' => depth = depth.saturating_sub(1),
                 _ => {
                     let mut atom = String::from(c);
                     while let Some(&(_, c)) = chars.peek() {
@@ -78,7 +107,7 @@ fn tokens<S: Read + Write>(io: &mut BufReader<S>, first: &str) -> Result<Vec<Str
                         atom.push(c);
                         chars.next();
                     }
-                    out.push(atom);
+                    out.push(tok(depth, atom, false));
                 }
             }
         }
@@ -88,21 +117,17 @@ fn tokens<S: Read + Write>(io: &mut BufReader<S>, first: &str) -> Result<Vec<Str
         }
         let mut buf = vec![0u8; n];
         io.read_exact(&mut buf)?;
-        out.push(String::from_utf8_lossy(&buf).into_owned());
+        out.push(tok(depth, String::from_utf8_lossy(&buf).into_owned(), true));
         line = read_line(io)?;
     }
 }
 
 fn read_line<S: Read + Write>(io: &mut BufReader<S>) -> Result<String> {
-    let mut buf = Vec::new();
-    let n = io.by_ref().take(MAX_LINE as u64).read_until(b'\n', &mut buf)?;
-    if n == 0 {
-        return Err(NetError::Closed("the ManageSieve server closed the connection".into()));
+    match super::capped_line(io, MAX_LINE)? {
+        super::Capped::Line(buf) => Ok(String::from_utf8_lossy(&buf).into_owned()),
+        super::Capped::Closed => Err(NetError::Closed("the ManageSieve server closed the connection".into())),
+        super::Capped::TooLong => Err(NetError::Protocol("ManageSieve: line too long".into())),
     }
-    if !buf.ends_with(b"\n") {
-        return Err(NetError::Protocol("ManageSieve: line too long".into()));
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn reply<S: Read + Write>(io: &mut BufReader<S>) -> Result<Reply> {
@@ -110,16 +135,15 @@ fn reply<S: Read + Write>(io: &mut BufReader<S>) -> Result<Reply> {
     loop {
         let line = read_line(io)?;
         let t = tokens(io, &line)?;
-        let head = t.first().map(|s| s.to_ascii_uppercase()).unwrap_or_default();
+        // Only an atom ends the reply: a string is data (a script named "ok").
+        let head = match t.first() {
+            Some(Tok::Atom(a)) => a.to_ascii_uppercase(),
+            _ => String::new(),
+        };
         match head.as_str() {
             "OK" | "NO" | "BYE" => {
-                let text = t
-                    .iter()
-                    .skip(1)
-                    .filter(|x| !x.chars().all(|c| c.is_ascii_uppercase() || c == '-' || c == '/'))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                // The response code left out: the rest is the human text, upper case or not.
+                let text = t.into_iter().skip(1).filter(|x| !matches!(x, Tok::Code(_))).map(Tok::text).collect::<Vec<_>>().join(" ");
                 if head == "BYE" {
                     return Err(NetError::Closed(text));
                 }
@@ -129,16 +153,14 @@ fn reply<S: Read + Write>(io: &mut BufReader<S>) -> Result<Reply> {
                 if data.len() > 10_000 {
                     return Err(NetError::Protocol("ManageSieve: too many lines".into()));
                 }
-                data.push(t);
+                data.push(t.into_iter().map(Tok::text).collect());
             }
         }
     }
 }
 
-/// A ManageSieve quoted string.
-fn q(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
+// A ManageSieve quoted string.
+use super::quote as q;
 
 impl<S: Read + Write> Client<S> {
     /// Read the greeting (the server's capabilities).
@@ -180,13 +202,15 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn login(&mut self, user: &str, pass: &str) -> Result<()> {
-        let token = crate::imap::base64(format!("\0{user}\0{pass}").as_bytes());
+        let token = mailcraft_model::base64::encode(format!("\0{user}\0{pass}").as_bytes());
         let r = self.run(&format!("AUTHENTICATE \"PLAIN\" {}", q(&token)))?;
         if r.ok { Ok(()) } else { Err(NetError::Auth(if r.text.is_empty() { "the Sieve server refused the password".into() } else { r.text })) }
     }
 
+    /// Sign in with an OAuth token: `xoauth2` is the initial response in base64 already, sent as
+    /// IMAP sends it.
     pub fn login_xoauth2(&mut self, user: &str, token: &str) -> Result<()> {
-        let r = self.run(&format!("AUTHENTICATE \"XOAUTH2\" {}", q(&crate::imap::base64(crate::oauth::xoauth2(user, token).as_bytes()))))?;
+        let r = self.run(&format!("AUTHENTICATE \"XOAUTH2\" {}", q(&crate::oauth::xoauth2(user, token))))?;
         if r.ok { Ok(()) } else { Err(NetError::Auth(r.text)) }
     }
 
@@ -224,7 +248,7 @@ impl<S: Read + Write> Client<S> {
         let _ = self.run("LOGOUT");
     }
 
-    /// The automatic replies this script holds (`None`: never set up here).
+    /// The automatic replies this script holds (the default when never set up here).
     pub fn vacation(&mut self) -> Result<Vacation> {
         let (names, active) = self.list()?;
         if !names.iter().any(|n| n == SCRIPT) {
@@ -269,13 +293,8 @@ impl<S: Read + Write> Client<S> {
 
 impl Client<Stream> {
     /// Connect to the account's Sieve server: the IMAP host on port 4190, encrypted with
-    /// STARTTLS unless the account is plain (local test servers).
-    pub fn connect(imap: &ServerConfig, port: u16) -> Result<Client<Stream>> {
-        Self::connect_trusting(imap, port, &[])
-    }
-
-    /// [`Client::connect`] for an account's server: `trusted` are the certificates the user chose
-    /// to trust for one on this computer ([`stream::tls_trusting`]).
+    /// STARTTLS unless the account is plain (local test servers). `trusted` are the certificates
+    /// the user chose to trust for the account's server on this computer ([`stream::tls_trusting`]).
     pub fn connect_trusting(imap: &ServerConfig, port: u16, trusted: &[String]) -> Result<Client<Stream>> {
         let sock = stream::tcp(&imap.host, port)?;
         let mut c = Client::from_stream(Stream::Plain(sock))?;
@@ -286,18 +305,15 @@ impl Client<Stream> {
             return Err(NetError::Tls("the Sieve server does not offer STARTTLS".into()));
         }
         c.run_ok("STARTTLS")?;
-        if !c.io.buffer().is_empty() {
-            return Err(NetError::Tls("unexpected data before TLS negotiation".into()));
-        }
-        let Stream::Plain(sock) = c.io.into_inner() else { return Err(NetError::Tls("connection already encrypted".into())) };
+        let unread = c.io.buffer().len();
         // The server repeats its capabilities over TLS (RFC 5804 §2.2); the earlier ones are void.
-        Client::from_stream(stream::tls_trusting(sock, &imap.host, trusted)?)
+        Client::from_stream(stream::starttls(c.io.into_inner(), unread, &imap.host, trusted)?)
     }
 }
 
 /// A Sieve string: quoted, with `\` and `"` escaped (line breaks are allowed inside).
 fn sieve_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\r', ""))
+    q(&s.replace('\r', ""))
 }
 
 /// Our script for these settings. The settings themselves (and the user's own script, which it
@@ -394,6 +410,40 @@ Zoe";"#
         assert_eq!(script(&evil, None).lines().next().unwrap().matches("require").count(), 1, "still one comment line");
     }
 
+    /// A server's answers, canned; what's sent to it is dropped.
+    struct Canned(std::io::Cursor<Vec<u8>>);
+
+    impl Read for Canned {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for Canned {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Found in review: a reply ended at any line whose first token read `OK`, `NO` or `BYE`,
+    /// quoted or not, so scripts named "ok", "no" or "bye" ended LISTSCRIPTS early and the lines
+    /// after were taken for the next command's answer; and every upper-case word was dropped
+    /// from a reply's text as if it were a response code.
+    #[test]
+    fn only_an_atom_ends_a_reply_and_only_a_code_is_left_out_of_its_text() {
+        let s = b"\"SIEVE\" \"vacation\"\r\nOK\r\n\
+\"ok\"\r\n\"no\" ACTIVE\r\n\"bye\"\r\nOK\r\n\
+NO (QUOTA/MAXSIZE \"x\") \"LOCKED\"\r\n\
+NO {6}\r\nFAILED\r\n";
+        let mut c = Client::from_stream(Canned(std::io::Cursor::new(s.to_vec()))).unwrap();
+        assert_eq!(c.list().unwrap(), (vec!["ok".to_string(), "no".into(), "bye".into()], Some("no".to_string())));
+        assert!(matches!(c.activate("x"), Err(NetError::No(m)) if m == "LOCKED"));
+        assert!(matches!(c.activate("x"), Err(NetError::No(m)) if m == "FAILED"));
+    }
+
     /// A ManageSieve server for tests: scripts in memory, one connection at a time.
     pub(crate) struct Fake {
         pub scripts: Vec<(String, String)>,
@@ -414,7 +464,7 @@ Zoe";"#
                 let caps = |s: &mut std::net::TcpStream, sieve: &str| {
                     let _ = write!(
                         s,
-                        "\"IMPLEMENTATION\" \"Fake\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"{sieve}\"\r\n\"VERSION\" \"1.0\"\r\nOK \"ready\"\r\n"
+                        "\"IMPLEMENTATION\" \"Fake\"\r\n\"SASL\" \"PLAIN XOAUTH2\"\r\n\"SIEVE\" \"{sieve}\"\r\n\"VERSION\" \"1.0\"\r\nOK \"ready\"\r\n"
                     );
                 };
                 caps(&mut s, shared.lock().unwrap().sieve);
@@ -428,7 +478,13 @@ Zoe";"#
                     let arg = |n: usize| line.split('"').nth(n).unwrap_or("").to_string();
                     let up = line.to_ascii_uppercase();
                     if up.starts_with("AUTHENTICATE") {
-                        let good = crate::imap::base64(b"\0me@studio.example\0pw");
+                        // PLAIN with the password, or XOAUTH2 with the token (its initial
+                        // response the SASL string in base64, RFC 5804 §2.1).
+                        let good = if up.contains("\"XOAUTH2\"") {
+                            format!("\"{}\"", mailcraft_model::base64::encode(b"user=me@studio.example\x01auth=Bearer token\x01\x01"))
+                        } else {
+                            mailcraft_model::base64::encode(b"\0me@studio.example\0pw")
+                        };
                         let _ = s.write_all(if line.contains(&good) { b"OK\r\n" as &[u8] } else { b"NO \"wrong password\"\r\n" });
                     } else if up.starts_with("LISTSCRIPTS") {
                         for (n, _) in &f.scripts {
@@ -477,6 +533,21 @@ Zoe";"#
         let mut c = Client::from_stream(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
         c.login("me@studio.example", "pw").unwrap();
         c
+    }
+
+    /// An account signed in with OAuth reaches ManageSieve with XOAUTH2, its initial response
+    /// encoded once, as IMAP sends it: it went encoded twice, which no server can read, so its
+    /// automatic replies could never be read or set.
+    #[test]
+    fn oauth_accounts_sign_in_with_xoauth2() {
+        let (port, _) = serve(Fake { scripts: Vec::new(), active: None, sieve: "vacation", log: Vec::new() });
+        let mut c = Client::from_stream(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
+        c.login_xoauth2("me@studio.example", "token").unwrap();
+        assert_eq!(c.vacation().unwrap(), Vacation::default());
+        c.logout();
+        let mut stale = Client::from_stream(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
+        assert!(matches!(stale.login_xoauth2("me@studio.example", "expired"), Err(NetError::Auth(_))));
+        stale.logout();
     }
 
     #[test]

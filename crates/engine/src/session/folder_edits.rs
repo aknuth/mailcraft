@@ -1,5 +1,7 @@
 //! The session: making, renaming, moving and deleting folders.
 
+use std::collections::VecDeque;
+
 use mailcraft_model::FOLLOW_UP_COMPLETE;
 use mailcraft_model::organize::MAX_FOLLOW_UP;
 
@@ -294,24 +296,21 @@ impl Session {
     /// Move the selection to a folder of the same role in each message's account (Archive,
     /// Deleted Items, Junk), or to an explicit folder.
     pub fn move_selection(&mut self, target: MoveTarget) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
         let next = self.successor(&self.selection.clone());
-        let mut by_account: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        for m in &sel {
-            by_account.entry(m.key.account.clone()).or_default().push(m.key.clone());
-        }
+        let by_account = keys_by_account(sel.iter().map(|m| m.key.clone()));
         // A data file's import writes its account's lists (and goes on writing them).
         for a in by_account.keys() {
             self.import_holds(a)?;
         }
         let mut moved = 0usize;
-        let mut accounts: Vec<String> = by_account.keys().cloned().collect();
-        accounts.sort();
-        for a in accounts {
-            let keys = by_account.remove(&a).unwrap_or_default();
+        // Each account's destination, checked for all of them before anything moves (the first
+        // account's mail was moved, and the selection left on it, when the second's was refused).
+        let mut plan: Vec<(String, String, Vec<MessageKey>)> = Vec::new();
+        for (a, keys) in by_account {
             let dest = match &target {
                 MoveTarget::Folder(f) => Some(f.clone()),
                 MoveTarget::Role(r) => self.account(&a).and_then(|acc| acc.folder(*r)).map(|f| f.path.clone()),
@@ -326,23 +325,36 @@ impl Session {
             if self.folder(&a, &dest).is_none() {
                 return Err(CmdError::Params(format!("no folder `{dest}`")));
             }
-            let keys: Vec<MessageKey> = keys.into_iter().filter(|k| k.folder != dest).collect();
-            moved += keys.len();
-            if !keys.is_empty() {
-                // Undo finds them again by Message-ID (those without one can't come back).
-                let back: Vec<(String, String)> = keys
-                    .iter()
-                    .filter_map(|k| self.summary(k).filter(|m| !m.message_id.is_empty()).map(|m| (m.message_id.clone(), k.folder.clone())))
-                    .collect();
-                // One that didn't happen (a local store error) has nothing to undo, and the
-                // selection stays on it.
-                self.apply_op_checked(&a, Op::Move { keys, to: dest.clone() }).map_err(CmdError::Failed)?;
-                if !back.is_empty() {
-                    self.moved_at = self.clock.now;
-                    self.remember(Undo::Move { account: a.clone(), to: dest, back });
+            plan.push((a, dest, keys));
+        }
+        let mut moves: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
+        let done = (|| -> Result<(), CmdError> {
+            for (a, dest, keys) in plan {
+                let keys: Vec<MessageKey> = keys.into_iter().filter(|k| k.folder != dest).collect();
+                moved += keys.len();
+                if !keys.is_empty() {
+                    // Undo finds them again by Message-ID (those without one can't come back).
+                    let back: Vec<(String, String)> = keys
+                        .iter()
+                        .filter_map(|k| self.summary(k).filter(|m| !m.message_id.is_empty()).map(|m| (m.message_id.clone(), k.folder.clone())))
+                        .collect();
+                    // One that didn't happen (a local store error) has nothing to undo, and the
+                    // selection stays on it.
+                    self.apply_op_checked(&a, Op::Move { keys, to: dest.clone() }).map_err(CmdError::Failed)?;
+                    if !back.is_empty() {
+                        moves.push((a.clone(), dest, back));
+                    }
                 }
             }
+            Ok(())
+        })();
+        // One Undo for all of it (All Inboxes: one per account took a Ctrl+Z each), kept even
+        // when a later account's move failed in the store.
+        if !moves.is_empty() {
+            self.moved_at = self.clock.now;
+            self.remember(Undo::Move { moves });
         }
+        done?;
         // All of it there already (Archive pressed in Archive): nothing moved, and the one open
         // stays open (it gave way to the next all the same).
         if moved == 0 {
@@ -354,15 +366,12 @@ impl Session {
 
     /// Delete permanently.
     pub fn expunge_selection(&mut self) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
         let next = self.successor(&self.selection.clone());
-        let mut by_account: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        for m in &sel {
-            by_account.entry(m.key.account.clone()).or_default().push(m.key.clone());
-        }
+        let by_account = keys_by_account(sel.iter().map(|m| m.key.clone()));
         // Gone from an account its import writes, it would come back as the import goes on.
         for a in by_account.keys() {
             self.import_holds(a)?;
@@ -390,7 +399,7 @@ impl Session {
     /// Set or clear a flag on the selection (`on: None` toggles, following the first message).
     /// Flagged again or cleared, a follow-up marked complete no longer is.
     pub fn flag_selection(&mut self, flag: Flag, on: Option<bool>) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         let first = sel.first().ok_or_else(|| CmdError::Disabled("no message selected".into()))?;
         let current = flag.get(&first.flags);
         let on = on.unwrap_or(!current);
@@ -400,22 +409,27 @@ impl Session {
             self.remember_follow_up(undo, was);
             return Ok(serde_json::json!({ "on": on, "count": sel.len() }));
         }
-        let mut by_account: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        // Undo puts back only the ones that changed.
-        let mut changed: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        for m in &sel {
-            by_account.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            if flag.get(&m.flags) != on {
-                changed.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            }
-        }
-        for (a, keys) in changed {
-            self.remember(Undo::Ops { account: a, ops: vec![Op::SetFlag { keys, flag, on: !on }] });
-        }
-        for (a, keys) in by_account {
-            self.apply_op(&a, Op::SetFlag { keys, flag, on });
-        }
+        self.mark_selection(&sel, on, |m| flag.get(&m.flags), |keys, on| Op::SetFlag { keys, flag, on });
         Ok(serde_json::json!({ "on": on, "count": sel.len() }))
+    }
+
+    /// Put a mark on `sel` or take it off (`on`), each account's in one change, in the
+    /// accounts' order: `has` says whether a message has it, `op` is the change for some keys.
+    /// One Undo puts back the ones that changed.
+    pub(super) fn mark_selection(
+        &mut self,
+        sel: &[SharedSummary],
+        on: bool,
+        has: impl Fn(&Summary) -> bool,
+        op: impl Fn(Vec<MessageKey>, bool) -> Op,
+    ) {
+        let changed = keys_by_account(sel.iter().filter(|m| has(m) != on).map(|m| m.key.clone()));
+        if !changed.is_empty() {
+            self.remember(Undo::Ops { ops: changed.into_iter().map(|(a, keys)| (a, vec![op(keys, !on)])).collect() });
+        }
+        for (a, keys) in keys_by_account(sel.iter().map(|m| m.key.clone())) {
+            self.apply_op(&a, op(keys, on));
+        }
     }
 
     /// Flag `sel` (or clear the flag): one marked complete no longer is, a fresh flag has no due
@@ -423,20 +437,11 @@ impl Session {
     ///
     /// A server that keeps one status for both (Microsoft Graph's flag) gets the
     /// [`FOLLOW_UP_COMPLETE`] keyword taken off before the flag is set, and put on after it.
-    fn set_flagged(&mut self, sel: &[Summary], on: bool) -> Vec<(String, Vec<Op>)> {
-        let mut by_account: BTreeMap<String, Vec<MessageKey>> = BTreeMap::new();
-        let mut changed: BTreeMap<String, Vec<MessageKey>> = BTreeMap::new();
+    fn set_flagged(&mut self, sel: &[SharedSummary], on: bool) -> Vec<(String, Vec<Op>)> {
+        let by_account = keys_by_account(sel.iter().map(|m| m.key.clone()));
+        let changed = keys_by_account(sel.iter().filter(|m| m.flags.flagged != on).map(|m| m.key.clone()));
         // Carrying the keyword: complete, or flagged again elsewhere with it left behind.
-        let mut completed: BTreeMap<String, Vec<MessageKey>> = BTreeMap::new();
-        for m in sel {
-            by_account.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            if m.flags.flagged != on {
-                changed.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            }
-            if m.flags.has(FOLLOW_UP_COMPLETE) {
-                completed.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            }
-        }
+        let completed = keys_by_account(sel.iter().filter(|m| m.flags.has(FOLLOW_UP_COMPLETE)).map(|m| m.key.clone()));
         for (a, keys) in &completed {
             self.apply_op(a, Op::SetKeyword { keys: keys.clone(), keyword: FOLLOW_UP_COMPLETE.into(), on: false });
         }
@@ -444,7 +449,7 @@ impl Session {
             self.apply_op(&a, Op::SetFlag { keys, flag: Flag::Flagged, on });
         }
         for m in sel {
-            let id = follow_up_id(m);
+            let id = m.follow_up_id();
             // Unflagged: no longer due. Flagged again once complete: a fresh flag, not the one
             // completed (one still flagged keeps its day).
             if !on || m.flags.follow_up_complete() {
@@ -463,10 +468,10 @@ impl Session {
     }
 
     /// Each of `sel`'s due and done days as they are, for Undo to put back.
-    fn follow_up_days_of(&self, sel: &[Summary]) -> Vec<(String, Option<i64>, Option<i64>)> {
+    fn follow_up_days_of<S: std::borrow::Borrow<Summary>>(&self, sel: &[S]) -> Vec<(String, Option<i64>, Option<i64>)> {
         sel.iter()
             .map(|m| {
-                let id = follow_up_id(m);
+                let id = m.borrow().follow_up_id();
                 let (due, done) = (self.prefs.follow_up.get(&id).copied(), self.prefs.follow_up_done.get(&id).copied());
                 (id, due, done)
             })
@@ -489,14 +494,14 @@ impl Session {
         if complete {
             return self.complete_selection();
         }
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
         let was = self.follow_up_days_of(&sel);
         let undo = self.set_flagged(&sel, true);
         for m in &sel {
-            let id = follow_up_id(m);
+            let id = m.follow_up_id();
             match due {
                 Some(d) if self.prefs.follow_up.len() < MAX_FOLLOW_UP || self.prefs.follow_up.contains_key(&id) => {
                     self.prefs.follow_up.insert(id, d);
@@ -514,29 +519,24 @@ impl Session {
     /// [`FOLLOW_UP_COMPLETE`] keyword, and the day it was done kept (as Outlook keeps it). Its
     /// due day stays; Undo puts the flag and both days back as they were, in one step.
     pub fn complete_selection(&mut self) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         self.complete_messages(sel)
     }
 
     /// [`Session::complete_selection`] for these messages, wherever they are (the To-Do Bar's
     /// are in any folder).
-    pub(crate) fn complete_messages(&mut self, sel: Vec<Summary>) -> CmdResult {
+    pub(crate) fn complete_messages<S: std::borrow::Borrow<Summary>>(&mut self, sel: Vec<S>) -> CmdResult {
+        let sel: Vec<&Summary> = sel.iter().map(std::borrow::Borrow::borrow).collect();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
         let was = self.follow_up_days_of(&sel);
         let today = mailcraft_model::dates::today(&self.clock);
-        let mut flagged: BTreeMap<String, Vec<MessageKey>> = BTreeMap::new();
-        let mut marked: BTreeMap<String, Vec<MessageKey>> = BTreeMap::new();
+        let flagged = keys_by_account(sel.iter().filter(|m| m.flags.flagged).map(|m| m.key.clone()));
+        let marked = keys_by_account(sel.iter().filter(|m| !m.flags.has(FOLLOW_UP_COMPLETE)).map(|m| m.key.clone()));
         for m in &sel {
-            if m.flags.flagged {
-                flagged.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            }
-            if !m.flags.has(FOLLOW_UP_COMPLETE) {
-                marked.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            }
             // Done today, unless it was already done (marked complete again).
-            let id = follow_up_id(m);
+            let id = m.follow_up_id();
             if !(m.flags.follow_up_complete() && self.prefs.follow_up_done.contains_key(&id))
                 && (self.prefs.follow_up_done.len() < MAX_FOLLOW_UP || self.prefs.follow_up_done.contains_key(&id))
             {
@@ -566,7 +566,7 @@ impl Session {
         if !m.flags.flagged {
             return None;
         }
-        self.prefs.follow_up.get(&follow_up_id(m)).copied()
+        self.prefs.follow_up.get(&m.follow_up_id()).copied()
     }
 
     /// When a message's follow-up was marked complete, if it was and the day is known.
@@ -574,7 +574,7 @@ impl Session {
         if !m.flags.follow_up_complete() {
             return None;
         }
-        self.prefs.follow_up_done.get(&follow_up_id(m)).copied()
+        self.prefs.follow_up_done.get(&m.follow_up_id()).copied()
     }
 
     pub(super) fn remember(&mut self, u: Undo) {
@@ -588,9 +588,11 @@ impl Session {
     pub fn undo_last(&mut self) -> CmdResult {
         let u = self.undo.pop().ok_or_else(|| CmdError::Disabled("nothing to undo".into()))?;
         match u {
-            Undo::Ops { account, ops } => {
-                for op in ops {
-                    self.apply_op(&account, op);
+            Undo::Ops { ops } => {
+                for (account, ops) in ops {
+                    for op in ops {
+                        self.apply_op(&account, op);
+                    }
                 }
                 Ok(serde_json::json!({ "undone": "changes" }))
             }
@@ -606,46 +608,69 @@ impl Session {
                 }
                 Ok(serde_json::json!({ "undone": "changes" }))
             }
-            Undo::Move { account, to, back } => {
-                if let Err(e) = self.import_holds(&account) {
-                    self.undo.push(Undo::Move { account, to, back });
-                    return Err(e);
-                }
-                if let Err(e) = self.folders_ready(&[(account.clone(), to.clone())]) {
-                    self.undo.push(Undo::Move { account, to, back });
-                    return Err(e);
-                }
-                // Where each one is now: the destination's messages with that Message-ID.
-                let here = self.folder_state(&account, &to).messages.clone();
-                let mut by_folder: std::collections::BTreeMap<String, Vec<MessageKey>> = std::collections::BTreeMap::new();
-                let mut used: BTreeSet<MessageKey> = BTreeSet::new();
-                for (id, from) in &back {
-                    if let Some(m) = here.iter().find(|m| &m.message_id == id && !used.contains(&m.key)) {
-                        used.insert(m.key.clone());
-                        by_folder.entry(from.clone()).or_default().push(m.key.clone());
+            Undo::Move { moves } => {
+                // Each account's put back; one that can't be yet is kept to be tried again.
+                let (mut n, mut again, mut failed) = (0, Vec::new(), None);
+                for (account, to, back) in moves {
+                    match self.move_back(&account, &to, &back) {
+                        Ok(k) => n += k,
+                        Err((e, keep)) => {
+                            if keep {
+                                again.push((account, to, back));
+                            }
+                            failed.get_or_insert(e);
+                        }
                     }
                 }
-                if by_folder.is_empty() {
-                    // Not there yet (the server is still moving them, and the folder they go
-                    // to is read after): try again in a moment. For a couple of minutes after
-                    // the move; a server account's, as a move on this computer is done at once.
-                    let server = self.account(&account).is_some_and(|a| !a.is_local());
-                    if server && self.clock.now.saturating_sub(self.moved_at) < 120 {
-                        self.undo.push(Undo::Move { account, to, back });
-                        return Err(CmdError::Failed("still being moved; try Undo again in a moment".into()));
-                    }
-                    // Gone from there since (deleted for good, moved on, the folder emptied):
-                    // nothing to put back, and what was done before it can be undone. Kept to
-                    // be tried again, it stood in the way of every Undo after.
-                    return Err(CmdError::Failed("the mail isn't where it was moved to any more, so it can't be put back".into()));
+                if !again.is_empty() {
+                    self.undo.push(Undo::Move { moves: again });
                 }
-                let n = used.len();
-                for (from, keys) in by_folder {
-                    self.apply_op(&account, Op::Move { keys, to: from });
+                match failed {
+                    Some(e) if n == 0 => Err(e),
+                    _ => Ok(serde_json::json!({ "undone": "move", "count": n })),
                 }
-                Ok(serde_json::json!({ "undone": "move", "count": n }))
             }
         }
+    }
+
+    /// The mail moved from `account`'s folders to `to` put back where each came from, found there
+    /// by its Message-ID (`back`); how many. Refused, with whether to keep it to try again.
+    fn move_back(&mut self, account: &str, to: &str, back: &[(String, String)]) -> Result<usize, (CmdError, bool)> {
+        self.import_holds(account).map_err(|e| (e, true))?;
+        self.folders_ready(&[(account.to_string(), to.to_string())]).map_err(|e| (e, true))?;
+        // Where each one is now: the destination's messages with that Message-ID, by it (each
+        // was looked for in the whole folder: 5,000 back from 55,000 took 0.4 s). Of two with
+        // one id, each goes back once, the first listed first.
+        let mut here: HashMap<String, VecDeque<MessageKey>> = HashMap::new();
+        for m in &self.folder_state(account, to).messages {
+            here.entry(m.message_id.clone()).or_default().push_back(m.key.clone());
+        }
+        let mut by_folder: std::collections::BTreeMap<String, Vec<MessageKey>> = std::collections::BTreeMap::new();
+        let mut used = 0usize;
+        for (id, from) in back {
+            if let Some(k) = here.get_mut(id).and_then(VecDeque::pop_front) {
+                used += 1;
+                by_folder.entry(from.clone()).or_default().push(k);
+            }
+        }
+        if by_folder.is_empty() {
+            // Not there yet (the server is still moving them, and the folder they go to is read
+            // after): try again in a moment. For a couple of minutes after the move; a server
+            // account's, as a move on this computer is done at once.
+            let server = self.account(account).is_some_and(|a| !a.is_local());
+            if server && self.clock.now.saturating_sub(self.moved_at) < 120 {
+                return Err((CmdError::Failed("still being moved; try Undo again in a moment".into()), true));
+            }
+            // Gone from there since (deleted for good, moved on, the folder emptied): nothing to
+            // put back, and what was done before it can be undone. Kept to be tried again, it
+            // stood in the way of every Undo after.
+            return Err((CmdError::Failed("the mail isn't where it was moved to any more, so it can't be put back".into()), false));
+        }
+        let n = used;
+        for (from, keys) in by_folder {
+            self.apply_op(account, Op::Move { keys, to: from });
+        }
+        Ok(n)
     }
 }
 
@@ -660,4 +685,13 @@ fn put_day(days: &mut BTreeMap<String, i64>, id: String, day: Option<i64>) {
             days.remove(&id);
         }
     }
+}
+
+/// Message keys by their account, the accounts in order (the changes made to each go out so).
+pub(super) fn keys_by_account(keys: impl IntoIterator<Item = MessageKey>) -> BTreeMap<String, Vec<MessageKey>> {
+    let mut out: BTreeMap<String, Vec<MessageKey>> = BTreeMap::new();
+    for k in keys {
+        out.entry(k.account.clone()).or_default().push(k);
+    }
+    out
 }

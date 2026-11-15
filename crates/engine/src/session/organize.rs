@@ -12,6 +12,24 @@ pub mod search_folders;
 
 /// The folder snoozed mail waits in.
 const SNOOZED: &str = "Snoozed";
+/// How long a due snooze whose message isn't here yet waits to be looked for again (seconds),
+/// unless its folder changes first.
+const SNOOZE_LOOK_AGAIN: i64 = 60;
+
+/// When due snoozes were last looked for in their folders ([`Session::tick`]), and since then:
+/// whether one of those folders changed, and whether an import held some back.
+#[derive(Debug)]
+pub(crate) struct SnoozesLooked {
+    pub(crate) at: i64,
+    pub(crate) folder_changed: bool,
+    pub(crate) held: bool,
+}
+
+impl Default for SnoozesLooked {
+    fn default() -> Self {
+        SnoozesLooked { at: i64::MIN, folder_changed: false, held: false }
+    }
+}
 
 impl Session {
     // ----- categories and pins -----
@@ -21,23 +39,10 @@ impl Session {
         if !is_keyword(keyword) {
             return Err(CmdError::Params(format!("`{keyword}` can't be used as a keyword")));
         }
-        let sel = self.selected();
+        let sel = self.selected_shared();
         let first = sel.first().ok_or_else(|| CmdError::Disabled("no message selected".into()))?;
         let on = on.unwrap_or(!first.flags.has(keyword));
-        let mut by_account: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        let mut changed: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        for m in &sel {
-            by_account.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            if m.flags.has(keyword) != on {
-                changed.entry(m.key.account.clone()).or_default().push(m.key.clone());
-            }
-        }
-        for (a, keys) in changed {
-            self.remember(Undo::Ops { account: a, ops: vec![Op::SetKeyword { keys, keyword: keyword.to_string(), on: !on }] });
-        }
-        for (a, keys) in by_account {
-            self.apply_op(&a, Op::SetKeyword { keys, keyword: keyword.to_string(), on });
-        }
+        self.mark_selection(&sel, on, |m| m.flags.has(keyword), |keys, on| Op::SetKeyword { keys, keyword: keyword.to_string(), on });
         Ok(serde_json::json!({ "on": on, "count": sel.len() }))
     }
 
@@ -65,7 +70,7 @@ impl Session {
         if until <= self.clock.now {
             return Err(CmdError::Params("pick a time in the future".into()));
         }
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
@@ -86,7 +91,7 @@ impl Session {
         }
         for a in accounts {
             let folder = self.snoozed_folder(&a)?;
-            let mine: Vec<&Summary> = sel.iter().filter(|m| m.key.account == a && m.key.folder != folder).collect();
+            let mine: Vec<&Summary> = sel.iter().map(|m| &**m).filter(|m| m.key.account == a && m.key.folder != folder).collect();
             for m in &mine {
                 self.snoozes.retain(|s| !(s.account == a && s.message_id == m.message_id));
                 self.snoozes.push(Snooze {
@@ -117,7 +122,7 @@ impl Session {
 
     /// Bring snoozed messages back now.
     pub fn unsnooze_selection(&mut self) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         for m in &sel {
             self.import_holds(&m.key.account)?;
         }
@@ -163,6 +168,21 @@ impl Session {
         if !self.snoozes.iter().any(|s| s.until <= now) {
             return;
         }
+        // Those not found when last looked for (not synced here yet) are looked for again once
+        // their folder changes, or a minute on, or with one newly due: each frame, each looked
+        // through the whole Snoozed folder, for up to a week.
+        let looked = &self.snoozes_looked;
+        let newly_due = self.snoozes.iter().any(|s| s.until <= now && s.until > looked.at);
+        // Held back by an import that's over now: at once, as the import ends.
+        let let_go = looked.held && !self.snoozes.iter().any(|s| s.until <= now && self.importing.held(&s.account));
+        if !newly_due && !looked.folder_changed && !let_go && now < looked.at.saturating_add(SNOOZE_LOOK_AGAIN) {
+            return;
+        }
+        self.snoozes_looked = SnoozesLooked { at: now, folder_changed: false, held: false };
+        #[cfg(test)]
+        {
+            self.snooze_looks += 1;
+        }
         let due: Vec<Snooze> = self.snoozes.iter().filter(|s| s.until <= now).cloned().collect();
         let mut changed = false;
         for s in due {
@@ -173,6 +193,14 @@ impl Session {
             }
             // Its account's import writes the folders: it comes back once that's done.
             if self.importing.held(&s.account) {
+                self.snoozes_looked.held = true;
+                continue;
+            }
+            // Its folder's list can't be read just now (its read marks being saved, its data file
+            // being compacted): not looked through, so looked for again at the next tick (cheap
+            // while it can't be read), not a minute on, and not given up on meanwhile.
+            if self.load_cached(&s.account, &s.folder).is_err_and(|e| super::mailboxes::read_soon(&e)) {
+                self.snoozes_looked.folder_changed = true;
                 continue;
             }
             let found = self.folder_state(&s.account, &s.folder).messages.iter().find(|m| m.message_id == s.message_id).map(|m| m.key.clone());
@@ -188,7 +216,7 @@ impl Session {
                     changed = true;
                 }
                 // Not synced into the Snoozed folder yet; give up after a week.
-                None if now > s.until + 7 * 86_400 => {
+                None if now > s.until.saturating_add(7 * 86_400) => {
                     self.snoozes.retain(|x| x != &s);
                     changed = true;
                 }
@@ -272,10 +300,23 @@ impl Session {
     // ----- rules -----
 
     pub fn set_rules(&mut self, rules: Vec<Rule>) -> CmdResult {
+        self.check_rules(&rules)?;
+        self.rules = rules;
+        if let Some(store) = &self.store
+            && let Err(e) = store.save_doc(RULES_DOC, &self.rules)
+        {
+            return Err(CmdError::Failed(format!("the rules couldn't be saved: {e}")));
+        }
+        Ok(serde_json::json!({ "rules": self.rules.len() }))
+    }
+
+    /// Whether `rules` can take the place of the rules here: at most 500, each named, each
+    /// category they file mail under in the list, and the rules here read (not saved over).
+    fn check_rules(&self, rules: &[Rule]) -> Result<(), CmdError> {
         if rules.len() > 500 {
             return Err(CmdError::Params("at most 500 rules".into()));
         }
-        for r in &rules {
+        for r in rules {
             if r.name.trim().is_empty() {
                 return Err(CmdError::Params("every rule needs a name".into()));
             }
@@ -290,13 +331,7 @@ impl Session {
         if self.docs_unread.contains(RULES_DOC) {
             return Err(CmdError::Failed("Your rules couldn't be read, so they aren't saved over".into()));
         }
-        self.rules = rules;
-        if let Some(store) = &self.store
-            && let Err(e) = store.save_doc(RULES_DOC, &self.rules)
-        {
-            return Err(CmdError::Failed(format!("the rules couldn't be saved: {e}")));
-        }
-        Ok(serde_json::json!({ "rules": self.rules.len() }))
+        Ok(())
     }
 
     /// The rules as a file to keep or take to another computer (Outlook's Export Rules): each
@@ -347,6 +382,8 @@ impl Session {
             doc.get("categories").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
         let mut rules = if replace { Vec::new() } else { self.rules.clone() };
         let (mut added, mut off) = (0usize, 0usize);
+        // The categories the rules read file mail under (those already here among them too).
+        let mut wanted: Vec<String> = Vec::new();
         for (i, v) in list.into_iter().take(500).enumerate() {
             let email = v.get("accountEmail").and_then(serde_json::Value::as_str).map(str::to_string);
             let mut rule: Rule =
@@ -362,29 +399,38 @@ impl Session {
                     }
                 }
             }
-            for a in &rule.actions {
-                if let RuleAction::Categorize(c) = a
-                    && self.category(c).is_none()
-                {
-                    // With the keyword and colour it has where the rules came from, when that
-                    // keyword is free here.
-                    let from = known.iter().find(|k| k.name.eq_ignore_ascii_case(c));
-                    let made = match from {
-                        Some(k) => self.add_category(c, Some(k.color), Some(&k.keyword)),
-                        None => Err(CmdError::Params(String::new())),
-                    };
-                    if made.is_err() {
-                        self.add_category(c, None, None)?;
-                    }
-                }
-            }
+            wanted.extend(rule.actions.iter().filter_map(|a| if let RuleAction::Categorize(c) = a { Some(c.clone()) } else { None }));
             if !rules.contains(&rule) {
                 rules.push(rule);
                 added += 1;
             }
         }
+        // Every rule read: the categories they file mail under are made, and taken back when
+        // the rules are refused all the same (too many, the rules here unread), so a failed
+        // import leaves nothing behind. Made ones only go on the end of the list.
+        let had = self.prefs.categories.len();
+        let made = self.make_categories(&wanted, &known).and_then(|()| self.check_rules(&rules));
+        if let Err(e) = made {
+            self.prefs.categories.truncate(had);
+            return Err(e);
+        }
         self.set_rules(rules)?;
         Ok(serde_json::json!({ "added": added, "turnedOff": off, "rules": self.rules.len() }))
+    }
+
+    /// Make the categories called `names` that aren't in the list: with the keyword and colour
+    /// they have where rules came from (`known`), when that keyword is free here.
+    fn make_categories(&mut self, names: &[String], known: &[mailcraft_model::organize::Category]) -> Result<(), CmdError> {
+        for c in names {
+            if self.category(c).is_some() {
+                continue;
+            }
+            let made = known.iter().find(|k| k.name.eq_ignore_ascii_case(c)).and_then(|k| self.add_category(c, Some(k.color), Some(&k.keyword)).ok());
+            if made.is_none() {
+                self.add_category(c, None, None)?;
+            }
+        }
+        Ok(())
     }
 
     // ----- ignoring conversations -----
@@ -408,7 +454,7 @@ impl Session {
     /// goes to Deleted Items, and so does whatever arrives in them later. On conversations already
     /// ignored, stop ignoring them.
     pub fn ignore_selection(&mut self) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
@@ -423,26 +469,23 @@ impl Session {
         // The conversations' messages, in the folders the selection is in.
         let folders: Vec<(String, String)> = sel.iter().map(|m| (m.key.account.clone(), m.key.folder.clone())).collect();
         self.folders_ready(&folders)?;
-        let mut members: Vec<Summary> = Vec::new();
-        for m in &sel {
-            let folder = self.folder_state(&m.key.account, &m.key.folder).messages.clone();
+        // Each folder is threaded once, however many of its messages are selected; its
+        // conversations that hold a selected message are taken whole.
+        let selected: HashSet<&MessageKey> = sel.iter().map(|m| &m.key).collect();
+        let folders: BTreeSet<(String, String)> = folders.into_iter().collect();
+        let (mut members, mut taken): (Vec<SharedSummary>, HashSet<MessageKey>) = (Vec::new(), HashSet::new());
+        for (account, path) in folders {
+            let folder = self.folder_state(&account, &path).messages.clone();
             for t in mailcraft_model::thread::threads(&folder) {
-                let msgs: Vec<&Summary> = t.messages.iter().filter_map(|&i| folder.get(i).map(|m| &**m)).collect();
-                if msgs.iter().any(|x| x.key == m.key) {
-                    members.extend(msgs.into_iter().cloned());
+                let msgs: Vec<&SharedSummary> = t.messages.iter().filter_map(|&i| folder.get(i)).collect();
+                if msgs.iter().any(|x| selected.contains(&x.key)) {
+                    members.extend(msgs.into_iter().filter(|x| taken.insert(x.key.clone())).cloned());
                 }
             }
-            if !members.iter().any(|x| x.key == m.key) {
-                members.push(m.clone());
-            }
         }
+        members.extend(sel.iter().filter(|m| taken.insert(m.key.clone())).cloned());
         for m in &members {
             self.prefs.ignored.extend(Self::conversation_ids(m));
-        }
-        // Kept bounded: the oldest ids go first (a BTreeSet has no age; dropping any is safe).
-        while self.prefs.ignored.len() > 5_000 {
-            let Some(first) = self.prefs.ignored.iter().next().cloned() else { break };
-            self.prefs.ignored.remove(&first);
         }
         let keys: BTreeSet<MessageKey> = members.iter().map(|m| m.key.clone()).collect();
         self.selection = keys.into_iter().collect();
@@ -458,49 +501,60 @@ impl Session {
             return Vec::new();
         }
         let mut gone = Vec::new();
+        let mut changes = Batch::default();
         for m in msgs {
             if !self.is_ignored(m) {
                 continue;
             }
             self.prefs.ignored.extend(Self::conversation_ids(m));
-            let a = m.key.account.clone();
-            if let Some(trash) = self.account(&a).and_then(|x| x.folder(FolderRole::Trash)).map(|f| f.path.clone())
+            let a = &m.key.account;
+            if let Some(trash) = self.account(a).and_then(|x| x.folder(FolderRole::Trash)).map(|f| f.path.clone())
                 && trash != m.key.folder
             {
-                self.apply_op(&a, Op::Move { keys: vec![m.key.clone()], to: trash });
+                changes.add(a, Op::Move { keys: vec![m.key.clone()], to: trash });
                 gone.push(m.key.clone());
             }
         }
+        self.apply_changes(changes);
         gone
     }
 
     /// Run the rules on messages: their actions become ordinary changes. Returns the keys the
     /// rules marked read or sent to Deleted Items or Junk (no need to announce those).
     pub(super) fn run_rules(&mut self, msgs: &[Summary]) -> Vec<MessageKey> {
-        let mut quiet = Vec::new();
         if self.rules.is_empty() {
-            return quiet;
+            return Vec::new();
         }
         let rules = self.rules.clone();
+        self.apply_rules(&rules, msgs).0
+    }
+
+    /// [`Session::run_rules`] with these rules: the keys not to announce, and how many of `msgs`
+    /// a rule matched.
+    fn apply_rules<S: std::borrow::Borrow<Summary>>(&mut self, rules: &[Rule], msgs: &[S]) -> (Vec<MessageKey>, usize) {
+        let (mut quiet, mut matched) = (Vec::new(), 0usize);
+        let mut changes = Batch::default();
         for m in msgs {
-            let actions = actions_for(&rules, m);
+            let m: &Summary = m.borrow();
+            let actions = actions_for(rules, m);
             if actions.is_empty() {
                 continue;
             }
+            matched += 1;
             let a = m.key.account.clone();
             let keys = vec![m.key.clone()];
             let mut dest: Option<String> = None;
             for act in actions {
                 match act {
                     RuleAction::MarkRead => {
-                        self.apply_op(&a, Op::SetFlag { keys: keys.clone(), flag: Flag::Seen, on: true });
+                        changes.add(&a, Op::SetFlag { keys: keys.clone(), flag: Flag::Seen, on: true });
                         quiet.push(m.key.clone());
                     }
-                    RuleAction::Flag => self.apply_op(&a, Op::SetFlag { keys: keys.clone(), flag: Flag::Flagged, on: true }),
-                    RuleAction::Pin => self.apply_op(&a, Op::SetKeyword { keys: keys.clone(), keyword: PINNED.into(), on: true }),
+                    RuleAction::Flag => changes.add(&a, Op::SetFlag { keys: keys.clone(), flag: Flag::Flagged, on: true }),
+                    RuleAction::Pin => changes.add(&a, Op::SetKeyword { keys: keys.clone(), keyword: PINNED.into(), on: true }),
                     RuleAction::Categorize(c) => {
                         if let Some(kw) = self.category(&c).map(|c| c.keyword.clone()) {
-                            self.apply_op(&a, Op::SetKeyword { keys: keys.clone(), keyword: kw, on: true });
+                            changes.add(&a, Op::SetKeyword { keys: keys.clone(), keyword: kw, on: true });
                         }
                     }
                     RuleAction::MoveTo(f) => dest = self.folder(&a, &f).map(|f| f.path.clone()).or(dest),
@@ -508,52 +562,46 @@ impl Session {
                     RuleAction::Delete => dest = self.account(&a).and_then(|x| x.folder(FolderRole::Trash)).map(|f| f.path.clone()).or(dest),
                 }
             }
-            // Moves last, so flags and categories are set on the message before it leaves. Mail
-            // filed in a folder is still new mail (announced, as Outlook does); mail a rule sends
-            // to Deleted Items or Junk isn't.
+            // Moves last (`apply_changes`), so flags and categories are set on the message before
+            // it leaves. Mail filed in a folder is still new mail (announced, as Outlook does);
+            // mail a rule sends to Deleted Items or Junk isn't.
             if let Some(to) = dest.filter(|to| *to != m.key.folder) {
                 let role = self.folder(&a, &to).map(|f| f.role);
                 if matches!(role, Some(FolderRole::Trash | FolderRole::Junk)) {
                     quiet.push(m.key.clone());
                 }
-                self.apply_op(&a, Op::Move { keys, to });
+                changes.add(&a, Op::Move { keys, to });
             }
         }
-        quiet
+        self.apply_changes(changes);
+        (quiet, matched)
     }
 
     /// Run the rules (or one) now, on the list on screen or (`inbox`) on the mail already in the
     /// Inbox of the accounts they apply to, as Outlook's "run this rule now".
     pub fn run_rules_now(&mut self, only: Option<usize>, inbox: bool) -> CmdResult {
-        let saved = self.rules.clone();
-        if let Some(i) = only {
-            let r = saved.get(i).cloned().ok_or_else(|| CmdError::Params(format!("no rule {i}")))?;
-            self.rules = vec![Rule { enabled: true, ..r }];
-        }
-        let msgs: Vec<Summary> = if inbox {
-            let only_account = only.and_then(|i| saved.get(i)).and_then(|r| r.account.clone());
+        // The one asked for runs even when it's turned off; the rules kept stay as they are.
+        let rules = match only {
+            Some(i) => vec![self.rules.get(i).cloned().map(|r| Rule { enabled: true, ..r }).ok_or_else(|| CmdError::Params(format!("no rule {i}")))?],
+            None => self.rules.clone(),
+        };
+        let msgs: Vec<SharedSummary> = if inbox {
+            let only_account = only.and(rules.first()).and_then(|r| r.account.clone());
             let inboxes: Vec<(String, String)> = self
                 .accounts
                 .iter()
                 .filter(|a| only_account.as_ref().is_none_or(|o| *o == a.config.id))
                 .filter_map(|a| a.folder(FolderRole::Inbox).map(|f| (a.config.id.clone(), f.path.clone())))
                 .collect();
-            if let Err(e) = self.folders_ready(&inboxes) {
-                self.rules = saved;
-                return Err(e);
-            }
+            self.folders_ready(&inboxes)?;
             inboxes
                 .iter()
-                .flat_map(|(a, f)| {
-                    self.folder_state(a, f).messages.iter().filter(|m| !m.flags.deleted).map(|m| Summary::clone(m)).collect::<Vec<_>>()
-                })
+                .flat_map(|(a, f)| self.folder_state(a, f).messages.iter().filter(|m| !m.flags.deleted).cloned().collect::<Vec<_>>())
                 .collect()
         } else {
-            self.list.iter().map(|m| Summary::clone(m)).collect()
+            self.list.clone()
         };
-        let n = msgs.iter().filter(|m| !actions_for(&self.rules, m).is_empty()).count();
-        self.run_rules(&msgs);
-        self.rules = saved;
+        let (_, n) = self.apply_rules(&rules, &msgs);
         let what = if n == 1 { "1 message".to_string() } else { format!("{n} messages") };
         self.notice(format!("Rules ran on the mail there now: {what} matched"), false);
         Ok(serde_json::json!({ "matched": n }))
@@ -568,7 +616,7 @@ impl Session {
         if let Some(&f) = self.prefs.focus_overrides.get(&sender) {
             return f;
         }
-        !m.bulk || self.contacts.as_ref().and_then(|b| b.get(&sender)).is_some_and(|c| c.sent > 0)
+        !m.bulk || self.focus_book().and_then(|b| b.get(&sender)).is_some_and(|c| c.sent > 0)
     }
 
     /// Whether the list shows the Focused/Other split (an Inbox, with the option on).
@@ -578,7 +626,7 @@ impl Session {
 
     /// Always put the selection's senders in Focused (or Other).
     pub fn set_focus_for_selection(&mut self, focused: bool) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
@@ -616,16 +664,25 @@ impl Session {
             if self.folder(a, f).is_none_or(|x| matches!(x.role, FolderRole::Trash | FolderRole::Junk)) {
                 continue;
             }
-            let msgs: Vec<Summary> = self.folder_state(a, f).messages.iter().filter(|m| !m.flags.deleted).map(|m| Summary::clone(m)).collect();
+            let msgs: Vec<SharedSummary> = self.folder_state(a, f).messages.iter().filter(|m| !m.flags.deleted).cloned().collect();
             for t in mailcraft_model::thread::threads(&msgs) {
-                let members: Vec<&Summary> = t.messages.iter().filter_map(|&i| msgs.get(i)).collect();
+                let members: Vec<&Summary> = t.messages.iter().filter_map(|&i| msgs.get(i).map(|m| &**m)).collect();
                 if members.len() < 2 || only.is_some_and(|keys| !members.iter().any(|m| keys.contains(&m.key))) {
                     continue;
                 }
                 looked += 1;
+                // Only the sources whose text can change the answer are read and parsed: none in a
+                // conversation where nothing may go (all unread, flagged or categorized).
+                let wanted = mailcraft_model::cleanup::texts_wanted(&members, &categories);
+                if !wanted.contains(&true) {
+                    continue;
+                }
                 let texts: Vec<Option<String>> = members
                     .iter()
-                    .map(|m| self.store.as_ref().and_then(|s| s.read_body(&m.key)).and_then(|raw| mime::parse(&raw)).map(|p| p.text))
+                    .zip(&wanted)
+                    .map(|(m, &w)| {
+                        w.then(|| self.store.as_ref().and_then(|s| s.read_body(&m.key)).and_then(|raw| mime::parse(&raw)).map(|p| p.text)).flatten()
+                    })
                     .collect();
                 gone.extend(
                     mailcraft_model::cleanup::redundant(&members, &texts, &categories)

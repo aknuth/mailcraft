@@ -31,13 +31,9 @@ fn riley() -> smime::Identity {
 
 /// Put `raw` in the sample Inbox and open it.
 fn open_raw(s: &mut Session, uid: u32, raw: &[u8]) -> mailcraft_model::MessageKey {
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), mailcraft_model::Flags::default(), 0, s.clock.now).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let key = mailcraft_model::MessageKey { uid, ..next_key(s, "sample", "INBOX") };
+    let summary = mailcraft_mime::summary_from_full(raw, key, mailcraft_model::Flags::default(), 0, s.clock.now);
+    let key = file_in(s, summary, Some(raw));
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     key
@@ -99,7 +95,6 @@ fn signed_mail_says_who_signed_and_whether_to_trust_it() {
         String::from_utf8(testdata("signed-clear.eml")).unwrap().replace("From: Ana <ana@posteo.example>", "From: Boss <boss@posteo.example>");
     open_raw(&mut s, 9304, posing.as_bytes());
     assert!(matches!(security(&s).signed.unwrap().seal, Seal::Untrusted(p) if matches!(p.as_slice(), [smime::Problem::OtherAddress(_)])));
-    done(s);
 }
 
 #[test]
@@ -133,7 +128,39 @@ fn encrypted_mail_is_decrypted_and_kept_off_the_web() {
     let c = s.compose.clone().unwrap();
     assert!(c.encrypt && c.sign);
     s.run("compose.discard", &json!({})).unwrap();
-    done(s);
+}
+
+/// Audit #265: with more messages decrypted than are held in memory (64), the oldest is let go
+/// first, but never one shown, which would ask for its key (a keychain or card prompt) again.
+#[test]
+fn the_oldest_decrypted_message_not_shown_is_let_go_first() {
+    let mut s = with_certificate("smime-opened-kept");
+    let raw = testdata("encrypted-gcm.eml");
+    let shown = open_raw(&mut s, 9315, &raw);
+    answer_decrypt(&mut s);
+    assert_eq!(security(&s).lock, Some(Lock::Open { authenticated: true }));
+    // 64 more decrypted while it stays shown: the oldest of them goes, the shown one stays
+    // though it's older still.
+    let entity = b"Content-Type: text/plain\r\n\r\nElsewhere.\r\n".to_vec();
+    let mut others = Vec::new();
+    for n in 0..64 {
+        let key = mailcraft_model::MessageKey { uid: 20_000 + n, ..next_key(&s, "sample", "INBOX") };
+        let summary = mailcraft_mime::summary_from_full(&raw, key, mailcraft_model::Flags::default(), 0, s.clock.now);
+        let key = file_in(&mut s, summary, Some(&raw));
+        s.apply(Event::Decrypted { key: key.clone(), content: Some(mailcraft_model::Private(entity.clone())), authenticated: true, error: None });
+        others.push(key);
+    }
+    assert_eq!(s.reading.as_ref().map(|r| r.key.clone()), Some(shown.clone()), "still shown");
+    let asked = |s: &mut Session, key: &mailcraft_model::MessageKey| {
+        s.take_jobs();
+        s.run("list.open", &json!({"key": key.to_id()})).unwrap();
+        s.take_jobs().iter().any(|j| matches!(j, Job::Decrypt { .. }))
+    };
+    assert!(!asked(&mut s, &others[1]), "the second oldest is held");
+    assert!(!asked(&mut s, &others[63]), "and the newest");
+    assert!(!asked(&mut s, &shown), "the one shown is held");
+    assert_eq!(security(&s).lock, Some(Lock::Open { authenticated: true }));
+    assert!(asked(&mut s, &others[0]), "the oldest not shown went");
 }
 
 #[test]
@@ -142,7 +169,6 @@ fn without_a_certificate_encrypted_mail_says_why() {
     open_raw(&mut s, 9321, &testdata("encrypted-cbc.eml"));
     assert!(matches!(security(&s).lock, Some(Lock::Failed(e)) if e.contains("no certificate")));
     assert!(!s.take_jobs().iter().any(|j| matches!(j, Job::Decrypt { .. })));
-    done(s);
 }
 
 #[test]
@@ -191,7 +217,6 @@ fn sending_signs_and_encrypts_to_known_people_only() {
     s.apply(Event::Protected { account: "sample".into(), id, raw: None, error: Some("the key is gone".into()) });
     let c = s.compose.clone().unwrap();
     assert!(!c.sending && c.error.as_deref().is_some_and(|e| e.contains("the key is gone")));
-    done(s);
 }
 
 #[test]
@@ -216,7 +241,6 @@ fn the_certificate_can_be_forgotten() {
         error: Some("the password is wrong".into()),
     });
     assert!(s.notices.last().is_some_and(|n| n.error && n.text.contains("the password is wrong")));
-    done(s);
 }
 
 /// Issue #6: a renewed certificate. The older one comes back from the network layer as kept for
@@ -275,7 +299,6 @@ fn an_older_certificate_is_kept_for_reading() {
     s.take_jobs();
     let key = open_raw(&mut s, 9101, &raw);
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::Decrypt { key: k, .. } if *k == key)), "the older key may read it");
-    done(s);
 }
 
 #[test]
@@ -291,7 +314,6 @@ fn the_root_that_came_with_ones_own_certificate_is_trusted() {
     assert!(!inbox.messages.iter().find(|m| m.key.uid == 9341).unwrap().has_attachments);
     let enc = mailcraft_mime::summary_from_full(&testdata("encrypted-cbc.eml"), Default::default(), Default::default(), 0, 0);
     assert!(!enc.has_attachments);
-    done(s);
 }
 
 /// A message whose header fields are protected inside its signature (RFC 9788): the subject and
@@ -328,7 +350,6 @@ Date: Sat, 24 Oct 2026 09:00:00 +0000\r\nMessage-ID: <hp2@studio.example>\r\nMIM
     assert_eq!(s.reading.as_ref().unwrap().parsed.as_ref().unwrap().from.email, "director@posteo.example");
     let seal = security(&s).signed.unwrap().seal;
     assert!(matches!(&seal, Seal::Untrusted(p) if p.iter().any(|p| matches!(p, smime::Problem::OtherAddress(_)))), "{seal:?}");
-    done(s);
 }
 
 #[test]
@@ -375,7 +396,6 @@ fn a_withdrawn_certificate_is_said_only_when_asked_for() {
     open_raw(&mut s, 9357, &testdata("signed-clear.eml"));
     assert!(!s.take_jobs().iter().any(|j| matches!(j, Job::CheckRevocation { .. })));
     assert!(matches!(security(&s).signed.unwrap().seal, Seal::Untrusted(p) if p.contains(&smime::Problem::Revoked(LATER - 60))));
-    done(s);
 }
 
 #[test]
@@ -387,12 +407,17 @@ fn a_certificate_on_a_smart_card_becomes_the_accounts() {
     assert!(s.card_search().searching);
     let job = s.take_jobs().into_iter().find(|j| matches!(j, Job::FindHeldKeys { .. })).unwrap();
     assert!(matches!(&job, Job::FindHeldKeys { module: Some(m), pin: Some(p) } if m == "/usr/lib/opensc-pkcs11.so" && p.0 == "123456"));
+    // Kept for the key chosen, never written out (in a log, or what's shown of the search).
+    assert!(!format!("{:?}", s.card_search()).contains("123456"), "{:?}", s.card_search());
     // Nothing used before anything's found.
     assert!(s.run("security.useKey", &json!({"index": 0})).is_err());
     let card = mailcraft_model::HeldKey { label: "riley (PIV)".into(), cert: riley().chain[0].clone(), at: "{\"kind\":\"card\"}".into() };
     s.apply(Event::HeldKeys { keys: vec![card.clone()], error: None });
     assert_eq!((s.card_search().searching, s.card_search().keys.len()), (false, 1));
     assert_eq!(s.card_search().modules, ["/usr/lib/opensc-pkcs11.so"], "kept across searches");
+    // Its certificate read once, as it came, for the dialog to show whose it is.
+    assert_eq!(s.card_search().info(0).map(|i| i.emails.clone()), Some(vec!["riley@studio.example".to_string()]));
+    assert!(s.card_search().info(1).is_none());
     s.run("security.useKey", &json!({"index": 0})).unwrap();
     let job = s.take_jobs().into_iter().find(|j| matches!(j, Job::UseHeldKey { .. })).unwrap();
     assert!(matches!(&job, Job::UseHeldKey { at, cert, pin: Some(p), .. } if *at == card.at && *cert == card.cert && p.0 == "123456"));
@@ -404,7 +429,7 @@ fn a_certificate_on_a_smart_card_becomes_the_accounts() {
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::FindHeldKeys { module: None, pin: None })));
     s.apply(Event::HeldKeys { keys: Vec::new(), error: None });
     assert!(s.card_search().error.is_some());
-    done(s);
+    assert!(s.card_search().info(0).is_none(), "the last search's certificates are gone");
 }
 
 #[test]
@@ -420,7 +445,6 @@ fn a_certificate_comes_from_its_bytes_or_the_one_kept() {
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::ImportIdentity { data, password, .. } if data.is_empty() && password.0 == "secret")));
     assert!(s.run("security.import", &json!({"data": vec![0u8; (1 << 20) + 1]})).is_err(), "too big");
     assert!(s.run("security.import", &json!({"data": "not bytes", "path": ""})).is_err());
-    done(s);
 }
 
 #[test]
@@ -441,7 +465,6 @@ fn a_withdrawn_answer_outlives_a_full_cache() {
     open_raw(&mut s, 9362, &testdata("signed-clear.eml"));
     assert!(!s.take_jobs().iter().any(|j| matches!(j, Job::CheckRevocation { .. })));
     assert_eq!(security(&s).signed.unwrap().seal, Seal::Untrusted(vec![smime::Problem::Revoked(LATER - 60)]));
-    done(s);
 }
 
 /// Gap 7: the browser keeps an account's certificates unlocked between visits when asked (the
@@ -465,5 +488,126 @@ fn certificates_are_kept_unlocked_in_the_browser_when_asked() {
     assert!(saved.contains("keep_unlocked") || saved.contains("keepUnlocked"), "{saved}");
     s.run("security.keepUnlocked", &json!({"account": id, "on": false})).unwrap();
     assert!(matches!(s.take_jobs().as_slice(), [Job::KeepUnlocked { on: false, .. }]));
-    done(s);
+}
+
+/// A recipient's certificate withdrawn (its authority says so): the message bar says at once
+/// that they can't receive it encrypted. What reached them was kept for up to an hour.
+#[test]
+fn a_withdrawn_certificate_reaches_no_one_at_once() {
+    let mut s = with_certificate("smime-reach-withdrawn");
+    s.set_trust_roots(vec![ca()]);
+    open_raw(&mut s, 9361, &testdata("signed-clear.eml"));
+    s.run("mail.new", &json!({})).unwrap();
+    s.run("compose.update", &json!({"to": "ana@posteo.example", "subject": "Plan"})).unwrap();
+    assert_eq!(s.encryption_reach(), Some(crate::Reach::Everyone(crate::Scheme::Smime)));
+    let cert = s.smime_settings("sample").known.get("ana@posteo.example").map(|k| k.cert.clone()).unwrap();
+    s.apply(Event::Revocation { cert, status: mailcraft_model::Revocation::Revoked { at: LATER - 60 } });
+    assert_eq!(s.encryption_reach(), Some(crate::Reach::Missing { scheme: crate::Scheme::Smime, who: vec!["ana@posteo.example".into()] }));
+}
+
+/// The settings of an account that has none kept (or of no account) read as the defaults.
+#[test]
+fn settings_never_kept_are_the_defaults() {
+    let s = sample_session("smime-none-kept");
+    for account in ["sample", "nobody"] {
+        assert_eq!(*s.smime_settings(account), crate::SmimeSettings::default(), "{account}");
+        assert_eq!(*s.pgp_settings(account), crate::PgpSettings::default(), "{account}");
+    }
+}
+
+/// Audit #468: the account's own certificates, read once each time they change, are what its
+/// settings hold after every change (imported, renewed, an older one forgotten, the one in use
+/// forgotten) and when MailCraft opens again; a damaged one is left out, the rest still found.
+#[test]
+fn own_certificates_follow_every_change() {
+    let fingerprint = |der: &[u8]| smime::cert::info(der).unwrap().fingerprint;
+    let mut s = with_certificate("smime-own-follow");
+    let store = s.store.clone().unwrap();
+    let old = smime::read_p12(&testdata("riley-2025.p12"), "secret").unwrap();
+    let now = riley().chain[0].clone();
+    let shown = |s: &Session| {
+        (s.identity("sample").map(|i| i.fingerprint.clone()), s.older_identities("sample").iter().map(|i| i.fingerprint.clone()).collect::<Vec<_>>())
+    };
+    assert_eq!(shown(&s), (Some(fingerprint(&now)), vec![]));
+    // Renewed: the older one kept for reading, a damaged one beside it left out.
+    s.apply(Event::Identity {
+        account: "sample".into(),
+        chain: riley().chain,
+        older: vec![b"junk".to_vec(), old.chain[0].clone()],
+        for_reading: true,
+        error: None,
+    });
+    assert_eq!(shown(&s), (Some(fingerprint(&now)), vec![fingerprint(&old.chain[0])]));
+    // The one in use signs the account's mail, the certificate with what's read of it.
+    let (der, info) = s.own_cert_for("sample", "").unwrap();
+    assert_eq!((der, info.fingerprint.clone()), (now.as_slice(), fingerprint(&now)));
+    // As MailCraft opens again.
+    let again = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(LATER, 0));
+    assert_eq!(shown(&again), shown(&s));
+    // The one in use forgotten: the older one signs, itself, not the damaged one before it.
+    s.run("security.forget", &json!({})).unwrap();
+    assert_eq!(shown(&s), (None, vec![fingerprint(&old.chain[0])]));
+    let (der, info) = s.own_cert_for("sample", "").unwrap();
+    assert_eq!((der, info.fingerprint.clone()), (old.chain[0].as_slice(), fingerprint(&old.chain[0])));
+    // Then the older one.
+    s.run("security.forget", &json!({"older": fingerprint(&old.chain[0])})).unwrap();
+    assert_eq!(shown(&s), (None, vec![]));
+    let again = Session::open(Some(store), mailcraft_model::dates::Clock::new(LATER, 0));
+    assert_eq!(shown(&again), (None, vec![]));
+}
+
+/// Audit #264: what a message being written and sent reads of the account's settings (whether
+/// it signs, sends its key) costs the same with 5000 people's certificates and keys known as
+/// with none. Run in release: `cargo test --release -p mailcraft-engine --lib
+/// settings_read_with_many_known -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn settings_read_with_many_known() {
+    let s = sample_session("smime-many-known");
+    let store = s.store.clone().unwrap();
+    let blob: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+    let known =
+        |kind: &str| -> serde_json::Map<String, Value> { (0..5000).map(|n| (format!("person{n}@far.example"), json!({ kind: blob }))).collect() };
+    store.save_account_doc("sample", crate::session::SMIME_DOC, &json!({"sign": true, "known": known("cert")})).unwrap();
+    store.save_account_doc("sample", crate::session::PGP_DOC, &json!({"known": known("key")})).unwrap();
+    let mut s = Session::open(Some(store), mailcraft_model::dates::Clock::new(NOW, 0));
+    assert_eq!((s.smime_settings("sample").known.len(), s.pgp_settings("sample").known.len()), (5000, 5000));
+    s.run("mail.new", &json!({})).unwrap();
+    let raw = b"From: Riley <riley@studio.example>\r\nTo: ana@posteo.example\r\nSubject: Hi\r\n\r\nHello\r\n".to_vec();
+    const ROUNDS: u32 = 200;
+    let t = std::time::Instant::now();
+    for _ in 0..ROUNDS {
+        let _ = s.with_autocrypt("sample", raw.clone());
+        s.signing_follows_from("sample", "riley@studio.example");
+    }
+    println!("MEASURE a send's and a From change's settings read, 5000 known: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / f64::from(ROUNDS));
+}
+
+/// Audit #468: what File › Info's Security card asks of the account's own certificates on every
+/// frame (the one in use, the older ones, which addresses each signs, whether it can protect),
+/// and a message being written (which certificate signs it), parse none of them. Run in
+/// release: `cargo test --release -p mailcraft-engine --lib own_certificates_read_measure --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn own_certificates_read_measure() {
+    let mut s = with_certificate("smime-own-measure");
+    let old = smime::read_p12(&testdata("riley-2025.p12"), "secret").unwrap();
+    s.apply(Event::Identity { account: "sample".into(), chain: riley().chain, older: vec![old.chain[0].clone(); 4], for_reading: true, error: None });
+    assert_eq!(s.older_identities("sample").len(), 4);
+    const ROUNDS: u32 = 2000;
+    let t = std::time::Instant::now();
+    for _ in 0..ROUNDS {
+        let in_use = s.identity("sample").map(|c| c.not_after);
+        let mut signs = 0;
+        for c in s.older_identities("sample") {
+            signs += s.signed_by_certificate("sample", &c.fingerprint).len();
+        }
+        let signer = s.identity_for("sample", "riley@studio.example").is_some();
+        std::hint::black_box((in_use, signs, signer, s.can_protect("sample")));
+    }
+    println!(
+        "MEASURE a frame's questions of an account's certificates, 1 in use and 4 older: {:.1} µs",
+        t.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS)
+    );
 }

@@ -51,6 +51,13 @@ impl Session {
         self.compose.as_ref().and_then(|c| self.send_block(&c.account))
     }
 
+    /// Whether the message being written is to no one: its addresses read, none in To, Cc or
+    /// Bcc. Send refuses it for that (a `Params` error, its words for scripts); the window
+    /// asks this to say so in its own.
+    pub fn compose_has_no_recipient(&self) -> bool {
+        self.compose.as_ref().and_then(|c| self.draft_of(c, false).ok()).is_some_and(|d| no_recipient(&d))
+    }
+
     /// `account` when mail can be sent from it; else the first account that can send, as Outlook
     /// writes from the default account in a data file's folders; else `account` still (its
     /// Send says why it can't).
@@ -65,18 +72,7 @@ impl Session {
     /// data file's, or one gone) goes From it, its signature following as a From change does,
     /// so the message the bar asked to add an account for can go.
     pub(crate) fn move_to_sending_account(&mut self) {
-        let current = self.compose.take();
-        let aside = std::mem::take(&mut self.composes);
-        let mut moved = Vec::with_capacity(aside.len());
-        // Each in turn is the current one while it changes (the signature works on that one).
-        for c in aside {
-            self.compose = Some(c);
-            self.move_compose_to_sending_account();
-            moved.extend(self.compose.take());
-        }
-        self.composes = moved;
-        self.compose = current;
-        self.move_compose_to_sending_account();
+        self.each_compose(Self::move_compose_to_sending_account);
     }
 
     fn move_compose_to_sending_account(&mut self) {
@@ -100,4 +96,9 @@ impl Session {
             None => Ok(()),
         }
     }
+}
+
+/// A message to no one, which Send refuses ([`Session::compose_has_no_recipient`]).
+pub(super) fn no_recipient(d: &mime::Draft) -> bool {
+    d.recipients().is_empty()
 }

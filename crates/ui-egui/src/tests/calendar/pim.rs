@@ -6,7 +6,7 @@ use super::*;
 /// every module) grew each frame to its widest and Mail, Calendar and Notes stayed that wide.
 #[test]
 fn people_keep_the_pane_its_width() {
-    let (mut a, dir) = app("pane-width");
+    let (mut a, _) = app("pane-width");
     let ctx = egui::Context::default();
     // A panel's id is its parent's (the window's root) salted with its name.
     let mut root = egui::Id::NULL;
@@ -30,12 +30,11 @@ fn people_keep_the_pane_its_width() {
     frame(&ctx, &mut a, vec![]);
     let after = width(&ctx);
     assert!(before > 0.0 && after <= before + 1.0, "the pane went from {before} to {after}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn calendar_and_people_forms_save_through_commands() {
-    let (mut a, dir) = app("pim-forms");
+    let (mut a, _) = app("pim-forms");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     pim_tour(&mut a, &ctx);
@@ -45,7 +44,7 @@ fn calendar_and_people_forms_save_through_commands() {
         Dialog::Event(f) => {
             f.summary = "Grade the trailer".into();
             f.location = "Suite B".into();
-            f.repeat = "weekly".into();
+            f.repeat = crate::pim_dialogs::Repeat::Weekly;
             f.params()
         }
         _ => serde_json::Value::Null,
@@ -60,7 +59,7 @@ fn calendar_and_people_forms_save_through_commands() {
     let mut d = Dialog::open_event(&a.session, &made[0].uid, made[0].occurrence).unwrap();
     let params = match &mut d {
         Dialog::Event(f) => {
-            assert_eq!((f.summary.as_str(), f.repeat.as_str(), f.recurring), ("Grade the trailer", "weekly", true));
+            assert_eq!((f.summary.as_str(), &f.repeat, f.recurring), ("Grade the trailer", &crate::pim_dialogs::Repeat::Weekly, true));
             f.start = "25:00".into();
             f.params()
         }
@@ -89,7 +88,6 @@ fn calendar_and_people_forms_save_through_commands() {
     a.ui.dialog = Some(Dialog::new_contact());
     a.act(crate::Action::Submit("contact.create", f.params()));
     assert!(matches!(&a.ui.dialog, Some(Dialog::Contact(f)) if f.error.is_some()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Gap 9: on a 12-hour clock, an event's and a task's time boxes show their times as MailCraft
@@ -98,7 +96,7 @@ fn calendar_and_people_forms_save_through_commands() {
 #[test]
 fn time_boxes_on_a_12_hour_clock() {
     use mailcraft_engine::model::dates;
-    let (mut a, dir) = app("pim-12-hour");
+    let (mut a, _) = app("pim-12-hour");
     a.run("view.dateFormat", json!({"hours12": true}));
     let mut d = Dialog::new_event(&a.session, Some(NOW + 3 * 86_400 + 3600));
     let Dialog::Event(f) = &mut d else { panic!("an event form") };
@@ -142,12 +140,11 @@ fn time_boxes_on_a_12_hour_clock() {
     assert_eq!(at(reminder), (21, 0));
     let Some(Dialog::Task(f)) = Dialog::open_task(&a.session, &uid) else { panic!("no form") };
     assert_eq!(f.reminder_time, "9:00 PM");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn people_lay_out_as_a_list_cards_or_a_phone_list() {
-    let (mut a, dir) = app("people-views");
+    let (mut a, _) = app("people-views");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.run("view.module", json!({"name": "people"}));
@@ -169,12 +166,72 @@ fn people_lay_out_as_a_list_cards_or_a_phone_list() {
     assert_eq!(a.ui.people_view, crate::people::PeopleView::Phone);
     assert_eq!(a.ui.people_list.columns, [crate::people::Column::Mobile, crate::people::Column::Book]);
     assert_eq!(a.ui.people_list.sort, Some(crate::people::Column::Book));
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Audit #471: the List view's Address book column names a server's address book as the side
+/// pane does: one with no name (or the server's own "Contacts") is "Contacts" in the language
+/// shown (the column left it blank).
+#[test]
+fn the_people_list_names_address_books_as_the_side_pane_does() {
+    use mailcraft_engine::model::pim::{BookInfo, StoredCard};
+    let (mut a, _) = app("people-book-names");
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    let pim = a.session.pim.get_mut("sample").unwrap();
+    for (id, name, who) in [("server", "", "Zed Nameless"), ("server-2", "Contacts", "Yara Servers")] {
+        pim.books.push(BookInfo { id: id.into(), name: name.into(), ..Default::default() });
+        let card = mailcraft_engine::model::vcard::Card { uid: who.into(), name: who.into(), ..Default::default() };
+        pim.cards.push(StoredCard { book: id.into(), card, ..Default::default() });
+    }
+    a.session.pim_revision += 1;
+    a.run("view.module", json!({"name": "people"}));
+    a.ui.people_view = crate::people::PeopleView::Phone;
+    a.ui.people_list.columns = vec![crate::people::Column::Book];
+    frame(&ctx, &mut a, vec![]);
+    let texts = drawn_text(&ctx, &mut a, egui::vec2(1280.0, 800.0));
+    for who in ["Zed Nameless", "Yara Servers"] {
+        // The row's name in the list (right of the side pane's), and what's beside it.
+        let row = texts.iter().filter(|d| d.text == who).max_by(|x, y| x.rect.min.x.total_cmp(&y.rect.min.x)).unwrap();
+        let book: Vec<&str> = texts
+            .iter()
+            .filter(|d| d.rect.min.x > row.rect.max.x && (d.rect.center().y - row.rect.center().y).abs() < 2.0)
+            .map(|d| d.text.as_str())
+            .collect();
+        assert_eq!(book, ["Contacts"], "{who}");
+    }
+}
+
+/// Audit #472: in the List view, the row under the pointer lights up (its hover was read from a
+/// widget nothing registered, and never did), and the others don't.
+#[test]
+fn the_people_list_view_lights_the_row_pointed_at() {
+    let (mut a, _) = app("people-list-hover");
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    a.run("view.module", json!({"name": "people"}));
+    a.ui.people_view = crate::people::PeopleView::Phone;
+    let size = egui::vec2(1280.0, 800.0);
+    frame(&ctx, &mut a, vec![]);
+    let name = a.session.people("").first().map(|p| p.card.display()).unwrap();
+    let texts = drawn_with(&ctx, &mut a, size, vec![]);
+    // Its name in the list, right of the side pane's.
+    let at = texts.iter().filter(|d| d.text == name).map(|d| d.rect.center()).max_by(|x, y| x.x.total_cmp(&y.x)).unwrap();
+    let hover = a.ui.tokens.hover_row;
+    let lit = |out: &egui::FullOutput, at: egui::Pos2| {
+        out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == hover && r.rect.contains(at)))
+    };
+    let _ = sized_frame(&ctx, &mut a, size, vec![Event::PointerMoved(at)]);
+    let out = sized_frame(&ctx, &mut a, size, vec![]);
+    assert!(lit(&out, at), "the row pointed at lights up");
+    let away = at + egui::vec2(0.0, 60.0);
+    let _ = sized_frame(&ctx, &mut a, size, vec![Event::PointerMoved(away)]);
+    let out = sized_frame(&ctx, &mut a, size, vec![]);
+    assert!(!lit(&out, at) && lit(&out, away), "the light follows the pointer");
 }
 
 #[test]
 fn notes_are_written_on_and_kept() {
-    let (mut a, dir) = app("notes-ui");
+    let (mut a, _) = app("notes-ui");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.run("view.module", json!({"name": "notes"}));
@@ -193,14 +250,13 @@ fn notes_are_written_on_and_kept() {
     // Ctrl+1 goes back to Mail.
     frame(&ctx, &mut a, vec![key(Key::Num1, Modifiers::COMMAND)]);
     assert_eq!(a.session.module, mailcraft_engine::Module::Mail);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A note with files shows them at its foot, in both themes; opening one saves it for another
 /// app (which isn't there in a test, and says so), and Save as… asks where first.
 #[test]
 fn a_note_s_files_open_from_the_note() {
-    let (mut a, dir) = app("note-files-ui");
+    let (mut a, _) = app("note-files-ui");
     let ctx = egui::Context::default();
     a.run("view.module", json!({"name": "notes"}));
     let uid = a.session.notes("")[0].note.uid.clone();
@@ -218,14 +274,13 @@ fn a_note_s_files_open_from_the_note() {
     let notices = a.session.notices.len();
     a.act(crate::Action::NoteFile { uid: uid.clone(), index: 0, open: true });
     assert!(a.session.notices.iter().skip(notices).any(|n| n.text.contains("swatch.pdf")), "{:?}", a.session.notices);
-    if let Some(open) = mailcraft_engine::store::scratch_dir("open") {
-        assert_eq!(std::fs::read(open.join("swatch.pdf")).unwrap(), b"%PDF-1.7");
-    }
+    // In the test's own folder for files handed to other apps, not the user's.
+    let open = own_scratch_dir("open").unwrap();
+    assert_eq!(std::fs::read(open.join("swatch.pdf")).unwrap(), b"%PDF-1.7");
     // Save as… with nowhere chosen saves nothing and says nothing.
     let notices = a.session.notices.len();
     a.act(crate::Action::NoteFile { uid, index: 0, open: false });
     assert_eq!(a.session.notices.len(), notices);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #1: an invitation opens with its notes to read, its links under their words, and the
@@ -233,7 +288,7 @@ fn a_note_s_files_open_from_the_note() {
 /// the list's footer and the close warning draw.
 #[test]
 fn invitations_read_and_the_new_footers_draw() {
-    let (mut a, dir) = app("invitation");
+    let (mut a, _) = app("invitation");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let mut notes = String::from("Join with Google Meet<https://meet.google.com/abc-defg-hij>\nMeeting link\n");
@@ -268,12 +323,11 @@ fn invitations_read_and_the_new_footers_draw() {
     frame(&ctx, &mut a, vec![]);
     a.ui.dialog = Some(Dialog::LostOnClose { unsent: 2, changes: 1, sending: 1 });
     frame(&ctx, &mut a, vec![]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn reminders_pop_up_snooze_and_dismiss() {
-    let (mut a, dir) = app("reminders");
+    let (mut a, _) = app("reminders");
     let now = std::sync::Arc::new(std::sync::Mutex::new(NOW));
     let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     a.services = Box::new(Ticking(now.clone(), shown.clone()));
@@ -333,7 +387,6 @@ fn reminders_pop_up_snooze_and_dismiss() {
     *now.lock().unwrap() += 3600;
     frame(&ctx, &mut a, vec![]);
     assert!(!crate::reminders::showing(&a.ui.reminders));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #32: the event form shows an event's Private and Show as and saves what's changed; the
@@ -341,7 +394,7 @@ fn reminders_pop_up_snooze_and_dismiss() {
 #[test]
 fn the_event_form_sets_private_and_show_as() {
     use mailcraft_engine::model::ical::{Privacy, ShowAs, privacy, show_as};
-    let (mut a, dir) = app("event-private");
+    let (mut a, _) = app("event-private");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let lunch = a.session.agenda(NOW - 86_400, NOW + 86_400).into_iter().find(|i| i.summary == "Lunch with Jun").unwrap();
@@ -369,14 +422,13 @@ fn the_event_form_sets_private_and_show_as() {
         a.run("calendar.view", json!({"mode": mode}));
         frame(&ctx, &mut a, vec![]);
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #33: in the Calendar the search box searches the calendar (not mail); what it finds is
 /// listed, and one clicked goes to its day and opens.
 #[test]
 fn the_calendar_search_box_lists_and_opens_events() {
-    let (mut a, dir) = app("calendar-search");
+    let (mut a, _) = app("calendar-search");
     let ctx = egui::Context::default();
     a.run("view.module", json!({"name": "calendar"}));
     frame(&ctx, &mut a, vec![]);
@@ -398,21 +450,11 @@ fn the_calendar_search_box_lists_and_opens_events() {
     let day = a.session.clock.local(hits[0].start).div_euclid(86_400);
     assert_eq!(a.session.cal_day(), day, "on its day");
     frame(&ctx, &mut a, vec![]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The text drawn in a frame.
 fn texts(ctx: &egui::Context, a: &mut MailApp) -> Vec<String> {
-    let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 1600.0))), ..Default::default() };
-    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-    out.textures_delta.clear();
-    out.shapes
-        .iter()
-        .filter_map(|s| match &s.shape {
-            egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
-            _ => None,
-        })
-        .collect()
+    drawn_strings(ctx, a, egui::vec2(1280.0, 1600.0))
 }
 
 /// Issue #30: events kept on this computer before the account's calendars on its server were
@@ -420,7 +462,7 @@ fn texts(ctx: &egui::Context, a: &mut MailApp) -> Vec<String> {
 /// answered invitations, a folder per account when moving to one.
 #[test]
 fn local_events_are_offered_to_the_server() {
-    let (mut a, dir) = app("pim-local-offer");
+    let (mut a, _) = app("pim-local-offer");
     let ctx = egui::Context::default();
     let id =
         a.session.run("account.add", &json!({"email": "riley@work.example", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
@@ -450,5 +492,53 @@ fn local_events_are_offered_to_the_server() {
     }
     let _ = texts(&ctx, &mut a);
     a.ui.backstage = None;
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A contact with more postal addresses than the form has places for (two at home), and a number
+/// and an address of kinds it has no place for (a pager, a postal address), saved from the form
+/// as it opened keeps them all, each with its kind. The second home address was dropped, and the
+/// pager number and the postal address, put in the form's Other places, lost their kinds.
+#[test]
+fn a_contact_saved_from_the_form_keeps_its_extra_addresses_and_kinds() {
+    let (mut a, _) = app("contact-extras");
+    let address = |kind: &str, city: &str| json!({"kind": kind, "street": "1 Quay", "city": city});
+    let made = a.session.run(
+        "contact.create",
+        &json!({
+            "name": "Ana Lima",
+            "phones": [{"value": "+1 555 0100", "kind": "pager"}, {"value": "+1 555 0101", "kind": "home"}],
+            "addresses": [address("home", "Gent"), address("home", "Brugge"), address("postal", "Antwerpen")],
+        }),
+    );
+    let uid = made.unwrap()["uid"].as_str().unwrap().to_string();
+    let before = a.session.find_person(&uid).unwrap().card.clone();
+    let form = crate::pim_dialogs::ContactForm::edit(&before);
+    a.act(crate::Action::Submit("contact.update", form.params()));
+    let after = a.session.find_person(&uid).unwrap().card.clone();
+    let kinds = |c: &mailcraft_engine::model::vcard::Card| {
+        let mut phones: Vec<(String, String)> = c.phones.iter().map(|p| (p.kind.clone(), p.value.clone())).collect();
+        let mut places: Vec<(String, String)> = c.addresses.iter().map(|x| (x.kind.clone(), x.city.clone())).collect();
+        phones.sort();
+        places.sort();
+        (phones, places)
+    };
+    assert_eq!(kinds(&after), kinds(&before));
+    assert_eq!(after.addresses.len(), 3);
+}
+
+/// The Email button on a card named the Outlook way, "Last, First", starts a message to that one
+/// person. The name went in bare, and the comma parted it into two recipients, the first of
+/// them ("Park") not an address.
+#[test]
+fn email_on_a_card_named_last_first_writes_to_that_person() {
+    use mailcraft_engine::model::addr::parse_list;
+    let (mut a, _) = app("email-last-first");
+    assert!(parse_list("Park, Ann <ann@studio.example>").is_err(), "the name as it went in");
+    for act in crate::panes::people::write_to("Park, Ann", "ann@studio.example") {
+        a.act(act);
+    }
+    let to = a.session.compose.as_ref().map(|c| c.to.clone()).unwrap_or_default();
+    let people = parse_list(&to).unwrap();
+    assert_eq!(people.len(), 1, "{to}");
+    assert_eq!((people[0].name.as_str(), people[0].email.as_str()), ("Park, Ann", "ann@studio.example"));
 }

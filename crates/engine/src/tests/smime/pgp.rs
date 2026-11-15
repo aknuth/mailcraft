@@ -114,7 +114,7 @@ fn pgp_mime_signatures_say_who_signed() {
     let signed = security(&s).signed.unwrap();
     assert_eq!(signed.seal, Seal::Trusted);
     assert_eq!(signed.key.unwrap().emails, ["ana@posteo.example"]);
-    let known = s.pgp_settings("sample").known;
+    let known = &s.pgp_settings("sample").known;
     assert!(known.get("ana@posteo.example").is_some_and(|k| k.mutual && k.from == crate::KeySource::Autocrypt));
     // Changed after it was signed.
     let changed = String::from_utf8(signed_by_ana(false, &part)).unwrap().replace("is approved", "is rejected");
@@ -131,7 +131,6 @@ fn pgp_mime_signatures_say_who_signed() {
         .replace("From: Ana Lima <ana@posteo.example>", "From: Eve <eve@posteo.example>");
     open_raw(&mut s, 9505, other.as_bytes());
     assert!(!s.pgp_settings("sample").known.contains_key("eve@posteo.example"));
-    done(s);
 }
 
 #[test]
@@ -170,7 +169,6 @@ fn pgp_mail_is_decrypted_and_its_signature_checked() {
     open_raw(&mut s, 9513, &from_ana(false, "text/plain; charset=us-ascii", &String::from_utf8(pgpdata("ana-clearsigned.txt")).unwrap()));
     assert_eq!(security(&s).signed.unwrap().seal, Seal::Trusted);
     assert!(text(&s).contains("signed in the text itself") && !text(&s).contains("BEGIN PGP"));
-    done(s);
 }
 
 #[test]
@@ -185,7 +183,6 @@ fn pgp_mail_for_someone_else_says_why() {
     answer_decrypt(&mut s);
     assert!(matches!(security(&s).lock, Some(Lock::Failed(_))));
     assert!(!text(&s).contains("The plan"));
-    done(s);
 }
 
 #[test]
@@ -235,7 +232,6 @@ fn sending_with_pgp_encrypts_to_known_keys_and_self() {
     // A draft of it (on a server) is encrypted to Riley's key before it's saved.
     s.run("compose.update", &json!({"to": "ana@posteo.example"})).unwrap();
     assert!(s.seals_with_pgp(s.compose.as_ref().unwrap()));
-    done(s);
 }
 
 #[test]
@@ -260,7 +256,6 @@ fn with_both_the_recipients_choose() {
     assert!(s.run("compose.security", &json!({"scheme": "quantum"})).is_err());
     let r = s.run("compose.encryption", &json!({})).unwrap();
     assert_eq!(r["missing"], json!(["bo@studio.example"]));
-    done(s);
 }
 
 #[test]
@@ -293,10 +288,13 @@ fn keys_are_listed_kept_and_forgotten() {
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::Pgp { work: PgpWork::Forget { .. }, .. })));
     assert!(s.pgp_key("sample").is_none());
     assert!(!s.smime_settings("sample").sign);
-    // Nothing secret in what MailCraft keeps.
-    let doc = std::fs::read_to_string(s.store.as_ref().unwrap().root().join("accounts").join("sample").join(crate::PGP_DOC)).unwrap_or_default();
-    assert!(!doc.contains("PRIVATE"));
-    done(s);
+    // Nothing secret in what MailCraft keeps, read where the store keeps it, which must be there
+    // (a path with a folder the store doesn't have read nothing, and found nothing secret
+    // whatever was written).
+    let doc = s.store.as_ref().unwrap().load_account_doc_bytes("sample", crate::PGP_DOC).unwrap().expect("the account's OpenPGP settings are kept");
+    let doc = String::from_utf8_lossy(&doc);
+    assert!(doc.contains("ana@posteo.example"), "the keys known are in it: {doc}");
+    assert!(!doc.contains("PRIVATE"), "{doc}");
 }
 
 /// Issue #81: mail from another of the account's addresses is signed with the key that names
@@ -336,7 +334,6 @@ fn mail_from_another_address_is_signed_with_its_own_key() {
     assert_eq!(signer.as_deref(), Some(ana_info.fingerprint.as_str()), "the key that names the address it's from");
     let head = String::from_utf8_lossy(&raw.0).to_string();
     assert!(head.starts_with("Autocrypt: addr=ana@posteo.example; keydata="), "that address's key goes along: {head}");
-    done(s);
 }
 
 /// Found in review: a key from mail takes the place of one from older mail, by the messages'
@@ -354,8 +351,6 @@ fn a_key_from_mail_dated_ahead_is_no_newer_than_today() {
     let undated = String::from_utf8(from_ana(true, "text/plain", "Hello\r\n")).unwrap().replace("Date: Sat, 24 Oct 2026 09:00:00 +0000\r\n", "");
     open_raw(&mut s2, 9502, undated.as_bytes());
     assert_eq!(s2.pgp_settings("sample").known["ana@posteo.example"].seen, s2.clock.now);
-    done(s);
-    done(s2);
 }
 
 /// Found in a second review: a draft in plain text with an encrypted block pasted into it (one
@@ -374,5 +369,122 @@ Content-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
     s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
     let c = s.compose.as_ref().unwrap();
     assert!(c.body.contains("BEGIN PGP MESSAGE") && !c.encrypt, "{}", c.body);
-    done(s);
+}
+
+/// A key file given as its bytes (`data`, the browser's picker) has the cap a file named by its
+/// path has: someone's keys at most 8 MB, an own key or a certificate 1 MB. One past it is too
+/// big, said before anything reads it (someone's keys went to the key reader whatever their
+/// size); bytes that aren't bytes are refused.
+#[test]
+fn key_files_given_as_bytes_have_the_caps_of_files() {
+    let mut s = with_key("pgp-caps");
+    let too_big = |n: usize| json!({"data": vec![0u8; n + 1]});
+    for (id, max) in [("pgp.importPublic", 8 << 20), ("pgp.import", 1 << 20), ("security.import", 1 << 20)] {
+        let e = s.run(id, &too_big(max)).unwrap_err().to_string();
+        assert!(e.contains("too big"), "{id}: {e}");
+    }
+    let e = s.run("pgp.importPublic", &json!({"data": [1, 2, 300]})).unwrap_err().to_string();
+    assert!(e.contains("bytes"), "{e}");
+}
+
+/// A stored key that can't be read (a damaged `pgp.json`) before the others: each of the rest
+/// still signs with its own key. Paired with the infos of those that read, every later key went
+/// with the next one's info, so mail from Ana's address was signed with Riley's key.
+#[test]
+fn a_key_that_cant_be_read_leaves_the_others_their_own() {
+    let mut s = with_key("pgp-damaged-key");
+    s.run("account.setAddress", &json!({"account": "sample", "address": "ana@posteo.example"})).unwrap();
+    let (riley, ana) = (riley_key(), ana_public());
+    let damaged = b"not a key".to_vec();
+    s.apply(Event::PgpKeys { account: "sample".into(), keys: vec![damaged, riley.public.clone(), ana.clone()], imported: None, error: None });
+    let (key, info) = s.own_pgp_for("sample", "ana@posteo.example").unwrap();
+    assert_eq!((key, info.fingerprint), (ana.clone(), pgp::info(&ana).unwrap().fingerprint));
+    let (key, info) = s.own_pgp_for("sample", "").unwrap();
+    assert_eq!((key, info.fingerprint), (riley.public.clone(), riley.info.fingerprint.clone()));
+    assert_eq!(s.pgp_key("sample").unwrap().fingerprint, riley.info.fingerprint, "the first that reads is in use");
+    assert_eq!(s.pgp_older_keys("sample").len(), 1);
+}
+
+/// Writing from an address only an OpenPGP key names, on an account that has a certificate too:
+/// what the message bar says reaches the recipients is OpenPGP's, the protection it's sent with.
+/// It was worked out from the account's (S/MIME reached Ana, whose certificate came with her
+/// signed mail), turned encryption on by itself, and sending with OpenPGP then failed.
+#[test]
+fn the_reach_shown_is_what_the_message_is_sent_with() {
+    let mut s = super::with_certificate("pgp-reach-from");
+    s.clock.now = PGP_NOW;
+    s.set_trust_roots(vec![super::ca()]);
+    super::open_raw(&mut s, 9331, &super::testdata("signed-clear.eml"));
+    s.run("account.setAddress", &json!({"account": "sample", "address": "ana@posteo.example"})).unwrap();
+    s.apply(Event::PgpKeys { account: "sample".into(), keys: vec![ana_public()], imported: None, error: None });
+    s.run("mail.new", &json!({})).unwrap();
+    s.run("compose.update", &json!({"from": "ana@posteo.example", "to": "ana@posteo.example", "subject": "Hello"})).unwrap();
+    let c = s.compose.clone().unwrap();
+    assert_eq!(s.scheme_for(&c, &["ana@posteo.example".to_string()]), crate::Scheme::Pgp);
+    let reach = s.encryption_reach().unwrap();
+    assert!(matches!(reach, crate::Reach::Everyone(crate::Scheme::Pgp) | crate::Reach::Missing { scheme: crate::Scheme::Pgp, .. }), "{reach:?}");
+}
+
+/// A message's OpenPGP protection taken off as it reads (to reply, print or export it) says
+/// what it took off: a signature (PGP/MIME, or in the text itself), an encryption once it's
+/// decrypted (PGP/MIME or in the text; before, and for someone else's, it stays as it came),
+/// and neither for mail with none.
+#[test]
+fn pgp_mail_as_written_says_whether_it_was_signed_and_encrypted() {
+    let mut s = with_key("pgp-as-written");
+    let asc = |name: &str| String::from_utf8(pgpdata(name)).unwrap();
+    let pgp_mime = format!(
+        "--enc\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n\r\n--enc\r\nContent-Type: application/octet-stream; name=\"encrypted.asc\"\r\n\r\n{}\r\n--enc--\r\n",
+        asc("ana-to-riley.asc")
+    );
+    let inline = "text/plain; charset=us-ascii";
+    // (the message, the text it reads as once its protection is off, signed, encrypted)
+    let table: [(&str, Vec<u8>, &str, bool, bool); 6] = [
+        ("PGP/MIME signed", signed_by_ana(true, &pgpdata("ana-part.txt")), "the proof is approved", true, false),
+        (
+            "PGP/MIME encrypted",
+            from_ana(true, "multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"enc\"", &pgp_mime),
+            "the proof is approved",
+            false,
+            true,
+        ),
+        ("encrypted in its text", from_ana(false, inline, &asc("ana-inline.asc")), "signed in the text itself", false, true),
+        ("signed in its text", from_ana(false, inline, &asc("ana-clearsigned.txt")), "signed in the text itself", true, false),
+        ("encrypted to someone else", from_ana(false, "text/plain", &asc("to-bo.asc")), "", false, false),
+        ("neither", from_ana(false, "text/plain", "Just words.\r\n"), "Just words.", false, false),
+    ];
+    for (n, (what, raw, reads, signed, encrypted)) in table.into_iter().enumerate() {
+        let key = open_raw(&mut s, 9700 + u32::try_from(n).unwrap(), &raw);
+        if encrypted {
+            // Not decrypted yet: as it came, nothing taken off.
+            assert_eq!(s.as_written(&key, raw.clone()), (raw.clone(), false, false), "{what}, before it's decrypted");
+        }
+        answer_decrypt(&mut s);
+        let (written, was_signed, was_encrypted) = s.as_written(&key, raw.clone());
+        assert_eq!((was_signed, was_encrypted), (signed, encrypted), "{what}");
+        assert_eq!(written == raw, !signed && !encrypted, "{what}: as it came only when nothing came off");
+        let text = mailcraft_mime::parse(&written).map(|p| p.text).unwrap_or_default();
+        assert!(text.contains(reads) && (reads.is_empty() || !text.contains("BEGIN PGP")), "{what}: {text}");
+    }
+}
+
+/// Audit #274: a message's protection taken off as it reads (to reply, print or export it),
+/// timed for a big PGP/MIME signed one. Run in release: `cargo test --release -p
+/// mailcraft-engine --lib big_signed_message_as_written -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn big_signed_message_as_written() {
+    let mut s = with_key("pgp-big-written");
+    let line = "The proof is approved; print the festival poster as it stands.\r\n".repeat(160_000);
+    let part = format!("Content-Type: text/plain; charset=us-ascii\r\n\r\n{line}");
+    let raw = signed_by_ana(false, part.as_bytes());
+    let key = open_raw(&mut s, 9601, &raw);
+    let (written, signed, encrypted) = s.as_written(&key, raw.clone());
+    assert!(signed && !encrypted && written.len() > 9 << 20, "{}", written.len());
+    const ROUNDS: u32 = 10;
+    let t = std::time::Instant::now();
+    for _ in 0..ROUNDS {
+        let _ = s.as_written(&key, raw.clone());
+    }
+    println!("MEASURE a {} MB PGP/MIME signed message as written: {:.1} ms", raw.len() >> 20, t.elapsed().as_secs_f64() * 1000.0 / f64::from(ROUNDS));
 }

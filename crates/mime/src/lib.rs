@@ -13,7 +13,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod css;
-mod fonts;
+mod header;
+pub use header::{field_span, header_end, header_field, header_fields, report_type, without_line_end, written_message_id};
 pub mod layout;
 pub mod markup;
 pub mod office;
@@ -36,11 +37,14 @@ mod photos;
 pub mod smime;
 pub use smime::pgp;
 mod tnef;
+/// Outlook's RTF bodies for tests (`test-support`).
+#[cfg(any(test, feature = "test-support"))]
+pub use tnef::fixtures as tnef_fixtures;
 mod trackers;
 pub use attachments::{
-    AttachmentInfo, AttachmentKind, HtmlRefs, MAX_WANTED, PendingFile, TEXT_FIRST, attachment_data, attachment_data_moved, attachment_out,
-    attachment_text, attachments_data, attachments_moved, craft_app_for, draft_carries_files, index_doc, is_text_first, kind_of, part_name,
-    quoted_pictures, quoted_pictures_given, text_first, text_preview_kind,
+    AttachmentInfo, AttachmentKind, HtmlRefs, MAX_WANTED, PendingFile, TEXT_FIRST, attachment_data, attachment_out, attachment_text,
+    attachments_data, attachments_moved, attachments_out, craft_app_for, draft_carries_files, index_doc, is_text_first, kind_of, part_name,
+    quoted_pictures_given, text_first, text_preview_kind,
 };
 #[doc(hidden)]
 pub use attachments::{IndexStats, index_doc_stats};
@@ -152,7 +156,7 @@ fn summary_from_message(m: &Message<'_>, key: MessageKey, flags: Flags, size: u3
     // runs one table cell into the next: "BANNERFirst block", issue #41), from its start.
     let html_only = m.text_body().next().is_some_and(|p| is_html(&p));
     let text = match m.body_html(0).filter(|_| html_only) {
-        Some(h) => html::html_to_words(h.get(..h.char_indices().nth(PREVIEW_HTML).map_or(h.len(), |(i, _)| i)).unwrap_or(&h)),
+        Some(h) => html::html_to_words(capped(&h, PREVIEW_HTML)),
         None => m.body_text(0).map(|t| t.into_owned()).unwrap_or_default(),
     };
     let mut s = Summary {
@@ -295,7 +299,7 @@ pub struct Parsed {
     /// how many words.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hidden_text: String,
-    #[serde(default, skip_serializing_if = "is_none")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hidden_words: usize,
     /// Tracking pictures and links that report clicks, in the HTML body.
     #[serde(default, skip_serializing_if = "Trackers::is_empty")]
@@ -314,7 +318,7 @@ pub struct Parsed {
 }
 
 /// A run of text in a rich (HTML) message, with its formatting.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
     pub text: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -353,7 +357,7 @@ pub struct Span {
 }
 
 /// Text set above or below its line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Rise {
     #[default]
     Normal,
@@ -367,12 +371,9 @@ impl Rise {
     }
 }
 
-fn is_none(v: &usize) -> bool {
-    *v == 0
-}
-
-fn is_zero(v: &u8) -> bool {
-    *v == 0
+/// Whether a number is 0, for a field left out of what's kept when it is.
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Lines of a rich message, each a list of spans.
@@ -386,11 +387,7 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
     let real_html = m.html_body().any(|p| is_html(&p));
     // A `winmail.dat` gives its files, and its rich body when the message has no HTML (issue #18).
     let (attached, tnef_body) = attached(&m);
-    let tnef_html = match &tnef_body {
-        TnefBody::Html(h) if !real_html => Some(h.as_str()),
-        _ => None,
-    };
-    let html = html_whole(&m).filter(|_| real_html).or(tnef_html.map(std::borrow::Cow::Borrowed));
+    let (html, standing_in) = html_bodies(&m, real_html, &tnef_body);
     // Read once as desktop Outlook reads it (issue #47): the copy a newsletter gives Outlook, in
     // tables, rather than the columns of floats it gives the others, and its VML made HTML. Cut
     // at the cap first: what's written from it is read up to a multiple of it ([`WRITTEN_MAX`]).
@@ -432,27 +429,7 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
         }
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
-    // The HTML body's text as it's shown (Outlook's copy, without what's hidden from Outlook);
-    // other HTML as it came.
-    let as_text = |h: &str| match &ready {
-        Some(r) if html.as_deref() == Some(h) => html::html_to_text_within(&r.text, WRITTEN_MAX, r.hidden),
-        _ => html_to_text(h),
-    };
-    let (text, had_html) = match (m.text_body().len() > 0, m.body_text(0), html_whole(&m)) {
-        _ if let Some(h) = tnef_html => (as_text(h), true),
-        // Prefer the HTML version when the text part is an auto-generated stub.
-        (_, Some(t), Some(h)) if t.trim().is_empty() => (as_text(&h), true),
-        // Every text part (one after an attachment too), soft-wrapped lines whole again.
-        (true, Some(t), _) if !m.text_body().next().is_some_and(|p| is_html(&p)) => (tidy_text(&plain_body(&m).unwrap_or(t.into_owned())), real_html),
-        (_, _, Some(h)) => (as_text(&h), true),
-        (_, Some(t), None) => (tidy_text(&plain_body(&m).unwrap_or(t.into_owned())), false),
-        _ => (String::new(), false),
-    };
-    // Plain text Outlook wrapped, when the message has none of its own.
-    let text = match &tnef_body {
-        TnefBody::Text(t) if text.trim().is_empty() => tidy_text(t),
-        _ => text,
-    };
+    let (text, had_html) = shown_text(&m, real_html, &tnef_body, html.as_deref(), standing_in.as_deref(), ready.as_ref());
     let attachments = attached.into_iter().map(|a| a.info).collect();
     let unsubscribe = m.list_unsubscribe().and_then(|a| a.first()).and_then(|x| x.address()).map(|t| t.trim_matches(['<', '>']).to_string());
     Some(Parsed {
@@ -493,11 +470,23 @@ pub fn search_text(raw: &[u8]) -> String {
 pub fn summary_from_full(raw: &[u8], key: MessageKey, flags: Flags, size: u32, fallback_date: i64) -> Summary {
     let mut s = summary_from_header(raw, key, flags, size, fallback_date);
     if s.preview.is_empty()
-        && let Some(p) = parse(raw)
+        && let Some(text) = text_only(raw)
     {
-        s.preview = preview(&p.text);
+        s.preview = preview(&text);
     }
     s
+}
+
+/// [`Parsed::text`] alone, read as [`parse`] reads it: its HTML body made ready as it's shown,
+/// without the rich text, layout, pictures, trackers, hidden text and files read with it.
+fn text_only(raw: &[u8]) -> Option<String> {
+    let raw = &*readable_headers(raw);
+    let m = MessageParser::default().parse(raw)?;
+    let real_html = m.html_body().any(|p| is_html(&p));
+    let tnef_body = attachments::tnef_body(&m);
+    let (html, standing_in) = html_bodies(&m, real_html, &tnef_body);
+    let ready = html.as_ref().map(|h| layout::ready(capped(h, HTML_MAX), &outlook_copy(capped(h, HTML_MAX))));
+    Some(shown_text(&m, real_html, &tnef_body, html.as_deref(), standing_in.as_deref(), ready.as_ref()).0)
 }
 
 /// The header a draft's copy names the message it answers or forwards in ([`Draft::source`]).
@@ -644,35 +633,20 @@ pub fn new_message_id(from_email: &str, time: i64, seed: u64) -> String {
     format!("{:x}.{:016x}@{}", time.max(0), seed, domain)
 }
 
-/// Serialise a draft to RFC 5322 bytes. Bcc is written into a draft's copy only
-/// ([`Draft::keep_bcc`]); a message sent carries it in the SMTP envelope alone.
 /// The message with its `Date:` set to `date` (a message held back to be sent later is dated
 /// when it goes, as Outlook dates delayed mail). Messages without a header block come back as
 /// they were.
 pub fn with_date(raw: &[u8], date: i64) -> Vec<u8> {
-    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { return raw.to_vec() };
-    let head = &raw[..end + 2];
-    let mut out = Vec::with_capacity(raw.len() + 40);
-    let mut skipping = false;
-    let mut replaced = false;
-    for line in head.split_inclusive(|b| *b == b'\n') {
-        let folded = line.first().is_some_and(|b| *b == b' ' || *b == b'\t');
-        if skipping && folded {
-            continue;
-        }
-        skipping = false;
-        if !replaced && !folded && line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"date:") {
-            out.extend_from_slice(format!("Date: {}\r\n", mail_builder::headers::date::Date::new(date.max(0)).to_rfc822()).as_bytes());
-            skipping = true;
-            replaced = true;
-            continue;
-        }
-        out.extend_from_slice(line);
+    let Some(blank) = header_end(raw) else { return raw.to_vec() };
+    let mut out = raw.to_vec();
+    if let Some(field) = field_span(raw.get(..blank.start).unwrap_or_default(), "Date") {
+        out.splice(field, format!("Date: {}", mail_builder::headers::date::Date::new(date.max(0)).to_rfc822()).into_bytes());
     }
-    out.extend_from_slice(&raw[end + 2..]);
     out
 }
 
+/// Serialise a draft to RFC 5322 bytes. Bcc is written into a draft's copy only
+/// ([`Draft::keep_bcc`]); a message sent carries it in the SMTP envelope alone.
 pub fn build<'d>(d: &'d Draft, from: &EmailAddress, date: i64, message_id: &str) -> Result<Vec<u8>, String> {
     let mut b = MessageBuilder::new().from(b_addr(from)).subject(d.subject.clone()).date(date.max(0)).message_id(message_id.to_string());
     if !d.to.is_empty() {
@@ -820,7 +794,7 @@ fn seven_bit(data: &[u8]) -> bool {
 
 /// FNV-1a, for boundaries.
 fn fnv(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    mailcraft_model::hash::fnv1a(s.as_bytes())
 }
 
 #[cfg(test)]

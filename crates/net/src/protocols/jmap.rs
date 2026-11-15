@@ -33,8 +33,9 @@ impl From<NetError> for mailcraft_jmap::Error {
         match e {
             NetError::Io(e) => E::Io(e.to_string()),
             NetError::Tls(m) => E::Tls(m),
+            NetError::Untrusted { host, fingerprint } => E::Tls(mailcraft_model::local_certificate_refusal(&host, &fingerprint)),
             NetError::Protocol(m) => E::Protocol(m),
-            NetError::No(m) | NetError::NoFolder(m) | NetError::Refused(m) => E::No(m),
+            NetError::No(m) | NetError::NoFolder(m) | NetError::Refused(m) | NetError::MailboxClosed(m) => E::No(m),
             NetError::Bad(m) => E::Bad(m),
             NetError::Auth(m) => E::Auth(m),
             NetError::Closed(m) => E::Closed(m),
@@ -97,33 +98,37 @@ pub fn list_folders(c: &Client, st: &mut State, account: &str) -> Result<Vec<Fol
     Ok(block_on(mailcraft_jmap::list_folders(&c.0, st, account))?)
 }
 
-/// Bring one folder's cache up to date.
+/// [`sync_folder_as`] for an account as it is now (the tests').
+#[cfg(test)]
 pub fn sync_folder(c: &Client, st: &mut State, store: &Store, account: &str, folder: &str, opts: &SyncOptions) -> Result<SyncReport> {
     sync_folder_as(c, st, store, account, folder, opts, store.removals(account))
 }
 
-/// [`sync_folder`] for a worker that started when its account had been removed `seen` times: a
-/// removal since, while the sync talks to the server, has it write nothing of the account again.
+/// Bring one folder's cache up to date, for a worker that started when its account had been
+/// removed `seen` times: a removal since, while the sync talks to the server, has it write
+/// nothing of the account again.
 pub fn sync_folder_as(c: &Client, st: &mut State, store: &Store, account: &str, folder: &str, opts: &SyncOptions, seen: u64) -> Result<SyncReport> {
     Ok(block_on(mailcraft_jmap::sync_folder_as(&c.0, st, store, account, folder, opts, seen))?)
 }
 
-/// What the server finds in a folder for a search (issue #4), brought into its list.
+/// What the server finds in a folder for a search (issue #4), brought into its list (unless the
+/// account was removed since it had been removed `seen` times).
 pub fn find_on_server(
     c: &Client,
     st: &mut State,
     store: &Store,
-    account: &str,
+    (account, seen): (&str, u64),
     folder: &str,
     filter: &serde_json::Value,
     cap: usize,
 ) -> Result<(Vec<MessageKey>, usize)> {
-    Ok(block_on(mailcraft_jmap::find_on_server(&c.0, st, store, account, folder, filter, cap))?)
+    Ok(block_on(mailcraft_jmap::find_on_server(&c.0, st, store, (account, seen), folder, filter, cap))?)
 }
 
-/// Download one message's source (and cache it).
-pub fn fetch_body(c: &Client, st: &State, store: &Store, key: &MessageKey) -> Result<(Vec<u8>, Option<Summary>)> {
-    Ok(block_on(mailcraft_jmap::fetch_body(&c.0, st, store, key))?)
+/// Download one message's source (and cache it, unless the account was removed since it had been
+/// removed `seen` times).
+pub fn fetch_body(c: &Client, st: &State, store: &Store, key: &MessageKey, seen: u64) -> Result<(Vec<u8>, Option<Summary>)> {
+    Ok(block_on(mailcraft_jmap::fetch_body(&c.0, st, store, key, seen))?)
 }
 
 /// Apply one change on the server.

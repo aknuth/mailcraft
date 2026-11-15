@@ -5,6 +5,7 @@ use super::*;
 mod importing;
 #[cfg(test)]
 pub(crate) use importing::REMOVE_BACKSTOP;
+pub(crate) use importing::data_file_path;
 pub use importing::{Changes, ImportState, Imports};
 
 /// A local account with more messages than this keeps the counts it saved when it opens, rather
@@ -21,6 +22,22 @@ pub(super) enum Leaves {
     /// Its data file and the record of it, while an import still holds the file: the import
     /// removes the file when it ends, or the next start does.
     ForImport,
+}
+
+/// What an export left out or wrote otherwise than one message for one, said when it's done.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ExportLeft {
+    /// Messages not on this computer, left out.
+    pub(super) skipped: usize,
+    /// Messages the data file already had, not written again.
+    pub(super) already: usize,
+    /// Occurrences of series whose rule Outlook can't keep, each written on its own.
+    pub(super) occurrences: usize,
+    /// Calendar items, contacts, notes and tasks changed since the last export, written in
+    /// place of their earlier copies.
+    pub(super) replaced: usize,
+    /// Folders whose mail couldn't be read, so isn't in the file.
+    pub(super) folders: usize,
 }
 
 impl Session {
@@ -187,16 +204,20 @@ impl Session {
         Ok(serde_json::json!({ "account": account, "exporting": true }))
     }
 
-    /// How an export is going; `left`: messages not on this computer, ones the data file already
-    /// had, and occurrences of series Outlook can't keep the rule of, each written on its own.
-    pub(super) fn exported(&mut self, account: &str, messages: usize, left: (usize, usize, usize, usize), done: bool, error: Option<String>) {
-        let (skipped, already, occurrences, replaced) = left;
+    /// How an export is going; `left`, what it left out or wrote otherwise, said when it's done.
+    pub(super) fn exported(&mut self, account: &str, messages: usize, left: ExportLeft, done: bool, error: Option<String>) {
+        let ExportLeft { skipped, already, occurrences, replaced, folders } = left;
         let name = self.account(account).map(|a| a.config.email.clone()).unwrap_or_default();
         match (done, error) {
             (false, _) => self.notice(format!("{name}: {messages} messages exported so far…"), false),
             (true, Some(e)) => self.notice(format!("{name} could not be exported: {e}"), true),
             (true, None) => {
                 let mut more = Vec::new();
+                // Mail that should be there and isn't: said as a problem.
+                if folders > 0 {
+                    let which = if folders == 1 { "1 folder".to_string() } else { format!("{folders} folders") };
+                    more.push(format!("the mail of {which} couldn't be read, so it isn't in the file"));
+                }
                 if skipped > 0 {
                     more.push(format!("{skipped} not on this computer were left out"));
                 }
@@ -212,7 +233,7 @@ impl Session {
                     ));
                 }
                 let more = if more.is_empty() { String::new() } else { format!(" ({})", more.join("; ")) };
-                self.notice(format!("{name}: {messages} messages exported{more}"), false);
+                self.notice(format!("{name}: {messages} messages exported{more}"), folders > 0);
             }
         }
     }
@@ -253,16 +274,32 @@ impl Session {
         out
     }
 
-    /// Move a mailbox in the folder pane `by` places (an account's own order follows, as the
-    /// accounts' order is theirs everywhere else). Returns where it is now.
+    /// The mailboxes the folder pane shows: [`Session::pane_sections`] less the accounts that
+    /// have no mail (calendars and contacts only, issue #86), which are in Calendar and People.
+    pub fn mail_sections(&self) -> Vec<PaneSection> {
+        let no_mail = |id: &str| self.account(id).is_some_and(|a| a.config.is_calendar_only());
+        self.pane_sections().into_iter().filter(|s| !no_mail(&s.account)).collect()
+    }
+
+    /// Move a mailbox in the folder pane `by` places among the ones it shows (an account's own
+    /// order follows, as the accounts' order is theirs everywhere else). Returns where it is now.
     pub fn move_pane_section(&mut self, key: &str, by: i64) -> Result<usize, CmdError> {
         let mut order: Vec<String> = self.pane_sections().into_iter().map(|s| s.key).collect();
-        let from = order.iter().position(|k| k == key).ok_or_else(|| CmdError::Params(format!("no mailbox `{key}` in the folder pane")))?;
-        let last = order.len().saturating_sub(1);
+        // Counted among the mailboxes shown: one that isn't (it has no mail) is no place to
+        // move past. (An account with no mail moves among all of them.)
+        let mut shown: Vec<String> = self.mail_sections().into_iter().map(|s| s.key).collect();
+        if !shown.iter().any(|k| k == key) {
+            shown = order.clone();
+        }
+        let from = shown.iter().position(|k| k == key).ok_or_else(|| CmdError::Params(format!("no mailbox `{key}` in the folder pane")))?;
+        let last = shown.len().saturating_sub(1);
         let to = if by < 0 { from.saturating_sub(by.unsigned_abs() as usize) } else { from.saturating_add(by as usize).min(last) };
         if to != from {
-            let k = order.remove(from);
-            order.insert(to, k);
+            // Past the mailbox that's there now: before it going up, after it going down.
+            let past = shown.get(to).cloned().unwrap_or_default();
+            order.retain(|k| k != key);
+            let at = order.iter().position(|k| *k == past).map_or(order.len(), |at| if to > from { at + 1 } else { at });
+            order.insert(at, key.to_string());
             let ids: Vec<String> = order.iter().filter(|k| !k.contains('|')).cloned().collect();
             let mut accounts = std::mem::take(&mut self.accounts);
             accounts.sort_by_key(|a| ids.iter().position(|id| *id == a.config.id).unwrap_or(usize::MAX));
@@ -309,6 +346,7 @@ impl Session {
         }
         self.held.remove(id);
         self.pim.remove(id);
+        self.pim_revision = self.pim_revision.wrapping_add(1);
         // An account added later under the same id has its own calendar and contacts to save.
         self.pim_unread.remove(id);
         let mut kept = None;
@@ -508,13 +546,18 @@ impl Session {
         }
     }
 
-    /// A connection was refused, and `error` says a mail server on this computer showed a
+    /// A connection was refused, of a `kind` that says a mail server on this computer showed a
     /// certificate no authority vouches for (issue #77): the window is to ask about it, once for
     /// each certificate.
-    pub(crate) fn note_untrusted_certificate(&mut self, account: &str, error: &str) {
-        let Some((host, fingerprint)) = mailcraft_model::untrusted_local_certificate(error) else { return };
+    pub(crate) fn note_untrusted_certificate(&mut self, account: &str, kind: &FailureKind) {
+        let FailureKind::LocalCertificate { host, fingerprint } = kind else { return };
+        // Only a server's certificate, by its SHA-256, is asked about (and trusted).
+        if host.trim().is_empty() || !mailcraft_model::is_certificate_fingerprint(fingerprint) {
+            return;
+        }
+        let fingerprint = fingerprint.to_ascii_lowercase();
         if self.asked_certificate.len() < 64 && self.asked_certificate.insert((account.to_string(), fingerprint.clone())) {
-            self.ask_certificate.push((account.to_string(), host, fingerprint));
+            self.ask_certificate.push((account.to_string(), host.trim().to_string(), fingerprint));
         }
     }
 
@@ -525,7 +568,7 @@ impl Session {
         if !mailcraft_model::is_certificate_fingerprint(&fingerprint) {
             return Err(CmdError::Params("`fingerprint` is a certificate's SHA-256 in hex: 64 characters".into()));
         }
-        let mut config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let mut config = self.config_of(account)?;
         if !config.has_server() {
             return Err(CmdError::Params("that account has no server".into()));
         }
@@ -541,24 +584,7 @@ impl Session {
         config.migrate_signature();
         let id = config.id.clone();
         let Some(a) = self.account_mut(&id) else { return Err(CmdError::Params(format!("no account `{id}`"))) };
-        let reconnect = a.config.imap != config.imap
-            || a.config.smtp != config.smtp
-            || a.config.jmap != config.jmap
-            || a.config.graph != config.graph
-            || a.config.ews != config.ews
-            || a.config.pop != config.pop
-            || a.config.pop_delete != config.pop_delete
-            || a.config.pop_keep_days != config.pop_keep_days
-            || a.config.pop_delete_with_trash != config.pop_delete_with_trash
-            || a.config.username != config.username
-            || a.config.smtp_username != config.smtp_username
-            || a.config.shared_mailboxes != config.shared_mailboxes
-            || a.config.online_only != config.online_only
-            || a.config.check_every != config.check_every
-            || a.config.dav != config.dav
-            || a.config.user_agent != config.user_agent
-            || a.config.trusted_certificates != config.trusted_certificates
-            || password.is_some();
+        let reconnect = !a.config.same_connection(&config) || password.is_some();
         if config.online_only && !config.can_be_online_only() {
             return Err(CmdError::Params("a POP account keeps its mail on this computer: it can't be online only".into()));
         }
@@ -592,7 +618,7 @@ impl Session {
     /// needs its password; one already kept keeps it when none is given. They're looked for again
     /// at once.
     pub fn set_dav(&mut self, account: &str, caldav: &str, carddav: &str, username: Option<&str>, password: Option<&str>) -> CmdResult {
-        let mut config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let mut config = self.config_of(account)?;
         if (config.is_local() && !config.is_calendar_only()) || config.graph.is_some() || config.ews.is_some() {
             return Err(CmdError::Params("this account's calendars and contacts come with it: there's no address to give".into()));
         }
@@ -651,9 +677,6 @@ impl Session {
         }
     }
 
-    /// Ask every account to sync now.
-    /// Work offline, or connect again: every account's connection closes (changes, sent mail and
-    /// drafts wait on this computer) or opens. Ahead of anything queued, so what follows sees it.
     #[cfg(test)]
     pub(crate) fn jobs_push_for_test(&mut self, j: Job) {
         self.jobs.push(j);
@@ -666,6 +689,8 @@ impl Session {
         self.jobs.insert(0, Job::SetSync { messages: self.prefs.keep_messages, offline: self.prefs.keep_offline });
     }
 
+    /// Work offline, or connect again: every account's connection closes (changes, sent mail and
+    /// drafts wait on this computer) or opens. Ahead of anything queued, so what follows sees it.
     pub fn set_work_offline(&mut self, on: bool) {
         self.prefs.work_offline = on;
         self.jobs.retain(|j| !matches!(j, Job::WorkOffline { .. }));
@@ -677,6 +702,7 @@ impl Session {
         }
     }
 
+    /// Ask every account with a server to sync now; how many were asked.
     pub fn sync_all(&mut self) -> usize {
         let ids: Vec<String> = self.accounts.iter().filter(|a| a.config.has_server()).map(|a| a.config.id.clone()).collect();
         for id in &ids {

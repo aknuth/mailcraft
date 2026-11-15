@@ -4,7 +4,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use super::commits::{child, inbox, repairs_on_open};
+use super::commits::repairs_on_open;
 use super::*;
 use crate::OpenStage;
 
@@ -70,7 +70,6 @@ fn data_files_open_later_and_a_check_is_told() {
     // Other stores have nothing to open.
     assert_eq!(Store::memory().open_progress().stage(), OpenStage::Done);
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// A check names the file it is of, whatever was being opened, and counts once however often the
@@ -171,7 +170,6 @@ fn a_checked_data_file_is_not_checked_again() {
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success() && said.contains("checked 1"), "the child was to check zoe's file, then be killed: {said}");
     assert_eq!(repairs_on_open(&t, &file), (0, true), "checked again");
-    let _ = std::fs::remove_dir_all(&t);
 
     // Opened when needed, not all together: the check ends there too.
     let t = crashed("checked-lazily");
@@ -180,7 +178,6 @@ fn a_checked_data_file_is_not_checked_again() {
     let progress = s.open_progress();
     assert_eq!((progress.checked(), progress.stage()), (1, OpenStage::Opening), "the check didn't end");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// The child of [`a_checked_data_file_is_not_checked_again`]: opens the data files, then is killed
@@ -231,7 +228,6 @@ fn a_check_holds_up_only_its_own_account() {
     opening.join().unwrap().unwrap();
     assert_eq!((progress.checked(), progress.stage()), (1, OpenStage::Done), "checked once");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// A data file that can't be opened (another MailCraft has it) is told, and the others still open.
@@ -253,9 +249,11 @@ fn a_data_file_that_cant_be_opened_is_told() {
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert_eq!(problems[0].0, "zoe@studio.example.mailcraft");
     assert!(problems[0].1.contains("another copy of MailCraft"), "{problems:?}");
+    // Asked for, it's an error of that kind (the CLI says to close MailCraft by it).
+    let e = s.load_folders("a1").unwrap_err();
+    assert!(e.is_open_elsewhere(), "{e}");
     assert!(s.read_body(&MessageKey { account: "a2".into(), ..inbox(5) }).is_some(), "the other opened");
     drop((s, holder));
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// A store that handed read marks to its thread, dropped, lets its data file go: the folder
@@ -263,8 +261,7 @@ fn a_data_file_that_cant_be_opened_is_told() {
 #[test]
 fn a_data_file_marked_on_its_thread_opens_again() {
     let t = temp("marked-reopen");
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(&t);
     let k = inbox(7);
     let st = crate::FolderState {
         validity: k.validity,
@@ -287,7 +284,6 @@ fn a_data_file_marked_on_its_thread_opens_again() {
         }
     };
     assert!(back.find(7).unwrap().flags.seen);
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// A data file reads through handles of its own (ten on Windows, where reads through one handle
@@ -347,7 +343,6 @@ fn reads_through_handles_of_their_own_see_every_write() {
     let table = tx.open_table(T).unwrap();
     assert!((0..400).all(|i| table.get(i).unwrap().is_some_and(|v| v.value() == value(i).as_slice())));
     drop((table, tx, db));
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// Where the system has no byte-range locks (FreeBSD), the database locks the whole data file
@@ -367,7 +362,6 @@ fn a_data_file_locked_whole_is_in_use() {
     drop(db);
     assert!(!super::super::handles::whole_file_held(&path).unwrap(), "closed");
     assert!(!super::super::handles::in_use(&path).unwrap());
-    let _ = std::fs::remove_dir_all(&t);
 }
 
 /// An account removed while another thread still writes for it (an import not stopped yet, as
@@ -380,14 +374,13 @@ fn a_data_file_locked_whole_is_in_use() {
 fn a_write_as_an_account_lets_go_never_lends_it_the_old_file() {
     use std::sync::Mutex;
     let t = temp("let-go-write");
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(&t);
     s.write_body(&inbox(1), b"Subject: before\r\n\r\nx").unwrap();
     let old = s.data_file("a1").expect("zoe's file");
     // As it lets go, another thread starts a write for the account and has the time to open.
     let (tx, rx) = mpsc::channel::<()>();
     let tx = Mutex::new(tx);
-    *Mutex::lock(&super::compact::packs(&s).let_go_hook).unwrap() = Some(Box::new(move || {
+    *Mutex::lock(&packs(&s).let_go_hook).unwrap() = Some(Box::new(move || {
         let _ = tx.lock().unwrap().send(());
         std::thread::sleep(Duration::from_millis(200));
     }));
@@ -400,12 +393,100 @@ fn a_write_as_an_account_lets_go_never_lends_it_the_old_file() {
         let kept = s.remove_account("a1").unwrap();
         assert_eq!(kept.as_ref(), Some(&old), "the removed account's file is kept");
     });
-    *Mutex::lock(&super::compact::packs(&s).let_go_hook).unwrap() = None;
+    *Mutex::lock(&packs(&s).let_go_hook).unwrap() = None;
     // The id given to a new account: its folders go in a file of its own.
     let folder = mailcraft_model::Folder { account: "a1".into(), path: "INBOX".into(), ..Default::default() };
     s.save_folders("a1", std::slice::from_ref(&folder)).unwrap();
     let new = s.data_file("a1").expect("the new account's file");
     assert_ne!(new, old, "the new account writes in the removed one's file");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
+}
+
+/// A damaged list of which data file is each account's is set aside, and each account's file is
+/// found again by the name it was given. The list was taken for empty: the account showed no
+/// mail, and the next write gave it a second file beside the first, which was forgotten. A list
+/// that can't be read at all stops the opening rather than being taken for none.
+#[test]
+fn a_damaged_list_of_data_files_finds_them_again() {
+    let k = |a: &str, uid| MessageKey { account: a.into(), folder: "INBOX".into(), validity: 1, uid };
+    let t = temp("names-damaged");
+    let (app, files) = (t.join("app"), t.join("Files"));
+    let s = Store::open_packed(&app, &files).unwrap();
+    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    s.write_body(&k("a1", 1), b"Subject: kept\r\n\r\nkept").unwrap();
+    let file = s.data_file("a1").unwrap();
+    drop(s);
+    std::fs::write(app.join(super::super::NAMES), b"{\"a1\": ").unwrap();
+    let s = Store::open_packed(&app, &files).unwrap();
+    assert_eq!(s.data_file("a1"), Some(file.clone()), "found again");
+    assert_eq!(s.read_body(&k("a1", 1)).unwrap(), b"Subject: kept\r\n\r\nkept");
+    s.write_body(&k("a1", 2), b"Subject: more\r\n\r\nmore").unwrap();
+    assert_eq!(
+        std::fs::read_dir(&files).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "mailcraft")).count(),
+        1,
+        "no second file"
+    );
+    assert!(app.join("datafiles.json.bad").exists(), "the damaged list is set aside");
+    drop(s);
+    // One that can't be read (a folder in its place, as a file another program holds would be).
+    std::fs::remove_file(app.join(super::super::NAMES)).unwrap();
+    std::fs::create_dir(app.join(super::super::NAMES)).unwrap();
+    assert!(Store::open_packed(&app, &files).is_err());
+}
+
+/// Two accounts with one address, their data files `<address>` and `<address> (2)`, with the
+/// accounts listed the other way round by then; and `ana`, an address of her own.
+fn two_of_one_address(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let k = |a: &str| MessageKey { account: a.into(), folder: "INBOX".into(), validity: 1, uid: 1 };
+    let t = temp(name);
+    let (app, files) = (t.join("app"), t.join("Files"));
+    let s = Store::open_packed(&app, &files).unwrap();
+    s.save_accounts(&[account("a1", "zoe@studio.example"), account("a2", "zoe@studio.example"), account("a3", "ana@studio.example")]).unwrap();
+    for a in ["a1", "a2", "a3"] {
+        s.write_body(&k(a), format!("Subject: of {a}\r\n\r\nx").as_bytes()).unwrap();
+    }
+    let made: Vec<_> = ["a1", "a2", "a3"].iter().map(|a| s.data_file(a).unwrap()).collect();
+    assert!(made[1].to_string_lossy().ends_with("zoe@studio.example (2).mailcraft"));
+    s.save_accounts(&[account("a3", "ana@studio.example"), account("a2", "zoe@studio.example"), account("a1", "zoe@studio.example")]).unwrap();
+    (app, files, made)
+}
+
+/// With the list of data files damaged, two accounts of one address each get their own file
+/// back, by the account the file says it is. They were found by name alone, in the order the
+/// accounts are listed: the second account took the first one's file (and showed its mail), and
+/// the first was left with none.
+#[test]
+fn a_damaged_list_gives_accounts_of_one_address_their_own_files() {
+    let k = |a: &str| MessageKey { account: a.into(), folder: "INBOX".into(), validity: 1, uid: 1 };
+    let (app, files, made) = two_of_one_address("names-one-address");
+    std::fs::write(app.join(super::super::NAMES), b"{\"a1\": ").unwrap();
+    let s = Store::open_packed(&app, &files).unwrap();
+    for (a, file) in ["a1", "a2", "a3"].iter().zip(&made) {
+        assert_eq!(s.data_file(a).as_ref(), Some(file), "{a}");
+        assert_eq!(s.read_body(&k(a)).unwrap(), format!("Subject: of {a}\r\n\r\nx").as_bytes(), "{a}");
+    }
+}
+
+/// Data files that don't say whose they are (made before they did): an account whose address is
+/// its own is found by its file's name; of two with one address neither is taken for the other.
+/// Each starts a new file, and the old ones stay.
+#[test]
+fn a_damaged_list_never_guesses_between_accounts_of_one_address() {
+    let k = |a: &str| MessageKey { account: a.into(), folder: "INBOX".into(), validity: 1, uid: 1 };
+    let (app, files, made) = two_of_one_address("names-not-guessed");
+    {
+        let s = Store::open_packed(&app, &files).unwrap();
+        for a in ["a1", "a2", "a3"] {
+            packs(&s).set_owner(a, false).unwrap();
+        }
+    }
+    std::fs::write(app.join(super::super::NAMES), b"{\"a1\": ").unwrap();
+    let s = Store::open_packed(&app, &files).unwrap();
+    assert_eq!(s.data_file("a3").as_ref(), made.get(2), "found by its name");
+    assert_eq!(s.read_body(&k("a3")).unwrap(), b"Subject: of a3\r\n\r\nx");
+    assert_eq!((s.data_file("a1"), s.data_file("a2")), (None, None), "not guessed");
+    s.write_body(&k("a2"), b"Subject: new\r\n\r\ny").unwrap();
+    let new = s.data_file("a2").unwrap();
+    assert!(!made.contains(&new), "{}", new.display());
+    assert!(made.iter().all(|f| f.is_file()), "the old files stay");
 }

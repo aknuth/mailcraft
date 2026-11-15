@@ -3,35 +3,25 @@
 
 use super::*;
 
-fn account(port: u16) -> AccountConfig {
-    AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port, security: Security::None },
-        ..Default::default()
-    }
-}
-
 /// What a folder change made here while a full sync is on the Inbox, before the folder's turn,
 /// leaves said: the notices, and the server's folders after.
 fn mid_sync(op: Op, name: &str) -> (Vec<String>, Vec<String>) {
     let st = State::new();
+    let (hold, holding) = Hold::on("SELECT \"INBOX\"");
     {
         let mut s = st.lock().unwrap();
         s.add("Archive", "kept", &[]);
-        s.stall_on = Some(("SELECT \"INBOX\"".into(), Duration::from_millis(800)));
+        s.hold_on = Some(hold);
     }
     let port = serve_tcp(&st);
     let store = store(name);
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    pool.submit(Job::Start { account: account(port), password: Some(Secret("pw".into())) });
-    let mut seen =
-        until(&pool, "syncing the Inbox", |e| matches!(e, Event::Status { status: SyncStatus::Syncing { folder }, .. } if folder == "INBOX"));
-    pool.submit(Job::Apply { account: "a1".into(), op });
+    pool.submit(Job::Start { account: imap_account(port, 1), password: Some(Secret("pw".into())) });
+    let mut seen = super::counts::made_while_held(&mut pool, &store, holding, &[op]);
     seen.extend(until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. })));
-    std::thread::sleep(Duration::from_millis(500));
-    seen.extend(pool.poll());
+    seen.extend(events_until(&pool, "the change sent", |_| store.load_ops("a1").is_ok_and(|ops| ops.is_empty())));
+    // The sync goes on to the folder's turn after the change is sent: what it says there too.
+    seen.extend(crate::waiting::until_idle(&pool, "a1"));
     let notices = seen
         .iter()
         .filter_map(|e| match e {
@@ -41,7 +31,6 @@ fn mid_sync(op: Op, name: &str) -> (Vec<String>, Vec<String>) {
         .collect();
     let folders = st.lock().unwrap().boxes.iter().map(|b| b.name.clone()).collect();
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
     (notices, folders)
 }
 
@@ -72,13 +61,13 @@ fn a_folder_renamed_twice_offline_keeps_its_mail() {
     {
         let mut s = st.lock().unwrap();
         s.add("Archive", "kept", &[]);
-        s.boxes.push(Mailbox { name: "Other".into(), attr: "", validity: 400, uid_next: 1, msgs: Vec::new(), expunged: Vec::new() });
+        s.boxes.push(Mailbox::new("Other", "", 400));
         s.add("Other", "elsewhere", &[]);
     }
     let port = serve_tcp(&st);
     let store = store("renamed-twice-offline");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    pool.submit(Job::Start { account: account(port), password: Some(Secret("pw".into())) });
+    pool.submit(Job::Start { account: imap_account(port, 1), password: Some(Secret("pw".into())) });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     let cached = |path: &str| store.load_folder("a1", path).map(|f| f.messages.len()).unwrap_or(0);
     assert_eq!((cached("Archive"), cached("Other")), (1, 1));
@@ -89,16 +78,13 @@ fn a_folder_renamed_twice_offline_keeps_its_mail() {
     pool.submit(Job::Apply { account: "a1".into(), op: Op::RenameFolder { from: "Plans".into(), to: "Done".into() } });
     // Both in the cache and waiting for the server (the second is queued just after the cache
     // has it).
-    let end = Instant::now() + Duration::from_secs(20);
-    while cached("Done") == 0 || store.load_ops("a1").unwrap_or_default().len() < 2 {
-        assert!(Instant::now() < end, "the renames never reached the cache");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the renames in the cache", || cached("Done") > 0 && store.load_ops("a1").unwrap_or_default().len() >= 2);
     st.lock().unwrap().log.clear();
     pool.submit(Job::WorkOffline { on: false });
     let mut seen = until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-    std::thread::sleep(Duration::from_millis(500));
-    seen.extend(pool.poll());
+    seen.extend(events_until(&pool, "the renames sent", |_| store.load_ops("a1").is_ok_and(|ops| ops.is_empty())));
+    // The folders are synced after the renames are sent: what's said, and cleared, then too.
+    seen.extend(crate::waiting::until_idle(&pool, "a1"));
     let notices: Vec<&String> = seen
         .iter()
         .filter_map(|e| match e {
@@ -114,5 +100,4 @@ fn a_folder_renamed_twice_offline_keeps_its_mail() {
     assert_eq!(cached("Done"), 1);
     assert_eq!(cached("Other"), 0, "the folder deleted on the server keeps its cache");
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }

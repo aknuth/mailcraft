@@ -171,10 +171,7 @@ fn details_ui(ui: &mut Ui, s: &Session, t: &Tokens, account: &str, st: &ImportSt
         let words = tf!("Not brought in so far: {n}", n = p.skipped);
         let shown = ui.add(egui::Label::new(RichText::new(words).color(t.dim).small()).wrap());
         if !why.is_empty() {
-            shown.on_hover_text(why.join(
-                "
-",
-            ));
+            shown.on_hover_text(why.join("\n"));
         }
     }
     if let Some(b) = &p.blocked {
@@ -183,8 +180,7 @@ fn details_ui(ui: &mut Ui, s: &Session, t: &Tokens, account: &str, st: &ImportSt
     if let Some(file) = s.store.as_ref().and_then(|store| store.data_file(account)) {
         line(ui, tf!("Saved in: {path}", path = file.display()));
         if file.exists() && ui.link(RichText::new(tl!("Open file location")).small()).clicked() {
-            let dir = file.parent().map_or_else(|| file.clone(), std::path::Path::to_path_buf);
-            acts.push(Action::OpenFolder(dir));
+            acts.push(Action::OpenFolder(nav::folder_of(&file)));
         }
     }
     ui.add_space(8.0);
@@ -271,7 +267,10 @@ pub(crate) fn nav_line(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Acti
 /// done with it).
 pub(crate) fn outline(s: &Session, t: &Tokens, ui: &mut Ui, account: &str, have: &[mailcraft_engine::model::Folder]) {
     let Some(st) = s.import_state(account).filter(|st| !st.removing) else { return };
-    for f in st.planned.iter().filter(|f| !have.iter().any(|h| h.path == f.path)) {
+    // Looked up, not searched for each planned folder: a plan of thousands of folders was
+    // compared with every folder in for each one, every frame.
+    let in_already: std::collections::HashSet<&str> = have.iter().map(|h| h.path.as_str()).collect();
+    for f in st.planned.iter().filter(|f| !in_already.contains(f.path.as_str())) {
         let depth = f.path.matches('/').count().saturating_add(1);
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
         let m = bidi::Mirror::new(rect);

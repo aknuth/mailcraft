@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod fold;
+mod forks;
 mod fuzz;
 mod ico;
 mod icons;
@@ -48,6 +49,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("mailcraft-print", 1),
     ("mailcraft-html", 1),
     ("mailcraft-smime", 1),
+    ("mailcraft-pgp", 1),
     ("mailcraft-jmap", 2),
     ("mailcraft-keys", 2),
     ("mailcraft-net", 3),
@@ -55,9 +57,9 @@ const LAYERS: &[(&str, u8)] = &[
     ("mailcraft-ui-egui", 6),
 ];
 
-/// Third-party crates built from a fork with fixes of ours, pinned by revision in
-/// `[patch.crates-io]`. Each fork's `PATCHES.md` lists its fixes, and its own tests prove them.
-const FORKED: &[&str] = &[];
+/// The workspace's binaries and tools, above every layer: they may depend on anything. Every
+/// other package must have a layer, so a new crate can't go unchecked.
+const APPS: &[&str] = &["mailcraft", "mailcraft-cli", "mailcraft-web", "xtask"];
 
 /// Crates that never build for the web (sockets, threads, TLS).
 const NATIVE_ONLY: &[&str] = &["mailcraft-keys", "mailcraft-net"];
@@ -109,7 +111,12 @@ fn layer(name: &str) -> Option<u8> {
 fn violations(crates: &[(String, Vec<(String, bool)>)]) -> Vec<String> {
     let mut out = Vec::new();
     for (name, deps) in crates {
-        let Some(own) = layer(name) else { continue };
+        let Some(own) = layer(name) else {
+            if !APPS.contains(&name.as_str()) {
+                out.push(format!("{name} has no layer: add it to LAYERS (or APPS) in xtask/src/main.rs"));
+            }
+            continue;
+        };
         for (dep, dev) in deps {
             if *dev {
                 continue;
@@ -147,7 +154,11 @@ fn cmd_layers() -> Result<(), String> {
         .collect();
     for (name, deps) in &crates {
         let ws: Vec<&str> = deps.iter().filter(|(d, dev)| !dev && d.starts_with("mailcraft-")).map(|(d, _)| d.as_str()).collect();
-        let l = layer(name).map_or("app".to_string(), |l| format!("L{l}"));
+        let l = match layer(name) {
+            Some(l) => format!("L{l}"),
+            None if APPS.contains(&name.as_str()) => "app".to_string(),
+            None => "?".to_string(),
+        };
         println!("{name:<20} {l:<4} {}", ws.join(", "));
     }
     let v = violations(&crates);
@@ -220,31 +231,6 @@ fn cmd_wasm() -> Result<(), String> {
     run(c, "cargo check --target wasm32-unknown-unknown (portable crates)")
 }
 
-/// Each forked crate is what both workspaces build, at the same revision: the main one and the
-/// fuzzing one (a fix missing from the fuzz build would leave the weekly run fuzzing the code it
-/// replaced).
-fn patched(root: &Path) -> Result<(), String> {
-    let read = |manifest: &str| std::fs::read_to_string(root.join(manifest)).map_err(|e| format!("{manifest}: {e}"));
-    let (main, fuzz) = (read("Cargo.toml")?, read("fuzz/Cargo.toml")?);
-    let wrong: Vec<String> = FORKED
-        .iter()
-        .filter_map(|name| match (pin(&main, name), pin(&fuzz, name)) {
-            (Some(a), Some(b)) if a == b => None,
-            (a, b) => Some(format!("{name}: {a:?} in Cargo.toml, {b:?} in fuzz/Cargo.toml")),
-        })
-        .collect();
-    if wrong.is_empty() { Ok(()) } else { Err(format!("forked crates not pinned alike in [patch.crates-io]:\n  {}", wrong.join("\n  "))) }
-}
-
-/// The fork and revision a manifest's `[patch.crates-io]` takes `name` from, as `<git>@<rev>`.
-fn pin(manifest: &str, name: &str) -> Option<String> {
-    // The section itself, at the start of a line (a comment may name it too).
-    let patch = manifest.split("\n[patch.crates-io]").nth(1).map(|p| p.split("\n[").next().unwrap_or(p))?;
-    let line = patch.lines().find(|l| l.trim_start().starts_with(&format!("{name} ")))?;
-    let field = |key: &str| line.split(&format!("{key} = \"")).nth(1).and_then(|v| v.split('"').next());
-    Some(format!("{}@{}", field("git")?, field("rev")?))
-}
-
 fn cmd_ci() -> Result<(), String> {
     let mut fmt = cargo();
     fmt.args(["fmt", "--all", "--", "--check"]);
@@ -257,7 +243,7 @@ fn cmd_ci() -> Result<(), String> {
     let mut test = cargo();
     test.args(["test", "--workspace"]);
     run(test, "cargo test")?;
-    patched(&root())?;
+    forks::run(&root())?;
     locks::run(&root(), &[])?;
     cmd_layers()?;
     cmd_assets()?;
@@ -310,20 +296,21 @@ mod tests {
         assert!(v[1].contains("egui"));
     }
 
+    /// A package with no layer fails the check instead of going unchecked; the apps may use
+    /// anything.
     #[test]
-    fn forked_crates_are_pinned_alike() {
-        let ok = "# [patch.crates-io] below\n[patch.crates-io]\negui = { git = \"x\" }\nforked-rw = { git = \"https://f.git\", rev = \"1a\" }\n";
-        assert_eq!(pin(ok, "forked-rw").as_deref(), Some("https://f.git@1a"));
-        assert_eq!(pin(&ok.replace("1a", "2b"), "forked-rw").as_deref(), Some("https://f.git@2b"), "another revision");
-        assert_eq!(pin(&ok.replace(", rev = \"1a\"", ""), "forked-rw"), None, "a branch's head isn't a pin");
-        let elsewhere = "[dependencies]\nforked-rw = { git = \"https://f.git\", rev = \"1a\" }\n[patch.crates-io]\negui = \"1\"\n";
-        assert_eq!(pin(elsewhere, "forked-rw"), None, "only [patch.crates-io] counts");
-        // A crate whose name begins another's has its own pin.
-        let both = format!("{ok}forked = {{ git = \"https://f.git\", rev = \"3c\" }}\n");
-        assert_eq!(pin(&both, "forked-rw").as_deref(), Some("https://f.git@1a"));
-        assert_eq!(pin(&both, "forked").as_deref(), Some("https://f.git@3c"));
-        assert_eq!(pin(ok, "forked"), None, "another crate's pin isn't this one's");
-        assert!(patched(&root()).is_ok(), "{:?}", patched(&root()));
+    fn a_crate_without_a_layer_fails() {
+        let crates = vec![
+            ("mailcraft-new".to_string(), vec![("mailcraft-net".to_string(), false), ("egui".to_string(), false)]),
+            ("mailcraft".to_string(), vec![("mailcraft-net".to_string(), false), ("eframe".to_string(), false)]),
+        ];
+        let v = violations(&crates);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].starts_with("mailcraft-new has no layer"), "{v:?}");
+        // OpenPGP is L1: it may use the model, not the engine.
+        let pgp = |dep: &str| violations(&[("mailcraft-pgp".to_string(), vec![(dep.to_string(), false)])]);
+        assert!(pgp("mailcraft-model").is_empty());
+        assert_eq!(pgp("mailcraft-engine").len(), 1);
     }
 
     /// Names are read whole, non-ASCII ones too; a listing that fails (no checkout) fails the
@@ -332,8 +319,11 @@ mod tests {
     fn file_listings_are_whole_and_never_silently_empty() {
         assert_eq!(nul_separated(b"assets/\xc3\xa9 b.png\0docs/x.svg\0"), vec!["assets/é b.png".to_string(), "docs/x.svg".into()]);
         assert!(nul_separated(b"").is_empty());
-        let dir = std::env::temp_dir().join(format!("mailcraft-xtask-nogit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Made new, under a name no one could have taken first: a folder or link already at a
+        // name it could guess would be someone else's, and the test would write into it.
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!("mailcraft-xtask-nogit-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("ATTRIBUTION.md"), "").unwrap();
         let in_checkout = Command::new("git").current_dir(&dir).args(["rev-parse", "--git-dir"]).output().is_ok_and(|o| o.status.success());
         let (listed, checked) = (git_files(&dir, None), assets(&dir));

@@ -3,25 +3,16 @@
 //! code, from a file saved as Outlook saves one, and back to the formatted editor.
 
 use super::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Services whose file picker gives this file.
-struct Picks(PathBuf);
+struct PicksFile(PathBuf);
 
-impl crate::Services for Picks {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
+impl crate::Services for PicksFile {
+    stub_services!(clock, save_path, open_path);
     fn pick_files(&mut self) -> Vec<PathBuf> {
         vec![self.0.clone()]
     }
-    fn save_path(&mut self, _: &str) -> Option<PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &Path) -> Result<(), String> {
-        Ok(())
-    }
-    fn notify(&mut self, _: &str, _: &str) {}
 }
 
 fn form(a: &MailApp) -> &crate::dialogs::SignatureForm {
@@ -50,7 +41,7 @@ fn an_outlook_signature_file_becomes_the_code() {
     htm.retain(|b| *b != b'\r');
     let file = folder.join("Andr\u{e9} Moss.htm");
     std::fs::write(&file, &htm).unwrap();
-    a.services = Box::new(Picks(file));
+    a.services = Box::new(PicksFile(file));
     frame(&ctx, &mut a, vec![]);
     a.ui.dialog = Dialog::signature(&a.session);
     a.act(crate::Action::SignatureFile);
@@ -59,7 +50,7 @@ fn an_outlook_signature_file_becomes_the_code() {
     assert!(code.starts_with("<div class=WordSection1>") && code.contains("Andr\u{e9} Moss") && code.contains("Caf\u{e9} \u{2013} Sales"), "{code}");
     assert!(code.contains("src=\"picture:1\"") && !code.contains("v:imagedata") && !code.contains("<![if"), "{code}");
     assert_eq!(f.pictures.len(), 1, "the one beside it, not the one outside its folder");
-    assert!(code.contains("src=\"file:../secret.png\"") || code.contains("src=\"../secret.png\""), "left as written: {code}");
+    assert!(code.contains("<img src=\"file:../secret.png\">"), "left as written, as a file it may not read: {code}");
 
     // To the formatted editor and back: the text and look, then the code again.
     let Some(Dialog::Signature(f)) = a.ui.dialog.as_mut() else { panic!() };
@@ -76,26 +67,6 @@ fn an_outlook_signature_file_becomes_the_code() {
     a.ui.dialog = Dialog::signature(&a.session);
     assert!(form(&a).code.as_deref().is_some_and(|c| c.contains("WordSection1")));
     frame(&ctx, &mut a, vec![]);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Click the button a screen reader names `label` (the frame after shows what it did).
-fn click(ctx: &egui::Context, a: &mut MailApp, label: &str) {
-    let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
-    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-    out.textures_delta.clear();
-    let nodes = out.platform_output.accesskit_update.expect("AccessKit is on").nodes;
-    let at = nodes
-        .iter()
-        .find(|(_, n)| n.label() == Some(label) && n.bounds().is_some() && !n.is_disabled())
-        .and_then(|(_, n)| n.bounds())
-        .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
-        .unwrap_or_else(|| panic!("no {label} to click"));
-    let button = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    frame(ctx, a, vec![Event::PointerMoved(at)]);
-    frame(ctx, a, vec![button(true)]);
-    frame(ctx, a, vec![button(false)]);
-    frame(ctx, a, vec![]);
 }
 
 fn form_mut(a: &mut MailApp) -> &mut crate::dialogs::SignatureForm {
@@ -107,7 +78,7 @@ fn form_mut(a: &mut MailApp) -> &mut crate::dialogs::SignatureForm {
 /// replies, renamed (the defaults following it) and deleted; "(none)" is a choice too.
 #[test]
 fn signatures_are_made_renamed_and_chosen_in_the_editor() {
-    let (mut a, dir) = app("signatures-editor");
+    let (mut a, _) = app("signatures-editor");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     frame(&ctx, &mut a, vec![]);
@@ -115,13 +86,13 @@ fn signatures_are_made_renamed_and_chosen_in_the_editor() {
     frame(&ctx, &mut a, vec![]);
     assert_eq!(form(&a).name, "Signature", "the one from before");
     assert!(form(&a).compose.body.contains("Riley Moreno"));
-    click(&ctx, &mut a, "New");
+    click_named(&ctx, &mut a, "New");
     let f = form_mut(&mut a);
     assert_eq!((f.editing.as_deref(), f.name.as_str()), (None, "Signature 2"), "a name not taken");
     f.name = "Short".into();
     f.compose.set_text("Riley".into());
     f.for_reply = Some("Short".into());
-    click(&ctx, &mut a, "Save");
+    click_named(&ctx, &mut a, "Save");
     assert!(a.ui.dialog.is_none(), "saved and closed");
     let config = a.session.account("sample").unwrap().config.clone();
     assert_eq!(config.signatures.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Signature", "Short"]);
@@ -132,7 +103,7 @@ fn signatures_are_made_renamed_and_chosen_in_the_editor() {
     a.ui.dialog = Dialog::signature(&a.session);
     frame(&ctx, &mut a, vec![]);
     form_mut(&mut a).name = "Full".into();
-    click(&ctx, &mut a, "New");
+    click_named(&ctx, &mut a, "New");
     let config = a.session.account("sample").unwrap().config.clone();
     assert_eq!(config.signature_new.as_deref(), Some("Full"), "{:?}", config.signatures);
     assert_eq!(form(&a).names, ["Short", "Full"]);
@@ -140,31 +111,30 @@ fn signatures_are_made_renamed_and_chosen_in_the_editor() {
     // Deleted: gone, and none goes into replies.
     let Some(Dialog::Signature(f)) = a.ui.dialog.as_mut() else { panic!() };
     f.load(&a.session, Some("Short"));
-    click(&ctx, &mut a, "Delete");
+    click_named(&ctx, &mut a, "Delete");
     assert!(a.session.account("sample").unwrap().config.signature_named("Short").is_none());
     assert_eq!(form(&a).for_reply, None);
     assert_eq!(form(&a).name, "Full", "the next one to edit");
     form_mut(&mut a).for_new = None;
-    click(&ctx, &mut a, "Save");
+    click_named(&ctx, &mut a, "Save");
     assert_eq!(a.session.account("sample").unwrap().config.signature_new, None, "(none) for new messages");
     a.run("mail.new", json!({}));
     assert_eq!(a.session.compose.as_ref().unwrap().body, "");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The message's Signature menu lists the account's signatures: one picked takes the place of
 /// the one in the message.
 #[test]
 fn the_signature_menu_lists_the_accounts_signatures() {
-    let (mut a, dir) = app("signatures-menu");
+    let (mut a, _) = app("signatures-menu");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     a.session.prefs.new_mail_window = false;
     a.run("account.setSignature", json!({"account": "sample", "name": "Short", "signature": "R."}));
     a.run("mail.new", json!({}));
     frame(&ctx, &mut a, vec![]);
-    click(&ctx, &mut a, "Signature");
-    click(&ctx, &mut a, "Short");
+    click_named(&ctx, &mut a, "Signature");
+    click_named(&ctx, &mut a, "Short");
     let c = a.session.compose.as_ref().unwrap();
     assert!(c.body.ends_with("-- \nR.") && c.body.matches("-- ").count() == 1, "{:?}", c.body);
     assert_eq!(c.signature_name, "Short");
@@ -173,19 +143,18 @@ fn the_signature_menu_lists_the_accounts_signatures() {
     let desk = a.session.accounts.iter().find(|x| x.config.email == "desk@studio.example").map(|x| x.config.id.clone()).unwrap();
     a.run("account.setSignature", json!({"account": desk, "name": "Desk", "signature": "Front desk"}));
     frame(&ctx, &mut a, vec![]);
-    click(&ctx, &mut a, "From");
-    click(&ctx, &mut a, "Front desk <desk@studio.example>");
+    click_named(&ctx, &mut a, "From");
+    click_named(&ctx, &mut a, "Front desk <desk@studio.example>");
     let c = a.session.compose.as_ref().unwrap();
     assert_eq!(c.account, desk);
     assert!(c.body.ends_with("-- \nFront desk") && c.body.matches("-- ").count() == 1, "{:?}", c.body);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Renamed to another signature's name, it isn't saved (it would take that one's place), nor
 /// left behind by switching: the editor says why and waits.
 #[test]
 fn a_signature_cant_take_anothers_name() {
-    let (mut a, dir) = app("signatures-taken");
+    let (mut a, _) = app("signatures-taken");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     a.run("account.setSignature", json!({"account": "sample", "name": "Short", "signature": "R."}));
@@ -194,24 +163,23 @@ fn a_signature_cant_take_anothers_name() {
     frame(&ctx, &mut a, vec![]);
     form_mut(&mut a).name = "short".into();
     assert!(form(&a).problem().is_some());
-    click(&ctx, &mut a, "New");
+    click_named(&ctx, &mut a, "New");
     assert_eq!(form(&a).name, "short", "still this one, to put right");
     frame(&ctx, &mut a, vec![]);
     let config = a.session.account("sample").unwrap().config.clone();
     assert_eq!(config.signature_named("Short").map(|g| g.text.as_str()), Some("R."), "the other one untouched");
     assert_eq!(config.signatures.len(), 2);
     form_mut(&mut a).name = "Long".into();
-    click(&ctx, &mut a, "Save");
+    click_named(&ctx, &mut a, "Save");
     let config = a.session.account("sample").unwrap().config.clone();
     assert_eq!(config.signatures.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["Long", "Short"]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An account's first signature shows for new messages and replies alike, as it's saved; one
 /// chosen for new messages only, "(none)" for replies, is saved so (it went into both).
 #[test]
 fn the_first_signature_is_saved_with_the_defaults_chosen() {
-    let (mut a, dir) = app("signatures-first");
+    let (mut a, _) = app("signatures-first");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     a.run("account.removeSignature", json!({"account": "sample", "name": "Signature"}));
@@ -228,8 +196,137 @@ fn the_first_signature_is_saved_with_the_defaults_chosen() {
     f.picked = true;
     frame(&ctx, &mut a, vec![]);
     assert_eq!(form(&a).for_reply, None, "kept as picked");
-    click(&ctx, &mut a, "Save");
+    click_named(&ctx, &mut a, "Save");
     let config = a.session.account("sample").unwrap().config.clone();
     assert_eq!((config.signature_new.as_deref(), config.signature_reply.as_deref()), (Some("Signature"), None));
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Issue #90: a signature written as HTML code shows in the message being written as it's sent,
+/// its columns side by side, where its text stands; the text itself stays in the message (what's
+/// sent is made from it) and isn't drawn. It was its text, one part under another. Sent as plain
+/// text, or changed in the message, it's its text again.
+#[test]
+fn a_signature_in_columns_is_drawn_in_columns_while_writing() {
+    const CODE: &str = r#"<table width="560" cellspacing="0" cellpadding="0" style="width:560px"><tr>
+<td width="120" style="width:120px">STUDIO</td>
+<td width="200" style="width:200px;padding:0 16px 0 12px"><b>Ms. Riley Moreno</b><br>riley@studio.example</td>
+<td style="padding:0 0 0 16px;border-left:1px solid #E30613;font-size:11px">12 Harbour Road<br>Portside</td></tr></table>"#;
+    let (mut a, _) = app("signature-card");
+    let ctx = egui::Context::default();
+    a.run("account.setSignature", json!({"account": "sample", "name": "Card", "signature": "", "code": CODE}));
+    a.run("account.signatureDefaults", json!({"account": "sample", "new": "Card"}));
+    a.run("mail.new", json!({}));
+    let size = egui::vec2(1280.0, 800.0);
+    // Where a piece of text was drawn by itself (the editor's text is one piece, all of it).
+    let piece = |a: &mut MailApp, text: &str| {
+        // (Its room is its size from the frame after it's first drawn.)
+        for _ in 0..3 {
+            drawn_text(&ctx, a, size);
+        }
+        drawn_text(&ctx, a, size).into_iter().find(|d| d.text.trim() == text).map(|d| d.ink)
+    };
+    let body = a.session.compose.as_ref().unwrap().body.clone();
+    assert!(body.contains("Ms. Riley Moreno") && body.contains("12 Harbour Road"), "its text is in the message: {body:?}");
+    assert!(a.session.compose.as_ref().unwrap().signature_card().is_some());
+    let (name, address) = (piece(&mut a, "Ms. Riley Moreno").expect("the name, laid out"), piece(&mut a, "12 Harbour Road").expect("the address"));
+    assert!(address.left() > name.right() && (address.top() - name.top()).abs() < 12.0, "side by side: {name:?} {address:?}");
+    assert_eq!(a.session.compose.as_ref().unwrap().body, body, "drawing it changes nothing");
+    // The cursor doesn't stop in its unseen text: put there, it's after the signature.
+    let card = a.session.compose.as_ref().unwrap().signature_card().unwrap();
+    assert_eq!(card.end, body.chars().count());
+    // As plain text, the message goes with the signature's text: shown so.
+    a.run("compose.format", json!({"plain": true}));
+    assert!(a.session.compose.as_ref().unwrap().signature_card().is_none());
+    assert!(piece(&mut a, "12 Harbour Road").is_none(), "its text, in the editor");
+    a.run("compose.format", json!({"plain": false}));
+    assert!(piece(&mut a, "12 Harbour Road").is_some());
+    // Changed in the message, it's the writer's text from then on.
+    let changed = body.replace("Harbour", "Harbor");
+    a.run("compose.update", json!({"body": changed}));
+    assert!(a.session.compose.as_ref().unwrap().signature_card().is_none());
+    assert!(piece(&mut a, "12 Harbour Road").is_none());
+}
+
+/// The drawn signature is one thing in the text (issue #90): Backspace after it, or Delete
+/// before it, takes all of it, its `-- ` line too (letter by letter, the rest of its unseen
+/// text came back as text); Undo brings it back. In a reply it's above the original, and text
+/// under the signature stays under it. Pictures it names on the web are fetched only once
+/// asked for.
+#[test]
+fn the_drawn_signature_is_one_thing_in_the_text() {
+    const CODE: &str = r#"<table width="560" cellspacing="0" cellpadding="0" style="width:560px"><tr>
+<td width="120" style="width:120px"><img src="https://studio.example/logo.png" width="96" height="40" alt="Studio"></td>
+<td width="200" style="width:200px"><b>Ms. Riley Moreno</b><br>riley@studio.example</td>
+<td style="padding:0 0 0 16px;border-left:1px solid #E30613;font-size:11px">12 Harbour Road<br>Portside</td></tr></table>"#;
+    let (mut a, _) = app("signature-card-keys");
+    // (Written beside the list, where one editor draws it: a window of its own draws it the same.)
+    a.session.prefs.new_mail_window = false;
+    let ctx = egui::Context::default();
+    a.run("account.setSignature", json!({"account": "sample", "name": "Card", "signature": "", "code": CODE}));
+    a.run("account.signatureDefaults", json!({"account": "sample", "new": "Card", "reply": "Card"}));
+    frame(&ctx, &mut a, vec![]);
+    a.run("mail.new", json!({}));
+    a.run("compose.update", json!({"body": format!("Hello Ana,{}", a.session.compose.as_ref().unwrap().body)}));
+    let size = egui::vec2(1280.0, 800.0);
+    let draw = |a: &mut MailApp, events: Vec<egui::Event>| frame(&ctx, a, events);
+    let compose = |a: &MailApp| a.session.compose.clone().unwrap();
+    let whole = compose(&a).signature_place().expect("the signature, whole");
+    let with_it = compose(&a).body;
+    // The cursor after it, in the text box; then Backspace.
+    let put_cursor = |a: &mut MailApp, at: usize| {
+        draw(a, vec![]);
+        a.ui.editor.as_mut().unwrap().refocus = Some(at..at);
+        draw(a, vec![]);
+        draw(a, vec![]);
+    };
+    put_cursor(&mut a, whole.end);
+    draw(&mut a, vec![key(Key::Backspace, Modifiers::NONE)]);
+    let without = compose(&a).body;
+    assert_eq!(without, "Hello Ana,\n", "the signature and its line are gone, the text stays: {without:?}");
+    assert!(compose(&a).signature_card().is_none());
+    draw(&mut a, vec![key(Key::Z, Modifiers::COMMAND)]);
+    assert_eq!(compose(&a).body, with_it, "Undo brings it back");
+    assert!(compose(&a).signature_card().is_some());
+    // Delete before it does the same.
+    put_cursor(&mut a, whole.start - 1);
+    draw(&mut a, vec![key(Key::Delete, Modifiers::NONE)]);
+    assert_eq!(compose(&a).body, "Hello Ana,\n");
+    draw(&mut a, vec![key(Key::Z, Modifiers::COMMAND)]);
+    // The cursor doesn't rest in it: put in its unseen text, it's after it.
+    put_cursor(&mut a, whole.start + 6);
+    assert_eq!(a.ui.editor.as_ref().unwrap().sel, whole.end..whole.end);
+
+    // Its picture on the web: nothing is asked of the web until Show pictures.
+    let pieces = |a: &mut MailApp| {
+        for _ in 0..3 {
+            drawn_text(&ctx, a, size);
+        }
+        drawn_text(&ctx, a, size)
+    };
+    assert!(pieces(&mut a).iter().any(|d| d.text == "Show pictures"));
+    assert!(!a.session.take_jobs().iter().any(|j| matches!(j, mailcraft_engine::model::Job::FetchUrl { .. })));
+    a.run("compose.signaturePictures", json!({}));
+    let jobs = a.session.take_jobs();
+    assert!(
+        matches!(jobs.as_slice(), [mailcraft_engine::model::Job::FetchUrl { url }] if url == "https://studio.example/logo.png"),
+        "its one picture, asked for: {jobs:?}"
+    );
+    a.run("compose.discard", json!({}));
+
+    // In a reply: the signature above the original, drawn in its columns.
+    let key_of = a.session.list.iter().find(|m| m.subject.contains("Storyboard")).map(|m| m.key.clone()).unwrap();
+    a.run("list.open", json!({"key": key_of.to_id()}));
+    a.run("mail.reply", json!({}));
+    assert!(compose(&a).signature_card().is_some(), "{:?}", compose(&a).body);
+    let drawn = pieces(&mut a);
+    let top = |text: &str| drawn.iter().find(|d| d.text.trim() == text).map(|d| d.ink.top());
+    let (name, address) = (top("Ms. Riley Moreno").expect("the name"), top("12 Harbour Road").expect("the address"));
+    assert!((name - address).abs() < 12.0, "side by side: {name} {address}");
+    // The original (plain text, quoted in the message's own text) is after it: the text box
+    // holds both, the signature's room between what's written and what's quoted.
+    let (card, body) = (compose(&a).signature_card().unwrap(), compose(&a).body);
+    let quoted = body.chars().skip(card.end).collect::<String>();
+    assert!(quoted.contains("Storyboard review"), "{quoted:?}");
+    let text_box = drawn.iter().find(|d| d.text.contains("Storyboard review") && d.text.contains("Ms. Riley Moreno")).map(|d| d.ink);
+    assert!(text_box.is_some_and(|ink| ink.top() < name && ink.bottom() > name + 40.0), "the signature inside the text: {text_box:?} {name}");
 }

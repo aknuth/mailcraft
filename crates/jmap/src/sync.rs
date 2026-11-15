@@ -16,7 +16,7 @@ pub async fn sync_folder<H: Http>(
 
 /// A change to `account`'s cache, unless the account was removed since [`Store::removals`] said
 /// `seen` ([`Store::while_kept`]): an error then, which ends the sync.
-fn if_kept<T>(store: &Store, account: &str, seen: u64, write: impl FnOnce() -> mailcraft_store::Result<T>) -> Result<T> {
+pub(crate) fn if_kept<T>(store: &Store, account: &str, seen: u64, write: impl FnOnce() -> mailcraft_store::Result<T>) -> Result<T> {
     Ok(store.while_kept(account, seen, write).ok_or_else(|| Error::Closed("the account was removed".into()))??)
 }
 
@@ -41,8 +41,7 @@ pub async fn sync_folder_as<H: Http>(
         report.reset = true;
     }
     fs.validity = VALIDITY;
-    let wanted: HashMap<u32, Flags> = newest.iter().map(|(id, f)| (st.number(id), f.clone())).collect();
-    let mut wanted = wanted;
+    let mut wanted: HashMap<u32, Flags> = newest.iter().map(|(id, f)| (st.number(id), f.clone())).collect();
     // Found by a search of the server past the window: kept while still in the mailbox.
     let extra = st.found_outside(folder, &fs.messages, &wanted);
     for (id, f) in c.still_in(&mailbox, &extra).await? {
@@ -66,13 +65,14 @@ pub async fn sync_folder_as<H: Http>(
             report.changed += 1;
         }
     }
-    // New.
-    let missing: Vec<String> =
-        newest.iter().filter(|(id, _)| st.ids.get(id).is_some_and(|n| fs.find(*n).is_none())).map(|(id, _)| id.clone()).collect();
+    // New. (The numbers kept, in a set: looked up in the list, each of the window's messages
+    // was a pass over the folder.)
+    let mut kept: HashSet<u32> = fs.messages.iter().map(|m| m.key.uid).collect();
+    let missing: Vec<String> = newest.iter().filter(|(id, _)| st.ids.get(id).is_some_and(|n| !kept.contains(n))).map(|(id, _)| id.clone()).collect();
     for e in c.headers(&missing).await? {
         let Some(id) = e.get("id").and_then(Value::as_str) else { continue };
         let key = MessageKey { account: account.to_string(), folder: folder.to_string(), validity: VALIDITY, uid: st.number(id) };
-        if fs.find(key.uid).is_some() {
+        if !kept.insert(key.uid) {
             continue;
         }
         fs.messages.push(email_summary(&e, key).into());
@@ -110,11 +110,13 @@ async fn prefetch<H: Http>(
         return Ok(0);
     }
     let blobs = c.blobs(&wanted.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>()).await?;
+    // Each message's place by its number (the first under it, as a search of the list found).
+    let at: HashMap<u32, usize> = fs.messages.iter().enumerate().rev().map(|(i, m)| (m.key.uid, i)).collect();
     let mut fetched = 0;
     for (n, id) in &wanted {
         let Some(blob) = blobs.get(id) else { continue };
         let raw = c.download(blob).await?;
-        let Some(m) = fs.find_mut(*n) else { continue };
+        let Some(m) = at.get(n).and_then(|&i| fs.messages.get_mut(i)).map(SharedSummary::make_mut) else { continue };
         if_kept(store, account, seen, || store.write_body(&m.key, &raw))?;
         fill_from_source(m, &raw);
         fetched += 1;

@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// What a message that can't be read as mail says, in its reading pane or window.
+pub(crate) const UNREADABLE: &str = "this message could not be read";
+
 mod files;
 pub(crate) use files::OpenedFile;
 mod selecting;
@@ -11,6 +14,7 @@ pub use selecting::Toward;
 pub(crate) use source::source_lines;
 pub use source::{SOURCE_SHOWN, SourceView};
 mod senders;
+pub(in crate::session) use senders::FRESH_SECS;
 pub use senders::SenderMarks;
 pub(crate) use senders::Senders;
 mod prepare;
@@ -20,7 +24,7 @@ pub use prepare::{BodyWork, PreparedBody};
 impl Session {
     /// A message file read by the network layer (issue #38), to show as `file.open` shows one.
     pub(crate) fn message_file_read(&mut self, path: &str, raw: Result<Vec<u8>, String>) {
-        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+        let name = mailcraft_model::file_name(path).to_string();
         self.opened_file = Some(match raw {
             Ok(raw) => self.open_message_file(&name, &raw),
             Err(e) => Err(CmdError::Failed(format!("{name} can't be read as a message: {e}"))),
@@ -143,7 +147,7 @@ impl Session {
                 Some(raw) => {
                     let (shown, security) = self.unwrap(key, &raw);
                     w.parsed = self.parse_for_reading(key, &shown);
-                    w.error = w.parsed.is_none().then(|| "this message could not be read".to_string());
+                    w.error = w.parsed.is_none().then(|| UNREADABLE.to_string());
                     let from = w.parsed.as_ref().map(|p| (p.from.clone(), p.bulk));
                     w.warning = from.and_then(|(from, bulk)| self.message_warning(key, &from, bulk));
                     w.security = security;
@@ -208,7 +212,7 @@ impl Session {
             }
             w.parsed = parsed.clone().flatten();
             w.text_first = text_first;
-            w.error = w.parsed.is_none().then(|| "this message could not be read".to_string());
+            w.error = w.parsed.is_none().then(|| UNREADABLE.to_string());
             let from = w.parsed.as_ref().map(|p| (p.from.clone(), p.bulk));
             w.warning = from.and_then(|(from, bulk)| self.message_warning(key, &from, bulk));
             w.security = security.clone();
@@ -219,7 +223,7 @@ impl Session {
             && let parsed = parsed.unwrap_or_else(|| self.parse_for_reading(key, raw))
             && let Some(r) = self.reading.as_mut()
         {
-            r.error = if parsed.is_none() { Some("this message could not be read".into()) } else { None };
+            r.error = if parsed.is_none() { Some(UNREADABLE.into()) } else { None };
             r.parsed = parsed;
             r.security = security;
             r.text_first = text_first;

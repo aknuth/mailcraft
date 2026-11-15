@@ -10,8 +10,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             if p::bool(v, "kept") == Some(true) {
                 return s.import_identity_data(&account, Vec::new(), &password);
             }
-            if let Some(data) = v.get("data").filter(|d| d.is_array()) {
-                let data: Vec<u8> = serde_json::from_value(data.clone()).map_err(|_| CmdError::Params("`data`: the file's bytes".into()))?;
+            if let Some(data) = p::bytes(v, "data", 1 << 20)? {
                 return s.import_identity_data(&account, data, &password);
             }
             let path = p::req_str(v, "path")?.trim().to_string();
@@ -46,10 +45,10 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         .params(r#"{"older": string (an older certificate's SHA-256, from security.certificates), "account"?: string}"#),
         CommandSpec::new("security.certificates", "Certificates", "File › Info › Security", |s, v| {
             let account = account_param(s, v)?;
-            let show = |i: mailcraft_smime::CertInfo| {
+            let show = |i: &mailcraft_smime::CertInfo| {
                 json!({ "name": i.name, "emails": i.emails, "issuer": i.issuer, "notBefore": i.not_before, "notAfter": i.not_after, "fingerprint": i.fingerprint })
             };
-            Ok(json!({ "inUse": s.identity(&account).map(show), "older": s.older_identities(&account).into_iter().map(show).collect::<Vec<_>>() }))
+            Ok(json!({ "inUse": s.identity(&account).map(show), "older": s.older_identities(&account).iter().map(show).collect::<Vec<_>>() }))
         })
         .params(r#"{"account"?: string}"#),
         CommandSpec::new("security.defaults", "Sign or encrypt new messages", "File › Info › Security", |s, v| {
@@ -66,7 +65,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         .when(|s| (!s.jmap_only).then_some("the desktop app keeps certificates in the system's keychain"))
         .params(r#"{"on"?: bool (default true; false forgets the kept password), "account"?: string}"#),
         CommandSpec::new("compose.security", "Sign and Encrypt", "Message › Options", |s, v| {
-            let c = s.compose.as_ref().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+            let c = s.composing()?;
             let wants = p::bool(v, "sign") == Some(true) || p::bool(v, "encrypt") == Some(true);
             if wants && !s.can_protect(&c.account) {
                 return Err(CmdError::Disabled("import a certificate or an OpenPGP key for the account first (File › Info › Security)".into()));
@@ -85,7 +84,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
                 Some("auto") => Some(None),
                 Some(other) => return Err(CmdError::Params(format!("`scheme`: smime, pgp or auto, one the account has (not `{other}`)"))),
             };
-            let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+            let c = s.composing_mut()?;
             if let Some(on) = p::bool(v, "sign") {
                 c.sign = on;
             }
@@ -101,7 +100,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         })
         .params(r#"{"sign"?: bool, "encrypt"?: bool, "scheme"?: "smime" | "pgp" | "auto" (S/MIME, OpenPGP, or whichever every recipient can receive)}"#),
         CommandSpec::new("compose.encryption", "Can it be encrypted?", "Message › Options", |s, _| {
-            let reach = s.encryption_reach().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+            let reach = s.encryption_reach().ok_or_else(|| CmdError::Disabled(NOT_WRITING.into()))?;
             let encrypt = s.compose.as_ref().is_some_and(|c| c.encrypt);
             Ok(match reach {
                 crate::Reach::NotSetUp => json!({ "setUp": false, "encrypt": encrypt }),

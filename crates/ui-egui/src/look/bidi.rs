@@ -9,8 +9,6 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use unicode_bidi::BidiInfo;
-
 const ARABIC: u8 = 1;
 const HEBREW: u8 = 2;
 /// What the main font draws: Arabic letters, Hebrew letters.
@@ -48,19 +46,10 @@ pub fn has_rtl(s: &str) -> bool {
     s.chars().any(is_rtl)
 }
 
-/// One line of mail (a subject, a name) to paint, and whether it reads right to left (then it
-/// belongs against the right edge, where it starts). The text is as written; egui orders it.
-pub fn shown(text: &str) -> (std::borrow::Cow<'_, str>, bool) {
-    (std::borrow::Cow::Borrowed(text), has_rtl(text) && paragraph_rtl(text))
-}
-
-/// A label for text that may be right to left: wrapped at the width there is, right-to-left
-/// paragraphs against the right edge.
-pub fn label(ui: &mut egui::Ui, text: &str, font: egui::FontId, color: egui::Color32) -> egui::Response {
-    if !has_rtl(text) {
-        return ui.label(egui::RichText::new(text).font(font).color(color));
-    }
-    add_label(ui, egui::text::LayoutJob::simple(text.to_string(), font, color, ui.available_width()))
+/// Whether one line of mail painted by hand (a subject, a name) reads right to left: then it
+/// belongs against the right edge, where it starts. It's painted as written; egui orders it.
+pub fn reads_rtl(text: &str) -> bool {
+    has_rtl(text) && paragraph_rtl(text)
 }
 
 /// A label for a laid-out job, wrapped at the width there is. One whose first paragraph reads
@@ -84,7 +73,7 @@ pub fn selectable_label(ui: &mut egui::Ui, text: &str, font: egui::FontId, color
 
 fn add_label_with(ui: &mut egui::Ui, mut job: egui::text::LayoutJob, selectable: bool) -> egui::Response {
     job.wrap.max_width = ui.available_width();
-    let rtl = has_rtl(&job.text) && paragraph_rtl(&job.text);
+    let rtl = reads_rtl(&job.text);
     let label = egui::Label::new(job).selectable(selectable);
     if rtl { ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| ui.add(label)).inner } else { ui.add(label) }
 }
@@ -167,9 +156,10 @@ pub fn vertical<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> e
     ui.scope_builder(egui::UiBuilder::new().layout(column()), add)
 }
 
-/// Whether a paragraph reads right to left (its first strong letter is).
+/// Whether a paragraph reads right to left (its first strong letter is, outside any isolate: UAX
+/// #9's P2 and P3). Read from the start up to that letter, not the whole text.
 pub fn paragraph_rtl(text: &str) -> bool {
-    BidiInfo::new(text, None).paragraphs.first().is_some_and(|p| p.level.is_rtl())
+    matches!(unicode_bidi::get_base_direction(text), unicode_bidi::Direction::Rtl)
 }
 
 #[cfg(test)]
@@ -203,8 +193,7 @@ mod tests {
         let line: String = rows.concat().into_iter().collect();
         // A left-to-right stretch inside keeps its own order ("abc 123").
         assert_eq!(line, "םלוע abc 123 םולש", "seen left to right on the screen");
-        assert_eq!(shown("שלום abc").0, "שלום abc", "handed over unchanged");
-        assert!(shown("שלום abc").1 && !shown("abc שלום").1 && !shown("plain").1);
+        assert!(reads_rtl("שלום abc") && !reads_rtl("abc שלום") && !reads_rtl("plain"));
     }
 
     /// A wrapped right-to-left paragraph keeps every word, and its short last line sits against
@@ -220,5 +209,46 @@ mod tests {
         want.sort_unstable();
         assert_eq!(seen, want);
         assert!(lefts.last().is_some_and(|l| *l > 20.0), "the last line starts away from the left: {lefts:?}");
+    }
+
+    /// A paragraph's direction is the one the whole algorithm gives its first paragraph, for
+    /// every text of up to five characters from both directions' letters, digits, neutrals,
+    /// marks, embeddings, isolates (closed or not) and paragraph breaks.
+    #[test]
+    fn paragraph_direction_is_the_whole_algorithms() {
+        const CHARS: [char; 12] = ['a', 'ש', 'ب', '1', ' ', '\u{200F}', '\u{202B}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\n'];
+        let mut tried = 0;
+        for len in 0..=5u32 {
+            for mut n in 0..CHARS.len().pow(len) {
+                let mut text = String::new();
+                for _ in 0..len {
+                    text.push(CHARS[n % CHARS.len()]);
+                    n /= CHARS.len();
+                }
+                let whole = unicode_bidi::BidiInfo::new(&text, None).paragraphs.first().is_some_and(|p| p.level.is_rtl());
+                assert_eq!(paragraph_rtl(&text), whole, "{text:?}");
+                tried += 1;
+            }
+        }
+        assert_eq!(tried, 271_453);
+    }
+
+    /// How long reading one paragraph's direction takes: a subject, and a message's long
+    /// paragraph, each right to left.
+    #[test]
+    #[ignore = "a measurement: cargo test --release -p mailcraft-ui-egui --lib measure_paragraph_rtl -- --ignored --nocapture"]
+    fn measure_paragraph_rtl() {
+        let subject = "أرفقنا الترجمة العربية للفيلم القصير (النسخة 2)";
+        let paragraph = "أرفقنا الترجمة العربية للفيلم القصير (النسخة 2). راجعنا التوقيت مع ملف shot_list_v2 وعدد الأسطر 128. ".repeat(20);
+        for (what, text) in [("a subject", subject), ("a 3 KB paragraph", paragraph.as_str())] {
+            const ROUNDS: u32 = 20_000;
+            let start = std::time::Instant::now();
+            let mut rtl = 0;
+            for _ in 0..ROUNDS {
+                rtl += usize::from(paragraph_rtl(std::hint::black_box(text)));
+            }
+            assert_eq!(rtl, ROUNDS as usize);
+            println!("MEASURE paragraph_rtl, {what} ({} bytes): {:?} a call", text.len(), start.elapsed() / ROUNDS);
+        }
     }
 }

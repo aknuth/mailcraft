@@ -3,14 +3,10 @@
 
 use super::*;
 
-/// Where raised and lowered text start, and where they end ([`mark_scripts`]).
-const SUP_MARK: char = '\u{E002}';
-const SUB_MARK: char = '\u{E003}';
-const SCRIPT_END: char = '\u{E004}';
-/// Where text of a size starts (the first plus its size in pixels) and ends, in text written for
-/// the rich text: in a plane of private characters that mail doesn't use.
-const SIZE_MARKS: u32 = 0xF_0000;
-pub(crate) const SIZE_END: char = '\u{F_0100}';
+// Where raised and lowered text start and end, and where text of a size starts (the first plus
+// its size in pixels) and ends ([`super::marks`]).
+pub(crate) use super::marks::SIZE_END;
+use super::marks::{SCRIPT_END, SIZES as SIZE_MARKS, SUB as SUB_MARK, SUP as SUP_MARK};
 /// The sizes marked, in pixels.
 const SMALLEST: u16 = 9;
 const LARGEST: u16 = 96;
@@ -20,9 +16,9 @@ pub(crate) fn size_mark(px: u16) -> char {
     char::from_u32(SIZE_MARKS + u32::from(px.clamp(SMALLEST, LARGEST))).unwrap_or(SIZE_END)
 }
 
-/// The size a character marks.
+/// The size a character marks, held to what [`size_mark`] writes.
 fn marked_size(c: char) -> Option<u16> {
-    u32::from(c).checked_sub(SIZE_MARKS).filter(|n| *n < 256).and_then(|n| u16::try_from(n).ok())
+    u32::from(c).checked_sub(SIZE_MARKS).filter(|n| *n < 256).and_then(|n| u16::try_from(n).ok()).map(|px| px.clamp(SMALLEST, LARGEST))
 }
 
 /// `html` with `<sup>` and `<sub>` made spans, a mark at each end of what's in them, and any mark
@@ -37,13 +33,13 @@ pub(crate) fn mark_scripts(html: &str) -> String {
     let mut out = String::with_capacity(html.len() + 64);
     let mut last = 0;
     let mut from = 0;
-    while let Some(i) = lower.get(from..).and_then(|r| r.find('<')) {
+    while let Some(i) = lower.get(from..).and_then(|r| work::scanned(r, r.find('<'))) {
         let start = from + i;
         let Some((closing, mark)) = script_tag(lower.get(start..).unwrap_or("")) else {
             from = start + 1;
             continue;
         };
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         out.push_str(html.get(last..start).unwrap_or(""));
         if closing {
             out.push(SCRIPT_END);
@@ -114,8 +110,9 @@ pub(super) fn scripts_split(spans: Vec<Span>, size: &mut u16) -> Vec<Span> {
     out
 }
 
-/// `html` for plain text: a `<sup>` or `<sub>` written as what's in it, unless that's digits,
-/// which the text converter writes as raised digits (issue #47: `^{$}15⁹⁸` in a price).
+/// `html` for plain text: a `<sup>` written as what's in it, unless that's digits, which the text
+/// converter writes as raised digits (issue #47: `^{$}15⁹⁸` in a price). A `<sub>` it writes as
+/// what's in it already.
 pub(crate) fn plain_scripts(html: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     let lower = html.to_ascii_lowercase();
@@ -125,15 +122,15 @@ pub(crate) fn plain_scripts(html: &str) -> std::borrow::Cow<'_, str> {
     let mut out = String::with_capacity(html.len());
     let mut last = 0;
     let mut from = 0;
-    while let Some(i) = lower.get(from..).and_then(|r| r.find("<sup")) {
+    while let Some(i) = lower.get(from..).and_then(|r| work::scanned(r, r.find("<sup"))) {
         let start = from + i;
         let Some((false, _)) = script_tag(lower.get(start..).unwrap_or("")) else {
             from = start + 4;
             continue;
         };
-        let Some(open_end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
-        let Some(close) = lower.get(open_end..).and_then(|r| r.find("</sup")).map(|e| open_end + e) else { break };
-        let Some(close_end) = lower.get(close..).and_then(|r| r.find('>')).map(|e| close + e) else { break };
+        let Some(open_end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
+        let Some(close) = lower.get(open_end..).and_then(|r| work::scanned(r, r.find("</sup"))).map(|e| open_end + e) else { break };
+        let Some(close_end) = lower.get(close..).and_then(|r| work::scanned(r, r.find('>'))).map(|e| close + e) else { break };
         let inner = html.get(open_end + 1..close).unwrap_or("").trim();
         if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
             out.push_str(html.get(last..=close_end).unwrap_or(""));

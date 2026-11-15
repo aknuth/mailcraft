@@ -33,8 +33,9 @@ const OLD: &str = "mailcraft.old.log";
 struct FileLog {
     /// The open file and how much has gone into it.
     out: Mutex<Option<(File, u64)>>,
-    /// Lines also go to the terminal (a debug build, or `--log`).
-    echo: bool,
+    /// Lines also go to the terminal (a debug build, or `--log`): standard error, a stand-in in
+    /// tests.
+    terminal: Option<fn() -> Box<dyn Write>>,
     /// What waits for the log's thread.
     waiting: Mutex<Waiting>,
     /// Lines were handed over, or the thread wrote what it took.
@@ -60,9 +61,15 @@ fn echo(to: &mut dyn Write, line: &str) {
     let _ = to.write_all(line.as_bytes());
 }
 
+/// Standard error, the terminal lines are echoed to.
+fn stderr() -> Box<dyn Write> {
+    Box::new(std::io::stderr())
+}
+
 impl FileLog {
     fn new(file: Option<File>, echo: bool) -> FileLog {
-        FileLog { out: Mutex::new(file.map(|f| (f, 0))), echo, waiting: Mutex::default(), moved: Condvar::new() }
+        let terminal = echo.then_some(stderr as fn() -> Box<dyn Write>);
+        FileLog { out: Mutex::new(file.map(|f| (f, 0))), terminal, waiting: Mutex::default(), moved: Condvar::new() }
     }
 
     fn waiting(&self) -> std::sync::MutexGuard<'_, Waiting> {
@@ -157,8 +164,8 @@ impl log::Log for FileLog {
             return;
         }
         let line = line(&stamp(), r.level(), r.target(), &r.args().to_string());
-        if self.echo {
-            echo(&mut std::io::stderr(), &line);
+        if let Some(terminal) = self.terminal {
+            echo(&mut *terminal(), &line);
         }
         self.hand_over(&line);
     }
@@ -177,10 +184,21 @@ fn enabled(target: &str, level: Level) -> bool {
 }
 
 /// One line as written: when (UTC), how serious, where from, what (a message over several lines
-/// indented under it).
+/// indented under it). What a server or a file put in a message can't pass for a line of its own
+/// or steer the terminal it's echoed to: a carriage return and every other control character but
+/// a tab are written as escapes (`\r`, `\u{1b}`).
 fn line(stamp: &str, level: Level, target: &str, msg: &str) -> String {
-    let msg = msg.trim_end().replace("\r\n", "\n").replace('\n', "\n    ");
-    format!("{stamp} {level:<5} {target}: {msg}\n")
+    let mut out = format!("{stamp} {level:<5} {target}: ");
+    for c in msg.trim_end().replace("\r\n", "\n").chars() {
+        match c {
+            '\n' => out.push_str("\n    "),
+            '\t' => out.push('\t'),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// Now, as `2026-10-19 14:03:07` (UTC).
@@ -250,9 +268,13 @@ mod tests {
         assert_eq!(panic_line(None, None), "internal error: a panic on thread (unnamed) at an unknown place");
     }
 
-    /// A terminal that's gone doesn't end MailCraft (found when its starter exited).
+    /// A terminal that's gone doesn't end MailCraft (found when its starter exited): a line
+    /// logged with the terminal gone is passed over there and still written to the file, and so
+    /// is the next. (Found in audit, #233: this test only handed a line to a log without a file,
+    /// which never echoes, so the terminal's path wasn't run.)
     #[test]
     fn a_closed_terminal_is_passed_over() {
+        use log::Log;
         struct Gone;
         impl Write for Gone {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
@@ -262,15 +284,20 @@ mod tests {
                 Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
             }
         }
-        echo(
-            &mut Gone, "a line
-",
-        );
-        let log = FileLog::new(None, true);
-        log.hand_over(
-            "still here
-",
-        );
+        echo(&mut Gone, "a line\n");
+        let dir = std::env::temp_dir().join(format!("mailcraft-log-gone-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(NAME);
+        let mut log = FileLog::new(Some(File::create(&path).unwrap()), true);
+        assert!(log.terminal.is_some(), "echoed");
+        log.terminal = Some(|| Box::new(Gone));
+        for msg in ["still here", "and on"] {
+            log.log(&Record::builder().level(Level::Warn).target("mailcraft::x").args(format_args!("{msg}")).build());
+        }
+        log.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("mailcraft::x: still here\n") && text.ends_with("mailcraft::x: and on\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -280,6 +307,10 @@ mod tests {
         assert!(!enabled("rustls::client", Level::Info));
         assert!(enabled("rustls::client", Level::Warn));
         assert_eq!(line("2026-10-19 14:03:07", Level::Warn, "x", "a\r\nb\n"), "2026-10-19 14:03:07 WARN  x: a\n    b\n");
+        // A server's text can't forge a line, move the terminal's cursor or clear its screen.
+        let forged = line("2026-10-19 14:03:07", Level::Warn, "x", "no\r2026-10-19 14:03:08 INFO  y: fine\x1b[2J\u{7}\tend");
+        assert_eq!(forged, "2026-10-19 14:03:07 WARN  x: no\\r2026-10-19 14:03:08 INFO  y: fine\\u{1b}[2J\\u{7}\tend\n");
+        assert_eq!(forged.lines().count(), 1);
         let s = stamp();
         assert_eq!((s.len(), s.as_bytes()[4], s.as_bytes()[13]), (19, b'-', b':'));
     }
@@ -312,14 +343,19 @@ mod tests {
         let path = dir.join(NAME);
         let log: &'static FileLog = Box::leak(Box::new(FileLog::new(Some(File::create(&path).unwrap()), false)));
         log.start_thread();
-        let record = |msg: &str| log.hand_over(&line("2026-10-19 14:03:07", Level::Warn, "mailcraft::x", msg));
+        let record = move |msg: &str| log.hand_over(&line("2026-10-19 14:03:07", Level::Warn, "mailcraft::x", msg));
         record("first");
         log.flush();
         let held = log.out.lock().unwrap();
-        let began = std::time::Instant::now();
-        record("while the disk is busy");
-        record("and another");
-        assert!(began.elapsed() < Duration::from_millis(500), "logging waited {:?}", began.elapsed());
+        // Logged on another thread, as the app's lines are: both while the disk is held, or never
+        // (a minute: a wait for the disk fails the test, not a busy computer).
+        let (logged, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            record("while the disk is busy");
+            record("and another");
+            let _ = logged.send(());
+        });
+        assert!(done.recv_timeout(Duration::from_secs(60)).is_ok(), "logging waited for the disk");
         drop(held);
         log.flush();
         let text = std::fs::read_to_string(&path).unwrap();

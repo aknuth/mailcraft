@@ -3,26 +3,11 @@
 
 use mailcraft_model::ical::{Attendee, CalEvent};
 
-use super::invites::{deliver, me, parts};
+use super::invites::{ZOE, deliver, invitation, parts};
 use super::*;
 
-const ZOE: (&str, &str) = ("Zoe Park", "zoe@studio.example");
-
-fn invitation(uid: &str, summary: &str, sequence: u32) -> CalEvent {
-    CalEvent {
-        uid: uid.into(),
-        summary: summary.into(),
-        start: NOW + 2 * 86_400,
-        end: NOW + 2 * 86_400 + 3600,
-        organizer: Some(Attendee { email: ZOE.1.into(), name: ZOE.0.into(), ..Default::default() }),
-        attendees: vec![me("NEEDS-ACTION")],
-        sequence,
-        ..Default::default()
-    }
-}
-
 /// What the sample account's Sent Items holds: answers go there (it has no server).
-fn sent(s: &mut Session) -> usize {
+fn sent_count(s: &mut Session) -> usize {
     let path = s.account("sample").and_then(|a| a.folder(FolderRole::Sent)).map(|f| f.path.clone()).unwrap_or_default();
     s.folder_state("sample", &path).messages.len()
 }
@@ -38,21 +23,20 @@ fn an_invitation_is_in_the_calendar_as_it_arrives() {
     let mut s = sample_session("tentative-arrives");
     // The invitation stays in the Inbox once answered (moving it: answered_invites.rs).
     s.run("options.answeredInvites", &json!({"after": "keep"})).unwrap();
-    let before = sent(&mut s);
+    let before = sent_count(&mut s);
     deliver(&mut s, 1, ZOE, "REQUEST", &[invitation("crit@studio.example", "Storyboard crit", 0)], NOW);
     assert_eq!(answer(&s, "crit@studio.example"), ["NEEDS-ACTION"]);
     let item = s.agenda(NOW, NOW + 7 * 86_400).into_iter().find(|i| i.uid == "crit@studio.example").expect("on the calendar");
     assert!(item.needs_reply, "drawn as tentative");
-    assert_eq!(sent(&mut s), before, "nothing went to the organizer");
+    assert_eq!(sent_count(&mut s), before, "nothing went to the organizer");
     let inv = s.invite().unwrap();
     assert!(inv.in_calendar && inv.problem.is_none() && inv.answer == "NEEDS-ACTION", "{inv:?}");
     s.run("invite.respond", &json!({"answer": "accepted"})).unwrap();
     assert_eq!(answer(&s, "crit@studio.example"), ["ACCEPTED"]);
-    assert_eq!(sent(&mut s), before + 1, "the answer went");
+    assert_eq!(sent_count(&mut s), before + 1, "the answer went");
     // Deleting the invitation leaves the meeting, as Outlook does.
     s.run("mail.delete", &json!({})).unwrap();
     assert_eq!(parts(&s, "crit@studio.example").len(), 1);
-    done(s);
 }
 
 /// Sent by a calendar service for the organizer (Google's sender isn't the organizer): it can
@@ -72,7 +56,6 @@ fn an_invitation_sent_for_the_organizer_can_be_answered() {
     assert_eq!(s.invite().unwrap().problem, None);
     s.run("invite.respond", &json!({"answer": "declined"})).unwrap();
     assert!(parts(&s, "svc@studio.example").is_empty(), "declined: out of the calendar");
-    done(s);
 }
 
 /// Updates from the organizer change it (keeping the user's answer once given); one from anyone
@@ -114,7 +97,6 @@ fn updates_and_cancellations_from_the_organizer_follow() {
     assert_eq!(answer(&s, uid), ["TENTATIVE"]);
     deliver(&mut s, 9, ZOE, "CANCEL", &[invitation(uid, "Mix", 2)], NOW);
     assert_eq!(parts(&s, uid)[0].event.status, "CANCELLED");
-    done(s);
 }
 
 /// One already in the calendar (the server put it there, RFC 6638) isn't added twice; with the
@@ -139,7 +121,6 @@ fn nothing_is_added_twice_or_when_turned_off() {
     s.run("calendar.tentativeInvites", &json!({"on": false})).unwrap();
     deliver(&mut s, 5, ZOE, "REQUEST", &[invitation("off@studio.example", "Off", 0)], NOW);
     assert!(parts(&s, "off@studio.example").is_empty());
-    done(s);
 }
 
 /// Mail that arrives with its header only is looked at when its body comes.
@@ -147,30 +128,13 @@ fn nothing_is_added_twice_or_when_turned_off() {
 fn an_invitation_whose_body_comes_later_is_taken_then() {
     let mut s = sample_session("tentative-later");
     let ics = mailcraft_model::ical::write(&[invitation("later@studio.example", "Later", 0)], Some("REQUEST"), NOW);
-    let d = mailcraft_mime::Draft {
-        to: vec![mailcraft_model::EmailAddress::new("Riley", "riley@studio.example")],
-        subject: "Invitation: Later".into(),
-        body: "See the calendar.".into(),
-        attachments: vec![mailcraft_mime::OutAttachment {
-            name: "invite.ics".into(),
-            mime: "text/calendar; method=REQUEST".into(),
-            data: ics.into_bytes(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    let raw = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new(ZOE.0, ZOE.1), NOW, "<later@x>").unwrap();
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 9500 };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_header(&raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let raw = calendar_mail(ZOE, "Invitation: Later", "text/calendar; method=REQUEST", ics.into_bytes(), "<later@x>");
+    let key = mailcraft_model::MessageKey { uid: 9500, ..next_key(&s, "sample", "INBOX") };
+    let key = file_in(&mut s, mailcraft_mime::summary_from_header(&raw, key, mailcraft_model::Flags::default(), 0, NOW), None);
     assert!(parts(&s, "later@studio.example").is_empty(), "no body yet");
-    store.write_body(&key, &raw).unwrap();
+    s.store.as_ref().unwrap().write_body(&key, &raw).unwrap();
     s.apply(Event::Body { key, raw });
     assert_eq!(answer(&s, "later@studio.example"), ["NEEDS-ACTION"]);
-    done(s);
 }
 
 /// Issue #32: Outlook sends the guest's copy as tentative (and means it to be busy). It stays
@@ -194,5 +158,4 @@ fn an_accepted_outlook_invitation_shows_as_busy() {
     assert_eq!(shown(&s), Some(ShowAs::Busy));
     s.run("event.respond", &json!({"uid": "plan@studio.example", "answer": "tentative"})).unwrap();
     assert_eq!(shown(&s), Some(ShowAs::Tentative));
-    done(s);
 }

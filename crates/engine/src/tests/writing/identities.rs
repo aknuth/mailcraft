@@ -2,21 +2,18 @@
 //! written from any of its addresses, with that address's name, signature and place for
 //! replies, and the server is told that address sends it.
 
-use mailcraft_model::{Flags, Folder, MessageKey};
+use mailcraft_model::MessageKey;
 
 use super::*;
 
 /// A session with one account on a server (`zoe@example.org`), its Inbox and Drafts in, two
 /// signatures ("Full" for new mail and replies, "Shop"), and no other address yet.
 fn one_account(name: &str) -> (Session, String) {
-    let mut s = Session::open(Some(temp(name)), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw", "name": "Zoe Park"})).unwrap()["account"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let folder =
-        |path: &str, role| Folder { account: id.clone(), path: path.into(), delimiter: Some('/'), role, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![folder("INBOX", FolderRole::Inbox), folder("Drafts", FolderRole::Drafts)] });
+    let (mut s, id) = server_account(
+        name,
+        json!({"email": "zoe@example.org", "password": "pw", "name": "Zoe Park"}),
+        &[("INBOX", FolderRole::Inbox), ("Drafts", FolderRole::Drafts)],
+    );
     s.run("account.setSignature", &json!({"account": id, "name": "Full", "signature": "Zoe Park\nStudio"})).unwrap();
     s.run("account.setSignature", &json!({"account": id, "name": "Shop", "signature": "The shop's desk"})).unwrap();
     s.run("account.signatureDefaults", &json!({"account": id, "new": "Full", "reply": "Full"})).unwrap();
@@ -26,14 +23,7 @@ fn one_account(name: &str) -> (Session, String) {
 
 /// Put a message in a folder of the account, its source here, and show the folder.
 fn put(s: &mut Session, account: &str, folder: &str, uid: u32, raw: &[u8]) -> MessageKey {
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder(account, folder).unwrap_or_default();
-    st.validity = 7;
-    let key = MessageKey { account: account.into(), folder: folder.into(), validity: 7, uid };
-    st.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), Flags::default(), 0, NOW).into());
-    store.save_folder(account, folder, &st).unwrap();
-    store.write_body(&key, raw).unwrap();
-    s.apply(Event::FolderChanged { account: account.into(), folder: folder.into() });
+    let key = file_whole(s, MessageKey { account: account.into(), folder: folder.into(), validity: 7, uid }, raw);
     s.run("folder.open", &json!({"account": account, "folder": folder})).unwrap();
     key
 }
@@ -90,7 +80,24 @@ fn an_account_has_other_addresses() {
     s.run("account.removeAddress", &json!({"account": id, "address": "SHOP@example.org"})).unwrap();
     assert!(s.account(&id).unwrap().config.identities.is_empty());
     assert!(matches!(s.run("account.removeAddress", &json!({"account": id, "address": "shop@example.org"})), Err(CmdError::Params(_))));
-    done(s);
+}
+
+/// An address taken out: every message being written from it, the one open and those set
+/// aside, goes from the account's own, each where it was.
+#[test]
+fn messages_from_an_address_taken_out_stay_where_they_were() {
+    let (mut s, id) = one_account("identities-removed-aside");
+    s.run("account.setAddress", &json!({"account": id, "address": "shop@example.org"})).unwrap();
+    for subject in ["One", "Two", "Three"] {
+        s.run("mail.new", &json!({})).unwrap();
+        s.run("compose.update", &json!({"from": "shop@example.org", "to": "ann@example.org", "subject": subject, "body": subject})).unwrap();
+    }
+    let order = |s: &Session| (s.compose.as_ref().map(|c| c.subject.clone()), s.composes.iter().map(|c| c.subject.clone()).collect::<Vec<_>>());
+    let before = order(&s);
+    assert!(s.all_composes().all(|c| c.from == "shop@example.org"));
+    s.run("account.removeAddress", &json!({"account": id, "address": "shop@example.org"})).unwrap();
+    assert_eq!(order(&s), before);
+    assert!(s.all_composes().all(|c| c.from.is_empty()));
 }
 
 /// A message written from another of the account's addresses: that address and its name in
@@ -138,7 +145,6 @@ fn a_message_goes_from_the_address_picked() {
     s.run("compose.send", &json!({})).unwrap();
     let (from, p, _) = sent(&mut s);
     assert_eq!((from.as_str(), p.reply_to[0].email.as_str()), ("shop@example.org", "me@x.example"));
-    done(s);
 }
 
 /// Mail sent to one of the account's other addresses is answered from it, and that address
@@ -226,7 +232,6 @@ fn replies_and_drafts_keep_the_address() {
     s.run("list.open", &json!({"key": second.to_id()})).unwrap();
     s.run("mail.reply", &json!({})).unwrap();
     assert_eq!(s.compose.as_ref().unwrap().from, "");
-    done(s);
 }
 
 /// The addresses a JMAP server keeps for the account become its other addresses when asked
@@ -248,7 +253,7 @@ fn a_jmap_servers_identities_become_the_accounts_addresses() {
         email: email.into(),
         name: name.into(),
         reply_to: reply_to.into(),
-        signature: None,
+        ..Default::default()
     };
     let found = vec![
         identity("zoe@example.org", "Zoe Park", ""),
@@ -278,7 +283,6 @@ fn a_jmap_servers_identities_become_the_accounts_addresses() {
     s.apply(Event::IdentitiesFound { account: id.clone(), found: Vec::new(), error: Some("the account is offline".into()) });
     assert!(s.notices.last().is_some_and(|n| n.error && n.text.contains("offline")));
     assert_eq!(s.account(&id).unwrap().config.identities.len(), 3);
-    done(s);
 }
 
 /// Found in review. An account removed took what was being written from it along, unsaid; and
@@ -318,5 +322,77 @@ fn what_is_being_written_is_neither_lost_nor_opened_twice() {
     let third =
         s.run("account.add", &json!({"email": "cy@example.net", "password": "pw", "name": "Cy"})).unwrap()["account"].as_str().unwrap().to_string();
     assert_eq!(s.compose.as_ref().unwrap().account, third);
-    done(s);
+}
+
+/// Issue #88: one of an account's other addresses can be the one its new mail is written from
+/// (an account that signs in as one address and writes as another, such as a Gmail mailbox with
+/// a domain of one's own). A new message starts from it, with its signature; an answer still
+/// goes from the address the mail came to, and from it when the mail came to none of them.
+#[test]
+fn new_mail_is_written_from_the_address_chosen_for_it() {
+    let (mut s, id) = one_account("identities-new-mail");
+    s.run("account.setAddress", &json!({"account": id, "address": "shop@example.org", "name": "The Shop", "signature": "Shop"})).unwrap();
+    s.run("account.setAddress", &json!({"account": id, "address": "press@example.org"})).unwrap();
+    let from = |s: &Session| s.compose.as_ref().map(|c| c.from.clone()).unwrap_or_default();
+    s.run("mail.new", &json!({})).unwrap();
+    assert_eq!(from(&s), "", "the account's own, until one is chosen");
+    s.run("compose.discard", &json!({})).unwrap();
+
+    let r = s.run("account.setAddress", &json!({"account": id, "address": "shop@example.org", "newMail": true})).unwrap();
+    assert_eq!(r["newMail"], true);
+    let config = |s: &Session| s.account(&id).unwrap().config.clone();
+    assert_eq!(config(&s).new_mail_from(), "shop@example.org");
+    assert_eq!(
+        config(&s).identity("shop@example.org").map(|i| (i.name.as_str(), i.signature.as_deref())),
+        Some(("The Shop", Some("Shop"))),
+        "the rest of it stays"
+    );
+    s.run("mail.new", &json!({})).unwrap();
+    assert_eq!(from(&s), "shop@example.org");
+    assert!(body(&s).contains("The shop's desk") && !body(&s).contains("Zoe Park"), "its signature: {:?}", body(&s));
+    s.run("compose.update", &json!({"to": "ana@example.net", "subject": "Hello", "body": "Hi"})).unwrap();
+    s.run("compose.send", &json!({})).unwrap();
+    let (envelope, parsed, _) = sent(&mut s);
+    assert_eq!((envelope.as_str(), parsed.from.email.as_str(), parsed.from.name.as_str()), ("shop@example.org", "shop@example.org", "The Shop"));
+    // Its own address can still be picked, and another.
+    s.run("mail.new", &json!({})).unwrap();
+    s.run("compose.update", &json!({"from": ""})).unwrap();
+    assert_eq!(from(&s), "");
+    s.run("compose.discard", &json!({})).unwrap();
+
+    // One at most: choosing another takes it from the first.
+    s.run("account.setAddress", &json!({"account": id, "address": "press@example.org", "newMail": true})).unwrap();
+    let chosen: Vec<String> = config(&s).identities.iter().filter(|i| i.new_mail).map(|i| i.email.clone()).collect();
+    assert_eq!(chosen, ["press@example.org"]);
+    // Changing an address without saying leaves the choice as it is.
+    s.run("account.setAddress", &json!({"account": id, "address": "press@example.org", "name": "Press desk"})).unwrap();
+    assert_eq!(config(&s).new_mail_from(), "press@example.org");
+
+    // An answer goes from the address the mail came to: the account's own, or one of the others.
+    let mail = |to: &str, n: u32| {
+        format!("From: Ana <ana@example.net>\r\nTo: {to}\r\nSubject: Question {n}\r\nMessage-ID: <q{n}@example.net>\r\n\r\nHello\r\n")
+    };
+    let came = [(1, "zoe@example.org", ""), (2, "shop@example.org", "shop@example.org"), (3, "list@example.net", "press@example.org")];
+    // (All in first: a folder that changes right after a message was opened is read again later.)
+    let keys: Vec<MessageKey> = came.iter().map(|(uid, to, _)| put(&mut s, &id, "INBOX", *uid, mail(to, *uid).as_bytes())).collect();
+    for (key, (_, to, answered_from)) in keys.iter().zip(came) {
+        s.run("list.open", &json!({"key": key.to_id()})).unwrap();
+        s.run("mail.reply", &json!({})).unwrap();
+        assert_eq!(from(&s), answered_from, "sent to {to}");
+        s.run("compose.discard", &json!({})).unwrap();
+    }
+
+    // Unchosen, or taken out, new mail is the account's own again.
+    s.run("account.setAddress", &json!({"account": id, "address": "press@example.org", "newMail": false})).unwrap();
+    assert_eq!(config(&s).new_mail_from(), "");
+    s.run("account.setAddress", &json!({"account": id, "address": "shop@example.org", "newMail": true})).unwrap();
+    s.run("account.removeAddress", &json!({"account": id, "address": "shop@example.org"})).unwrap();
+    s.run("mail.new", &json!({})).unwrap();
+    assert_eq!(from(&s), "");
+    // Kept with the account.
+    s.run("compose.discard", &json!({})).unwrap();
+    s.run("account.setAddress", &json!({"account": id, "address": "press@example.org", "newMail": true})).unwrap();
+    let kept = serde_json::to_value(config(&s)).unwrap();
+    let back: mailcraft_model::AccountConfig = serde_json::from_value(kept).unwrap();
+    assert_eq!(back.new_mail_from(), "press@example.org");
 }

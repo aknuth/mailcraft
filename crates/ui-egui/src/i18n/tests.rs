@@ -229,6 +229,7 @@ pub(crate) fn interface_strings() -> BTreeSet<String> {
         "Calendar and contacts couldn't be read: changes to them won't be saved",
         "Your rules couldn't be read: changes to them won't be saved",
         "Snoozed mail couldn't be read: changes to it won't be saved",
+        "What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered",
         "Opened as a PDF: print it from the viewer",
         "Reply",
         "Reply all",
@@ -433,6 +434,8 @@ fn french_keeps_filled_in_values_away_from_words_that_elide() {
     assert_eq!(word_before("{x}", 0), "");
 }
 
+/// Every interface string is in every catalog. With `MAILCRAFT_DUMP_STRINGS=<file>` set, the
+/// strings are also written to that file, one a line, for a new language's catalog to start from.
 #[test]
 fn every_interface_string_is_translated() {
     let strings = interface_strings();
@@ -543,7 +546,13 @@ fn a_tour_in_the_pseudo_language_only_draws_known_strings() {
     pseudo::set(false);
     let unknown: Vec<String> = pseudo::seen().into_iter().filter(|s| !known.contains(s)).collect();
     // Dynamic text (names, subjects, notices with values) also goes through `t`; only fixed
-    // interface wording must be known. Anything here that is wording needs adding to the scan.
+    // interface wording must be known. What reads as wording and the scan doesn't find (looked up
+    // through a variable: "Incoming mail (IMAP)", "No task matches.") must still be in every
+    // catalog; the only text drawn that isn't, the values the tour hands the interface.
+    let values = [
+        "Archive.pst: 100 messages imported".to_string(),
+        format!("{}. Turn on IMAP on Outlook.com.", mailcraft_engine::model::MICROSOFT_IMAP_CLOSED),
+    ];
     let wording: Vec<&String> = unknown
         .iter()
         .filter(|s| {
@@ -552,9 +561,11 @@ fn a_tour_in_the_pseudo_language_only_draws_known_strings() {
                 && s.chars().next().is_some_and(char::is_uppercase)
                 && s.split(' ').count() > 2
                 && !s.contains("Storyboard")
+                && !values.contains(s)
+                && Lang::all().skip(1).any(|l| l.0.catalog().get(s.as_str()).is_none())
         })
         .collect();
-    assert!(wording.len() < 40, "{wording:?}");
+    assert!(wording.is_empty(), "drawn, read as wording, but not in every catalog: {wording:?}");
     // Short labels too (the filter above passes "To:" and "Sent To", looked up by a variable):
     // what was drawn and is written as a literal in the interface's code is wording, and must
     // be in the catalogs.
@@ -574,4 +585,150 @@ fn the_language_list_reads_in_order() {
     let latin = ["English", "Deutsch", "Español", "Français", "Italiano", "Nederlands", "Português (Brasil)", "Türkçe"];
     assert_eq!(names.get(..latin.len()), Some(&latin[..]), "{names:?}");
     assert!(names.iter().skip(latin.len()).all(|n| !n.is_ascii()), "{names:?}");
+}
+
+/// The catalog reader as it was, each key checked against every one before it: what [`parse`]
+/// must still read, entry for entry and error for error.
+fn parse_as_it_was(text: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut errors = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let (Some(ctx), Some(src), Some(tr), None) = (cols.next(), cols.next(), cols.next(), cols.next()) else {
+            errors.push(format!("line {}: expected context<TAB>source<TAB>translation", i + 1));
+            continue;
+        };
+        match (unescape(src), unescape(tr)) {
+            (Ok(s), Ok(t)) if !s.is_empty() && !t.is_empty() => {
+                if placeholders(&s) != placeholders(&t) {
+                    errors.push(format!("line {}: placeholders differ: {s:?}", i + 1));
+                } else if s.ends_with('…') != t.ends_with('…') {
+                    errors.push(format!("line {}: trailing ellipsis differs: {s:?}", i + 1));
+                } else {
+                    let key = if ctx.is_empty() { s } else { format!("{ctx}{CTX}{s}") };
+                    if entries.iter().any(|(e, _)| *e == key) {
+                        errors.push(format!("line {}: duplicate {key:?}", i + 1));
+                    } else {
+                        entries.push((key, t));
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => errors.push(format!("line {}: {e}", i + 1)),
+            _ => errors.push(format!("line {}: empty column", i + 1)),
+        }
+    }
+    (entries, errors)
+}
+
+/// A catalog with every kind of line: twice the same key (the first kept), a bad line before a
+/// good one for the same key, escapes, contexts, comments.
+const TRICKY: &str = "# a comment\n\tSave\tGuardar\n\tSave\tSalvar\nfolder\tArchive\tArchivo\n\tArchive\tArchivar\n\
+    \tOpen {x}\tAbrir\n\tOpen {x}\tAbrir {x}\n\tTab\\there\tTab\\taquí\n\tBad\\q\tMal\n\tBad\\q\tMal2\n\ttwo\n\t\tvacío\n\
+    \tMore…\tMás\n\tMore…\tMás…\n\tBack\\\\slash\tBarra\\\\invertida\n\t{time} AM\t{time} a. m.\n\t{time} AM\t{time} AM\n";
+
+/// Every key of every catalog reads as it did, translated the same, with the same errors; and a
+/// string read alone from a catalog's text ([`find`], what typing a time reads) is what the
+/// whole catalog gives it.
+#[test]
+fn every_catalog_reads_as_it_did() {
+    for (code, text) in LANGUAGES.iter().map(|l| (l.code, l.source)).chain([("tricky", TRICKY)]) {
+        let (entries, errors) = parse(text);
+        let (was, was_errors) = parse_as_it_was(text);
+        assert_eq!(entries, was, "{code}");
+        assert_eq!(errors, was_errors, "{code}");
+        let catalog: HashMap<String, String> = entries.into_iter().collect();
+        for (key, translation) in &was {
+            assert_eq!(catalog.get(key), Some(translation), "{code} {key:?}");
+            if !key.contains(CTX) {
+                assert_eq!(find(text, key).as_ref(), Some(translation), "{code} {key:?}");
+            }
+        }
+        for slot in ["{time}", "{hour}"] {
+            for half in ["AM", "PM"] {
+                let key = format!("{slot} {half}");
+                assert_eq!(find(text, &key), catalog.get(&key).cloned(), "{code} {key:?}");
+            }
+        }
+    }
+    for l in Lang::all() {
+        let (was, _) = parse_as_it_was(l.0.source);
+        assert_eq!(l.0.catalog().len(), was.len(), "{}", l.code());
+        assert!(was.iter().all(|(k, t)| l.0.catalog().get(k) == Some(t)), "{}", l.code());
+    }
+    let (tricky, _) = parse(TRICKY);
+    assert_eq!(tricky.len(), 8, "{tricky:?}");
+    assert_eq!(find(TRICKY, "Save").as_deref(), Some("Guardar"), "the first of two");
+    assert_eq!(find(TRICKY, "Open {x}").as_deref(), Some("Abrir {x}"), "the first good one");
+    assert_eq!(find(TRICKY, "Tab\there").as_deref(), Some("Tab\taquí"));
+    assert_eq!(find(TRICKY, "Back\\slash").as_deref(), Some("Barra\\invertida"));
+    assert_eq!(find(TRICKY, "Archive").as_deref(), Some("Archivar"), "not the folder's");
+    assert_eq!(find(TRICKY, "Bad\\q"), None);
+    assert_eq!(find(TRICKY, "Missing"), None);
+}
+
+/// The first time typed into a box (the words for before and after noon of every language),
+/// cold; then parsing all the catalogs, as showing the interface in each language once does.
+#[test]
+#[ignore = "a measurement: cargo test --release -p mailcraft-ui-egui --lib measure_catalogs -- --ignored --nocapture"]
+fn measure_catalogs() {
+    let start = std::time::Instant::now();
+    let halves = build_day_halves();
+    let cold = start.elapsed();
+    assert_eq!(dates::read_time("1:30 PM", &halves), Some((13, 30)));
+    const ROUNDS: u32 = 20;
+    let start = std::time::Instant::now();
+    let mut entries = 0;
+    for _ in 0..ROUNDS {
+        for l in &LANGUAGES {
+            entries += parse(l.source).0.len();
+        }
+    }
+    let each = start.elapsed() / ROUNDS;
+    println!("MEASURE first typed time (cold, every catalog's AM and PM): {cold:?}");
+    println!("MEASURE parsing all {} catalogs ({} entries): {each:?}", LANGUAGES.len(), entries / ROUNDS as usize);
+}
+
+/// Every catalog's strings with a context are found by context and English as by their whole
+/// key, and there are no others; the plain translation stays the fallback.
+#[test]
+fn contexted_strings_are_found_without_a_key() {
+    for l in Lang::all() {
+        let mut n = 0;
+        for (key, t) in l.0.catalog() {
+            if let Some((ctx, s)) = key.split_once(CTX) {
+                assert_eq!(l.0.contexted(ctx, s), Some(t.as_str()), "{} {key:?}", l.code());
+                n += 1;
+            }
+        }
+        let indexed: usize = l.0.loaded().contexted.values().map(HashMap::len).sum();
+        assert_eq!(indexed, n, "{}", l.code());
+        assert!(n > 0 || l == Lang::EN, "{} has the folder names", l.code());
+    }
+    assert_eq!(Lang::from_code("de").and_then(|de| de.0.contexted("folder", "Archive")), Some("Archiv"));
+    assert_eq!(Lang::from_code("de").and_then(|de| de.0.contexted("folder", "Projects")), None);
+}
+
+/// A folder's name looked up with its context, as the folder pane does for every folder on
+/// every frame: in English, and in German (which has the folder's own word).
+#[test]
+#[ignore = "a measurement: cargo test --release -p mailcraft-ui-egui --lib measure_contexted_lookup -- --ignored --nocapture"]
+fn measure_contexted_lookup() {
+    for code in ["en", "de"] {
+        set_current(Lang::from_code(code).unwrap_or(Lang::EN));
+        let _ = tc("folder", "Archive");
+        const ROUNDS: u32 = 1_000_000;
+        let start = std::time::Instant::now();
+        let mut bytes = 0;
+        for _ in 0..ROUNDS {
+            for name in ["Inbox", "Archive", "Projects"] {
+                bytes += tc("folder", std::hint::black_box(name)).len();
+            }
+        }
+        assert!(bytes > 0);
+        println!("MEASURE tc(\"folder\", …) in {code}: {:?} a call", start.elapsed() / (ROUNDS * 3));
+    }
+    set_current(Lang::EN);
 }

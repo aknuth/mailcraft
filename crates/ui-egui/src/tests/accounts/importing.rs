@@ -4,7 +4,9 @@
 //! right to left.
 
 use mailcraft_engine::model::Job;
-use mailcraft_engine::model::job::{Blocked, DataFileFacts, ImportPhase, ImportProgress, ImportReport, PlannedFolder, SkipReason, StopHow, Work};
+use mailcraft_engine::model::job::{
+    Blocked, DataFileFacts, DataFileKind, ImportPhase, ImportProgress, ImportReport, PlannedFolder, SkipReason, StopHow, Work,
+};
 
 use super::*;
 use crate::Action;
@@ -101,32 +103,7 @@ fn ended(id: &str, r: ImportReport) -> MailEvent {
 /// The text a frame draws (after one more: a dialog or a popup just opened is measured first).
 fn drawn(ctx: &egui::Context, a: &mut MailApp) -> Vec<String> {
     frame(ctx, a, vec![]);
-    let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
-    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-    out.textures_delta.clear();
-    out.shapes
-        .iter()
-        .filter_map(|s| match &s.shape {
-            egui::Shape::Text(t) => Some(t.galley.job.text.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn has(texts: &[String], what: &str) -> bool {
-    texts.iter().any(|t| t.contains(what))
-}
-
-/// The window asked to close, as its close button does.
-fn close(ctx: &egui::Context, a: &mut MailApp) {
-    let input = RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
-        viewports: std::iter::once((egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() }))
-            .collect(),
-        ..Default::default()
-    };
-    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-    out.textures_delta.clear();
+    drawn_strings(ctx, a, egui::vec2(1280.0, 800.0))
 }
 
 /// The frames of an import in each state and each of its questions, for the tour (light and
@@ -215,7 +192,7 @@ pub(crate) fn tour(a: &mut MailApp, ctx: &egui::Context) {
 /// a line under the account in the folder pane instead of "Loading folders…".
 #[test]
 fn an_import_is_shown_from_its_first_second() {
-    let (mut a, dir) = app("import-shown");
+    let (mut a, _) = app("import-shown");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let id = import(&mut a);
@@ -258,14 +235,13 @@ fn an_import_is_shown_from_its_first_second() {
     let texts = drawn(&ctx, &mut a);
     assert!(!has(&texts, "Mail received"), "once in, a folder as any: {texts:?}");
     assert!(has(&texts, "Festival 2024"), "{texts:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Closing while a data file is imported says it goes on next time: closing then pauses it (its
 /// place kept); with nothing imported, or the import already stopping, nothing is asked.
 #[test]
 fn closing_while_importing_says_it_goes_on() {
-    let (mut a, dir) = app("import-close");
+    let (mut a, _) = app("import-close");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let id = import(&mut a);
@@ -284,21 +260,19 @@ fn closing_while_importing_says_it_goes_on() {
     a.act(Action::CloseAnyway);
     assert!(a.ui.close_now);
     assert_eq!(a.session.take_jobs(), [Job::StopImport { account: id.clone(), how: StopHow::Pause }]);
-    let _ = std::fs::remove_dir_all(dir);
 
     // Nothing being imported: nothing asked.
-    let (mut a, dir) = app("import-close-none");
+    let (mut a, _) = app("import-close-none");
     frame(&ctx, &mut a, vec![]);
     close(&ctx, &mut a);
     assert!(a.ui.dialog.is_none());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An import that finishes shows what it came to, every loss on a line of its own; one stopped
 /// doesn't, and its report is there again from the account's menu once done.
 #[test]
 fn a_finished_import_shows_what_it_came_to() {
-    let (mut a, dir) = app("import-done");
+    let (mut a, _) = app("import-done");
     let ctx = egui::Context::default();
     let id = import(&mut a);
     a.session.run("account.stopImport", &json!({"account": id})).unwrap();
@@ -307,7 +281,7 @@ fn a_finished_import_shows_what_it_came_to() {
     frame(&ctx, &mut a, vec![]);
     assert!(a.ui.dialog.is_none(), "stopped: nothing to sum up yet");
     let texts = drawn(&ctx, &mut a);
-    assert!(has(&texts, "Import stopped: 0 of 0") || has(&texts, "Import stopped"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "Import stopped: Archive.pst"), "the status bar says so: {texts:?}");
 
     a.session.run("account.resumeImport", &json!({"account": id})).unwrap();
     a.session.apply(ended(&id, report(1234)));
@@ -326,14 +300,13 @@ fn a_finished_import_shows_what_it_came_to() {
     a.ui.dialog = None;
     frame(&ctx, &mut a, vec![]);
     assert!(a.ui.dialog.is_none());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A data file chosen is looked at first: counting, then what it holds and where its copy goes,
 /// no Import when there's no room for it, and one already open as an account caught.
 #[test]
 fn a_data_file_is_looked_at_before_it_is_imported() {
-    let (mut a, dir) = app("import-look");
+    let (mut a, _) = app("import-look");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let path = "E:/Big.pst";
@@ -360,35 +333,25 @@ fn a_data_file_is_looked_at_before_it_is_imported() {
     a.act(Action::ImportDataFile { path: PATH.into(), again: false, changes: None, take_over: false });
     assert!(a.session.imports().any(|(_, st)| st.path == PATH));
     a.session.take_jobs();
-    // The same file again: caught, with another copy only when asked for.
-    a.ui.dialog = Some(Dialog::OpenDataFile { path: "c:/mail/ARCHIVE.pst".into() });
+    // The same file again, as it may be written: caught, with another copy only when asked for.
+    // Its other letter case is the same file only where file names ignore it (Windows, macOS):
+    // on Linux `ARCHIVE.pst` is another file.
+    let again = if cfg!(any(windows, target_os = "macos")) { r"c:\mail\ARCHIVE.pst" } else { r"C:\Mail\Archive.pst" };
+    a.ui.dialog = Some(Dialog::OpenDataFile { path: again.into() });
     let texts = drawn(&ctx, &mut a);
     assert!(has(&texts, "This data file is already open as Archive."), "{texts:?}");
     let before = a.session.accounts.len();
-    a.act(Action::ImportDataFile { path: "c:/mail/ARCHIVE.pst".into(), again: false, changes: None, take_over: false });
+    a.act(Action::ImportDataFile { path: again.into(), again: false, changes: None, take_over: false });
     assert_eq!(a.session.accounts.len(), before, "refused");
-    a.act(Action::ImportDataFile { path: "c:/mail/ARCHIVE.pst".into(), again: true, changes: None, take_over: false });
+    a.act(Action::ImportDataFile { path: again.into(), again: true, changes: None, take_over: false });
     assert_eq!(a.session.accounts.len(), before + 1);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Services whose file picker hands over one data file.
-struct Picks(&'static str);
+struct PicksDataFile(&'static str);
 
-impl crate::Services for Picks {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
-    fn notify(&mut self, _: &str, _: &str) {}
+impl crate::Services for PicksDataFile {
+    stub_services!();
     fn pick_data_file(&mut self) -> Option<std::path::PathBuf> {
         Some(self.0.into())
     }
@@ -422,8 +385,8 @@ fn facts(free: u64) -> DataFileFacts {
 /// imported without restarting MailCraft (the first answer was kept for the session).
 #[test]
 fn a_data_file_picked_again_is_looked_at_again() {
-    let (mut a, dir) = app("import-again");
-    a.services = Box::new(Picks("E:/Big.pst"));
+    let (mut a, _) = app("import-again");
+    a.services = Box::new(PicksDataFile("E:/Big.pst"));
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.act(Action::OpenDataFile);
@@ -440,14 +403,13 @@ fn a_data_file_picked_again_is_looked_at_again() {
     a.session.apply(MailEvent::DataFileInspected { path: "E:/Big.pst".into(), facts: Box::new(facts(400 << 30)) });
     let texts = drawn(&ctx, &mut a);
     assert!(has(&texts, "Free there: 400.0 GB") && !has(&texts, "There isn't room"), "{texts:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A path with spaces at its ends is looked at by the path trimmed, and the dialog finds the
 /// answer by it (it asked again on every frame, and stayed on "Counting items…").
 #[test]
 fn a_data_file_path_with_spaces_at_its_ends_is_answered() {
-    let (mut a, dir) = app("import-trim");
+    let (mut a, _) = app("import-trim");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.ui.dialog = Some(Dialog::OpenDataFile { path: " E:/Big.pst ".into() });
@@ -457,14 +419,13 @@ fn a_data_file_path_with_spaces_at_its_ends_is_answered() {
     let texts = drawn(&ctx, &mut a);
     assert!(has(&texts, "34000 items in 120 folders") && !has(&texts, "Counting items"), "{texts:?}");
     assert!(a.session.data_file_open_as(" E:/Big.pst ").is_none());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An import stopped by something (a full drive) is paused, one the user stopped is stopped:
 /// said the same in the status bar, the folder pane and the account's status.
 #[test]
 fn a_paused_import_and_a_stopped_one_are_told_apart() {
-    let (mut a, dir) = app("import-paused");
+    let (mut a, _) = app("import-paused");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let id = import(&mut a);
@@ -496,7 +457,6 @@ fn a_paused_import_and_a_stopped_one_are_told_apart() {
     assert!(has(&texts, "Import stopped: Archive.pst") && has(&texts, "Import stopped: "), "{texts:?}");
     assert!(!has(&texts, "Import paused"), "{texts:?}");
     assert_eq!(status(&a).as_deref(), Some("Import stopped"));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Every state and question of an import drawn in Arabic and Hebrew, light and dark (mirrored
@@ -504,7 +464,7 @@ fn a_paused_import_and_a_stopped_one_are_told_apart() {
 #[test]
 fn an_import_is_drawn_right_to_left() {
     for lang in ["he", "ar"] {
-        let (mut a, dir) = app(&format!("import-rtl-{lang}"));
+        let (mut a, _) = app(&format!("import-rtl-{lang}"));
         a.ui.language = lang.to_string();
         crate::i18n::set_current(crate::i18n::Lang::from_code(lang).unwrap());
         let ctx = egui::Context::default();
@@ -519,7 +479,6 @@ fn an_import_is_drawn_right_to_left() {
         assert_ne!(words, "Importing {file}… {percent}%", "{lang}: translated");
         assert!(!has(&texts, "Importing Archive.pst"), "{lang}: {texts:?}");
         crate::i18n::set_current(crate::i18n::Lang::EN);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -538,12 +497,12 @@ fn inbox(account: &str) -> mailcraft_engine::model::Folder {
 /// read what's new into it or open it as it was.
 #[test]
 fn an_outlook_files_copy_is_beside_it_and_found_again() {
-    let (mut a, dir) = app("import-beside");
+    let (mut a, _) = app("import-beside");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let path = "D:/Mail/Old.pst";
     let facts = |copy: &str, changed: bool, elsewhere: bool| DataFileFacts {
-        kind: "pst".into(),
+        kind: DataFileKind::Pst,
         messages: 40,
         folders: 3,
         estimate: 3 << 20,
@@ -583,5 +542,42 @@ fn an_outlook_files_copy_is_beside_it_and_found_again() {
     assert!(has(&texts, "Take it over") && has(&texts, "Import another copy") && !has(&texts, "Take it over and read"), "{texts:?}");
     let texts = show(&mut a, held(true));
     assert!(has(&texts, "Take it over and read the changes in") && !has(&texts, "Open as it was"), "{texts:?}");
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What the folder pane's outline of the folders still to come costs a frame, for a plan of
+/// 3,000 folders of which all but ten are in; and a fingerprint of what it draws (the same
+/// before and after a change that only makes it faster). Run in release under the machine's lock:
+/// `cargo test --release -p mailcraft-ui-egui --lib measure_import_outline -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_import_outline() {
+    use std::hash::{Hash, Hasher};
+    let (mut a, _) = app("measure-import-outline");
+    let ctx = egui::Context::default();
+    let id = import(&mut a);
+    let plan: Vec<PlannedFolder> = (0..3000)
+        .map(|n| PlannedFolder { path: format!("Projects/Folder {:04}/Part {}", n / 10, n % 10), name: format!("Part {n}"), items: 1 })
+        .collect();
+    a.session.apply(MailEvent::ImportPlanned { account: id.clone(), folders: plan.clone() });
+    let base = a.session.accounts[0].folders.first().cloned().unwrap();
+    let have: Vec<mailcraft_engine::model::Folder> =
+        plan.iter().skip(10).map(|p| mailcraft_engine::model::Folder { path: p.path.clone(), ..base.clone() }).collect();
+    let t = crate::theme::Tokens::light();
+    let outline = |a: &MailApp| {
+        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 900.0))), ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| crate::app::importing::outline(&a.session, &t, ui, &id, &have));
+        out.textures_delta.clear();
+        texts_in(&out.shapes)
+    };
+    let drawn = outline(&a);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for d in &drawn {
+        (&d.text, d.rect.min.x.to_bits(), d.rect.min.y.to_bits()).hash(&mut h);
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..50 {
+        let _ = outline(&a);
+    }
+    let each = started.elapsed().as_secs_f64() * 1000.0 / 50.0;
+    println!("MEASURE import outline, 3000 planned, 2990 in: {each:.3} ms a frame; drawn {} texts, {:016x}", drawn.len(), h.finish());
 }

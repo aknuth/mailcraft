@@ -19,29 +19,17 @@ fn mailbox() -> (Data, String, String) {
     let contacts = d.folder("Contacts", None, Some("contacts"), "IPF.Contact");
     let review =
         parse("<t:CalendarItem><t:Subject>Review</t:Subject><t:Start>2026-10-05T09:00:00Z</t:Start><t:UID>review-1</t:UID></t:CalendarItem>");
-    d.pim.push(("E1".into(), cal.clone(), review.kids[0].clone()));
+    d.pim.push(PimItem::new("E1", cal.clone(), review.kids[0].clone()));
     let ana = parse(
         "<t:Contact><t:DisplayName>Ana Silva</t:DisplayName><t:EmailAddresses><t:Entry Key=\"EmailAddress1\">ana@contoso.example</t:Entry>\
          </t:EmailAddresses></t:Contact>",
     );
-    d.pim.push(("K1".into(), contacts, ana.kids[0].clone()));
+    d.pim.push(PimItem::new("K1", contacts, ana.kids[0].clone()));
     (d, cal, "E1".into())
 }
 
-fn account(url: &str) -> AccountConfig {
-    AccountConfig {
-        id: "a1".into(),
-        email: "riley@contoso.example".into(),
-        username: format!("{DOMAIN}\\{USER}"),
-        ews: Some(url.into()),
-        ..Default::default()
-    }
-}
-
 fn store(name: &str) -> Store {
-    let dir = std::env::temp_dir().join(format!("mailcraft-ews-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    Store::open(&dir).unwrap()
+    Store::open(crate::data_files::scratch::scratch(&format!("ews-{name}"))).unwrap()
 }
 
 /// What was said until the account was online and its calendar read: the folders in the order
@@ -76,7 +64,7 @@ fn the_calendar_comes_with_the_inbox_the_first_time() {
     let server = serve(d);
     let store = store("calendar-first");
     let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    pool.submit(Job::Start { account: account(&server.url), password: Some(Secret(PASSWORD.into())) });
+    pool.submit(Job::Start { account: account("a1", &server.url), password: Some(Secret(PASSWORD.into())) });
     let said = order(&pool);
     let at = |what: &str| said.iter().position(|s| s == what).unwrap_or_else(|| panic!("{what} isn't in {said:?}"));
     assert_eq!(at("INBOX"), 0, "{said:?}");
@@ -87,12 +75,11 @@ fn the_calendar_comes_with_the_inbox_the_first_time() {
     // Read before (the engine keeps when): after the mail, as ever.
     store.save_account_doc("a1", PIM_DOC, &Pim { dav_checked: Some(1_792_000_000), ..Default::default() }).unwrap();
     let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    pool.submit(Job::Start { account: account(&server.url), password: Some(Secret(PASSWORD.into())) });
+    pool.submit(Job::Start { account: account("a1", &server.url), password: Some(Secret(PASSWORD.into())) });
     let said = order(&pool);
     assert_eq!(said.last().map(String::as_str), Some("calendar"), "{said:?}");
     assert_eq!(said.len(), 5, "{said:?}");
     drop(pool);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// A calendar the server won't list is said, with why, and the contacts still come; said once,
@@ -110,7 +97,7 @@ fn a_calendar_the_server_refuses_says_so_once() {
 
     let store = store("calendar-refused");
     let mut pool = crate::worker::Pool::new(store.clone(), Arc::new(crate::worker::MemoryCredentials::default()));
-    pool.submit(Job::Start { account: account(&server.url), password: Some(Secret(PASSWORD.into())) });
+    pool.submit(Job::Start { account: account("a1", &server.url), password: Some(Secret(PASSWORD.into())) });
     let errors = |pool: &crate::worker::Pool| {
         let seen = until(pool, "the calendar's answer", |e| matches!(e, Event::DavSynced { .. }));
         match seen.into_iter().next_back() {
@@ -130,7 +117,6 @@ fn a_calendar_the_server_refuses_says_so_once() {
     pool.submit(Job::SyncDav { account: "a1".into() });
     assert_eq!(errors(&pool), ["Calendar: ErrorAccessDenied"]);
     drop(pool);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Appointments the server fails on are counted and said with why (they were left out without a
@@ -140,7 +126,7 @@ fn a_calendar_the_server_refuses_says_so_once() {
 fn appointments_the_server_fails_on_are_said() {
     let (mut d, cal, first) = mailbox();
     let more = parse("<t:CalendarItem><t:Subject>Plan</t:Subject><t:Start>2026-10-06T09:00:00Z</t:Start><t:UID>plan-1</t:UID></t:CalendarItem>");
-    d.pim.push(("E2".into(), cal, more.kids[0].clone()));
+    d.pim.push(PimItem::new("E2", cal, more.kids[0].clone()));
     d.unreadable.push(first);
     let server = serve(d);
     let c = crate::ews::Client::connect(&server.url, &format!("{DOMAIN}\\{USER}"), PASSWORD, "riley@contoso.example").unwrap();

@@ -26,6 +26,7 @@ mod app;
 mod backup;
 mod dialogs;
 pub mod i18n;
+mod kept;
 mod keytips;
 mod lists;
 mod look;
@@ -40,7 +41,7 @@ pub use look::thumbs::VideoFrame;
 pub use look::{bidi, craft_fonts, faces, icons, motion, theme};
 use look::{progress, thumbs, widgets};
 pub use panes::backstage;
-use panes::{calendar, list, nav, notes, organize, people, reminders, tasks, todo_bar};
+use panes::{calendar, list, nav, notes, organize, people, reminders, shown, tasks, todo_bar};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,10 +51,10 @@ use mailcraft_engine::model::{MessageKey, SyncStatus};
 use mailcraft_engine::{CalMode, Module, ReadingPane, SearchScope, Session};
 use serde_json::{Value, json};
 
-pub use app::caption::take_zooming;
-pub use app::{BootCard, ClipboardRead, WindowPlace, after_open, alt_code_pages, alt_codes, clipboard_keys};
+pub use app::caption::{MIN_WINDOW_SIZE, take_zooming};
+pub use app::{BootCard, ClipboardRead, FramePart, Monitors, WindowPlace, after_open, alt_code_pages, alt_codes, clipboard_keys, set_monitors};
 pub(crate) use app::{SearchDrop, junk_menu, scope_label};
-pub use dialogs::Dialog;
+pub use dialogs::{AccountKind, Dialog};
 
 /// MailCraft's id: the Linux app id (its `.desktop` file and icon are named so), the macOS bundle
 /// id and the Windows notifications' app id.
@@ -65,12 +66,16 @@ pub const APP_ID: &str = "io.github.zidan44.MailCraft";
 pub(crate) fn os_window() -> egui::ViewportBuilder {
     egui::ViewportBuilder::default().with_app_id(APP_ID)
 }
+
+/// A lock that outlives a panic elsewhere (what the window's work shares with its threads is
+/// whole between steps).
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 use icons::Icon;
-pub use services::{Backend, InstallAsks, KeptOnClose, Lane, NullBackend, NullServices, Services, UpdateState, Work};
+pub use services::{Backend, InstallAsks, KeptOnClose, Lane, NullBackend, NullServices, Picked, Services, UpdateState, Work};
 use theme::Tokens;
 
-/// Whether the message being written shows in the reading pane: when it isn't popped out, or
-/// where windows of its own can't open (the browser).
 /// How the app reads HTML from the clipboard, set once at start (the clipboard is the
 /// platform's; a build without one has none).
 static CLIPBOARD_HTML: std::sync::OnceLock<fn() -> Option<String>> = std::sync::OnceLock::new();
@@ -96,6 +101,18 @@ pub(crate) fn clipboard_html() -> Option<String> {
     CLIPBOARD_HTML.get().and_then(|read| read())
 }
 
+/// The user's folder `name` for files handed to other apps ([`mailcraft_engine::store::scratch_dir`]);
+/// in the tests, the test's own (the user's is shared with a running MailCraft and other runs).
+pub(crate) fn scratch_dir(name: &str) -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(own) = tests::own_scratch_dir(name) {
+        return Some(own);
+    }
+    mailcraft_engine::store::scratch_dir(name)
+}
+
+/// Whether the message being written shows in the reading pane: when it isn't popped out, or
+/// where windows of its own can't open (the browser).
 pub(crate) fn compose_inline(c: &mailcraft_engine::Compose, ctx: &egui::Context) -> bool {
     !c.window || ctx.embed_viewports()
 }
@@ -111,8 +128,9 @@ pub(crate) fn use_editor(st: &mut UiState, id: u64) {
     st.editor = st.editors.remove(&id);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RibbonTab {
+    #[default]
     Home,
     SendReceive,
     View,
@@ -245,13 +263,13 @@ pub enum Action {
     /// A saved message to look at (`.eml`, `.msg`), picked here as one handed over by the system.
     OpenMailFile,
     /// Import the data file at `path` (`again`: though it's open as another account already;
-    /// `changes`: what becomes of a file changed since MailCraft's copy of it was read, "read"
-    /// or "keep"; `take_over`: its copy is an account in another MailCraft data folder, and
-    /// becomes this one's).
+    /// `changes`: what becomes of a file changed since MailCraft's copy of it was read;
+    /// `take_over`: its copy is an account in another MailCraft data folder, and becomes this
+    /// one's).
     ImportDataFile {
         path: String,
         again: bool,
-        changes: Option<&'static str>,
+        changes: Option<mailcraft_engine::Changes>,
         take_over: bool,
     },
     /// Show how an account's import is going, beside the status bar.
@@ -273,7 +291,9 @@ pub enum Action {
     CancelDataMove,
 }
 
-/// UI-only state.
+/// UI-only state. Its `Default` is a blank one: [`MailApp::new`] starts it with what the
+/// platform says and the few values that aren't their type's default.
+#[derive(Default)]
 pub struct UiState {
     /// Where the main window, the last message window and the last compose window were.
     pub places: std::collections::BTreeMap<String, WindowPlace>,
@@ -283,6 +303,8 @@ pub struct UiState {
     /// The window's GPU device is gone: nothing is drawn any more, and MailCraft closes
     /// ([`MailApp::graphics_lost`]).
     pub graphics_lost: bool,
+    /// How the frames run under the guard went ([`MailApp::frame_part_ended`]).
+    pub(crate) frame_guard: app::frame::FrameGuard,
     pub close_now: bool,
     /// When the close was last decided (the input's time): [`MailApp::logic`] decides it, and
     /// `ui` in the same pass doesn't again.
@@ -336,13 +358,19 @@ pub struct UiState {
     search_drop: SearchDrop,
     /// The time the last frame spent on the search's work.
     search_spent: web_time::Duration,
+    /// In a test, the time each look at the clock adds while a search is stepped, in place of
+    /// the clock: how much of a search a frame runs then doesn't hang on the machine's speed.
+    #[cfg(test)]
+    search_tick: Option<web_time::Duration>,
     /// The time the search running has spent on each kind of its work, all told.
     search_times: app::SearchTimes,
     /// Why the message being written couldn't be sent or saved, shown over it until dismissed.
-    pub compose_alert: Option<String>,
+    pub compose_alert: Option<reading::ComposeAlert>,
     /// The attachment shown in place of its message's text (a click on its chip), as Outlook
     /// previews attachments in the reading pane.
     pub attachment_view: Option<(MessageKey, usize)>,
+    /// The attachment previewed, as it was read to show it.
+    pub(crate) attachment_shown: Option<reading::ShownAttachment>,
     /// The messages shown formatted or as plain text for themselves, not by the setting.
     shown_as: reading::body::ShownAs,
     /// The preview a plain click on a chip waits to show, and when: once the double-click time
@@ -375,7 +403,7 @@ pub struct UiState {
     pub(crate) bodies: app::Bodies,
     /// Decoded web pictures, by address, and the frame each was last shown in (the oldest go
     /// when there are too many).
-    web_pictures: HashMap<String, (Option<egui::TextureHandle>, u64)>,
+    web_pictures: reading::FrameLru<String, Option<egui::TextureHandle>, { reading::WEB_PICTURES }>,
     /// PROTOTYPE: the open HTML message laid out by Blitz, when that's on ([`reading::blitz`]).
     pub(crate) html_view: Option<reading::blitz::HtmlView>,
     /// Its page asks for the reading lane's work (handed over after the frame).
@@ -403,21 +431,25 @@ pub struct UiState {
     pub(crate) editors: HashMap<u64, rich_edit::Editor>,
     /// The message whose window a dialog for messages belongs to (Save changes, Address Book).
     pub(crate) dialog_for: Option<u64>,
-    /// The body's cursor (characters), where pictures go.
     /// The message editor's state (selection, undo, what's typed next).
     pub(crate) editor: Option<rich_edit::Editor>,
     /// The editors of the blocks of text of the quoted originals being changed, and the one with
     /// the cursor (its message, its place).
     pub(crate) quote_editors: reading::QuoteEditors,
     pub(crate) quote_focus: Option<(u64, usize)>,
-    /// The recipient box showing suggestions (`to`, `cc`, `bcc`), the highlighted one, and the
-    /// text for which Escape hid them.
-    pub(crate) suggest_field: Option<&'static str>,
+    /// Signatures written as HTML code, laid out for the messages being written (issue #90).
+    pub(crate) signature_cards: reading::SignatureCards,
+    /// The recipient box showing suggestions, the highlighted one, and the text for which Escape
+    /// hid them.
+    pub(crate) suggest_field: Option<dialogs::Recipients>,
     pub(crate) suggest_index: usize,
     pub(crate) suggest_dismissed: Option<String>,
     /// The recipient box a suggestion was just picked into: it keeps the cursor through the rest
     /// of that click (the release lands outside the box, which would otherwise end its focus).
-    pub(crate) suggest_refocus: Option<&'static str>,
+    pub(crate) suggest_refocus: Option<dialogs::Recipients>,
+    /// The people suggested for the text in that box, kept while it and what they're made of
+    /// stay the same.
+    pub(crate) suggested: Option<reading::Suggested>,
     /// Installed Craft apps (command, path), found at start-up.
     pub(crate) craft_apps: Vec<(&'static str, PathBuf)>,
     /// The interface language setting (`auto` or a language code).
@@ -441,12 +473,15 @@ pub struct UiState {
     pub(crate) title_shown: String,
     /// Raise the main window on the next frame.
     focus_main: bool,
-    /// Video attachments written out for the platform to take a frame from, and the frames.
+    /// Video attachments written out for the platform to take a frame from, and the frames, with
+    /// the frame each was last asked for in: a frame made into its thumbnail isn't kept, and of
+    /// those waiting to be (their message left before they came) only a few
+    /// (`reading::bound_video_frames`).
     pub(crate) video_files: HashMap<(MessageKey, usize), PathBuf>,
-    pub(crate) video_frames: HashMap<PathBuf, VideoFrame>,
+    pub(crate) video_frames: HashMap<PathBuf, (VideoFrame, u64)>,
     /// Video frames made thumbnails, kept apart from the pictures (a few, by attachment), and
     /// the frame each was last shown in.
-    pub(crate) video_thumbs: HashMap<(MessageKey, usize), (Option<egui::TextureHandle>, u64)>,
+    pub(crate) video_thumbs: reading::FrameLru<(MessageKey, usize), Option<egui::TextureHandle>, { reading::VIDEO_THUMBS }>,
     /// The work behind them, on the pictures lane: the files written, the frames decoded.
     pub(crate) videos: reading::Videos,
     /// The File page, while it's open.
@@ -454,7 +489,6 @@ pub struct UiState {
     /// The month the calendar's small month shows (`year * 12 + month - 1`; `None`: the day on
     /// screen's).
     pub(crate) mini_month: Option<i64>,
-    /// The hours were scrolled to the working day once.
     /// The day and week views have been scrolled to the working day once (each has its own scroll).
     pub(crate) cal_scrolled: [bool; 2],
     pub(crate) people_query: String,
@@ -466,13 +500,13 @@ pub struct UiState {
     pub people_view: people::PeopleView,
     /// The People list's columns and sort.
     pub people_list: people::ListSettings,
-    /// Notes: the search, the note being written on (and its text), a new note to write on,
-    /// and the keyboard to give its text box.
-    pub(crate) notes_query: String,
     /// The calendar's search (issue #33): what's typed, the switches, what it found.
     pub(crate) cal_search: calendar::CalSearch,
     /// How far the calendar's month grip has been dragged since it last added or took a month.
     pub(crate) months_drag: f32,
+    /// Notes: the search, the note being written on (and its text; a new one's is empty), and
+    /// the keyboard to give its text box.
+    pub(crate) notes_query: String,
     pub(crate) note_edit: Option<(String, String)>,
     pub(crate) note_focus: bool,
     /// Tasks: the search, and the task picked (uid).
@@ -485,6 +519,8 @@ pub struct UiState {
     pub(crate) task: Option<String>,
     /// The person whose card is shown (uid).
     pub(crate) person: Option<String>,
+    /// What People, Tasks and Notes list, as last made (see `shown`).
+    pub(crate) shown: shown::Shown,
     /// The invitation in the open message, worked out once per message and calendar change.
     pub(crate) invite: Option<(MessageKey, u64, Option<mailcraft_engine::Invite>)>,
     /// A file to drag out of the window (the app starts the system drag).
@@ -526,123 +562,24 @@ impl MailApp {
             .into_iter()
             .filter_map(|c| services.craft_app(c).map(|p| (c, p)))
             .collect();
-        let mut app = MailApp {
-            session,
-            backend,
-            services,
-            ui: UiState {
-                tokens: Tokens::light(),
-                closing_anyway: false,
-                graphics_lost: false,
-                close_now: false,
-                close_checked: None,
-                update: UpdateState::None,
-                update_later: None,
-                update_told: None,
-                old_flatpak,
-                update_answered: false,
-                restart_wanted: false,
-                close_asked: false,
-                compact: Default::default(),
-                reminders: reminders::State::default(),
-                has_files,
-                keeps_running,
-                in_tray: false,
-                quit_wanted: false,
-                data_folder,
-                pending_move,
-                dark: None,
-                tab: RibbonTab::Home,
-                search_text: String::new(),
-                focus_search: false,
-                keytips: keytips::KeyTips::default(),
-                search_focused: false,
-                search_cursor_end: false,
-                search_due: None,
-                search_drop: SearchDrop::None,
-                search_spent: web_time::Duration::ZERO,
-                search_times: app::SearchTimes::default(),
-                compose_alert: None,
-                attachment_view: None,
-                shown_as: Default::default(),
-                attachment_click: None,
-                attachment_selected: None,
-                attachments_active: false,
-                attachment_hovered: false,
-                ribbon_rect: None,
-                top_bar_rect: None,
-                bar_two_rows: false,
-                ribbon_icons_from: usize::MAX,
-                dialog: None,
-                pictures: reading::Pictures::default(),
-                bodies: app::Bodies::default(),
-                web_pictures: HashMap::new(),
-                html_view: None,
-                html_pump: false,
-                blitz: reading::blitz::wanted(),
-                toast: None,
-                seen_notices: seen,
-                scroll_to_focus: false,
-                backstage_typing: false,
-                list_page: 10,
-                raise_source: None,
-                source_headers: Default::default(),
-                fonts_ready: false,
-                compose_shown: Default::default(),
-                compose_area: None,
-                editors: HashMap::new(),
-                dialog_for: None,
-                editor: None,
-                quote_editors: Default::default(),
-                quote_focus: None,
-                suggest_field: None,
-                suggest_index: 0,
-                suggest_dismissed: None,
-                suggest_refocus: None,
-                craft_apps: Vec::new(),
-                language: i18n::AUTO.into(),
-                fonts: (None, None),
-                rtl_font: None,
-                cjk_loaded: None,
-                han_missing: false,
-                long_text: HashMap::new(),
-                text_selection: Default::default(),
-                title_base: "MailCraft".into(),
-                places: Default::default(),
-                page_message: None,
-                title_shown: String::new(),
-                focus_main: false,
-                video_files: HashMap::new(),
-                video_frames: HashMap::new(),
-                video_thumbs: HashMap::new(),
-                videos: reading::Videos::default(),
-                backstage: None,
-                mini_month: None,
-                cal_scrolled: [false; 2],
-                people_query: String::new(),
-                people_book: None,
-                list_rows: None,
-                people_view: people::PeopleView::default(),
-                people_list: people::ListSettings::default(),
-                notes_query: String::new(),
-                cal_search: calendar::CalSearch::default(),
-                months_drag: 0.0,
-                note_edit: None,
-                note_focus: false,
-                tasks_query: String::new(),
-                todo_month: None,
-                todo_new: String::new(),
-                task: None,
-                person: None,
-                invite: None,
-                drag_out: None,
-                can_drag_out: false,
-                import_details: None,
-            },
+        let ui = UiState {
+            has_files,
+            keeps_running,
+            data_folder,
+            pending_move,
+            old_flatpak,
+            seen_notices: seen,
+            craft_apps,
+            can_drag_out: services.can_drag_out(),
+            // Until the ribbon and the list are first drawn: every button labelled, a page of ten.
+            ribbon_icons_from: usize::MAX,
+            list_page: 10,
+            language: i18n::AUTO.into(),
+            title_base: "MailCraft".into(),
+            blitz: reading::blitz::wanted(),
+            ..UiState::default()
         };
-        app.ui.craft_apps = craft_apps;
-        app.ui.can_drag_out = app.services.can_drag_out();
-        app
+        MailApp { session, backend, services, ui }
     }
 
     /// A file the user started dragging out of the window, for the app to hand to the system's
@@ -718,7 +655,12 @@ impl MailApp {
         match self.session.run(id, &params) {
             // Held to be looked at first: said in the message's window when it has one.
             Ok(v) if id == "compose.send" && v.get("check").is_some() => {
-                let found = serde_json::from_value(v["check"].clone()).unwrap_or_default();
+                // One that can't be read (none ever should) still holds the message, the dialog
+                // saying so rather than nothing.
+                let found = serde_json::from_value(v["check"].clone()).unwrap_or_else(|e| {
+                    log::warn!("what the check before sending found couldn't be read: {e}");
+                    Vec::new()
+                });
                 self.ui.dialog_for = self.session.compose.as_ref().filter(|c| c.window).map(|c| c.id);
                 self.ui.dialog = Some(Dialog::SendCheck(found));
             }
@@ -731,13 +673,17 @@ impl MailApp {
                 if id == "compose.send"
                     && let Some(b) = self.session.compose_send_block() =>
             {
-                self.ui.compose_alert = Some(reading::send_block_text(b));
+                self.ui.compose_alert = Some(reading::ComposeAlert::Blocked(b));
             }
             Err(CmdError::Disabled(_)) => {}
             // What went wrong with the message being written is said over it, in its own
-            // window if it has one, as Outlook does (not in the main window's corner).
+            // window if it has one, as Outlook does (not in the main window's corner). Sent to
+            // no one: said in the window's own words (the engine's are for scripts).
+            Err(CmdError::Params(_)) if id == "compose.send" && self.session.compose_has_no_recipient() => {
+                self.ui.compose_alert = Some(reading::ComposeAlert::NoRecipient);
+            }
             Err(CmdError::Params(m) | CmdError::Failed(m)) if id.starts_with("compose.") && self.session.compose.is_some() => {
-                self.ui.compose_alert = Some(m);
+                self.ui.compose_alert = Some(reading::ComposeAlert::Other(m));
             }
             Err(CmdError::Params(m) | CmdError::Failed(m)) => self.session.notice(m, true),
             Err(e) => self.session.notice(e.to_string(), true),
@@ -751,7 +697,7 @@ impl MailApp {
         use mailcraft_engine::CmdError;
         let mailto = mailcraft_engine::model::mailto::is_mailto(what);
         let r = if mailto { self.session.run("mail.mailto", &json!({"url": what})) } else { self.session.run("file.open", &json!({"path": what})) };
-        let name = what.rsplit(['/', '\\']).next().unwrap_or(what).to_string();
+        let name = mailcraft_engine::model::file_name(what);
         // How many the answer says were added or left out (none when it doesn't say).
         let tally = |answer: &Value, field: &str| answer[field].as_u64().unwrap_or(0);
         match r {
@@ -786,8 +732,8 @@ impl MailApp {
                 self.session.notice(tl!("Add an account first: events and people are kept with an account.").to_string(), true)
             }
             // One that names the file says all there is to say, by its name and not its whole path.
-            Err(CmdError::Params(m) | CmdError::Failed(m)) if m.contains(what) || m.contains(&name) => {
-                self.session.notice(m.replace(what, &name), true);
+            Err(CmdError::Params(m) | CmdError::Failed(m)) if m.contains(what) || m.contains(name) => {
+                self.session.notice(m.replace(what, name), true);
             }
             Err(e) => self.session.notice(tf!("Couldn't open {file}: {error}", file = name, error = e.to_string()), true),
         }
@@ -813,22 +759,26 @@ impl MailApp {
         }
         // Files chosen in the browser's picker.
         for (purpose, name, data) in self.services.take_picked() {
-            if let Some(account) = purpose.strip_prefix("certificate:") {
-                self.ui.dialog = Some(Dialog::Certificate { account: account.to_string(), path: name, data: Some(data), password: String::new() });
-            } else if purpose == "backup" {
-                self.backup_picked(name, data);
-            } else if purpose == "rules" {
-                self.rules_picked(&data);
-            } else if purpose == "categories" {
-                self.categories_picked(&data);
-            } else if purpose == "picture" {
-                let size = rich_edit::own_size(&data);
-                let (width, line) = (rich_edit::fitted_width(size), rich_edit::own_line(size));
-                let r =
-                    self.session.run("compose.insertPicture", &self.picture_place(json!({"name": name, "data": data, "width": width, "line": line})));
-                self.place_picture(r);
-            } else {
-                self.run("compose.attach", json!({"name": name, "data": data}));
+            match purpose {
+                Picked::Certificate(account) => {
+                    self.ui.dialog = Some(Dialog::Certificate { account, path: name, data: Some(data), password: String::new() });
+                }
+                Picked::Backup => self.backup_picked(name, data),
+                Picked::Rules => self.rules_picked(&data),
+                Picked::Categories => self.categories_picked(&data),
+                Picked::Picture => {
+                    let size = rich_edit::own_size(&data);
+                    let (width, line) = (rich_edit::fitted_width(size), rich_edit::own_line(size));
+                    // Handed over as they are, not as a JSON list (a value per byte).
+                    let handed = self.session.hand(data);
+                    let params = self.picture_place(json!({"name": name, "handed": handed, "width": width, "line": line}));
+                    let r = self.session.run("compose.insertPicture", &params);
+                    self.place_picture(r);
+                }
+                Picked::Attach => {
+                    let handed = self.session.hand(data);
+                    self.run("compose.attach", json!({"name": name, "handed": handed}));
+                }
             }
         }
         // Snoozed mail that is due comes back.
@@ -838,42 +788,6 @@ impl MailApp {
     fn flush_jobs(&mut self) {
         for j in self.session.take_jobs() {
             self.backend.submit(j);
-        }
-    }
-
-    /// Preferences and theme for the app to save.
-    pub fn saved_state(&self) -> Value {
-        json!({ "prefs": self.session.prefs, "dark": self.ui.dark, "language": self.ui.language, "windows": self.ui.places, "peopleView": self.ui.people_view, "peopleList": self.ui.people_list })
-    }
-
-    pub fn restore_state(&mut self, v: &Value) {
-        if let Some(p) = v.get("prefs").and_then(|p| serde_json::from_value::<mailcraft_engine::Prefs>(p.clone()).ok()) {
-            let offline = p.work_offline;
-            let keep = (p.keep_messages, p.keep_offline);
-            self.session.prefs = p;
-            self.session.refresh_list();
-            // How much mail to keep, before any account connects (when it isn't the default).
-            let d = mailcraft_engine::Prefs::default();
-            if keep != (d.keep_messages, d.keep_offline) {
-                self.session.apply_sync_prefs();
-            }
-            // Still working offline from last time: before any account connects.
-            if offline {
-                self.session.set_work_offline(true);
-            }
-        }
-        self.ui.dark = v.get("dark").and_then(Value::as_bool);
-        if let Some(pv) = v.get("peopleView").and_then(|w| serde_json::from_value(w.clone()).ok()) {
-            self.ui.people_view = pv;
-        }
-        if let Some(pl) = v.get("peopleList").and_then(|w| serde_json::from_value(w.clone()).ok()) {
-            self.ui.people_list = pl;
-        }
-        if let Some(w) = v.get("windows").and_then(|w| serde_json::from_value(w.clone()).ok()) {
-            self.ui.places = w;
-        }
-        if let Some(l) = v.get("language").and_then(Value::as_str).filter(|l| *l == i18n::AUTO || i18n::Lang::from_code(l).is_some()) {
-            self.ui.language = l.to_string();
         }
     }
 }

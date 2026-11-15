@@ -1,6 +1,55 @@
 //! The session: changing mail (flags, moves, deletions, undo).
 
+use std::collections::VecDeque;
+
 use super::*;
+
+/// The most moves into an Inbox or Junk remembered ([`MovedIn`]) before the oldest are
+/// forgotten: the server's answer takes each out again, so only those it never confirms stay.
+pub(crate) const MOVED_IN_MAX: usize = 50_000;
+
+/// Mail the user put in a server account's Inbox or Junk (a move, an undo, a snooze over), by
+/// (account, folder, Message-ID): the server gives it a new UID there, and it isn't mail
+/// arriving. Past [`MOVED_IN_MAX`] the oldest are forgotten first (all of them were, at once,
+/// so a move still on its way counted as mail arriving).
+#[derive(Debug, Default)]
+pub(crate) struct MovedIn {
+    /// Each one remembered and when (a count of insertions).
+    at: HashMap<(String, String, String), u64>,
+    /// The same, oldest first; one taken out since, or remembered again later, is skipped as it
+    /// comes up.
+    order: VecDeque<(u64, (String, String, String))>,
+    count: u64,
+}
+
+impl MovedIn {
+    pub(crate) fn insert(&mut self, k: (String, String, String)) {
+        self.count = self.count.saturating_add(1);
+        self.at.insert(k.clone(), self.count);
+        self.order.push_back((self.count, k));
+        while self.at.len() > MOVED_IN_MAX {
+            let Some((when, k)) = self.order.pop_front() else { break };
+            if self.at.get(&k) == Some(&when) {
+                self.at.remove(&k);
+            }
+        }
+        // What was taken out stays in the order until it comes up: not past twice the cap.
+        if self.order.len() > MOVED_IN_MAX.saturating_mul(2) {
+            let at = &self.at;
+            self.order.retain(|(when, k)| at.get(k) == Some(when));
+        }
+    }
+
+    /// Forget one; whether it was remembered.
+    pub(crate) fn remove(&mut self, k: &(String, String, String)) -> bool {
+        self.at.remove(k).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(String, String, String)> {
+        self.at.keys()
+    }
+}
 
 impl Session {
     /// Apply a change: to the in-memory list at once, then to the cache and server (through a
@@ -11,8 +60,18 @@ impl Session {
         }
     }
 
-    /// [`Session::apply_op`], saying when a local move didn't happen (the mail stays where it
-    /// was) rather than putting it in a notice: a move command fails with it.
+    /// Make the changes gathered for many messages: flags and categories first, so they're set
+    /// on the mail before it moves, then the moves.
+    pub(super) fn apply_changes(&mut self, batch: Batch) {
+        let (moves, marks): (Vec<_>, Vec<_>) = batch.0.into_iter().partition(|(_, op)| matches!(op, Op::Move { .. }));
+        for (account, op) in marks.into_iter().chain(moves) {
+            self.apply_op(&account, op);
+        }
+    }
+
+    /// [`Session::apply_op`], saying when a local change didn't happen (a move's mail stays where
+    /// it was, or is in both folders when only its copies were filed) rather than putting it in a
+    /// notice: a move command fails with it.
     pub(super) fn apply_op_checked(&mut self, account: &str, op: Op) -> Result<(), String> {
         // Outbox entries aren't on a server: mail commands leave them alone.
         let op = match op {
@@ -52,12 +111,20 @@ impl Session {
         if !matches!(self.folder(account, to).map(|f| f.role), Some(FolderRole::Inbox | FolderRole::Junk)) {
             return;
         }
-        if self.moved_in.len() > 2000 {
-            self.moved_in.clear();
-        }
+        // Each source folder looked through once (per message, 5,000 out of 50,000 took 80 ms).
+        let mut from: BTreeMap<(&str, &str), HashSet<&MessageKey>> = BTreeMap::new();
         for k in keys.iter().filter(|k| k.folder != *to) {
-            let id = self.folder_state(&k.account, &k.folder).messages.iter().find(|m| m.key == *k).map(|m| m.message_id.clone());
-            if let Some(id) = id.filter(|id| !id.is_empty()) {
+            from.entry((k.account.as_str(), k.folder.as_str())).or_default().insert(k);
+        }
+        for ((a, folder), keys) in from {
+            let ids: Vec<String> = self
+                .folder_state(a, folder)
+                .messages
+                .iter()
+                .filter(|m| !m.message_id.is_empty() && keys.contains(&m.key))
+                .map(|m| m.message_id.clone())
+                .collect();
+            for id in ids {
                 self.moved_in.insert((account.to_string(), to.clone(), id));
             }
         }
@@ -154,7 +221,7 @@ impl Session {
     }
 
     /// Local accounts: change the cache directly, including filing moved messages in their
-    /// destination with new UIDs.
+    /// destination with new UIDs. An error says what the cache couldn't do.
     pub(super) fn apply_op_local(&mut self, account: &str, op: &Op) -> Result<(), String> {
         let Some(store) = self.store.clone() else { return Ok(()) };
         // The folders it touches (counted again after; all of them for a folder change).
@@ -210,14 +277,28 @@ impl Session {
         } else {
             None
         };
-        match store.apply_op(account, op) {
+        // Not done (a move's sources not taken out after its copies were filed): the lists in
+        // memory are read again, and the caller is told (`apply_op` says it in a notice).
+        let failed = match store.apply_op(account, op) {
             Ok(changed) => {
                 for f in changed {
                     self.reload_folder(account, &f);
                 }
+                None
             }
-            Err(e) => self.notice(e.to_string(), true),
-        }
+            Err(e) => {
+                for f in &touched {
+                    self.reload_folder(account, f);
+                }
+                Some(match op {
+                    // The folder as its name reads (its path is kept in modified UTF-7).
+                    Op::Move { to, .. } => {
+                        format!("Your mail was copied to {}, but couldn't be taken out of where it was: {e}", mailcraft_model::utf7::decode(to))
+                    }
+                    _ => e.to_string(),
+                })
+            }
+        };
         if op.is_folder_op()
             && let Ok(mut folders) = store.load_folders(account)
         {
@@ -236,28 +317,16 @@ impl Session {
                 self.want_index(account, Some(f));
             }
         }
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 
     /// A local move's first half: the messages filed in `to` with new numbers, their sources with
-    /// them. Every list is read before anything is written, and any error but a source that
-    /// isn't here stops it (a list read as empty was saved over the destination's mail).
-    ///
-    /// A move of more than a batch of sources is a long write ([`Store::long_write`], returned to
-    /// last until the rest of the move is saved): its batches don't wait for the disk, and the
-    /// last, which the destination's list counts on, is a sealed commit that waits for it, refused
-    /// if the data file lost what didn't (opened again after a failed write) meanwhile. Each
-    /// batch waiting for the disk unsealed, a crash part-way checked the whole file as it opened
-    /// again (105 s for 37 GB); the batches before the last are lost to a crash, but no list names
-    /// them yet.
+    /// them ([`Filing`]: a long write past a batch of them, returned to last until the rest of the
+    /// move is saved). Every list is read before anything is written, and any error but a source
+    /// that isn't here stops it (a list read as empty was saved over the destination's mail).
     fn file_moved<'s>(store: &'s Store, account: &str, keys: &[MessageKey], to: &str) -> Result<Option<LongWrite<'s>>, mailcraft_store::StoreError> {
-        let mut dest = store.load_folder(account, to)?;
-        if dest.validity == 0 {
-            dest.validity = 1;
-        }
-        // Each source folder read once, its messages found by number; the bodies written
-        // together (a folder's every message may go at once: per message, all of this was
-        // read again, and each body was a write of its own).
+        let mut filing = Filing::new(store, account, to)?;
+        // Each source folder read once, its messages found by number.
         let mut sources: HashMap<String, HashMap<u32, SharedSummary>> = HashMap::new();
         for k in keys.iter().filter(|k| k.folder != to) {
             if !sources.contains_key(&k.folder) {
@@ -265,49 +334,27 @@ impl Session {
                 sources.insert(k.folder.clone(), st.messages.into_iter().map(|m| (m.key.uid, m)).collect());
             }
         }
-        let mut uid = dest.free_uid(account, to)?;
-        let mut bodies: Vec<(MessageKey, Vec<u8>)> = Vec::new();
-        let mut pending = 0usize;
-        let packs = store.packs(account);
-        let prepare = |bodies: Vec<(MessageKey, Vec<u8>)>| bodies.into_iter().map(|(k, raw)| (k, Store::prepare(packs, raw))).collect();
-        // The long write, and how often its data file had been let go of after a failed write
-        // as it began.
-        let mut long: Option<(LongWrite<'s>, u64)> = None;
         for k in keys.iter().filter(|k| k.folder != to) {
             let Some(m) = sources.get(&k.folder).and_then(|src| src.get(&k.uid)) else { continue };
             let mut moved = Summary::clone(m);
-            moved.key = MessageKey {
-                account: account.to_string(),
-                folder: to.to_string(),
-                validity: dest.validity,
-                uid: FolderState::take_uid(&mut uid, account, to)?,
-            };
+            moved.key = filing.key()?;
             // One never downloaded moves without it.
-            if let Some(raw) = store.load_body(k)? {
-                // A full batch goes before this one, so the last batch is never empty.
-                if !bodies.is_empty() && (bodies.len() >= 1000 || pending.saturating_add(raw.len()) > 16 << 20) {
-                    if long.is_none() {
-                        let began = store.long_write(account);
-                        long = Some((began, store.data_file_reopened(account)));
-                    }
-                    store.write_prepared(prepare(std::mem::take(&mut bodies)), false)?;
-                    pending = 0;
-                }
-                pending = pending.saturating_add(raw.len());
-                bodies.push((moved.key.clone(), raw));
-            }
-            dest.messages.push(moved.into());
+            filing.add(moved, store.load_body(k)?)?;
         }
-        if !bodies.is_empty() {
-            match &long {
-                Some((_, reopened)) => store.write_batch(account, prepare(bodies), Vec::new(), *reopened)?,
-                None => store.write_prepared(prepare(bodies), true)?,
-            }
-        }
-        dest.uid_next = uid;
-        sort_newest_first(&mut dest.messages);
-        store.save_folder(account, to, &dest)?;
-        Ok(long.map(|(l, _)| l))
+        filing.finish()
+    }
+
+    /// File a message whose source is `raw`, marked `flags`, arrived at `date`; its key.
+    pub(crate) fn file_raw(
+        filing: &mut Filing,
+        raw: Vec<u8>,
+        flags: mailcraft_model::Flags,
+        date: i64,
+    ) -> Result<MessageKey, mailcraft_store::StoreError> {
+        let key = filing.key()?;
+        let size = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+        filing.add(mime::summary_from_full(&raw, key.clone(), flags, size, date), Some(raw))?;
+        Ok(key)
     }
 
     /// A folder-list change, in memory: the account's folders, the open view, cached folder
@@ -320,7 +367,7 @@ impl Session {
                 Op::CreateFolder { path } => {
                     if !a.folders.iter().any(|f| &f.path == path) {
                         // Made in another mailbox (a shared one), it's in that mailbox too.
-                        let parent = delimiter.and_then(|d| path.rsplit_once(d)).map(|(p, _)| p);
+                        let parent = Self::parent_of(path, delimiter);
                         let mailbox = a.folders.iter().find(|f| Some(f.path.as_str()) == parent).and_then(|f| f.mailbox.clone());
                         a.folders.push(Folder {
                             account: account.to_string(),
@@ -380,5 +427,43 @@ impl Session {
             Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::Move { .. } | Op::Expunge { .. } | Op::EmptyFolder { .. } => {}
         }
         self.search_folders_changed(account);
+    }
+}
+
+/// Changes to many messages, gathered as they're worked out (rules, junk lists and ignored
+/// conversations on mail arriving) and made by [`Session::apply_changes`]: the same flag,
+/// category or destination in one account is one change for all its messages, as a selection's
+/// is, not one per message (each rebuilt the list and asked the server again).
+#[derive(Default)]
+pub(super) struct Batch(Vec<(String, Op)>);
+
+impl Batch {
+    /// `op` (a flag, category or move) for messages of `account`, joined to the same change
+    /// asked for already. Messages are added one at a time, all of one message's changes
+    /// together, so one named twice for a change (two rules flagging it) is that change's last.
+    pub(super) fn add(&mut self, account: &str, op: Op) {
+        let mut op = op;
+        for (a, have) in &mut self.0 {
+            if a != account {
+                continue;
+            }
+            op = match (have, op) {
+                (Op::SetFlag { keys, flag, on }, Op::SetFlag { keys: more, flag: f, on: o }) if *flag == f && *on == o => return join(keys, more),
+                (Op::SetKeyword { keys, keyword, on }, Op::SetKeyword { keys: more, keyword: k, on: o }) if *keyword == k && *on == o => {
+                    return join(keys, more);
+                }
+                (Op::Move { keys, to }, Op::Move { keys: more, to: t }) if *to == t => return join(keys, more),
+                (_, op) => op,
+            };
+        }
+        self.0.push((account.to_string(), op));
+    }
+}
+
+fn join(keys: &mut Vec<MessageKey>, more: Vec<MessageKey>) {
+    for k in more {
+        if keys.last() != Some(&k) {
+            keys.push(k);
+        }
     }
 }

@@ -26,13 +26,7 @@ fn data_file_session(name: &str) -> (Session, String) {
 
 /// Put `raw` in the account's Inbox and open it.
 fn put_in_inbox(s: &mut Session, account: &str, uid: u32, raw: &[u8]) {
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder(account, "INBOX").unwrap_or_default();
-    let key = mailcraft_model::MessageKey { account: account.into(), folder: "INBOX".into(), validity: inbox.validity, uid };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder(account, "INBOX", &inbox).unwrap();
-    store.write_body(&key, raw).unwrap();
-    s.apply(Event::FolderChanged { account: account.into(), folder: "INBOX".into() });
+    let key = file_whole(s, mailcraft_model::MessageKey { uid, ..next_key(s, account, "INBOX") }, raw);
     s.run("folder.open", &json!({"account": account, "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
 }
@@ -82,7 +76,6 @@ fn mail_isnt_sent_from_a_data_file() {
     nothing_sent(&mut s, &id);
     s.tick();
     nothing_sent(&mut s, &id);
-    done(s);
 }
 
 /// A reply or forward from a data file: written from the account that can send when there is
@@ -117,7 +110,6 @@ fn replies_from_a_data_file_go_from_an_account_that_can_send() {
     s.run("compose.update", &json!({"account": file, "to": "ann@example.org", "subject": "x"})).unwrap();
     assert!(matches!(s.run("compose.send", &json!({})), Err(CmdError::Disabled(_))));
     assert!(!s.take_jobs().iter().any(|j| matches!(j, Job::Send { .. })));
-    done(s);
 }
 
 /// Forwarded as an attachment from a data file: it goes from the account that can send, with
@@ -138,7 +130,6 @@ fn forward_as_attachment_from_a_data_file_has_the_senders_signature() {
     assert_eq!(c.account, zoe);
     assert!(c.body.contains("Zoe x"), "{:?}", c.body);
     assert_eq!(c.attachments.len(), 1);
-    done(s);
 }
 
 /// The bar's Add an account: the messages being written from the data file (the open one and
@@ -166,7 +157,28 @@ fn adding_an_account_lets_an_open_message_go() {
     assert_eq!(send_off(&s), None);
     s.run("compose.send", &json!({})).unwrap();
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::Send { account, .. } if *account == zoe)));
-    done(s);
+}
+
+/// Each message being written goes From the account added, and stays where it was: the one
+/// open stays open, those set aside stay in their order; with none open, none is opened.
+#[test]
+fn messages_moved_to_an_account_added_stay_where_they_were() {
+    for open in [true, false] {
+        let (mut s, _file) = data_file_session(&format!("send-add-account-order-{open}"));
+        for subject in ["One", "Two", "Three"] {
+            s.run("mail.new", &json!({})).unwrap();
+            s.run("compose.update", &json!({"to": "ann@example.org", "subject": subject, "body": subject})).unwrap();
+        }
+        if !open {
+            let c = s.compose.take().unwrap();
+            s.composes.insert(1, c);
+        }
+        let order = |s: &Session| (s.compose.as_ref().map(|c| c.subject.clone()), s.composes.iter().map(|c| c.subject.clone()).collect::<Vec<_>>());
+        let before = order(&s);
+        let zoe = s.add_account(mailcraft_model::AccountConfig::guess("zoe@example.org"), Some("pw".into())).unwrap();
+        assert_eq!(order(&s), before, "open: {open}");
+        assert!(s.all_composes().all(|c| c.account == zoe), "open: {open}");
+    }
 }
 
 /// No account at all (the one written from was removed): Send is off, and nothing goes.
@@ -188,7 +200,6 @@ fn mail_isnt_sent_with_no_account() {
     assert!(matches!(s.send_compose(true, true), Err(CmdError::Disabled(_))));
     assert_eq!(s.compose.as_ref(), Some(&written));
     nothing_sent(&mut s, &id);
-    done(s);
 }
 
 /// Held in the Outbox for an account that can't send (written by an older MailCraft): Send now
@@ -207,7 +218,6 @@ fn the_outbox_doesnt_send_from_a_data_file() {
     s.set_clock(NOW + 120, 0);
     s.tick();
     assert!(!s.take_jobs().iter().any(|j| matches!(j, Job::FlushOutbox { .. })));
-    done(s);
 }
 
 /// An answer to a meeting invitation in a data file: the calendar takes it, the answer isn't
@@ -242,7 +252,6 @@ fn invitation_answers_arent_sent_from_a_data_file() {
     assert!(s.pim.get(&id).is_some_and(|p| p.events.iter().any(|e| e.event.uid == "m1@example.org")), "in the calendar");
     assert!(s.notices.iter().any(|n| n.error && n.text.contains("not sent")), "{:?}", s.notices);
     nothing_sent(&mut s, &id);
-    done(s);
 }
 
 /// The sample mailbox, a demonstration, still files what it sends in Sent; another mailbox kept
@@ -254,7 +263,6 @@ fn the_sample_mailbox_can_send_and_a_local_one_cant() {
     // A mailbox kept only here, with an address: no server, so no sending.
     let local = s.run("account.add", &json!({"email": "me@example.org", "local": true})).unwrap()["account"].as_str().unwrap().to_string();
     assert_eq!(s.send_block(&local), Some(SendBlock::NoServer));
-    done(s);
 }
 
 /// Found closing MailCraft: a message sent, and another started before it had gone. It was set
@@ -262,11 +270,8 @@ fn the_sample_mailbox_can_send_and_a_local_one_cant() {
 /// sent" for good. Delivered, kept for later or refused, the news finds it.
 #[test]
 fn a_message_set_aside_as_it_goes_hears_what_became_of_it() {
-    let mut s = Session::open(Some(temp("set-aside-sending")), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "riley@studio.example", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let inbox =
-        mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![inbox] });
+    let (mut s, id) =
+        server_account("set-aside-sending", json!({"email": "riley@studio.example", "password": "pw"}), &[("INBOX", FolderRole::Inbox)]);
     let send = |s: &mut Session, subject: &str| -> u64 {
         s.run("mail.new", &json!({"account": id})).unwrap();
         s.run("compose.update", &json!({"to": "ben@x.example", "subject": subject, "body": "hi"})).unwrap();
@@ -283,7 +288,7 @@ fn a_message_set_aside_as_it_goes_hears_what_became_of_it() {
     assert_eq!(sending(&s), 3);
 
     s.apply(Event::Sent { account: id.clone(), id: delivered });
-    s.apply(Event::Queued { account: id.clone(), id: later, error: "offline".into() });
+    s.apply(Event::Queued { account: id.clone(), id: later, error: "offline".into(), kind: Default::default() });
     assert_eq!(sending(&s), 1, "gone from those being sent");
     assert!(s.all_composes().all(|c| c.id != delivered && c.id != later));
 
@@ -315,14 +320,13 @@ fn an_outbox_selection_follows_its_message() {
     let second = s.list.iter().find(|m| m.subject == "Second").map(|m| m.key.clone()).unwrap();
     s.open_message(&second);
     // The first one goes.
-    store.outbox_remove(&id, 7);
+    store.outbox_remove(&id, 7).unwrap();
     s.apply(Event::Sent { account: id.clone(), id: 7 });
     let chosen: Vec<u64> = s.selection.iter().filter_map(|k| s.outbox_entry(k)).map(|(_, i)| i.id).collect();
     assert_eq!(chosen, [8]);
     assert_eq!(s.reading.as_ref().and_then(|r| s.outbox_entry(&r.key)).map(|(_, i)| i.id), Some(8));
     s.run("mail.delete", &json!({})).unwrap();
     assert_eq!(store.outbox(&id).iter().map(|i| i.id).collect::<Vec<_>>(), [9]);
-    done(s);
 }
 
 /// A message closed (or discarded) while it's being sent isn't lost when the server then
@@ -330,11 +334,7 @@ fn an_outbox_selection_follows_its_message() {
 /// again with the reason; one that does go is done with.
 #[test]
 fn a_message_closed_as_it_goes_comes_back_if_refused() {
-    let mut s = Session::open(Some(temp("closed-sending")), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "riley@studio.example", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let inbox =
-        mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![inbox] });
+    let (mut s, id) = server_account("closed-sending", json!({"email": "riley@studio.example", "password": "pw"}), &[("INBOX", FolderRole::Inbox)]);
     for (close, params) in [("compose.close", json!({"save": true})), ("compose.discard", json!({}))] {
         s.run("mail.new", &json!({"account": id})).unwrap();
         s.run("compose.update", &json!({"to": "ben@x.example", "subject": "Refused", "body": "hi"})).unwrap();
@@ -354,4 +354,83 @@ fn a_message_closed_as_it_goes_comes_back_if_refused() {
     s.run("compose.close", &json!({})).unwrap();
     s.apply(Event::Sent { account: id.clone(), id: sent });
     assert!(s.sent_away.is_empty() && s.all_composes().next().is_none());
+}
+
+/// What a message's sending says: sent, held to be sent later (Delay Delivery), or waiting in
+/// the Outbox for the server, each once and nothing else ("Message sent" was said, then taken
+/// back by removing the last notice).
+#[test]
+fn sending_says_where_the_message_went() {
+    let mut s = Session::open(Some(temp("send-says")), mailcraft_model::dates::Clock::new(NOW, 0));
+    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
+    s.take_jobs();
+    let said = |s: &Session| s.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+    let send = |s: &mut Session, more: Value| -> u64 {
+        s.run("mail.new", &json!({})).unwrap();
+        let mut params = json!({"to": "ann@example.org", "subject": "Plans", "body": "See you"});
+        if let (Some(p), Value::Object(more)) = (params.as_object_mut(), more) {
+            p.extend(more);
+        }
+        s.run("compose.update", &params).unwrap();
+        s.run("compose.send", &json!({})).unwrap();
+        s.take_jobs().into_iter().find_map(|j| if let Job::Send { id, .. } = j { Some(id) } else { None }).unwrap_or(0)
+    };
+    let first = send(&mut s, json!({}));
+    s.apply(Event::Sent { account: id.clone(), id: first });
+    assert_eq!(said(&s), ["Message sent"]);
+    s.notices.clear();
+    send(&mut s, json!({"sendAfter": NOW + 3600}));
+    let later = said(&s);
+    assert!(later.len() == 1 && later[0].starts_with("It will be sent "), "{later:?}");
+    s.notices.clear();
+    let queued = send(&mut s, json!({}));
+    s.apply(Event::Queued { account: id.clone(), id: queued, error: "offline".into(), kind: Default::default() });
+    assert_eq!(said(&s), ["Saved in the Outbox: it will be sent when you're back online"]);
+}
+
+/// A message to no one is refused, and the session says that's why (the window says so in its
+/// own words); not for one with a bad address, or one that has a recipient.
+#[test]
+fn a_message_to_no_one_is_told_apart() {
+    let mut s = sample_session("send-no-one");
+    assert!(!s.compose_has_no_recipient(), "nothing being written");
+    s.run("mail.new", &json!({})).unwrap();
+    s.run("compose.update", &json!({"subject": "Plans", "body": "See you"})).unwrap();
+    assert!(s.compose_has_no_recipient());
+    assert!(matches!(s.run("compose.send", &json!({})), Err(CmdError::Params(_))));
+    s.run("compose.update", &json!({"bcc": "  ;  "})).unwrap();
+    assert!(s.compose_has_no_recipient(), "separators alone are no one");
+    s.run("compose.update", &json!({"to": "ann@"})).unwrap();
+    assert!(!s.compose_has_no_recipient(), "a bad address is another reason");
+    assert!(matches!(s.run("compose.send", &json!({})), Err(CmdError::Params(_))));
+    s.run("compose.update", &json!({"to": "ann@example.org"})).unwrap();
+    assert!(!s.compose_has_no_recipient());
+}
+
+/// What Forward as Attachment takes on a message of 20 MB of files (`cargo test -p
+/// mailcraft-engine --release measure_forward_as_attachment -- --ignored --nocapture`): the
+/// message goes whole, its files aren't read.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_forward_as_attachment() {
+    let mut s = sample_session("measure-forward-attachment");
+    let files = (0..4)
+        .map(|i| mailcraft_mime::OutAttachment {
+            name: format!("scan{i}.bin"),
+            mime: "application/octet-stream".into(),
+            data: (0..5_000_000u32).map(|b| (b.wrapping_mul(2_654_435_761) >> 13) as u8).collect(),
+            ..Default::default()
+        })
+        .collect();
+    let d = mailcraft_mime::Draft { subject: "Scans".into(), body: "The scans.".into(), attachments: files, ..Default::default() };
+    let raw = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new("Ana", "ana@example.org"), NOW, "<scans@x>").unwrap();
+    put_in_inbox(&mut s, "sample", 9701, &raw);
+    let runs = 5u32;
+    let began = std::time::Instant::now();
+    for _ in 0..runs {
+        s.run("mail.forwardAsAttachment", &json!({})).unwrap();
+        assert_eq!(s.compose.as_ref().unwrap().attachments.len(), 1);
+        s.run("compose.discard", &json!({})).unwrap();
+    }
+    println!("MEASURE forward as attachment of a message of 20 MB of files: {} ms", began.elapsed().as_millis() / u128::from(runs));
 }

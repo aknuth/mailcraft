@@ -12,14 +12,7 @@ fn online(st: &Arc<Mutex<State>>, name: &str) -> (crate::worker::Pool, Store, st
     let store = store(name);
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: smtp_port, security: Security::None },
-        ..Default::default()
-    };
+    let account = imap_account(imap_port, smtp_port);
     pool.submit(Job::Start { account, password: Some(Secret("pw".into())) });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     (pool, store, log)
@@ -40,16 +33,11 @@ fn send(pool: &mut crate::worker::Pool) {
 
 /// The copy in `folder` on the server, marked read, waited for.
 fn copy_in(st: &Arc<Mutex<State>>, folder: &str) {
-    let end = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(m) = st.lock().unwrap().mailbox(folder).and_then(|b| b.msgs.first()) {
-            assert!(String::from_utf8_lossy(&m.raw).contains("Subject: Copy please"));
-            assert!(m.flags.iter().any(|f| f == "\\Seen"), "{:?}", m.flags);
-            return;
-        }
-        assert!(Instant::now() < end, "no copy in {folder}: {:?}", st.lock().unwrap().boxes.iter().map(|b| b.name.clone()).collect::<Vec<_>>());
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually(&format!("a copy in {folder}"), || st.lock().unwrap().mailbox(folder).is_some_and(|b| !b.msgs.is_empty()));
+    let mut s = st.lock().unwrap();
+    let m = s.mailbox(folder).and_then(|b| b.msgs.first()).unwrap();
+    assert!(String::from_utf8_lossy(&m.raw).contains("Subject: Copy please"));
+    assert!(m.flags.iter().any(|f| f == "\\Seen"), "{:?}", m.flags);
 }
 
 /// A server with no Sent folder (GreenMail, a new account on many hosts): one is made, the copy
@@ -62,13 +50,10 @@ fn a_sent_folder_is_made_where_there_is_none() {
     send(&mut pool);
     assert!(log.join().unwrap().contains("Subject: Copy please"));
     copy_in(&st, "Sent");
-    let end = Instant::now() + Duration::from_secs(10);
-    while !store.load_folders("a1").unwrap_or_default().iter().any(|f| f.path == "Sent" && f.role == FolderRole::Sent) {
-        assert!(Instant::now() < end, "the account never knew it as Sent Items");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the account to know it as Sent Items", || {
+        store.load_folders("a1").unwrap_or_default().iter().any(|f| f.path == "Sent" && f.role == FolderRole::Sent)
+    });
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// A server that keeps every folder in the Inbox (cPanel, Courier) refuses `Sent`: `INBOX/Sent`
@@ -81,12 +66,11 @@ fn a_sent_folder_is_made_in_the_inbox_where_folders_must_be() {
         s.boxes.retain(|b| b.name == "INBOX");
         s.create_under = Some("INBOX/".into());
     }
-    let (mut pool, store, _log) = online(&st, "sent-in-inbox");
+    let (mut pool, _store, _log) = online(&st, "sent-in-inbox");
     send(&mut pool);
     copy_in(&st, "INBOX/Sent");
     assert!(st.lock().unwrap().mailbox("Sent").is_none());
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Sent Items by another language's name, without the server saying so (`Gesendet`): that one
@@ -101,13 +85,12 @@ fn a_sent_folder_in_another_language_takes_the_copy() {
             b.attr = "";
         }
     }
-    let (mut pool, store, _log) = online(&st, "sent-gesendet");
+    let (mut pool, _store, _log) = online(&st, "sent-gesendet");
     send(&mut pool);
     copy_in(&st, "Gesendet");
     assert!(st.lock().unwrap().mailbox("Sent").is_none(), "nothing made");
     assert!(!st.lock().unwrap().log.iter().any(|c| c.starts_with("CREATE")));
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Listed ahead of the server's flagged Sent (Dovecot lists cPanel's `INBOX.Sent` last): another
@@ -119,7 +102,7 @@ fn the_flagged_sent_folder_takes_the_copy_wherever_it_is_listed() {
     {
         let mut s = st.lock().unwrap();
         for (at, name) in (1..).zip(["Clients", "Clients/Sent", "Sent Items"]) {
-            let b = Mailbox { name: name.into(), attr: "", validity: 500 + at, uid_next: 1, msgs: Vec::new(), expunged: Vec::new() };
+            let b = Mailbox::new(name, "", 500 + at);
             s.boxes.insert(at as usize, b);
         }
     }
@@ -133,7 +116,6 @@ fn the_flagged_sent_folder_takes_the_copy_wherever_it_is_listed() {
         assert!(st.lock().unwrap().mailbox(other).is_some_and(|b| b.msgs.is_empty()), "{other} got it");
     }
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Found testing drafts on GreenMail started afresh: Sent and Drafts deleted on the server after
@@ -143,14 +125,7 @@ fn the_flagged_sent_folder_takes_the_copy_wherever_it_is_listed() {
 #[test]
 fn a_sent_or_drafts_folder_deleted_on_the_server_is_made_again() {
     let st = State::new();
-    st.lock().unwrap().boxes.push(Mailbox {
-        name: "Drafts".into(),
-        attr: r"\Drafts",
-        validity: 600,
-        uid_next: 1,
-        msgs: Vec::new(),
-        expunged: Vec::new(),
-    });
+    with_drafts(&st);
     let (mut pool, store, _log) = online(&st, "sent-gone");
     assert!(store.load_folders("a1").unwrap_or_default().iter().any(|f| f.path == "Drafts"), "listed");
     st.lock().unwrap().boxes.retain(|b| b.name != "Sent" && b.name != "Drafts");
@@ -161,7 +136,6 @@ fn a_sent_or_drafts_folder_deleted_on_the_server_is_made_again() {
     until(&pool, "draft saved", |e| matches!(e, Event::DraftSaved { message_id, error: None, .. } if message_id == "again@studio.example"));
     assert!(st.lock().unwrap().mailbox("Drafts").is_some_and(|b| b.msgs.len() == 1), "the draft is in Drafts again");
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Sent and Drafts renamed on the server since they were listed (by another client), still the
@@ -171,15 +145,8 @@ fn a_sent_or_drafts_folder_deleted_on_the_server_is_made_again() {
 #[test]
 fn a_sent_or_drafts_folder_renamed_on_the_server_is_found_again() {
     let st = State::new();
-    st.lock().unwrap().boxes.push(Mailbox {
-        name: "Drafts".into(),
-        attr: r"\Drafts",
-        validity: 600,
-        uid_next: 1,
-        msgs: Vec::new(),
-        expunged: Vec::new(),
-    });
-    let (mut pool, store, _log) = online(&st, "sent-renamed");
+    with_drafts(&st);
+    let (mut pool, _store, _log) = online(&st, "sent-renamed");
     for (from, to) in [("Sent", "Sent Messages"), ("Drafts", "Brouillons")] {
         if let Some(b) = st.lock().unwrap().boxes.iter_mut().find(|b| b.name == from) {
             b.name = to.into();
@@ -195,7 +162,6 @@ fn a_sent_or_drafts_folder_renamed_on_the_server_is_found_again() {
     assert!(s.mailbox("Sent").is_none() && s.mailbox("Drafts").is_none(), "{:?}", s.boxes.iter().map(|b| b.name.clone()).collect::<Vec<_>>());
     drop(s);
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// A draft kept on this computer as MailCraft closed, while its save was on its way and got there
@@ -204,15 +170,8 @@ fn a_sent_or_drafts_folder_renamed_on_the_server_is_found_again() {
 #[test]
 fn a_draft_saved_twice_is_there_once() {
     let st = State::new();
-    st.lock().unwrap().boxes.push(Mailbox {
-        name: "Drafts".into(),
-        attr: r"\Drafts",
-        validity: 600,
-        uid_next: 1,
-        msgs: Vec::new(),
-        expunged: Vec::new(),
-    });
-    let (mut pool, store, _log) = online(&st, "draft-twice");
+    with_drafts(&st);
+    let (mut pool, _store, _log) = online(&st, "draft-twice");
     let draft = b"From: me@studio.example\r\nSubject: Plans\r\nMessage-ID: <twice@studio.example>\r\n\r\nto finish\r\n".to_vec();
     for _ in 0..2 {
         pool.submit(Job::SaveDraft { account: "a1".into(), raw: draft.clone(), folder: "Drafts".into(), replaces: None });
@@ -220,19 +179,11 @@ fn a_draft_saved_twice_is_there_once() {
     }
     assert_eq!(st.lock().unwrap().mailbox("Drafts").map(|b| b.msgs.len()), Some(1), "once");
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Drafts, with nothing in it yet, on `st`.
 fn with_drafts(st: &Arc<Mutex<State>>) {
-    st.lock().unwrap().boxes.push(Mailbox {
-        name: "Drafts".into(),
-        attr: r"\Drafts",
-        validity: 600,
-        uid_next: 1,
-        msgs: Vec::new(),
-        expunged: Vec::new(),
-    });
+    st.lock().unwrap().boxes.push(Mailbox::new("Drafts", r"\Drafts", 600));
 }
 
 /// A message put in Drafts by another program.
@@ -258,14 +209,7 @@ fn in_folder(st: &Arc<Mutex<State>>, folder: &str) -> Vec<Vec<u8>> {
 
 /// A Trash folder (SPECIAL-USE `\Trash`), with nothing in it yet, on `st`.
 fn with_trash(st: &Arc<Mutex<State>>) {
-    st.lock().unwrap().boxes.push(Mailbox {
-        name: "Trash".into(),
-        attr: r"\Trash",
-        validity: 700,
-        uid_next: 1,
-        msgs: Vec::new(),
-        expunged: Vec::new(),
-    });
+    st.lock().unwrap().boxes.push(Mailbox::new("Trash", r"\Trash", 700));
 }
 
 /// A draft saved again on a phone, which kept its Message-ID and built the rest anew.
@@ -282,7 +226,7 @@ fn own_copy_saved_again(name: &str, caps: &'static str, stamp: Option<&'static s
     st.lock().unwrap().stamp_appends = stamp;
     with_drafts(&st);
     with_trash(&st);
-    let (mut pool, store, _log) = online(&st, name);
+    let (mut pool, _store, _log) = online(&st, name);
     let own =
         b"From: me@studio.example\r\nSubject: Plans\r\nMessage-ID: <own@studio.example>\r\n\r\nto finish the plans for the winter show\r\n".to_vec();
     save_draft(&mut pool, &own, "own@studio.example");
@@ -294,7 +238,6 @@ fn own_copy_saved_again(name: &str, caps: &'static str, stamp: Option<&'static s
     save_draft(&mut pool, &own, "own@studio.example");
     let (drafts, trash) = (in_folder(&st, "Drafts"), in_folder(&st, "Trash"));
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
     (drafts, trash, own)
 }
 
@@ -354,7 +297,7 @@ fn without_uidplus_the_own_copy_is_marked_deleted() {
         if let Some(m) = st.lock().unwrap().mailbox("Drafts").and_then(|b| b.msgs.last_mut()) {
             m.flags.push(r"\Deleted".into());
         }
-        let (mut pool, store, _log) = online(&st, &format!("draft-no-uidplus-{pass}"));
+        let (mut pool, _store, _log) = online(&st, &format!("draft-no-uidplus-{pass}"));
         let own = b"From: me@studio.example\r\nSubject: Plans\r\nMessage-ID: <own@studio.example>\r\n\r\nto finish\r\n".to_vec();
         save_draft(&mut pool, &own, "own@studio.example");
         put_in_drafts(&st, PHONE.to_vec());
@@ -367,7 +310,6 @@ fn without_uidplus_the_own_copy_is_marked_deleted() {
         let log = st.lock().unwrap().log.clone();
         assert!(!log.iter().any(|c| ["EXPUNGE", "UID EXPUNGE", "UID MOVE", "UID COPY"].iter().any(|v| c.starts_with(v))), "{caps}: {log:?}");
         pool.submit(Job::Remove { account: "a1".into() });
-        let _ = std::fs::remove_dir_all(store.root());
     }
 }
 
@@ -383,7 +325,7 @@ fn each_save_replaces_its_copy_alone() {
         st.lock().unwrap().caps = caps;
         with_drafts(&st);
         with_trash(&st);
-        let (mut pool, store, _log) = online(&st, &format!("draft-versions-{pass}"));
+        let (mut pool, _store, _log) = online(&st, &format!("draft-versions-{pass}"));
         let mut replaces = None;
         let mut last = Vec::new();
         for n in 1..=3 {
@@ -401,7 +343,6 @@ fn each_save_replaces_its_copy_alone() {
         let expunges = log.iter().filter(|c| c.starts_with("UID EXPUNGE")).count();
         assert_eq!(expunges, if caps.contains("UIDPLUS") { 2 } else { 0 }, "{caps}: each replaced copy once: {log:?}");
         pool.submit(Job::Remove { account: "a1".into() });
-        let _ = std::fs::remove_dir_all(store.root());
     }
 }
 
@@ -423,13 +364,7 @@ fn a_draft_kept_on_close_goes_before_the_next_runs_save() {
     drop(pool);
     let port = serve_tcp(&st);
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port, security: Security::None },
-        ..Default::default()
-    };
+    let account = imap_account(port, 1);
     pool.submit(Job::Start { account, password: Some(Secret("pw".into())) });
     pool.submit(Job::SaveDraft { account: "a1".into(), raw: next.clone(), folder: "Drafts".into(), replaces: None });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
@@ -444,5 +379,30 @@ fn a_draft_kept_on_close_goes_before_the_next_runs_save() {
     let appends = st.lock().unwrap().log.iter().filter(|c| c.contains("APPEND")).count();
     assert_eq!(appends, 3, "{:?}", st.lock().unwrap().log);
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
+}
+
+/// A server where no Sent Items can be made: the message goes, and that no copy was kept comes as
+/// an event of its own, which the CLI's send waits for (it looked for words in a notice, which
+/// rewording would have turned into a minute's wait for a copy that never comes).
+#[test]
+fn a_copy_that_cant_be_kept_is_said_by_its_own_event() {
+    let st = State::new();
+    {
+        let mut s = st.lock().unwrap();
+        s.boxes.retain(|b| b.name == "INBOX");
+        s.create_under = Some("Elsewhere/".into());
+    }
+    let (mut pool, _store, _log) = online(&st, "sent-not-kept");
+    send(&mut pool);
+    let mut said = String::new();
+    until(&pool, "word that no copy was kept", |e| match e {
+        Event::SentCopyNotKept { account, error } if account == "a1" => {
+            said = error.clone();
+            true
+        }
+        _ => false,
+    });
+    assert!(said.contains("no copy was saved"), "{said}");
+    assert_eq!(st.lock().unwrap().boxes.len(), 1, "nothing made");
+    pool.submit(Job::Remove { account: "a1".into() });
 }

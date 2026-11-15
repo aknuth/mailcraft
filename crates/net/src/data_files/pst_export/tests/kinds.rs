@@ -2,6 +2,8 @@
 //! mail, meeting mail and reports, exported as Outlook keeps them and read back by the import.
 
 use super::*;
+use crate::data_files::scratch::scratch;
+use crate::data_files::test_data::cms;
 use mailcraft_mime::smime::{self, Protection};
 use mailcraft_pst::{Attachment, AttachmentData};
 
@@ -11,13 +13,6 @@ const NOW: i64 = 1_792_900_000;
 fn riley() -> mailcraft_smime::Identity {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../smime/testdata/riley-aes.p12");
     mailcraft_smime::read_p12(&std::fs::read(path).unwrap(), "secret").unwrap()
-}
-
-fn scratch(label: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-kinds-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn draft(subject: &str, body: &str, attachments: Vec<mime::OutAttachment>) -> mime::Draft {
@@ -70,23 +65,7 @@ fn imported(back: &Store, subject: &str) -> Vec<u8> {
 
 /// The message with `subject` in the file's Inbox, as the writer's reader reads it.
 fn in_file(path: &Path, subject: &str) -> Rc<Message> {
-    let store = PstStore::read(Rc::new(PstFile::open(path).unwrap())).unwrap();
-    let any: Rc<PstStore> = store.clone();
-    let top = any.open_folder(any.ipm_subtree().unwrap()).unwrap();
-    let table = top.hierarchy_table().unwrap().clone();
-    let inbox = table
-        .rows_matrix()
-        .filter_map(|row| any.open_folder(row.id()).ok())
-        .find(|f| f.properties().display_name().is_ok_and(|n| n == "Inbox"))
-        .unwrap();
-    for row in inbox.contents_table().unwrap().rows_matrix() {
-        let entry = row.id();
-        let m = Message::read(store.clone(), entry).unwrap();
-        if m.properties().get(0x0037).and_then(crate::pst::text_of).as_deref() == Some(subject) {
-            return m;
-        }
-    }
-    panic!("no {subject} in the file")
+    message_at(&read_file(path), &["Inbox"], subject)
 }
 
 fn attachments_of(m: &Rc<Message>) -> Vec<Rc<Attachment>> {
@@ -104,7 +83,7 @@ fn text(value: Option<&mailcraft_pst::PropertyValue>) -> Option<String> {
 #[test]
 fn attached_messages_go_in_as_messages() {
     use mailcraft_pst::PropertyValue as V;
-    let dir = scratch("attached");
+    let dir = scratch("pst-export-kinds-attached");
     let deep = build(&draft("Level 3", "The bottom.", vec![file("deep.txt", "text/plain", b"found it")]), "l3@studio.example");
     let two = build(&draft("Level 2", "Two.", vec![file("Level 3.eml", "message/rfc822", &deep)]), "l2@studio.example");
     let one = build(&draft("Level 1", "One.", vec![file("Level 2.eml", "message/rfc822", &two)]), "l1@studio.example");
@@ -148,7 +127,6 @@ fn attached_messages_go_in_as_messages() {
     let p = mime::parse(&raw).unwrap();
     assert_eq!(p.attachments.len(), 1);
     assert_eq!(mime::attachment_data(&raw, p.attachments[0].index).as_deref(), Some(&b"found it"[..]));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A clear-signed message goes in as `IPM.Note.SMIME.MultipartSigned` and comes back with its
@@ -156,7 +134,7 @@ fn attached_messages_go_in_as_messages() {
 /// and it still decrypts; an opaque signature's CMS comes back as it was.
 #[test]
 fn signed_and_encrypted_mail_goes_in_as_outlook_keeps_it() {
-    let dir = scratch("smime");
+    let dir = scratch("pst-export-kinds-smime");
     let id = riley();
     let cert = id.certificate().to_vec();
     let mut sign = |entity: &[u8]| mailcraft_smime::sign(entity, &id, NOW, &mut rand_core::OsRng).map_err(|e| format!("{e:?}"));
@@ -171,8 +149,7 @@ fn signed_and_encrypted_mail_goes_in_as_outlook_keeps_it() {
         smime::protect(&build(&draft("Sealed", "Secret plans.", Vec::new()), "s2@studio.example"), None, Some(&mut encrypt), false, false, "=_e")
             .unwrap();
     // A made-up opaque signature: its bytes come back, whatever they hold.
-    let mut cms = vec![0x30, 0x80, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02, 0xA0, 0x80];
-    cms.extend([0x5A; 40]);
+    let cms = cms(2);
     let outer = b"From: Riley <riley@studio.example>\r\nTo: ana@studio.example\r\nSubject: Opaque\r\nDate: Mon, 2 Nov 2026 10:00:00 +0000\r\nMessage-ID: <s3@studio.example>\r\n";
     let opaque = smime::pkcs7_message(outer, &cms, "signed-data");
     let (path, back) = round_trip(&dir, &[signed, secret, opaque]);
@@ -202,7 +179,6 @@ fn signed_and_encrypted_mail_goes_in_as_outlook_keeps_it() {
     let (entity, _) = mailcraft_smime::decrypt(&cms_back, &id, &mut rand_core::OsRng).unwrap();
     assert!(String::from_utf8_lossy(&entity).contains("Secret plans."));
     assert_eq!(smime::protection(&imported(&back, "Opaque")), Protection::Opaque(cms));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A report: its header, a text, its status and the message it returns.
@@ -226,7 +202,7 @@ fn report(id: &str, kind: &str, status: &str, returned: (&str, &[u8])) -> Vec<u8
 /// a report's class, and come back as reports, the returned message attached as a message.
 #[test]
 fn meeting_mail_and_reports_keep_their_classes() {
-    let dir = scratch("reports");
+    let dir = scratch("pst-export-kinds-reports");
     let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:review@studio.example\r\nDTSTAMP:20261101T100000Z\r\n\
                DTSTART:20261110T100000Z\r\nDTEND:20261110T110000Z\r\nSUMMARY:Review\r\nORGANIZER:mailto:riley@studio.example\r\n\
                ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:ana@studio.example\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -262,12 +238,6 @@ fn meeting_mail_and_reports_keep_their_classes() {
         let p = mime::parse(&raw).unwrap();
         assert!(p.attachments.iter().any(|a| a.mime == returned), "{subject}: {:?}", p.attachments);
     }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A big file's bytes, the `n`th file's: not one repeated block.
-fn big_file(n: u8, len: usize) -> Vec<u8> {
-    (0..len).map(|at| ((at as u64).wrapping_add(u64::from(n)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8).collect()
 }
 
 /// A big file waits in a file of its own, not in the cache: a message whose source leaves the
@@ -275,7 +245,7 @@ fn big_file(n: u8, len: usize) -> Vec<u8> {
 /// written whole, and the export leaves nothing beside its file.
 #[test]
 fn a_big_file_doesnt_need_the_cache_once_collected() {
-    let dir = scratch("waits");
+    let dir = scratch("pst-export-kinds-waits");
     let data = big_file(1, 5 << 20);
     let raw = build(&draft("Footage", "The take.", vec![file("take.bin", "application/octet-stream", &data)]), "take@studio.example");
     let store = Store::open(dir.join("cache")).unwrap();
@@ -295,13 +265,11 @@ fn a_big_file_doesnt_need_the_cache_once_collected() {
     assert!(matches!(got[0].data(), Some(AttachmentData::Binary(b)) if b.buffer() == data.as_slice()));
 
     // Through a whole export: the file byte for byte, and nothing left beside it.
-    let again = scratch("waits-export");
+    let again = scratch("pst-export-kinds-waits-export");
     let (path, _) = round_trip(&again, &[raw]);
     let got = attachments_of(&in_file(&path, "Footage"));
     assert!(matches!(got[0].data(), Some(AttachmentData::Binary(b)) if b.buffer() == data.as_slice()));
     assert!(!again.join("Mail.pst.part-files").exists() && !again.join("Mail.pst.part").exists());
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&again);
 }
 
 /// Attached messages hold what they decode while those below them are read: past their room
@@ -338,7 +306,7 @@ fn attached_messages_hold_no_more_than_their_room() {
 /// both go into the data file.
 #[test]
 fn long_names_keep_their_extension_and_long_ids_their_pictures() {
-    let dir = scratch("long-names");
+    let dir = scratch("pst-export-kinds-long-names");
     let name = format!("{}.pdf", "report ".repeat(50));
     let cid = format!("{}@studio.example", "c".repeat(1200));
     // By hand: MailCraft's own mail never carries such a Content-ID.
@@ -364,5 +332,4 @@ fn long_names_keep_their_extension_and_long_ids_their_pictures() {
     let got = attachments_of(&in_file(&path, "Long names"));
     assert_eq!(text(got[0].properties().get(0x3712)).as_deref(), Some(short_cid.as_str()));
     assert_eq!(text(got[1].properties().get(0x3707)).as_deref(), Some(short.as_str()));
-    let _ = std::fs::remove_dir_all(&dir);
 }

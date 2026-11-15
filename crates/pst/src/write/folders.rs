@@ -3,27 +3,31 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::rc::Rc;
 
-use super::edit::Editor;
-use super::message::{NID_TYPE_NORMAL_MESSAGE, contents_cell, is_unread, text_of};
+use super::FIRST_SUBNODE;
+use super::edit::{ADD_MAX_VALUE_SIZE, Editor};
+use super::message::{ContentsRow, given_by_id, is_unread, text_of};
 use super::table::{Cell, NewRow, ROW_ID, ROW_VERSION};
 use super::text::{Text, same_ansi_name};
 use super::types::*;
-use crate::ltp::{Bytes, PropertyType as P, PropertyValue, Table};
-use crate::messaging::{NID_MESSAGE_STORE, PstFolder, node_of_entry_id};
-use crate::ndb::{NID_TYPE_ASSOC_CONTENTS_TABLE, NID_TYPE_CONTENTS_TABLE, NID_TYPE_HIERARCHY_TABLE, NID_TYPE_MASK, SubNodes};
+use crate::ltp::{Bytes, Properties, PropertyType as P, PropertyValue};
+use crate::messaging::{NID_MESSAGE_STORE, PstStore, node_of_entry_id};
+use crate::ndb::{
+    NID_TYPE_ASSOC_CONTENTS_TABLE, NID_TYPE_CONTENTS_TABLE, NID_TYPE_HIERARCHY_TABLE, NID_TYPE_MASK, NID_TYPE_NORMAL_FOLDER, NID_TYPE_NORMAL_MESSAGE,
+    PstFile, SubNodes,
+};
 use crate::util::{invalid, short};
 
 pub(crate) const NID_ROOT_FOLDER: u32 = 0x122;
-const NID_TYPE_NORMAL_FOLDER: u32 = 0x02;
 const NID_HIERARCHY_TEMPLATE: u32 = 0x60D;
 const NID_CONTENTS_TEMPLATE: u32 = 0x60E;
 const NID_ASSOC_TEMPLATE: u32 = 0x60F;
-const NID_SEARCH_QUEUE: u32 = 0x1E1;
+pub(crate) const NID_SEARCH_QUEUE: u32 = 0x1E1;
 
 const DISPLAY_NAME: u16 = 0x3001;
-const CONTENT_COUNT: u16 = 0x3602;
-const CONTENT_UNREAD: u16 = 0x3603;
+pub(crate) const CONTENT_COUNT: u16 = 0x3602;
+pub(crate) const CONTENT_UNREAD: u16 = 0x3603;
 const SUBFOLDERS: u16 = 0x360A;
 const CONTAINER_CLASS: u16 = 0x3613;
 
@@ -44,8 +48,38 @@ fn folder_prop(p: &mut Vec<(u16, PropertyValue)>, id: u16, v: PropertyValue) {
     p.push((id, v));
 }
 
-pub(crate) fn writable(f: &PstFolder) -> Vec<(u16, PropertyValue)> {
-    f.properties().iter().map(|(k, v)| (*k, v.clone())).collect()
+/// A property set as a list to change and write again.
+pub(crate) fn writable(p: &Properties) -> Vec<(u16, PropertyValue)> {
+    p.iter().map(|(k, v)| (*k, v.clone())).collect()
+}
+
+/// A new folder's row in its parent's hierarchy table.
+struct FolderRow<'a> {
+    folder: u32,
+    name: &'a str,
+    class: &'a str,
+    version: u32,
+    text: Text,
+    /// The folder's entry ID; none when the store has no record key.
+    entry: Option<Vec<u8>>,
+}
+
+impl FolderRow<'_> {
+    /// The row's cell for a hierarchy column.
+    fn cell(&self, id: u16, kind: u16) -> Option<Cell> {
+        match (id, kind) {
+            #[allow(clippy::cast_possible_wrap)]
+            (ROW_ID, P::INT32) => Some(Cell::Fixed((self.folder as i32).to_le_bytes().to_vec())),
+            #[allow(clippy::cast_possible_wrap)]
+            (ROW_VERSION, P::INT32) => Some(Cell::Fixed((self.version as i32).to_le_bytes().to_vec())),
+            (DISPLAY_NAME, _) => self.text.cell(kind, self.name).map(Cell::Bytes),
+            (CONTENT_COUNT | CONTENT_UNREAD, P::INT32) => Some(Cell::Fixed(0i32.to_le_bytes().to_vec())),
+            (SUBFOLDERS, P::BOOLEAN) => Some(Cell::Fixed(vec![0])),
+            (CONTAINER_CLASS, _) => self.text.cell(kind, self.class).map(Cell::Bytes),
+            (0x0FFF, P::BINARY) => self.entry.clone().map(Cell::Bytes),
+            _ => None,
+        }
+    }
 }
 
 /// A display name read as text.
@@ -86,30 +120,9 @@ impl Editor {
         Ok(None)
     }
 
-    /// The cell a new folder's row has for a hierarchy column.
-    fn folder_cell(&self, id: u16, kind: u16, folder: u32, name: &str, class: &str, version: u32) -> Option<Cell> {
-        let text = Text::plain(self.format());
-        match (id, kind) {
-            #[allow(clippy::cast_possible_wrap)]
-            (ROW_ID, P::INT32) => Some(Cell::Fixed((folder as i32).to_le_bytes().to_vec())),
-            #[allow(clippy::cast_possible_wrap)]
-            (ROW_VERSION, P::INT32) => Some(Cell::Fixed((version as i32).to_le_bytes().to_vec())),
-            (DISPLAY_NAME, _) => text.cell(kind, name).map(Cell::Bytes),
-            (CONTENT_COUNT | CONTENT_UNREAD, P::INT32) => Some(Cell::Fixed(0i32.to_le_bytes().to_vec())),
-            (SUBFOLDERS, P::BOOLEAN) => Some(Cell::Fixed(vec![0])),
-            (CONTAINER_CLASS, _) => text.cell(kind, class).map(Cell::Bytes),
-            (0x0FFF, P::BINARY) => Some(Cell::Bytes(self.entry_id(folder).ok()?)),
-            _ => None,
-        }
-    }
-
     /// The entry ID of node `nid` in this file.
     pub(crate) fn entry_id(&self, nid: u32) -> io::Result<Vec<u8>> {
-        let key = self.record_key()?;
-        let mut e = vec![0u8; 4];
-        e.extend_from_slice(&key);
-        e.extend(nid.to_le_bytes());
-        Ok(e)
+        Ok(super::entry_id(&self.record_key()?, nid))
     }
 
     pub(crate) fn record_key(&self) -> io::Result<[u8; 16]> {
@@ -144,19 +157,16 @@ impl Editor {
         let version = self.header.unique;
         // The parent's hierarchy table gets a row.
         let hierarchy = (parent & !NID_TYPE_MASK) | NID_TYPE_HIERARCHY_TABLE;
-        let cell_rows: Vec<Option<Cell>> = {
-            let entry = self.node(hierarchy)?;
-            let table = Table::read(self.pst.clone(), entry.data, entry.sub)?;
-            table.columns().iter().map(|c| self.folder_cell(c.prop_id(), c.prop_type(), folder, name, class, version)).collect()
-        };
-        self.rewrite_table(hierarchy, move |_, _, rows| {
-            rows.push(NewRow { id: folder, cells: cell_rows });
+        let row = FolderRow { folder, name, class, version, text, entry: self.entry_id(folder).ok() };
+        self.rewrite_table(hierarchy, |schema, rows| {
+            let cells = schema.columns.iter().map(|c| row.cell(c.prop_id(), c.prop_type())).collect();
+            rows.push(NewRow { id: folder, cells });
             Ok(())
         })?;
         // The parent says it has subfolders, in its own properties and in its row.
         let parent_folder = self.store.open_folder(parent)?;
         if !matches!(parent_folder.properties().get(SUBFOLDERS), Some(PropertyValue::Boolean(true))) {
-            let mut props = writable(&parent_folder);
+            let mut props = writable(parent_folder.properties());
             folder_prop(&mut props, SUBFOLDERS, PropertyValue::Boolean(true));
             self.rewrite_props(parent, props)?;
             let parent_parent = self.node(parent)?.parent;
@@ -175,14 +185,10 @@ impl Editor {
             (SUBFOLDERS, PropertyValue::Boolean(false)),
             (CONTAINER_CLASS, text.value(class)),
         ];
-        let built = super::heap::build_props(format, props, 0x80)?;
+        let built = super::heap::build_props(format, props, FIRST_SUBNODE)?;
         // A name too long for the heap goes in a subnode.
         let mut subs = SubNodes::new();
-        for (node, bytes) in built.external {
-            let bid = self.write_tree(&bytes)?;
-            subs.insert(node, (bid, 0));
-        }
-        let data = self.write_leaves(&built.blocks)?;
+        let data = self.write_props_into(built, &mut subs)?;
         let sub = self.write_subnodes(&subs)?;
         self.set_node(folder, data, sub, parent);
         let index = folder & !NID_TYPE_MASK;
@@ -205,7 +211,7 @@ impl Editor {
     /// Sets cells of rows in the table at `nid`, by row ID.
     pub(crate) fn patch_rows(&mut self, nid: u32, patches: &BTreeMap<u32, Vec<(u16, Cell)>>) -> io::Result<()> {
         let version = self.header.unique;
-        self.rewrite_table(nid, |_, schema, rows| {
+        self.rewrite_table(nid, |schema, rows| {
             for row in rows.iter_mut() {
                 let Some(cells) = patches.get(&row.id) else { continue };
                 for (id, cell) in cells {
@@ -229,12 +235,13 @@ impl Editor {
     /// Writes `batch` into folder `folder`.
     fn append_to(&mut self, folder: u32, batch: &[BatchMessage<'_>]) -> io::Result<()> {
         let format = self.format();
-        let named = self.resolve_named(batch).map_err(|e| io::Error::new(e.kind(), format!("name-to-ID map: {e}")))?;
+        let named = self.resolve_named(batch).map_err(|e| io::Error::new(e.kind(), NamesRefused(e)))?;
         let version = self.header.unique.wrapping_add(1);
         let key = self.record_key()?;
         struct Written {
             nid: u32,
             size: i32,
+            text: Text,
         }
         let mut written = Vec::with_capacity(batch.len());
         let mut updates = Vec::with_capacity(batch.len() + 1);
@@ -244,31 +251,23 @@ impl Editor {
             let (data, sub, total) = self.write_message(&input.message, input.attachments, &named, nid, version, text)?;
             self.set_node(nid, data, sub, folder);
             updates.push((SUD_MSG_ADD, folder, nid));
-            written.push(Written { nid, size: i32::try_from(total.saturating_sub(6)).map_err(|_| short())? });
+            written.push(Written { nid, size: i32::try_from(total.saturating_sub(6)).map_err(|_| short())?, text });
         }
         let contents = (folder & !NID_TYPE_MASK) | NID_TYPE_CONTENTS_TABLE;
-        let count = self.rewrite_table(contents, |_, schema, rows| {
+        let count = self.rewrite_table(contents, |schema, rows| {
             for (input, w) in batch.iter().zip(&written) {
-                let text = text_of(format, &input.message, input.attachments);
-                let cells = schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        contents_cell(
-                            c.prop_id(),
-                            c.prop_type(),
-                            &input.message,
-                            !input.attachments.is_empty(),
-                            &named,
-                            &key,
-                            folder,
-                            w.nid,
-                            version,
-                            w.size,
-                            text,
-                        )
-                    })
-                    .collect();
+                let row = ContentsRow {
+                    message: &input.message,
+                    has_attachments: !input.attachments.is_empty(),
+                    given: given_by_id(&input.message, &named),
+                    record_key: &key,
+                    folder,
+                    nid: w.nid,
+                    version,
+                    size: w.size,
+                    text: w.text,
+                };
+                let cells = schema.columns.iter().map(|c| row.cell(c.prop_id(), c.prop_type())).collect();
                 rows.push(NewRow { id: w.nid, cells });
             }
             Ok(())
@@ -280,7 +279,7 @@ impl Editor {
         };
         let added = i32::try_from(batch.iter().filter(|b| is_unread(&b.message)).count()).map_err(|_| short())?;
         let (count, unread) = (i32::try_from(count).map_err(|_| short())?, before.saturating_add(added));
-        let mut props = writable(&folder_obj);
+        let mut props = writable(folder_obj.properties());
         folder_prop(&mut props, CONTENT_COUNT, PropertyValue::Integer32(count));
         folder_prop(&mut props, CONTENT_UNREAD, PropertyValue::Integer32(unread));
         self.rewrite_props(folder, props)?;
@@ -305,14 +304,24 @@ impl Editor {
 }
 
 /// The folder at the path of names from the IPM subtree, made when missing: the last with
-/// `class`, any on the way `IPF.Note`. Each one made is its own change.
-pub(crate) fn ensure_path(path: &Path, names: &[&str], class: &str) -> io::Result<u32> {
+/// `class`, any on the way `IPF.Note`. Each one made is its own change. The file is opened to
+/// change once, and again only after a change is made: the opening that found the folder there
+/// comes back with it, unchanged, for what the caller changes next.
+fn ensure_path_in(path: &Path, names: &[&str], class: &str) -> io::Result<(u32, Option<Editor>)> {
     check_path(names)?;
-    let mut parent = Editor::open(path)?.store.ipm_subtree()?;
+    let first = Editor::open(path)?;
+    let mut parent = first.store.ipm_subtree()?;
+    let mut open = Some(first);
     for (i, name) in names.iter().enumerate() {
-        let mut ed = Editor::open(path)?;
+        let mut ed = match open.take() {
+            Some(ed) => ed,
+            None => Editor::open(path)?,
+        };
         match ed.find_child(parent, name)? {
-            Some(child) => parent = child,
+            Some(child) => {
+                parent = child;
+                open = Some(ed);
+            }
             None => {
                 let this_class = if i + 1 == names.len() { class } else { "IPF.Note" };
                 let made = ed.make_folder(parent, name, this_class)?;
@@ -321,7 +330,22 @@ pub(crate) fn ensure_path(path: &Path, names: &[&str], class: &str) -> io::Resul
             }
         }
     }
-    Ok(parent)
+    Ok((parent, open))
+}
+
+/// [`ensure_path_in`]'s folder.
+pub(crate) fn ensure_path(path: &Path, names: &[&str], class: &str) -> io::Result<u32> {
+    ensure_path_in(path, names, class).map(|(folder, _)| folder)
+}
+
+/// The file opened to change, the folder at `names` in it (made when missing).
+fn editor_at(path: &Path, names: &[&str], class: &str) -> io::Result<(u32, Editor)> {
+    let (folder, open) = ensure_path_in(path, names, class)?;
+    let ed = match open {
+        Some(ed) => ed,
+        None => Editor::open(path)?,
+    };
+    Ok((folder, ed))
 }
 
 /// Adds `batch` to the folder at the path `names`, made when missing.
@@ -333,8 +357,7 @@ pub(crate) fn append(path: &Path, names: &[&str], batch: &[BatchMessage<'_>]) ->
         check_message(&input.message)?;
         check_attachments(input.attachments, 0)?;
     }
-    let folder = ensure_path(path, names, "IPF.Note")?;
-    let mut ed = Editor::open(path)?;
+    let (folder, mut ed) = editor_at(path, names, "IPF.Note")?;
     ed.append_to(folder, batch)?;
     ed.commit()
 }
@@ -356,15 +379,15 @@ fn role_property(role: SpecialFolder) -> (u16, bool) {
 
 /// The root folder, the IPM subtree and, when there is one, the Inbox: found by what it records
 /// (MS-OXOSFLD 2.2), else by its name.
-fn recording_folders(ed: &Editor) -> io::Result<Vec<u32>> {
-    let top = ed.store.ipm_subtree()?;
+fn recording_folders(store: &PstStore) -> io::Result<Vec<u32>> {
+    let top = store.ipm_subtree()?;
     let mut nodes = vec![NID_ROOT_FOLDER, top];
-    let parent = ed.store.open_folder(top)?;
+    let parent = store.open_folder(top)?;
     let mut named = None;
     let mut inbox = None;
     if let Some(table) = parent.hierarchy_table() {
         for row in table.rows_matrix() {
-            let Ok(f) = ed.store.open_folder(row.id()) else { continue };
+            let Ok(f) = store.open_folder(row.id()) else { continue };
             if INBOX_RECORDS.iter().any(|id| f.properties().get(*id).is_some()) {
                 inbox = Some(row.id());
                 break;
@@ -379,41 +402,81 @@ fn recording_folders(ed: &Editor) -> io::Result<Vec<u32>> {
     Ok(nodes)
 }
 
-/// The names from the IPM subtree down to `node`, each folder looked through once.
-fn folder_names(ed: &Editor, node: u32) -> io::Result<Option<Vec<String>>> {
-    let top = ed.store.ipm_subtree()?;
+/// The names from the IPM subtree down to `node`. Found by going up from it, each node naming
+/// its parent ([`names_upward`]): every folder isn't looked through. A file whose nodes don't
+/// name their parents, or name the wrong ones (another program's, or damage), is looked through
+/// from the IPM subtree down instead, by the folders each one lists ([`names_downward`]), which is
+/// what says where a folder is.
+fn folder_names(store: &PstStore, node: u32) -> io::Result<Option<Vec<String>>> {
+    let top = store.ipm_subtree()?;
     if node == top {
         return Ok(None);
     }
+    Ok(names_upward(store, node, top).or_else(|| names_downward(store, node, top)))
+}
+
+/// The names from `top` down to `node`, by each node's parent, up to `top`: a step counts only
+/// when the parent lists the folder among its own (its hierarchy table), so a parent that is
+/// stale never names a path the file doesn't have. None when the chain doesn't lead to `top` so
+/// (or not within [`MAX_DEPTH`], which also ends a chain that comes round again).
+fn names_upward(store: &PstStore, node: u32, top: u32) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut at = node;
+    let mut folder = store.open_folder(at).ok()?;
+    while at != top {
+        if names.len() >= MAX_DEPTH {
+            return None;
+        }
+        let parent = store.pst().node(at).ok()?.parent;
+        if parent == at {
+            return None;
+        }
+        let above = store.open_folder(parent).ok()?;
+        if !above.hierarchy_table()?.rows_matrix().any(|row| row.id() == at) {
+            return None;
+        }
+        names.push(name_of(folder.properties().get(DISPLAY_NAME)));
+        (at, folder) = (parent, above);
+    }
+    names.reverse();
+    (!names.is_empty()).then_some(names)
+}
+
+/// The names from `top` down to `node`, each folder under `top` looked through once (at most
+/// [`MAX_DEPTH`] deep).
+fn names_downward(store: &PstStore, node: u32, top: u32) -> Option<Vec<String>> {
     let mut seen = HashSet::new();
     let mut todo: Vec<(u32, Vec<String>)> = vec![(top, Vec::new())];
     while let Some((at, path)) = todo.pop() {
         if !seen.insert(at) || path.len() >= MAX_DEPTH {
             continue;
         }
-        let Ok(folder) = ed.store.open_folder(at) else { continue };
+        let Ok(folder) = store.open_folder(at) else { continue };
         let Some(table) = folder.hierarchy_table() else { continue };
         for row in table.rows_matrix() {
-            let Ok(child) = ed.store.open_folder(row.id()) else { continue };
+            let Ok(child) = store.open_folder(row.id()) else { continue };
             let mut names = path.clone();
             names.push(name_of(child.properties().get(DISPLAY_NAME)));
             if row.id() == node {
-                return Ok(Some(names));
+                return Some(names);
             }
             todo.push((row.id(), names));
         }
     }
-    Ok(None)
+    None
 }
 
-/// The folder the file records as `role`, as names from the IPM subtree.
+/// The folder the file records as `role`, as names from the IPM subtree. Only read: the file is
+/// opened as any file read is, not to be changed.
 pub(crate) fn special_folder(path: &Path, role: SpecialFolder) -> io::Result<Option<Vec<String>>> {
-    let ed = Editor::open(path)?;
+    let pst = PstFile::open(path)?;
+    pst.set_max_value_size(ADD_MAX_VALUE_SIZE);
+    let store = PstStore::read(Rc::new(pst))?;
     let (id, on_store) = role_property(role);
     let values: Vec<Option<PropertyValue>> = if on_store {
-        vec![ed.store.properties().get(id).cloned()]
+        vec![store.properties().get(id).cloned()]
     } else {
-        recording_folders(&ed)?.into_iter().map(|n| Ok(ed.store.open_folder(n)?.properties().get(id).cloned())).collect::<io::Result<_>>()?
+        recording_folders(&store)?.into_iter().map(|n| Ok(store.open_folder(n)?.properties().get(id).cloned())).collect::<io::Result<_>>()?
     };
     for value in values.into_iter().flatten() {
         let entry = match (&value, role) {
@@ -422,7 +485,7 @@ pub(crate) fn special_folder(path: &Path, role: SpecialFolder) -> io::Result<Opt
             _ => None,
         };
         let Some(node) = entry.and_then(|b| node_of_entry_id(&b).ok()) else { continue };
-        if let Some(names) = folder_names(&ed, node)? {
+        if let Some(names) = folder_names(&store, node)? {
             return Ok(Some(names));
         }
     }
@@ -431,8 +494,7 @@ pub(crate) fn special_folder(path: &Path, role: SpecialFolder) -> io::Result<Opt
 
 /// Records the folder at `names`, made when missing, as `role`.
 pub(crate) fn set_special_folder(path: &Path, role: SpecialFolder, names: &[&str]) -> io::Result<()> {
-    let folder = ensure_path(path, names, role.container_class())?;
-    let mut ed = Editor::open(path)?;
+    let (folder, mut ed) = editor_at(path, names, role.container_class())?;
     let entry = ed.entry_id(folder)?;
     let (id, on_store) = role_property(role);
     let set = |props: &mut Vec<(u16, PropertyValue)>| {
@@ -454,12 +516,12 @@ pub(crate) fn set_special_folder(path: &Path, role: SpecialFolder, names: &[&str
         folder_prop(props, id, value);
     };
     if on_store {
-        let mut props: Vec<_> = ed.store.properties().iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut props = writable(ed.store.properties());
         set(&mut props);
         ed.rewrite_props(NID_MESSAGE_STORE, props)?;
     } else {
-        for node in recording_folders(&ed)? {
-            let mut props = writable(&*ed.store.open_folder(node)?);
+        for node in recording_folders(&ed.store)? {
+            let mut props = writable(ed.store.open_folder(node)?.properties());
             set(&mut props);
             ed.rewrite_props(node, props)?;
         }
@@ -471,8 +533,11 @@ pub(crate) fn set_special_folder(path: &Path, role: SpecialFolder, names: &[&str
 pub(crate) fn set_store_display_name(path: &Path, name: &str) -> io::Result<()> {
     let mut ed = Editor::open(path)?;
     let text = Text::plain(ed.format());
-    let mut props: Vec<_> = ed.store.properties().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let mut props = writable(ed.store.properties());
     folder_prop(&mut props, DISPLAY_NAME, text.value(name));
     ed.rewrite_props(NID_MESSAGE_STORE, props)?;
     ed.commit()
 }
+
+#[cfg(test)]
+mod tests;

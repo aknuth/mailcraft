@@ -3,15 +3,27 @@
 use super::*;
 use std::collections::{HashMap, VecDeque};
 
+mod body;
 mod deep;
+mod entities;
+mod fonts;
 mod footers;
+mod lines;
+pub(crate) mod marks;
 mod outlook;
 mod page;
 mod plain;
 mod quote;
 mod scripts;
 mod signature;
+mod tags;
+pub(crate) use body::{html_bodies, shown_text};
+pub(crate) use entities::{Refs, decode_refs, escaped};
+pub use entities::{decode_xml_refs, xml_ref_char};
 pub(crate) use footers::footers_last;
+use lines::{bullet, heading_of, line_spans, table_rules};
+use mailcraft_model::work;
+#[doc(hidden)]
 pub use outlook::as_outlook_reads;
 pub(crate) use outlook::{HIDDEN_RULE, OUTLOOK_MARK, OUTLOOK_TABLE, OutlookCopy, marked_hidden, mso_hidden, outlook_copy};
 use page::no_page_background;
@@ -20,6 +32,7 @@ pub use quote::*;
 use scripts::scripts_split;
 pub(crate) use scripts::{SIZE_END, mark_scripts, plain_scripts, size_mark};
 pub use signature::*;
+pub(crate) use tags::{Attribute, attribute, attributes, tag_end, void};
 
 /// Most lines kept of a rich rendering (the rest is shown as text).
 pub(super) const RICH_MAX_LINES: usize = 20_000;
@@ -28,7 +41,7 @@ pub(super) const RICH_MAX_LINES: usize = 20_000;
 /// pixels; a width can be a share of the space it's in), as Outlook and browsers show it: a
 /// picture twice as big as it says (a sharp one for screens that have the pixels) shows at the
 /// size it says, and the layout around it stays as it was made (issue #10).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImageSize {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<layout::Width>,
@@ -55,12 +68,12 @@ pub(super) fn picture_sizes(html: &str) -> Vec<(String, ImageSize)> {
     let mut from = 0;
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         from = end + 1;
         let tag = html.get(start..end).unwrap_or("");
         let Some(src) = tag_attr(tag, "src").map(str::trim).filter(|s| !s.is_empty()) else { continue };
         let style = tag_attr(tag, "style").map(css::declarations).unwrap_or_default();
-        let css = |prop: &str| style.iter().rev().find(|d| d.prop == prop).map(|d| d.value.as_str());
+        let css = |prop: &str| css::pick(&style, prop);
         // The style's size wins over the attributes', as in a browser.
         let width = css("width").and_then(|w| {
             let w = w.trim();
@@ -161,8 +174,8 @@ pub const SIGNATURE_PICTURE_MAX: usize = 1 << 20;
 /// The kinds of picture a signature can hold: those mail programs show (#16).
 pub const SIGNATURE_PICTURE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// Where a signature's picture stands while its HTML becomes text (a private-use character).
-const SIGNATURE_MARK: char = '\u{E002}';
+/// Where a signature's picture stands while its HTML becomes text.
+const SIGNATURE_MARK: char = marks::SIGNATURE;
 
 /// The pictures written into a signature's HTML (`<img src="data:image/png;base64,…">`, as a
 /// signature keeps them with it), each given a `cid:` of its own in their place: the HTML with
@@ -175,29 +188,17 @@ fn data_pictures(html: &str) -> (String, Vec<InlinePicture>) {
     let (mut last, mut from) = (0, 0);
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         from = end + 1;
         let tag = html.get(start..end).unwrap_or("");
-        let Some(src) = tag_attr(tag, "src") else { continue };
-        let Some(rest) = src.trim().get(..11).filter(|p| p.eq_ignore_ascii_case("data:image/")).and_then(|_| src.trim().get(11..)) else { continue };
-        let Some((kind, b64)) = rest.split_once(',') else { continue };
-        let kind = kind.to_ascii_lowercase();
-        let ext = match kind.as_str() {
-            "png;base64" => "png",
-            "jpeg;base64" | "jpg;base64" => "jpg",
-            "gif;base64" => "gif",
-            "webp;base64" => "webp",
-            _ => continue,
-        };
-        if pictures.len() >= SIGNATURE_PICTURES || b64.len() > SIGNATURE_PICTURE_MAX / 3 * 4 + 8 {
-            continue;
-        }
-        let clean: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-        let Some(data) = encodify::base64::LENIENT.decode(&clean).ok().filter(|d| !d.is_empty() && d.len() <= SIGNATURE_PICTURE_MAX) else {
+        let Some(src) = tag_attr(tag, "src").filter(|_| pictures.len() < SIGNATURE_PICTURES) else { continue };
+        // Read as a reply reads one it quotes ([`attachments::data_url`]).
+        let Some((mime, data)) = attachments::data_url(src, SIGNATURE_PICTURE_MAX) else { continue };
+        let Some(ext) = SIGNATURE_PICTURE_TYPES.contains(&mime.as_str()).then(|| crate::files::ext_for_mime(&mime).trim_start_matches('.')) else {
             continue;
         };
         let n = pictures.len() + 1;
-        let cid = format!("signature{n}@mailcraft");
+        let cid = signature_cid(n);
         // The address alone changes, where it's written in the tag.
         let Some(at) = tag.find(src).map(|a| start + a) else { continue };
         out.push_str(html.get(last..at).unwrap_or(""));
@@ -259,7 +260,7 @@ pub fn signature_html(html: &str) -> (String, rich::Styles, Vec<InlinePicture>) 
 pub fn embed_pictures(html: &str, pictures: &[InlinePicture]) -> String {
     let mut out = html.to_string();
     for p in pictures.iter().filter(|p| SIGNATURE_PICTURE_TYPES.contains(&p.mime.as_str())) {
-        let b64 = String::from_utf8(smime::base64(&p.data)).unwrap_or_default();
+        let b64 = mailcraft_model::base64::encode(&p.data);
         out = out.replace(&format!("src=\"cid:{}\"", p.cid), &format!("src=\"data:{};base64,{b64}\"", p.mime));
     }
     out
@@ -278,7 +279,7 @@ pub fn local_pictures(html: &str, mut read: impl FnMut(&str) -> Option<(String, 
     let mut from = 0;
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         from = end + 1;
         if found.len() >= LOCAL_PICTURES {
             break;
@@ -318,7 +319,8 @@ pub fn local_pictures(html: &str, mut read: impl FnMut(&str) -> Option<(String, 
 /// laid out as text, and pictures by reference. No scripts, styles or remote loads: what comes
 /// out is plain data. Never panics; empty when conversion fails.
 pub fn html_to_rich(html: &str) -> RichText {
-    html_to_rich_within(html, HTML_MAX, false)
+    // A size is marked before ([`crate::layout::sized_html`]): none the HTML writes itself.
+    html_to_rich_within(&marks::without(html, marks::is_size), HTML_MAX, false)
 }
 
 /// [`html_to_rich`], up to `max` characters of `html` (more for what MailCraft wrote from a
@@ -337,83 +339,14 @@ pub(crate) fn html_to_rich_within(html: &str, max: usize, hidden: bool) -> RichT
     let mut blank = 0;
     let mut size = 0u16;
     for line in lines.into_iter().take(RICH_MAX_LINES) {
-        let mut spans: Vec<Span> = Vec::new();
-        for ts in line.tagged_strings() {
-            let mut sp = Span { text: ts.s.clone(), ..Default::default() };
-            for a in &ts.tag {
-                match a {
-                    html2text::render::RichAnnotation::Strong => sp.bold = true,
-                    html2text::render::RichAnnotation::Emphasis => sp.italic = true,
-                    html2text::render::RichAnnotation::Strikeout => sp.strike = true,
-                    html2text::render::RichAnnotation::Code | html2text::render::RichAnnotation::Preformat(_) => sp.code = true,
-                    html2text::render::RichAnnotation::Link(l) => sp.link = Some(l.clone()),
-                    html2text::render::RichAnnotation::Image(src) => sp.image = Some(src.clone()),
-                    html2text::render::RichAnnotation::Colour(c) => sp.color = Some([c.r, c.g, c.b]),
-                    html2text::render::RichAnnotation::BgColour(c) => sp.background = Some([c.r, c.g, c.b]),
-                    _ => {}
-                }
-            }
-            // Merge with the previous span when the formatting is the same.
-            match spans.last_mut() {
-                Some(last) if Span { text: String::new(), ..last.clone() } == Span { text: String::new(), ..sp.clone() } => {
-                    last.text.push_str(&sp.text)
-                }
-                _ => spans.push(sp),
-            }
-        }
-        if let Some(last) = spans.last_mut() {
-            let trimmed = last.text.trim_end().len();
-            last.text.truncate(trimmed);
-        }
-        // Headings come out as `## <mark>Title`, each line of them (see `mark_headings`): drop
-        // both, keep the level.
-        let mut level = 0u8;
-        let mut hashes = 0usize;
-        for sp in &mut spans {
-            if level > 0 {
-                break;
-            }
-            match sp.text.find(HEADING_MARK) {
-                Some(i) => {
-                    hashes += sp.text.get(..i).unwrap_or("").chars().filter(|c| *c == '#').count();
-                    level = u8::try_from(hashes.clamp(1, 6)).unwrap_or(1);
-                    sp.text = sp.text.get(i + HEADING_MARK.len_utf8()..).unwrap_or("").to_string();
-                }
-                None => hashes += sp.text.chars().filter(|c| *c == '#').count(),
-            }
-        }
-        if level > 0 {
-            if let Some(first) = spans.first_mut()
-                && first.text.trim_start_matches('#').trim().is_empty()
-                && first.image.is_none()
-            {
-                first.text.clear();
-            }
-            for sp in &mut spans {
-                sp.heading = level;
-            }
-        }
+        let mut spans = line_spans(&line);
+        heading_of(&mut spans);
         for sp in &mut spans {
             sp.text = sp.text.replace([HEADING_MARK, PICTURE_MARK], "");
         }
         let mut spans = scripts_split(spans, &mut size);
-        // List bullets (`* item`, indented when nested) as real bullets.
-        if let Some(first) = spans.first_mut() {
-            let indent = first.text.len() - first.text.trim_start_matches(' ').len();
-            if first.text.get(indent..).is_some_and(|r| r.starts_with("* ")) {
-                first.text = format!("{}• {}", " ".repeat(indent), first.text.get(indent + 2..).unwrap_or(""));
-            }
-        }
-        // Tables come laid out with box-drawing borders. A layout table (one column) only adds
-        // rules around its text: drop those. A data table's rows line up only in a monospace font.
-        let whole: String = spans.iter().map(|s| s.text.as_str()).collect();
-        if !whole.trim().is_empty() && whole.chars().all(|c| matches!(c, '─' | '━' | '═' | ' ')) {
-            spans.clear();
-        } else if whole.contains(['│', '┼', '┬', '┴']) {
-            for sp in &mut spans {
-                sp.code = true;
-            }
-        }
+        bullet(&mut spans);
+        table_rules(&mut spans);
         spans.retain(|s| !s.text.is_empty() || s.image.is_some());
         if spans.is_empty() {
             blank += 1;
@@ -433,39 +366,16 @@ pub(crate) fn html_to_rich_within(html: &str, max: usize, hidden: bool) -> RichT
 }
 
 /// Marks where a heading starts, so a paragraph that just begins with `#` isn't taken for one.
-pub(super) const HEADING_MARK: char = '\u{E000}';
+pub(super) const HEADING_MARK: char = marks::HEADING;
 
 /// The description given to pictures that have none (a report's charts, a logo), which the
 /// converter would otherwise leave out: removed again once they're pictures.
-pub(super) const PICTURE_MARK: char = '\u{E001}';
+pub(super) const PICTURE_MARK: char = marks::PICTURE;
 
 /// An attribute's value in a tag's text (`<img alt="x" …>`), as written; `Some("")` when it's
 /// there and empty.
 pub(super) fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let lower = tag.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(i) = lower.get(from..).and_then(|r| r.find(name)).map(|i| i + from) {
-        from = i + name.len();
-        let before = lower.as_bytes().get(i.wrapping_sub(1)).copied().unwrap_or(b' ');
-        if !before.is_ascii_whitespace() || i == 0 {
-            continue;
-        }
-        let after = lower.get(from..).unwrap_or("").trim_start();
-        if !after.starts_with('=') {
-            // A bare attribute (`alt`): there, and empty.
-            if after.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/') || after.is_empty() {
-                return Some("");
-            }
-            continue;
-        }
-        let at = tag.len() - after.len() + 1;
-        let v = tag.get(at..).unwrap_or("").trim_start();
-        return Some(match v.chars().next() {
-            Some(q @ ('"' | '\'')) => v.get(1..).and_then(|r| r.split(q).next()).unwrap_or(""),
-            _ => v.split(|c: char| c.is_ascii_whitespace() || c == '>').next().unwrap_or(""),
-        });
-    }
-    None
+    attribute(tag, name)
 }
 
 /// `html` with a description on every picture that has none, except tracking pixels (1 by 1).
@@ -477,7 +387,7 @@ pub(super) fn mark_pictures(html: &str) -> String {
     let mut from = 0;
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         let tag = html.get(start..end).unwrap_or("");
         let tiny = |a: &str| tag_attr(tag, a).is_some_and(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().is_ok_and(|n| n <= 2.0));
         let described = tag_attr(tag, "alt").is_some_and(|a| !a.trim().is_empty());
@@ -502,30 +412,13 @@ pub fn picture_attachment(p: &Parsed, src: &str) -> Option<usize> {
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:") || src.is_empty() || src.len() > 4096 {
         return None;
     }
-    let decoded = |s: &str| {
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while let Some(&c) = b.get(i) {
-            let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
-            match (c, hex) {
-                (b'%', Some(v)) => {
-                    out.push(v);
-                    i += 3;
-                }
-                _ => {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    };
-    let last_part = |s: &str| s.rsplit(['/', '\\']).next().unwrap_or(s).to_string();
+    // Decoded and cut as the paperclip reads the HTML ([`HtmlRefs`]), so that the two agree.
+    use attachments::percent_decoded;
+    use mailcraft_model::file_name;
     let name_is = |a: &AttachmentInfo, n: &str| !n.is_empty() && a.name.eq_ignore_ascii_case(n);
     if let Some(cid) = src.get(..4).filter(|s| s.eq_ignore_ascii_case("cid:")).and_then(|_| src.get(4..)) {
         let cid = cid.trim().trim_matches(['<', '>']);
-        let plain = decoded(cid);
+        let plain = percent_decoded(cid);
         let by_id = |id: &str| p.attachments.iter().find(|a| a.content_id.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(id)));
         return by_id(cid)
             .or_else(|| by_id(&plain))
@@ -533,12 +426,12 @@ pub fn picture_attachment(p: &Parsed, src: &str) -> Option<usize> {
             .or_else(|| p.attachments.iter().find(|a| a.content_location.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&plain))))
             .map(|a| a.index);
     }
-    let path = decoded(src.split(['?', '#']).next().unwrap_or(src));
-    let file = last_part(&path);
+    let path = percent_decoded(src.split(['?', '#']).next().unwrap_or(src));
+    let file = file_name(&path);
     p.attachments
         .iter()
-        .find(|a| a.content_location.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&path) || last_part(l).eq_ignore_ascii_case(&file)))
-        .or_else(|| p.attachments.iter().find(|a| name_is(a, &file) || a.content_id.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&file))))
+        .find(|a| a.content_location.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(&path) || file_name(l).eq_ignore_ascii_case(file)))
+        .or_else(|| p.attachments.iter().find(|a| name_is(a, file) || a.content_id.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(file))))
         .map(|a| a.index)
 }
 
@@ -550,9 +443,9 @@ pub(super) fn close_css_rules(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len() + 64);
     let mut at = 0;
-    while let Some(start) = lower.get(at..).and_then(|r| r.find("<style")).map(|i| i + at) {
+    while let Some(start) = lower.get(at..).and_then(|r| work::scanned(r, r.find("<style"))).map(|i| i + at) {
         // An unclosed `<style>` runs to the end of the document.
-        let end = lower.get(start..).and_then(|r| r.find("</style")).map_or(html.len(), |i| i + start);
+        let end = lower.get(start..).and_then(|r| work::scanned(r, r.find("</style"))).map_or(html.len(), |i| i + start);
         out.push_str(html.get(at..start).unwrap_or(""));
         out.push_str(&html.get(start..end).unwrap_or("").replace('}', ";}"));
         out.push_str("\n*{}");
@@ -572,7 +465,7 @@ pub(super) fn mark_headings(html: &str) -> String {
     let mut out = String::with_capacity(html.len() + 64);
     let mut last = 0;
     let mut from = 0;
-    while let Some(i) = lower.get(from..).and_then(|r| r.find("<h")) {
+    while let Some(i) = lower.get(from..).and_then(|r| work::scanned(r, r.find("<h"))) {
         let start = from + i;
         let is_heading = lower.as_bytes().get(start + 2).is_some_and(|b| (b'1'..=b'6').contains(b))
             && lower.as_bytes().get(start + 3).is_some_and(|b| *b == b'>' || b.is_ascii_whitespace());
@@ -582,15 +475,15 @@ pub(super) fn mark_headings(html: &str) -> String {
             from = start + 2;
             continue;
         }
-        let Some(end) = lower.get(start..).and_then(|r| r.find('>')).map(|e| start + e) else { break };
+        let Some(end) = crate::html::tag_end(lower.as_bytes(), start + 1) else { break };
         from = end + 1;
         let closing = format!("</{}", lower.get(start + 1..start + 3).unwrap_or("h1"));
-        let stop = lower.get(end + 1..).and_then(|r| r.find(&closing)).map_or(lower.len(), |e| end + 1 + e);
+        let stop = lower.get(end + 1..).and_then(|r| work::scanned(r, r.find(&closing))).map_or(lower.len(), |e| end + 1 + e);
         // Each run of text in it; `from` goes on past it, so that each part is looked through once.
         let mut marked = false;
         let mut at = end + 1;
         while at < stop {
-            let run_end = lower.get(at..stop).and_then(|r| r.find('<')).map_or(stop, |l| at + l);
+            let run_end = lower.get(at..stop).and_then(|r| work::scanned(r, r.find('<'))).map_or(stop, |l| at + l);
             let run = html.get(at..run_end).unwrap_or("");
             if let Some(word) = run.find(|c: char| !c.is_whitespace()) {
                 out.push_str(html.get(last..at + word).unwrap_or(""));
@@ -598,7 +491,7 @@ pub(super) fn mark_headings(html: &str) -> String {
                 last = at + word;
                 marked = true;
             }
-            at = lower.get(run_end..stop).and_then(|r| r.find('>')).map_or(stop, |g| run_end + g + 1);
+            at = lower.get(run_end..stop).and_then(|r| work::scanned(r, r.find('>'))).map_or(stop, |g| run_end + g + 1);
         }
         if !marked {
             out.push_str(html.get(last..=end).unwrap_or(""));
@@ -611,20 +504,6 @@ pub(super) fn mark_headings(html: &str) -> String {
     out
 }
 
-/// Web pictures a rich message refers to (`http:`/`https:` only), in order, without repeats.
-pub fn remote_images(rich: &RichText) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for sp in rich.iter().flatten() {
-        if let Some(src) = &sp.image
-            && (src.starts_with("https://") || src.starts_with("http://"))
-            && !out.contains(src)
-        {
-            out.push(src.clone());
-        }
-    }
-    out
-}
-
 /// Every `<img src>` of an HTML body, in order, without repeats (at most 200). Pictures without
 /// a description (tracking pixels, mostly) leave no trace in the formatted text, so they are
 /// found here, to be blocked or shown like the rest.
@@ -634,21 +513,16 @@ pub fn html_images(html: &str) -> Vec<String> {
     let mut from = 0;
     while let Some(i) = lower.get(from..).and_then(|r| r.find("<img")) {
         let start = from + i;
-        let end = lower.get(start..).and_then(|r| r.find('>')).map_or(lower.len(), |e| start + e);
-        let tag_lower = lower.get(start..end).unwrap_or("");
+        let end = crate::html::tag_end(lower.as_bytes(), start + 1).unwrap_or(lower.len());
         let tag = html.get(start..end).unwrap_or("");
-        if let Some(p) = tag_lower.find(" src=").or_else(|| tag_lower.find("\nsrc=")) {
-            let v = tag.get(p + 5..).unwrap_or("");
-            let src = match v.chars().next() {
-                Some(q @ ('"' | '\'')) => v.get(1..).and_then(|r| r.split(q).next()).unwrap_or(""),
-                // Unquoted: to the next space (an address has slashes; cut at the first,
-                // `src=https://…` was `https:`, a picture that could never be shown).
-                _ => {
-                    let bare = v.split([' ', '\t', '\n', '\r']).next().unwrap_or("");
-                    bare.strip_suffix('/').filter(|b| !b.ends_with('/')).unwrap_or(bare)
-                }
-            };
-            let src = src.trim().replace("&amp;", "&");
+        // Its `src` read as the other passes read it ([`attributes`]: after a tab, `src = …`; not
+        // one in another's quoted value).
+        if let Some(a) = attributes(tag).1.into_iter().find(|a| a.name == "src") {
+            let v = tag.get(a.value.clone()).unwrap_or("");
+            // Unquoted, to the next space: an address has slashes (cut at the first, `src=https://…`
+            // was `https:`), and the `/` of a `/>` after it isn't its.
+            let src = if a.quoted { v } else { v.strip_suffix('/').filter(|b| !b.ends_with('/')).unwrap_or(v) };
+            let src = decode_refs(src.trim(), Refs::Value).into_owned();
             if !src.is_empty() && src.len() < 4096 && !out.contains(&src) {
                 out.push(src);
             }
@@ -661,7 +535,6 @@ pub fn html_images(html: &str) -> Vec<String> {
     out
 }
 
-/// HTML → readable text. Never panics; returns an empty string when conversion fails.
 /// An HTML body's words for a preview: as [`html_to_text`] reads it, without its marks for bold
 /// and the like.
 pub(crate) fn html_to_words(html: &str) -> String {
@@ -675,6 +548,7 @@ pub(crate) fn html_to_words(html: &str) -> String {
     }
 }
 
+/// HTML → readable text. Never panics; returns an empty string when conversion fails.
 pub fn html_to_text(html: &str) -> String {
     html_to_text_within(html, HTML_MAX, false)
 }
@@ -751,7 +625,7 @@ pub fn html_links(html: &str) -> Vec<String> {
         if raw.len() > 8192 {
             continue;
         }
-        let url = raw.replace("&amp;", "&").replace("&#38;", "&").replace("&quot;", "\"").replace("&#39;", "'");
+        let url = decode_refs(raw, Refs::Value).into_owned();
         let lower_url = url.to_ascii_lowercase();
         if (lower_url.starts_with("https://") || lower_url.starts_with("http://")) && !url.contains(char::is_whitespace) && !out.contains(&url) {
             out.push(url);

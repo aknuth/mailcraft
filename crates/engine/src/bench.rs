@@ -84,26 +84,49 @@ fn walk(s: &mut Session) {
     }
 }
 
+/// The big mailbox the benches measure, and its account: `MC_DATA`, a data folder as the app's
+/// `--data` keeps it ([`data_store`]), or `MC_CACHE`, a cache a data file was imported into (its
+/// account saved as the made-up `d1`). Its data files are opened as the app opens them before
+/// it has a session ([`open_files`]). `None` when neither is set.
+fn bench_store() -> Option<(Store, String)> {
+    if let Ok(data) = std::env::var("MC_DATA") {
+        return Some(data_store(&data));
+    }
+    let cache = PathBuf::from(std::env::var("MC_CACHE").ok()?);
+    let store = Store::open_packed(cache.join("root"), cache.join("files")).unwrap();
+    store
+        .save_accounts(&[crate::model::AccountConfig { id: "d1".into(), name: "Big".into(), email: "big@local".into(), ..Default::default() }])
+        .unwrap();
+    open_files(&store);
+    Some((store, "d1".to_string()))
+}
+
+/// The data folder at `data` (`MC_DATA`), its data files opened ([`open_files`]), and its first
+/// account: the big one.
+fn data_store(data: &str) -> (Store, String) {
+    let data = PathBuf::from(data);
+    let store = Store::open_packed(data.clone(), data.join("MailCraft Files")).unwrap();
+    open_files(&store);
+    let account = store.load_accounts().unwrap().first().map(|a| a.id.clone()).expect("an account in MC_DATA");
+    (store, account)
+}
+
+/// Open `store`'s data files as the app does before its session (checking one that wasn't
+/// closed properly), timed apart: otherwise the first step to touch a file pays for opening it.
+fn open_files(store: &Store) {
+    let t = Instant::now();
+    store.open_data_files().unwrap();
+    println!("data files opened: {:.2} s", t.elapsed().as_secs_f64());
+}
+
 #[test]
-#[ignore]
+#[ignore = "a measurement: of MC_DATA or MC_CACHE, else a made-up big mailbox"]
 fn big_mailbox() {
-    let (store, account) = if let Ok(data) = std::env::var("MC_DATA") {
-        let data = PathBuf::from(data);
-        let store = Store::open_packed(data.clone(), data.join("MailCraft Files")).unwrap();
-        let account = store.load_accounts().unwrap().first().map(|a| a.id.clone()).expect("an account in MC_DATA");
-        (store, account)
-    } else if let Ok(cache) = std::env::var("MC_CACHE") {
-        let cache = PathBuf::from(cache);
-        let store = Store::open_packed(cache.join("root"), cache.join("files")).unwrap();
-        store
-            .save_accounts(&[crate::model::AccountConfig { id: "d1".into(), name: "Big".into(), email: "big@local".into(), ..Default::default() }])
-            .unwrap();
-        (store, "d1".to_string())
-    } else {
+    let (store, account) = bench_store().unwrap_or_else(|| {
         let store = Store::memory();
         big::generate(&store, 1_800_000_000, big::Shape::default()).unwrap();
         (store, big::ACCOUNT.to_string())
-    };
+    });
     // The words searched for: on the made-up mailbox, words it was made with (an everyday word
     // there finds nothing, measuring nothing).
     let made_up = account == big::ACCOUNT;
@@ -151,15 +174,10 @@ fn big_mailbox() {
         println!("cache before searching: {}", serde_json::to_string(&store.cache_use(&account)).unwrap());
     }
     // The account's search index, as the indexer brings it up (one thread here).
-    step("indexing pass", || {
-        let Some(store) = s.store.clone() else { return };
-        let Ok(mut p) = crate::store::search::Pass::start(&store, &account, &[]) else { return };
-        let adds = p.adds().clone();
-        for (i, m) in adds.iter().enumerate() {
-            let doc = store.read_body(&m.key).map(|raw| crate::mime::index_doc(&raw));
-            let _ = p.add(&store, i, doc.as_ref());
-        }
-        let _ = p.finish(&store, true);
+    step("indexing pass", || match s.store.as_ref().map(|store| big::index(store, &account)) {
+        Some(Ok(pass)) => println!("indexed {}, {} summaries put right", pass.added, pass.corrected),
+        Some(Err(e)) => println!("indexing failed: {e}"),
+        None => {}
     });
     step("search this folder", || s.run_search(&here, crate::SearchScope::Current));
     println!("found {}", s.list.len());

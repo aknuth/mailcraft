@@ -72,6 +72,7 @@
 	Edit rule	Regel bearbeiten
 	Email address	E-Mail-Adresse
 	Enter the password for {email}.	Geben Sie das Kennwort für {email} ein.
+	Enter the password for {email}, which signs in as {user}.	Geben Sie das Kennwort für {email} ein, das sich als {user} anmeldet.
 	Favorites	Favoriten
 	Feb	Feb
 	File	Datei
@@ -409,7 +410,7 @@
 	Mark messages as read when opened	Nachrichten beim Öffnen als gelesen markieren
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Noch keine Absender.
-	Not available: the sample mailbox has no server.	Nicht verfügbar: Das Beispielpostfach hat keinen Server.
+	Not available: this mailbox has no server.	Nicht verfügbar: Dieses Postfach hat keinen Server.
 	Not available: {error}	Nicht verfügbar: {error}
 	On	Aktiv
 	On from {from}	Aktiv ab {from}
@@ -841,7 +842,8 @@
 	Formatted	Formatiert
 	HTML code	HTML-Code
 	From a file…	Aus einer Datei…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	Fügen Sie den HTML-Code einer anderswo erstellten Signatur ein oder öffnen Sie eine als Webseite gespeicherte (.htm aus Outlook). Sie wird so gesendet, wie sie geschrieben ist; beim Schreiben zeigt eine Nachricht ihren Text.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	Fügen Sie den HTML-Code einer anderswo erstellten Signatur ein oder öffnen Sie eine als Webseite gespeicherte (.htm aus Outlook). Sie wird so gesendet, wie sie geschrieben ist, und beim Schreiben auch so angezeigt.
+	Your signature as it will be sent. To change it, pick Signature above the message.	Ihre Signatur, wie sie gesendet wird. Zum Ändern wählen Sie „Signatur“ über der Nachricht.
 	{name} can't be read as a signature	{name} kann nicht als Signatur gelesen werden
 	All contacts	Alle Kontakte
 	Always open with this address book	Immer mit diesem Adressbuch öffnen
@@ -933,6 +935,9 @@
 	Name on mail from it	Name auf E-Mails von dieser Adresse
 	Replies go to	Antworten gehen an
 	(the account's own)	(die des Kontos)
+	Write new mail from this address	Neue Nachrichten von dieser Adresse schreiben
+	A new message starts from this address, not from {email}. Pick another in From as ever.	Eine neue Nachricht beginnt mit dieser Adresse, nicht mit {email}. Unter „Von“ lässt sich wie bisher eine andere wählen.
+	{address} (new mail)	{address} (neue Nachrichten)
 	Add…	Hinzufügen…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	Seine Ordner erscheinen unter diesem Konto. Sie brauchen auf dem Exchange-Server Zugriff darauf; Postfächer mit Vollzugriff öffnen sich von selbst.
 	Mailboxes you have full access to open by themselves.	Postfächer mit Vollzugriff öffnen sich von selbst.
@@ -1107,6 +1112,7 @@ month	May	Mai
 	Check before sending	Vor dem Senden prüfen
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} sieht aus wie eine Adresse bei {like}, ist aber keine. Ist es die richtige?
 	{n} people who may not know each other will all see each other's addresses.	{n} Personen, die sich vielleicht nicht kennen, sehen alle gegenseitig ihre Adressen.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	Bei den Empfängern wurde etwas gefunden, das Sie prüfen sollten, aber es kann nicht angezeigt werden. Sehen Sie sie vor dem Senden durch.
 	Put everyone in Bcc	Alle in Bcc setzen
 	Each of them gets the message without seeing who else did; you're in To	Jeder erhält die Nachricht, ohne zu sehen, wer sonst; Sie stehen in An
 	Open links without their tracking	Links ohne Tracking öffnen
@@ -1446,6 +1452,7 @@ month	May	Mai
 	Calendar and contacts couldn't be read: changes to them won't be saved	Kalender und Kontakte konnten nicht gelesen werden: Änderungen daran werden nicht gespeichert
 	Your rules couldn't be read: changes to them won't be saved	Deine Regeln konnten nicht gelesen werden: Änderungen daran werden nicht gespeichert
 	Snoozed mail couldn't be read: changes to it won't be saved	Zurückgestellte E-Mails konnten nicht gelesen werden: Änderungen daran werden nicht gespeichert
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	Worauf die Antworten im Postausgang antworten, konnte nicht gelesen werden: Diese E-Mails werden möglicherweise nicht als beantwortet markiert
 	Checking your data file	Ihre Datendatei wird geprüft
 	Opening your mail…	Ihre E-Mails werden geöffnet…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} wurde beim letzten Mal nicht richtig geschlossen. MailCraft prüft die Datei; bei einer großen Datei kann das ein, zwei Minuten dauern.
@@ -1463,6 +1470,8 @@ month	May	Mai
 	Some results may be missing: still indexing	Möglicherweise fehlen Ergebnisse: Indizierung läuft noch
 	Some long messages were searched only in part	Einige lange Nachrichten wurden nur teilweise durchsucht
 	Couldn't read the date “{value}”	Das Datum „{value}“ konnte nicht gelesen werden
+	Couldn't read “{value}”	„{value}“ konnte nicht gelesen werden
+	Part of a long search was left out	Ein Teil einer langen Suche wurde weggelassen
 	Received after	Empfangen nach
 	Received before	Empfangen vor
 	About {h} h {m} min left	Noch etwa {h} Std. {m} Min.
@@ -1709,3 +1718,7 @@ month	May	Mai
 	Nothing to do	Nichts zu erledigen
 	Nothing in the next 7 days	Nichts in den nächsten 7 Tagen
 	Show the calendar, what's coming up and your tasks beside the mail	Kalender, anstehende Termine und Aufgaben neben den E-Mails anzeigen
+	Read / Unread (Ctrl+Q / Ctrl+U)	Gelesen / Ungelesen (Strg+Q / Strg+U)
+	{name} couldn't be downloaded: {error}	{name} konnte nicht heruntergeladen werden: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Im Fenster ist etwas schiefgegangen, und was es gerade tat, wurde abgebrochen. MailCraft läuft weiter; das Protokoll sagt, wo es passiert ist.
+	Font size	Schriftgröße

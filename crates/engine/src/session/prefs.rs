@@ -146,7 +146,7 @@ pub struct Prefs {
     pub work_offline: bool,
     /// Ignored conversations (Delete › Ignore): their messages' Message-IDs; replies to any of
     /// them go to Deleted Items as they arrive.
-    pub ignored: BTreeSet<String>,
+    pub ignored: IgnoredIds,
     /// The folder pane minimized to a narrow strip (View › Folder pane, or its ‹ button).
     pub folder_pane_minimized: bool,
     /// What's collapsed in the folder pane, kept from one start to the next as Outlook keeps it:
@@ -309,7 +309,7 @@ impl Default for Prefs {
             arrange: Arrange::Date,
             reverse_sort: false,
             work_offline: false,
-            ignored: BTreeSet::new(),
+            ignored: IgnoredIds::default(),
             follow_up: BTreeMap::new(),
             follow_up_done: BTreeMap::new(),
             follow_up_taken: BTreeMap::new(),
@@ -335,6 +335,29 @@ impl Default for Prefs {
             pane_order: Vec::new(),
             todo_bar: pim::TodoBar::default(),
         }
+    }
+}
+
+impl Prefs {
+    /// The preferences as the app saved them, from this version or another that names or types
+    /// a setting otherwise: a setting that can't be read starts as it does for everyone (its name
+    /// is in the answer), the others are kept. `None` when `saved` isn't preferences at all.
+    pub fn from_saved(saved: &serde_json::Value) -> Option<(Prefs, Vec<String>)> {
+        if let Ok(p) = serde_json::from_value::<Prefs>(saved.clone()) {
+            return Some((p, Vec::new()));
+        }
+        // One at a time: each read alone (the rest as they start), those that can be kept.
+        let mut kept = serde_json::Map::new();
+        let mut unread = Vec::new();
+        for (name, value) in saved.as_object()? {
+            let alone = serde_json::Value::Object(std::iter::once((name.clone(), value.clone())).collect());
+            if serde_json::from_value::<Prefs>(alone).is_ok() {
+                kept.insert(name.clone(), value.clone());
+            } else {
+                unread.push(name.clone());
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(kept)).ok().map(|p| (p, unread))
     }
 }
 
@@ -381,4 +404,90 @@ pub fn accent_rgb(code: &str) -> Option<[u8; 3]> {
     let hex = hex.strip_prefix('#')?;
     let byte = |i: usize| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
     Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
+/// The Message-IDs of ignored conversations, each with when it was last added: past
+/// [`IgnoredIds::MAX`] the oldest go (never the ones just added), and they're kept oldest first.
+#[derive(Clone, Debug, Default)]
+pub struct IgnoredIds {
+    ids: HashMap<String, u64>,
+    added: u64,
+}
+
+/// The same ids in the same order (the counts they were added at may differ: read back from a
+/// file, they start again from one).
+impl PartialEq for IgnoredIds {
+    fn eq(&self, other: &Self) -> bool {
+        self.ids.len() == other.ids.len() && self.in_order() == other.in_order()
+    }
+}
+
+impl Eq for IgnoredIds {}
+
+impl IgnoredIds {
+    /// The most ids kept.
+    pub const MAX: usize = 5_000;
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.contains_key(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn remove(&mut self, id: &str) -> bool {
+        self.ids.remove(id).is_some()
+    }
+
+    /// The ids, oldest first.
+    pub fn in_order(&self) -> Vec<&str> {
+        let mut all: Vec<(&String, &u64)> = self.ids.iter().collect();
+        all.sort_unstable_by_key(|(_, at)| **at);
+        all.into_iter().map(|(id, _)| id.as_str()).collect()
+    }
+
+    /// Past [`IgnoredIds::MAX`], the oldest go.
+    fn trim(&mut self) {
+        let excess = self.ids.len().saturating_sub(Self::MAX);
+        if excess == 0 {
+            return;
+        }
+        let mut ats: Vec<u64> = self.ids.values().copied().collect();
+        ats.sort_unstable();
+        // Each id was added at its own count: those up to the excess-th oldest go.
+        if let Some(&last_gone) = ats.get(excess - 1) {
+            self.ids.retain(|_, at| *at > last_gone);
+        }
+    }
+}
+
+/// Added, or added again, as the newest; the oldest go past [`IgnoredIds::MAX`].
+impl Extend<String> for IgnoredIds {
+    fn extend<I: IntoIterator<Item = String>>(&mut self, ids: I) {
+        for id in ids {
+            self.added = self.added.saturating_add(1);
+            self.ids.insert(id, self.added);
+        }
+        self.trim();
+    }
+}
+
+/// Saved as a list, oldest first (as a set was saved before, in its own order).
+impl Serialize for IgnoredIds {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.in_order())
+    }
+}
+
+impl<'de> Deserialize<'de> for IgnoredIds {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut ids = IgnoredIds::default();
+        ids.extend(Vec::<String>::deserialize(d)?);
+        Ok(ids)
+    }
 }

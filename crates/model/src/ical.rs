@@ -25,6 +25,7 @@ mod alarms;
 mod find;
 mod meeting;
 mod notes;
+mod reading;
 mod recurrence;
 mod scheduling;
 mod showing;
@@ -33,14 +34,13 @@ mod zones;
 pub use alarms::*;
 pub use find::*;
 pub use meeting::*;
-use notes::*;
 pub use notes::*;
-use recurrence::*;
+use reading::*;
 pub use recurrence::*;
 pub use scheduling::*;
 pub use showing::*;
+pub use tasks::TASK_STATUS;
 use tasks::*;
-pub use tasks::{TASK_STATUS, write_task};
 use zones::*;
 pub use zones::{ZoneChange, ZoneRule, wall_clock, zone_rule};
 
@@ -269,7 +269,6 @@ fn parse_line(raw: &str) -> Option<Line> {
     Some(Line { name, params, value, raw: String::new() })
 }
 
-/// A TEXT value with its escapes undone.
 /// A list of texts (`CATEGORIES:Work,Clients\, big`): split at commas that aren't escaped, each
 /// unescaped and trimmed.
 pub fn split_text_list(v: &str) -> Vec<String> {
@@ -292,6 +291,7 @@ pub fn split_text_list(v: &str) -> Vec<String> {
     out.into_iter().filter(|c| !c.is_empty()).collect()
 }
 
+/// A TEXT value with its escapes undone.
 pub fn unescape(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     let mut it = v.chars();
@@ -307,6 +307,22 @@ pub fn unescape(v: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a character may stand in a content line: any but the control characters, of which
+/// only HTAB is allowed (RFC 5545 §3.1, RFC 6350 §3.3). The others are left out of what's
+/// written (but of the uid a meeting's message echoes), and of a uid as a server stores it
+/// ([`stored_uid`]).
+pub fn allowed(c: char) -> bool {
+    c == '\t' || !c.is_ascii_control()
+}
+
+/// A `UID` value as a server stores it: what can be written of it ([`allowed`]), trimmed. A
+/// task's and a card's are kept so. An event's is kept as its organizer wrote it (they look for
+/// their meeting by it in an answer), and its copy on a server has this one: it's looked for
+/// there, and told from the others it reads, by this.
+pub fn stored_uid(v: &str) -> String {
+    v.chars().filter(|c| allowed(*c)).collect::<String>().trim().to_string()
 }
 
 /// A TEXT value escaped for writing.
@@ -381,6 +397,35 @@ fn person(l: &Line) -> Attendee {
     }
 }
 
+/// The most lines an event or a to-do keeps as written (`extra`): its properties MailCraft doesn't
+/// read, and the components it holds. One that begins past it is left out whole.
+const EXTRA_MAX: usize = 200;
+
+/// An event's alarms may go on to this many: its reminder is kept past a calendar's own
+/// properties, where every reader of its alarms finds it.
+const EXTRA_ALARMS_MAX: usize = 400;
+
+/// The most events read from one file, and the most tasks.
+const MAX_ITEMS: usize = 20_000;
+/// The most categories an event or a task keeps.
+const MAX_CATEGORIES: usize = 20;
+/// The most of an event's excluded dates kept, and of its added ones (and the most lines giving
+/// them, and its changed instance, waiting for its zone).
+const MAX_DATES: usize = 1000;
+/// The most guests an event keeps.
+const MAX_ATTENDEES: usize = 500;
+/// The longest calendar name kept, in characters.
+const CALENDAR_NAME_MAX: usize = 200;
+
+/// Add the categories of a `CATEGORIES` value, each once, within [`MAX_CATEGORIES`].
+fn add_categories(to: &mut Vec<String>, value: &str) {
+    for c in split_text_list(value) {
+        if !to.contains(&c) && to.len() < MAX_CATEGORIES {
+            to.push(c);
+        }
+    }
+}
+
 /// Read a calendar file. `local_offset` (seconds east of UTC) places floating times; better,
 /// [`parse_in`] the viewer's zone.
 pub fn parse(text: &str, local_offset: i64) -> ICalendar {
@@ -396,173 +441,57 @@ pub fn parse_in(text: &str, local: crate::zone::Zone) -> ICalendar {
     let mut cal = ICalendar::default();
     // Zones first: events can come before the zones they use.
     let zones = FileZones::read(&all, local);
-    // An exception's times wait for the event's zone (DTSTART may come after them).
-    let mut pending: Vec<&Line> = Vec::new();
-    let mut ev: Option<(CalEvent, Option<i64>)> = None;
-    let mut depth_in_event = 0usize;
-    // Which of the event's CLASS, TRANSP and busy status have come (kept past the cap).
-    let mut showing_seen = 0u8;
+    let mut event: Option<EventReading<'_>> = None;
     // The lines outside every event, where its to-dos are: an event's are its own, whatever they
     // begin and end, so a to-do it holds is never one of the file's too.
     let mut outside: Vec<&Line> = Vec::new();
     for l in &all {
-        let n = l.name.as_str();
-        if ev.is_none() && !(n == "BEGIN" && l.value.trim().eq_ignore_ascii_case("VEVENT")) {
-            outside.push(l);
-        }
-        if n == "BEGIN" {
-            let what = l.value.trim().to_ascii_uppercase();
-            if what == "VEVENT" && ev.is_none() {
-                ev = Some((CalEvent::default(), None));
-                depth_in_event = 0;
-                showing_seen = 0;
-                pending.clear();
-                continue;
-            }
-            if ev.is_some() {
-                // A nested component (VALARM): kept as written.
-                depth_in_event += 1;
-                if let Some((e, _)) = ev.as_mut() {
-                    e.extra.push(l.raw.clone());
-                }
-            }
-            continue;
-        }
-        if n == "END" {
-            if let Some((e, _)) = ev.as_mut()
-                && depth_in_event > 0
-            {
-                depth_in_event -= 1;
-                e.extra.push(l.raw.clone());
-                continue;
-            }
-            if l.value.trim().eq_ignore_ascii_case("VEVENT")
-                && let Some((mut e, dur)) = ev.take()
-            {
-                for x in pending.drain(..) {
-                    if x.name == "RECURRENCE-ID" {
-                        e.recurrence_id = zones.time(x, &e.tzid).map(|(t, _, _)| t);
-                        continue;
-                    }
-                    let list = if x.name == "RDATE" { &mut e.rdates } else { &mut e.exdates };
-                    for v in x.value.split(',') {
-                        // A period (`RDATE;VALUE=PERIOD`) starts the occurrence.
-                        let v = v.split('/').next().unwrap_or(v);
-                        let one = Line { value: v.to_string(), ..x.clone() };
-                        if let Some((t, _, _)) = zones.time(&one, &e.tzid)
-                            && list.len() < 1000
-                        {
-                            list.push(t);
-                        }
-                    }
-                }
-                // The server's stand-in for a title it hid ("(Private event)") isn't the event's:
-                // it shows as a private appointment, in the user's language (issue #32).
-                if details_hidden(&e) {
-                    e.summary.clear();
-                }
-                if e.end <= e.start {
-                    e.end = match dur {
-                        Some(d) => e.start.saturating_add(d.max(0)),
-                        None if e.all_day => e.start + 86_400,
-                        None => e.start,
-                    };
-                }
-                if cal.events.len() < 20_000 {
-                    cal.events.push(e);
-                }
-            }
-            continue;
-        }
-        let Some((e, dur)) = ev.as_mut() else {
-            match n {
-                "METHOD" => cal.method = Some(l.value.trim().to_ascii_uppercase()),
-                "NAME" | "X-WR-CALNAME" if cal.name.is_none() => {
-                    let name: String = unescape(&l.value).chars().filter(|c| !c.is_control()).take(200).collect();
-                    cal.name = Some(name.trim().to_string()).filter(|s| !s.is_empty());
-                }
-                "REFRESH-INTERVAL" | "X-PUBLISHED-TTL" if cal.refresh.is_none() => cal.refresh = duration(l.value.trim()).filter(|d| *d > 0),
-                _ => {}
+        let Some(reading) = event.as_mut() else {
+            if l.name == "BEGIN" && l.value.trim().eq_ignore_ascii_case("VEVENT") {
+                event = Some(EventReading::new());
+            } else {
+                outside.push(l);
+                calendar_property(&mut cal, l);
             }
             continue;
         };
-        if depth_in_event > 0 {
-            e.extra.push(l.raw.clone());
-            continue;
-        }
-        match n {
-            "UID" => e.uid = l.value.trim().to_string(),
-            "SUMMARY" => e.summary = unescape(&l.value),
-            "DESCRIPTION" => e.description = unescape(&l.value),
-            "LOCATION" => e.location = unescape(&l.value),
-            "CATEGORIES" => {
-                for c in split_text_list(&l.value) {
-                    if !c.is_empty() && !e.categories.contains(&c) && e.categories.len() < 20 {
-                        e.categories.push(c);
-                    }
-                }
-            }
-            "STATUS" => e.status = l.value.trim().to_ascii_uppercase(),
-            "SEQUENCE" => e.sequence = l.value.trim().parse().unwrap_or(0),
-            "DTSTART" => {
-                if let Some((t, all_day, tzid)) = zones.time(l, "") {
-                    e.start = t;
-                    e.all_day = all_day;
-                    e.vtimezone = zones.definition(&tzid);
-                    e.tzid = tzid;
-                }
-            }
-            "DTEND" => {
-                if let Some((t, _, _)) = zones.time(l, "") {
-                    e.end = t;
-                }
-            }
-            "DURATION" => *dur = duration(&l.value),
-            "RRULE" => e.rrule = Some(l.value.trim().to_string()),
-            "EXDATE" | "RDATE" | "RECURRENCE-ID" => {
-                if pending.len() < 1000 {
-                    pending.push(l);
-                }
-            }
-            "ORGANIZER" => {
-                e.organizer = Some(person(l));
-                e.client_scheduled = schedule_agent_client(l.param("SCHEDULE-AGENT"));
-            }
-            "ATTENDEE" => {
-                e.server_delivered |= server_delivered(l.param("SCHEDULE-STATUS"));
-                if e.attendees.len() < 500 {
-                    e.attendees.push(person(l));
-                }
-            }
-            "DTSTAMP" => e.dtstamp = zones.time(l, "").map_or(0, |(t, _, _)| t),
-            "CREATED" | "LAST-MODIFIED" => {}
-            _ => {
-                // Past the cap, an event's classification and Show as are still kept (once each):
-                // they're never dropped (issue #32).
-                let bit = match n {
-                    "CLASS" => 1u8,
-                    "TRANSP" => 2,
-                    "X-MICROSOFT-CDO-BUSYSTATUS" => 4,
-                    _ => 0,
-                };
-                let kept_anyway = bit != 0 && showing_seen & bit == 0;
-                showing_seen |= bit;
-                if e.extra.len() < 200 || kept_anyway {
-                    e.extra.push(l.raw.clone());
-                }
-            }
+        if reading.line(l, &zones)
+            && let Some(done) = event.take()
+            && cal.events.len() < MAX_ITEMS
+        {
+            cal.events.push(done.finish(&zones));
         }
     }
     cal.tasks = read_tasks(&outside, &zones);
     cal
 }
 
+/// A line outside every event that tells about the calendar: what it asks, its name, how often
+/// to read it again.
+fn calendar_property(cal: &mut ICalendar, l: &Line) {
+    match l.name.as_str() {
+        "METHOD" => cal.method = Some(l.value.trim().to_ascii_uppercase()),
+        "NAME" | "X-WR-CALNAME" if cal.name.is_none() => {
+            let name: String = unescape(&l.value).chars().filter(|c| !c.is_control()).take(CALENDAR_NAME_MAX).collect();
+            cal.name = Some(name.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        "REFRESH-INTERVAL" | "X-PUBLISHED-TTL" if cal.refresh.is_none() => cal.refresh = duration(l.value.trim()).filter(|d| *d > 0),
+        _ => {}
+    }
+}
+
 // ----- writing -----
 
-/// Fold a content line at 75 octets (RFC 5545 §3.1), on character boundaries.
+/// Fold a content line at 75 octets (RFC 5545 §3.1), on character boundaries; a character it
+/// may not hold ([`allowed`]) is left out.
 fn fold(line: &str, out: &mut String) {
+    fold_chars(line.chars().filter(|c| allowed(*c)), out);
+}
+
+/// Fold a content line of these characters at 75 octets.
+fn fold_chars(line: impl Iterator<Item = char>, out: &mut String) {
     let mut width = 0;
-    for c in line.chars() {
+    for c in line {
         let n = c.len_utf8();
         if width + n > 75 {
             out.push_str("\r\n ");
@@ -583,7 +512,9 @@ fn whole<'a>(raw: impl IntoIterator<Item = &'a String>, left_out: &[&str]) -> Ve
     // The components open around the line: each one's name, and whether it's written.
     let mut open: Vec<(String, bool)> = Vec::new();
     for r in raw {
-        let s = r.replace(['\r', '\n'], "");
+        // Line breaks, and the other characters a line can't hold ([`allowed`]), taken out
+        // before it's read: what it begins and ends is what it will when written and read back.
+        let s: String = r.chars().filter(|c| allowed(*c)).collect();
         // Not a folded line's next part, nor nothing.
         let s = s.trim_start_matches([' ', '\t']);
         let Some(l) = parse_line(s) else { continue };
@@ -592,8 +523,10 @@ fn whole<'a>(raw: impl IntoIterator<Item = &'a String>, left_out: &[&str]) -> Ve
             "BEGIN" => {
                 let name = l.value.trim().to_string();
                 let w = writing && !left_out.iter().any(|x| name.eq_ignore_ascii_case(x));
+                // Written as its end is, with nothing around its name (servers refuse a
+                // `BEGIN: valarm`, which reading takes).
                 if w {
-                    out.push(s.to_string());
+                    out.push(format!("BEGIN:{name}"));
                 }
                 open.push((name, w));
             }
@@ -643,11 +576,6 @@ fn mailbox(prop: &str, a: &Attendee, client: bool) -> String {
     s
 }
 
-/// One `VEVENT`, folded; `now` is its `DTSTAMP`.
-pub fn write_event(e: &CalEvent, now: i64, out: &mut String) {
-    write_one(e, now, Purpose::Plain, out);
-}
-
 /// What a written event is for: what of the server's scheduling it carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Purpose {
@@ -660,7 +588,15 @@ enum Purpose {
 
 fn write_one(e: &CalEvent, now: i64, purpose: Purpose, out: &mut String) {
     let client = purpose == Purpose::Server && e.client_scheduled;
-    let mut lines: Vec<String> = vec!["BEGIN:VEVENT".into(), format!("UID:{}", e.uid.replace(['\r', '\n'], "")), format!("DTSTAMP:{}", stamp(now))];
+    fold("BEGIN:VEVENT", out);
+    // The uid of a file's or a message's event is the one it came with, whatever it holds but
+    // line breaks: an organizer finds their meeting by it in an answer. A server's copy has it
+    // as a line may hold it ([`stored_uid`]: servers store it so, or refuse it).
+    match purpose {
+        Purpose::Plain => fold_chars("UID:".chars().chain(e.uid.chars().filter(|c| !matches!(c, '\r' | '\n'))), out),
+        Purpose::Server => fold(&format!("UID:{}", e.uid), out),
+    }
+    let mut lines: Vec<String> = vec![format!("DTSTAMP:{}", stamp(now))];
     // Timed events in a zone are written in it (repeating at its wall-clock time); others in UTC.
     let zone = zone_of(e);
     let when = |prop: &str, t: i64| match &zone {
@@ -669,7 +605,7 @@ fn write_one(e: &CalEvent, now: i64, purpose: Purpose, out: &mut String) {
     };
     if e.all_day {
         lines.push(format!("DTSTART;VALUE=DATE:{}", day(e.start)));
-        lines.push(format!("DTEND;VALUE=DATE:{}", day(e.end.max(e.start + 86_400))));
+        lines.push(format!("DTEND;VALUE=DATE:{}", day(e.end.max(e.start.saturating_add(86_400)))));
     } else {
         lines.push(when("DTSTART", e.start));
         lines.push(when("DTEND", e.end.max(e.start)));
@@ -722,22 +658,36 @@ fn write_one(e: &CalEvent, now: i64, purpose: Purpose, out: &mut String) {
 /// An invitation is stamped `now`; a stored event keeps the stamp it came with, so the copy on a
 /// server still tells which invitation it was.
 pub fn write(events: &[CalEvent], method: Option<&str>, now: i64) -> String {
-    write_all(events, &[], method, now, Purpose::Plain)
+    write_all(events, method, now, Purpose::Plain)
 }
 
-/// A calendar file with these events and tasks (`VTODO`s): an account's calendar exported.
+/// A calendar file with these events and tasks (`VTODO`s). Nothing exports one yet: the tests and
+/// the fuzz targets write tasks with it, to check what reading a calendar's tasks keeps.
+#[doc(hidden)]
 pub fn write_calendar(events: &[CalEvent], tasks: &[crate::pim::Task], now: i64) -> String {
-    write_all(events, tasks, None, now, Purpose::Plain)
+    let mut out = write_events(events, None, now, Purpose::Plain);
+    for t in tasks {
+        write_task(t, now, &mut out);
+    }
+    fold("END:VCALENDAR", &mut out);
+    out
 }
 
 /// A CalDAV server's copy of these events: as [`write`] stores them, with who schedules them
 /// (`SCHEDULE-AGENT=CLIENT` on the organizer and every guest of a meeting MailCraft schedules)
 /// and the mark of a guest's own copy ([`mark_guest_copy`]).
 pub fn write_for_server(events: &[CalEvent], now: i64) -> String {
-    write_all(events, &[], None, now, Purpose::Server)
+    write_all(events, None, now, Purpose::Server)
 }
 
-fn write_all(events: &[CalEvent], tasks: &[crate::pim::Task], method: Option<&str>, now: i64, purpose: Purpose) -> String {
+fn write_all(events: &[CalEvent], method: Option<&str>, now: i64, purpose: Purpose) -> String {
+    let mut out = write_events(events, method, now, purpose);
+    fold("END:VCALENDAR", &mut out);
+    out
+}
+
+/// A calendar file's beginning, its zones and these events, folded; what's left is its end.
+fn write_events(events: &[CalEvent], method: Option<&str>, now: i64, purpose: Purpose) -> String {
     let mut out = String::new();
     for l in ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//MailCraft//MailCraft//EN", "CALSCALE:GREGORIAN"] {
         fold(l, &mut out);
@@ -771,14 +721,8 @@ fn write_all(events: &[CalEvent], tasks: &[crate::pim::Task], method: Option<&st
         let stamp = if method.is_none() && e.dtstamp > 0 { e.dtstamp } else { now };
         write_one(e, stamp, purpose, &mut out);
     }
-    for t in tasks {
-        write_task(t, now, &mut out);
-    }
-    fold("END:VCALENDAR", &mut out);
     out
 }
-
-// ----- recurrence -----
 
 #[cfg(test)]
 mod tests;

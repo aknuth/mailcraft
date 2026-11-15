@@ -27,9 +27,9 @@ pub use mailcraft_print as print;
 pub use mailcraft_smime as smime;
 pub use mailcraft_store as store;
 pub use session::{
-    ACCENTS, ARRANGE_HEADINGS, AccountState, Arrange, BodyWork, CardSearch, Compacting, Compaction, Compose, Drafted, Filed, FolderRef, IDLE_AFTER_S,
-    ImportState, Imports, IndexPass, KeySource, KnownCert, KnownKey, ListFilter, Lock, MoveTarget, NotesOrder, Notice, PANICS_CAUGHT, PGP_DOC,
-    PaneSection, PgpSettings, Picture, Prefs, PreparedBody, Quote, Reach, Reactions, ReadInPane, Reading, ReadingPane, RevocationCheck, Row,
+    ACCENTS, ARRANGE_HEADINGS, AccountState, Arrange, BodyWork, CardSearch, Changes, Compacting, Compaction, Compose, Drafted, Filed, FolderRef,
+    IDLE_AFTER_S, ImportState, Imports, IndexPass, KeySource, KnownCert, KnownKey, ListFilter, Lock, MoveTarget, NotesOrder, Notice, PANICS_CAUGHT,
+    PGP_DOC, PaneSection, PgpSettings, Picture, Prefs, PreparedBody, Quote, Reach, Reactions, ReadInPane, Reading, ReadingPane, RevocationCheck, Row,
     SMIME_DOC, SOURCE_SHOWN, Scheme, Seal, SearchProgress, SearchScope, SearchStats, SearchWork, Security, SendBlock, SendCheck, SenderAddresses,
     SenderMarks, ServerSearch, Session, SignedBy, SmimeSettings, SourceView, UpdateCheck, VacationState, View, accent_code, accent_rgb,
     invite::{AnsweredInvites, Invite, InviteProblem, Route},
@@ -43,6 +43,21 @@ pub use session::{
     search_folders::SearchFolder,
     signature_parts,
 };
+
+/// What `--version` prints for the program `name` (`mailcraft`, `mailcraft-cli`): its version,
+/// plus the commit and date of release builds (packaging/common.sh).
+pub fn version_line(name: &str) -> String {
+    build_line(name, env!("CARGO_PKG_VERSION"), option_env!("MAILCRAFT_BUILD_SHA"), option_env!("MAILCRAFT_BUILD_DATE"))
+}
+
+/// [`version_line`] of a build: the commit shortened to 9 characters.
+fn build_line(name: &str, version: &str, sha: Option<&str>, date: Option<&str>) -> String {
+    let v = format!("{name} {version}");
+    match (sha, date) {
+        (Some(sha), Some(date)) if !sha.is_empty() => format!("{v} ({}, {date})", sha.get(..9).unwrap_or(sha)),
+        _ => v,
+    }
+}
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
 pub enum CmdError {
@@ -78,6 +93,11 @@ pub struct CommandSpec {
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
     pub run: fn(&mut Session, &Value) -> CmdResult,
+    /// It leaves the open message's body being got ready on another thread, where every other
+    /// command waits for it: it only moves about the list (or opens another message), changes the
+    /// list or the view without acting on the open message, or is about a data file (the window
+    /// tells the idle policy how long it's been every half minute).
+    pub leaves_body: bool,
 }
 
 fn always(_: &Session) -> Option<&'static str> {
@@ -86,7 +106,7 @@ fn always(_: &Session) -> Option<&'static str> {
 
 impl CommandSpec {
     pub const fn new(id: &'static str, label: &'static str, location: &'static str, run: fn(&mut Session, &Value) -> CmdResult) -> Self {
-        CommandSpec { id, label, location, shortcut: "", params: "{}", enabled: always, run }
+        CommandSpec { id, label, location, shortcut: "", params: "{}", enabled: always, run, leaves_body: false }
     }
     pub const fn key(mut self, s: &'static str) -> Self {
         self.shortcut = s;
@@ -94,6 +114,11 @@ impl CommandSpec {
     }
     pub const fn params(mut self, p: &'static str) -> Self {
         self.params = p;
+        self
+    }
+    /// It leaves the open message's body waiting ([`CommandSpec::leaves_body`]).
+    pub const fn leaves_body(mut self) -> Self {
+        self.leaves_body = true;
         self
     }
     pub const fn when(mut self, f: fn(&Session) -> Option<&'static str>) -> Self {
@@ -154,6 +179,17 @@ pub mod p {
     }
     pub fn i64(v: &Value, k: &str) -> Option<i64> {
         v.get(k).and_then(|x| x.as_i64().or_else(|| x.as_f64().filter(|f| f.is_finite() && f.abs() < 9.0e15).map(|f| f as i64)))
+    }
+    /// A file's bytes given as `k` (a list of numbers, 0 to 255), at most `max` of them: `None`
+    /// when there's no list, "too big" as for a file named by its path (`read_capped`), and read
+    /// where it is (each caller decoded its own way: one without the cap, two after a copy).
+    pub fn bytes(v: &Value, k: &str, max: usize) -> Result<Option<Vec<u8>>, CmdError> {
+        let Some(list) = v.get(k).and_then(Value::as_array) else { return Ok(None) };
+        if list.len() > max {
+            return Err(CmdError::Params(format!("`{k}` is too big")));
+        }
+        let not_bytes = || CmdError::Params(format!("`{k}` must be bytes"));
+        list.iter().map(|b| b.as_u64().and_then(|x| u8::try_from(x).ok()).ok_or_else(not_bytes)).collect::<Result<_, _>>().map(Some)
     }
 }
 

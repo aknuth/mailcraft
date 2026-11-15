@@ -3,12 +3,12 @@
 use std::io::{self, Read};
 
 use super::edit::Editor;
+use super::heap::BuiltProps;
+use super::put_id;
 use crate::ndb::btree::id_at;
 use crate::ndb::*;
 use crate::util::{invalid, short, u8_at, u16_at};
 
-const BT_DATA: u8 = 0x01;
-const BT_SUBNODE: u8 = 0x02;
 /// Subnode trees nested at most when one is let go of: attached messages in attached messages,
 /// two levels each, and a file whose tree names itself ends here.
 const MAX_RELEASE_DEPTH: usize = 2 * crate::messaging::MAX_EMBEDDED_DEPTH + 8;
@@ -33,10 +33,13 @@ impl Editor {
         self.write_block(&b, true)
     }
 
-    /// The tree over these leaf blocks (their IDs and sizes): one by itself needs none.
+    /// The tree over these leaf blocks (their IDs and sizes): one by itself needs none, and none
+    /// is one empty block.
     fn tree_over(&mut self, leaves: &[(u64, usize)]) -> io::Result<u64> {
-        if let [(bid, _)] = leaves {
-            return Ok(*bid);
+        match leaves {
+            [] => return self.write_block(&[], false),
+            [(bid, _)] => return Ok(*bid),
+            _ => {}
         }
         let room = self.list_room().max(1);
         let total = |part: &[(u64, usize)]| -> io::Result<u32> {
@@ -62,9 +65,6 @@ impl Editor {
     pub(crate) fn write_tree(&mut self, data: &[u8]) -> io::Result<u64> {
         let size = self.format().block_data();
         let mut leaves = Vec::with_capacity(data.len() / size + 1);
-        if data.is_empty() {
-            leaves.push((self.write_block(&[], false)?, 0));
-        }
         for chunk in data.chunks(size) {
             leaves.push((self.write_block(chunk, false)?, chunk.len()));
         }
@@ -73,14 +73,21 @@ impl Editor {
 
     /// Writes these blocks as a data tree (a heap's, or a table's rows).
     pub(crate) fn write_leaves(&mut self, blocks: &[Vec<u8>]) -> io::Result<u64> {
-        let mut leaves = Vec::with_capacity(blocks.len().max(1));
+        let mut leaves = Vec::with_capacity(blocks.len());
         for b in blocks {
             leaves.push((self.write_block(b, false)?, b.len()));
         }
-        if leaves.is_empty() {
-            leaves.push((self.write_block(&[], false)?, 0));
-        }
         self.tree_over(&leaves)
+    }
+
+    /// Writes a property set: its values kept outside the heap into subnodes added to `subs`, then
+    /// the heap's blocks as a data tree, whose ID it gives.
+    pub(crate) fn write_props_into(&mut self, built: BuiltProps, subs: &mut SubNodes) -> io::Result<u64> {
+        for (nid, bytes) in built.external {
+            let bid = self.write_tree(&bytes)?;
+            subs.insert(nid, (bid, 0));
+        }
+        self.write_leaves(&built.blocks)
     }
 
     /// Writes exactly `size` bytes read from `source` as a data tree, a block at a time.
@@ -100,9 +107,6 @@ impl Editor {
         if source.read(&mut extra)? != 0 {
             return Err(invalid("a file gave more than its size"));
         }
-        if leaves.is_empty() {
-            leaves.push((self.write_block(&[], false)?, 0));
-        }
         self.tree_over(&leaves)
     }
 
@@ -113,7 +117,7 @@ impl Editor {
         }
         let f = self.format();
         let id = f.id_size();
-        let head = if f.wide() { 8 } else { 4 };
+        let head = f.sub_header();
         let room = (f.block_data() - head) / (id * 3);
         let list: Vec<(u32, (u64, u64))> = subs.iter().map(|(k, v)| (*k, *v)).collect();
         let mut leaves = Vec::new();
@@ -220,7 +224,7 @@ impl Editor {
         // The tree's own blocks: those it lists when it is two levels.
         if u8_at(&raw, 1)? == 1 {
             let f = self.format();
-            let head = if f.wide() { 8 } else { 4 };
+            let head = f.sub_header();
             for i in 0..usize::from(u16_at(&raw, 2)?) {
                 self.drop_ref(id_at(&raw, head + i * 2 * f.id_size() + f.id_size(), f)?)?;
             }
@@ -230,13 +234,4 @@ impl Editor {
         }
         Ok(())
     }
-}
-
-fn put_id(out: &mut Vec<u8>, format: Format, id: u64) -> io::Result<()> {
-    if format.wide() {
-        out.extend(id.to_le_bytes());
-    } else {
-        out.extend(u32::try_from(id).map_err(|_| invalid("past what an ANSI data file can hold"))?.to_le_bytes());
-    }
-    Ok(())
 }

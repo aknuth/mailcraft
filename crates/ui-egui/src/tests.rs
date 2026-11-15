@@ -17,6 +17,38 @@ use crate::{Dialog, MailApp, NullBackend, NullServices};
 
 const NOW: i64 = 1_791_979_200;
 
+/// The methods [`crate::Services`] requires, as a test's services that don't vary them have
+/// them: the clock at [`NOW`], no files picked or saved to, and a file opened without complaint.
+/// `stub_services!()` writes all four; `stub_services!(clock, save_path)` only those named.
+macro_rules! stub_services {
+    () => {
+        stub_services!(clock, pick_files, save_path, open_path);
+    };
+    ($($method:ident),+) => {
+        $(stub_services!(@ $method);)+
+    };
+    (@ clock) => {
+        fn clock(&self) -> (i64, i32) {
+            (crate::tests::NOW, 0)
+        }
+    };
+    (@ pick_files) => {
+        fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+    };
+    (@ save_path) => {
+        fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+    };
+    (@ open_path) => {
+        fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+    };
+}
+
 /// A backend that keeps the jobs it's given (the tests look at them).
 #[derive(Clone, Default)]
 struct Jobs(std::sync::Arc<std::sync::Mutex<Vec<mailcraft_engine::model::Job>>>);
@@ -38,10 +70,69 @@ impl crate::Backend for Jobs {
     }
 }
 
+/// What a test made in the temporary folder, removed when the test's thread ends, passed or not.
+#[derive(Default)]
+struct Scratch {
+    folders: Vec<std::path::PathBuf>,
+    /// The caches made in them: their read marks are written first (written after, on their
+    /// own thread, they'd make the folder again).
+    stores: Vec<Store>,
+    /// Where the window puts files for other apps in this test ([`own_scratch_dir`]).
+    handed: Option<std::path::PathBuf>,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for store in self.stores.drain(..) {
+            store.flush_marks();
+        }
+        for folder in self.folders.iter().chain(&self.handed) {
+            // Leftovers in the temporary folder are harmless; a failed clean-up isn't a failed test.
+            let _ = std::fs::remove_dir_all(folder);
+        }
+    }
+}
+
+thread_local!(static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default());
+
+/// A scratch folder for the test, `mailcraft-ui-<name>-<pid>` in the temporary folder: what a
+/// run before left there is removed now, and the folder with all in it once the test is over.
+pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
+    let folder = std::env::temp_dir().join(format!("mailcraft-ui-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    SCRATCH.with(|s| s.borrow_mut().folders.push(folder.clone()));
+    folder
+}
+
+/// The folder `name` the window puts files for other apps in ([`crate::scratch_dir`]), for a
+/// test that has a [`scratch`] folder: `<that folder>-handed/<name>`, gone with it. `None` on a
+/// thread with none (work a test sent to a thread of its own), which takes the user's.
+pub(crate) fn own_scratch_dir(name: &str) -> Option<std::path::PathBuf> {
+    let root = SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.handed.is_none() {
+            let first = s.folders.first()?;
+            let handed = first.with_file_name(format!("{}-handed", first.file_name()?.to_string_lossy()));
+            let _ = std::fs::remove_dir_all(&handed);
+            s.handed = Some(handed);
+        }
+        s.handed.clone()
+    })?;
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// A cache made in a [`scratch`] folder, its marks written before the folder goes.
+pub(crate) fn scratch_store(store: Store) -> Store {
+    SCRATCH.with(|s| s.borrow_mut().stores.push(store.clone()));
+    store
+}
+
+/// The window over the sample mailbox, in a [`scratch`] folder (also given, for the test's files).
 pub(crate) fn app(name: &str) -> (MailApp, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mailcraft-ui-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::open(&dir).unwrap();
+    let dir = scratch(name);
+    let store = scratch_store(Store::open(&dir).unwrap());
     sample::seed_if_empty(&store, NOW).unwrap();
     let s = Session::open(Some(store), Clock::new(NOW, 0));
     (MailApp::new(s, Box::new(NullBackend), Box::new(NullServices(NOW))), dir)
@@ -61,12 +152,212 @@ pub(crate) fn key(k: Key, modifiers: Modifiers) -> Event {
     Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
 }
 
+/// The input of a frame in which the window is asked to close, as its close button does.
+pub(crate) fn close_input() -> RawInput {
+    let asked = egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() };
+    RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+        viewports: std::iter::once((egui::ViewportId::ROOT, asked)).collect(),
+        ..Default::default()
+    }
+}
+
+/// A frame in which the window is asked to close: what it put out.
+pub(crate) fn close(ctx: &egui::Context, a: &mut MailApp) -> egui::FullOutput {
+    let mut out = ctx.run_ui(close_input(), |ui| a.ui(ui));
+    // No renderer here: drop the texture uploads deliberately.
+    out.textures_delta.clear();
+    out
+}
+
+/// A frame in a window of `size` given `events` (not dressed or looked at, as [`frame`]'s are):
+/// what it put out.
+pub(crate) fn sized_frame(ctx: &egui::Context, a: &mut MailApp, size: egui::Vec2, events: Vec<Event>) -> egui::FullOutput {
+    let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
+    out.textures_delta.clear();
+    out
+}
+
+/// A text a frame draws.
+#[derive(Clone, Debug)]
+pub(crate) struct Drawn {
+    pub(crate) text: String,
+    /// Where it's laid out: its place, as wide and tall as its lines.
+    pub(crate) rect: egui::Rect,
+    /// Where its letters are, left to right on the screen, as tall as its lines.
+    pub(crate) ink: egui::Rect,
+    /// The room it's cut to.
+    pub(crate) clip: egui::Rect,
+}
+
+impl Drawn {
+    /// Whether some of it can be seen (it isn't wholly outside its room).
+    pub(crate) fn seen(&self) -> bool {
+        self.clip.intersects(self.rect)
+    }
+}
+
+/// The texts among a frame's shapes.
+pub(crate) fn texts_in(shapes: &[egui::epaint::ClippedShape]) -> Vec<Drawn> {
+    shapes
+        .iter()
+        .filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => {
+                let ink = t.galley.rows.iter().flat_map(|r| r.row.glyphs.iter().map(move |g| (r.pos.x + g.pos.x, r.pos.x + g.max_x())));
+                let (l, r) = ink.fold((f32::INFINITY, f32::NEG_INFINITY), |(l, r), (a, b)| (l.min(a), r.max(b)));
+                let size = t.galley.size();
+                Some(Drawn {
+                    text: t.galley.job.text.clone(),
+                    rect: egui::Rect::from_min_size(t.pos, size),
+                    ink: egui::Rect::from_x_y_ranges(t.pos.x + l..=t.pos.x + r, t.pos.y..=t.pos.y + size.y),
+                    clip: s.clip_rect,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The texts a frame in a window of `size` given `events` draws.
+pub(crate) fn drawn_with(ctx: &egui::Context, a: &mut MailApp, size: egui::Vec2, events: Vec<Event>) -> Vec<Drawn> {
+    texts_in(&sized_frame(ctx, a, size, events).shapes)
+}
+
+/// The texts a frame in a window of `size` draws.
+pub(crate) fn drawn_text(ctx: &egui::Context, a: &mut MailApp, size: egui::Vec2) -> Vec<Drawn> {
+    drawn_with(ctx, a, size, vec![])
+}
+
+/// The texts a frame in a window of `size` draws, the words alone.
+pub(crate) fn drawn_strings(ctx: &egui::Context, a: &mut MailApp, size: egui::Vec2) -> Vec<String> {
+    drawn_text(ctx, a, size).into_iter().map(|d| d.text).collect()
+}
+
+/// Whether one of `texts` says `what`.
+pub(crate) fn has(texts: &[String], what: &str) -> bool {
+    texts.iter().any(|t| t.contains(what))
+}
+
+/// A node a screen reader is told of.
+#[derive(Clone, Debug)]
+pub(crate) struct Named {
+    pub(crate) role: egui::accesskit::Role,
+    pub(crate) label: Option<String>,
+    pub(crate) value: Option<String>,
+    /// Where it is, if it's on screen.
+    pub(crate) rect: Option<egui::Rect>,
+    pub(crate) disabled: bool,
+}
+
+impl Named {
+    /// What it's called: its label, else its value.
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.label.as_deref().or(self.value.as_deref())
+    }
+
+    /// Where a click on it lands: its middle.
+    pub(crate) fn centre(&self) -> Option<egui::Pos2> {
+        self.rect.map(|r| r.center())
+    }
+}
+
+/// The nodes a frame told a screen reader of (the context's AccessKit on).
+pub(crate) fn named_in(out: &egui::FullOutput) -> Vec<Named> {
+    let tree = out.platform_output.accesskit_update.as_ref().expect("AccessKit is on");
+    tree.nodes
+        .iter()
+        .map(|(_, n)| Named {
+            role: n.role(),
+            label: n.label().map(str::to_string),
+            value: n.value().map(str::to_string),
+            rect: n.bounds().map(|b| egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))),
+            disabled: n.is_disabled(),
+        })
+        .collect()
+}
+
+/// The nodes a frame in a window of `size` tells a screen reader of (the context's AccessKit on).
+pub(crate) fn named(ctx: &egui::Context, a: &mut MailApp, size: egui::Vec2) -> Vec<Named> {
+    named_in(&sized_frame(ctx, a, size, vec![]))
+}
+
+/// A click of `button` at `at` with `modifiers` held for the whole of it, as the input's
+/// modifiers say and not only the pointer's events: a frame each for the pointer coming, the
+/// button going down and coming up, and one letting go of the keys, if any were held. What it
+/// did shows in the frame after, the caller's.
+pub(crate) fn click_at(ctx: &egui::Context, a: &mut MailApp, at: egui::Pos2, button: egui::PointerButton, modifiers: Modifiers) {
+    let press = |pressed| Event::PointerButton { pos: at, button, pressed, modifiers };
+    frame(ctx, a, vec![Event::ModifiersChanged(modifiers), Event::PointerMoved(at)]);
+    frame(ctx, a, vec![press(true)]);
+    frame(ctx, a, vec![press(false)]);
+    if modifiers != Modifiers::NONE {
+        frame(ctx, a, vec![Event::ModifiersChanged(Modifiers::NONE)]);
+    }
+}
+
+/// A click of the primary button at `at`, no keys held ([`click_at`]).
+pub(crate) fn click(ctx: &egui::Context, a: &mut MailApp, at: egui::Pos2) {
+    click_at(ctx, a, at, egui::PointerButton::Primary, Modifiers::NONE);
+}
+
+/// A click on the control a screen reader names `label` (the first that's on and on screen).
+pub(crate) fn click_named(ctx: &egui::Context, a: &mut MailApp, label: &str) {
+    let size = windows::layout::SIZE.with(std::cell::Cell::get);
+    let all = named(ctx, a, size);
+    let at = all.iter().filter(|n| n.label.as_deref() == Some(label) && !n.disabled).find_map(Named::centre);
+    let at = at.unwrap_or_else(|| panic!("no {label} to click: {:?}", all.iter().filter_map(Named::name).collect::<Vec<_>>()));
+    click(ctx, a, at);
+}
+
+/// A message of this source filed first in the sample's Inbox at `uid`, as mail coming in.
+pub(crate) fn arrive(a: &mut MailApp, uid: u32, raw: &[u8]) -> MessageKey {
+    let store = a.session.store.clone().unwrap();
+    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
+    let key = MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid };
+    inbox.messages.insert(0, mailcraft_engine::mime::summary_from_full(raw, key.clone(), Default::default(), 0, NOW).into());
+    store.save_folder("sample", "INBOX", &inbox).unwrap();
+    store.write_body(&key, raw).unwrap();
+    a.session.apply(MailEvent::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    key
+}
+
+/// A message of this source put first in the Inbox, and the Inbox shown.
+pub(crate) fn with_raw(a: &mut MailApp, uid: u32, raw: &[u8]) -> MessageKey {
+    let key = arrive(a, uid, raw);
+    a.run("folder.open", json!({"account": "sample", "folder": "INBOX"}));
+    key
+}
+
+/// A message with these files put first in the Inbox, and the Inbox shown.
+pub(crate) fn with_files(a: &mut MailApp, uid: u32, files: Vec<(String, &str, Vec<u8>)>) -> MessageKey {
+    use mailcraft_engine::mime::{self, Draft, OutAttachment};
+    let d = Draft {
+        subject: format!("Files {uid}"),
+        body: "Here they are.".into(),
+        attachments: files.into_iter().map(|(name, mime, data)| OutAttachment { name, mime: mime.into(), data, ..Default::default() }).collect(),
+        ..Default::default()
+    };
+    let raw = mime::build(&d, &mailcraft_engine::model::EmailAddress::new("Sam", "sam@studio.example"), NOW, &format!("<files{uid}@x>")).unwrap();
+    with_raw(a, uid, &raw)
+}
+
+/// The sample's Archive made of these summaries alone (keys in Archive, validity 1), and shown.
+pub(crate) fn archive_of(a: &mut MailApp, messages: Vec<Summary>) {
+    let store = a.session.store.clone().unwrap();
+    let uid_next = messages.iter().map(|m| m.key.uid).max().unwrap_or(0) + 1;
+    let state = FolderState { validity: 1, uid_next, highest_modseq: 0, messages: messages.into_iter().map(Into::into).collect(), window: 0 };
+    store.save_folder("sample", "Archive", &state).unwrap();
+    a.session.apply(MailEvent::FolderChanged { account: "sample".into(), folder: "Archive".into() });
+    a.run("folder.open", json!({"account": "sample", "folder": "Archive"}));
+}
+
 /// Every pane layout, state and dialog, in light and dark (also run in the pseudo-language by
 /// the translation tests).
 pub(crate) fn tour() {
     static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (mut a, dir) = app(&format!("states-{n}"));
+    let (mut a, _) = app(&format!("states-{n}"));
     let ctx = egui::Context::default();
     for dark in [Some(false), Some(true)] {
         a.ui.dark = dark;
@@ -201,7 +492,7 @@ pub(crate) fn tour() {
             Dialog::add_account_with("zoe@hotmail.com", true),
             Dialog::Signature(Box::new(crate::dialogs::SignatureForm::new(&a.session, "sample", false))),
             Dialog::Signature(Box::new(crate::dialogs::SignatureForm::new(&a.session, "sample", true))),
-            Dialog::Password { account: "sample".into(), email: "x".into(), password: String::new() },
+            Dialog::Password { account: "sample".into(), email: "x".into(), user: "riley".into(), password: String::new() },
             Dialog::Certificate { account: "sample".into(), path: "riley.p12".into(), data: None, password: String::new() },
             Dialog::Certificate { account: "sample".into(), path: String::new(), data: None, password: String::new() },
             Dialog::Backup(Default::default()),
@@ -219,12 +510,12 @@ pub(crate) fn tour() {
             Dialog::name_keyword("r=c3=bcckfrage"),
             Dialog::Categories,
             Dialog::Rules,
-            Dialog::rule_from("zoe@studio.example", "x"),
+            Dialog::rule_from("zoe@studio.example"),
             Dialog::add_account_with("zoe@gmail.com", true),
-            jmap_form(),
-            graph_form(),
-            pop_form(),
-            calendar_form(),
+            accounts::jmap_form(),
+            accounts::graph_form(),
+            accounts::pop_form(),
+            accounts::calendar_form(),
             Dialog::Preview {
                 title: "notes.txt".into(),
                 header: vec![("From".into(), "Zoe".into())],
@@ -291,75 +582,19 @@ line two"
     assert_eq!(a.session.reading.as_ref().and_then(|r| r.parsed.as_ref()).map(|p| p.subject.as_str()), Some("Waiting"));
     a.run("folder.open", json!({"account": "sample", "folder": "INBOX"}));
     // Statuses and a notice toast.
-    for st in [
-        SyncStatus::Connecting,
-        SyncStatus::NeedsPassword { error: "no".into() },
-        SyncStatus::Error { error: "x".repeat(300) },
-        SyncStatus::Online { at: NOW },
-    ] {
+    for st in
+        [SyncStatus::Connecting, SyncStatus::NeedsPassword { error: "no".into() }, SyncStatus::error("x".repeat(300)), SyncStatus::Online { at: NOW }]
+    {
         a.session.apply(MailEvent::Status { account: "sample".into(), status: st });
         frame(&ctx, &mut a, vec![]);
     }
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-fn jmap_form() -> Dialog {
-    let mut d = Dialog::add_account_with("zoe@fastmail.example", true);
-    if let Dialog::AddAccount(f) = &mut d {
-        f.jmap = true;
-        f.jmap_url = " https://api.fastmail.example/jmap/session".into();
-        f.password = "pw".into();
-    }
-    d
-}
-
-fn pop_form() -> Dialog {
-    let mut d = Dialog::add_account_with("ana@example.org", true);
-    if let Dialog::AddAccount(f) = &mut d {
-        f.imap_host = "imap.example.org".into();
-        f.smtp_host = "smtp.example.org".into();
-        f.pop = true;
-        f.pop_host = "pop.example.org".into();
-        f.pop_port = "995".into();
-        f.pop_security = mailcraft_engine::model::Security::Tls;
-        f.pst = "C:/Mail/old.pst".into();
-        f.password = "pw".into();
-    }
-    d
-}
-
-fn calendar_form() -> Dialog {
-    let mut d = Dialog::add_account();
-    if let Dialog::AddAccount(f) = &mut d {
-        f.calendar_only = true;
-        f.dav_url = " https://cloud.example.org/remote.php/dav ".into();
-        f.email = "zoe@example.org".into();
-        f.password = "app-pw".into();
-    }
-    d
-}
-
-fn graph_form() -> Dialog {
-    let mut d = Dialog::add_account_with("ana@contoso.example", true);
-    if let Dialog::AddAccount(f) = &mut d {
-        f.graph = true;
-    }
-    d
 }
 
 /// The browser's services: a popped-out message goes to a browser window of its own.
 struct PageServices(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
 
 impl crate::Services for PageServices {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
+    stub_services!(clock, pick_files, save_path);
     fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
         Err("no".into())
     }
@@ -468,18 +703,7 @@ pub(crate) fn pim_tour(a: &mut MailApp, ctx: &egui::Context) {
 struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
 
 impl crate::Services for Recorder {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
-    }
+    stub_services!();
     fn notify(&mut self, title: &str, body: &str) {
         self.0.lock().unwrap().push((title.into(), body.into()));
     }
@@ -495,16 +719,14 @@ impl crate::Services for Recorder {
 #[derive(Default)]
 struct WebLike {
     downloads: std::rc::Rc<std::cell::RefCell<Vec<(String, usize)>>>,
-    picked: Vec<(String, String, Vec<u8>)>,
-    asked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    picked: Vec<(crate::Picked, String, Vec<u8>)>,
+    asked: std::rc::Rc<std::cell::RefCell<Vec<crate::Picked>>>,
     /// The file the picker gives next (else a note).
     hands: std::rc::Rc<std::cell::RefCell<Option<Vec<u8>>>>,
 }
 
 impl crate::Services for WebLike {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
+    stub_services!(clock);
     fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
         panic!("the browser can't pick files at once")
     }
@@ -520,13 +742,13 @@ impl crate::Services for WebLike {
     fn download(&mut self, name: &str, bytes: &[u8]) {
         self.downloads.borrow_mut().push((name.to_string(), bytes.len()));
     }
-    fn pick_later(&mut self, purpose: &str) -> bool {
-        self.asked.borrow_mut().push(purpose.to_string());
+    fn pick_later(&mut self, purpose: &crate::Picked) -> bool {
+        self.asked.borrow_mut().push(purpose.clone());
         let file = self.hands.borrow_mut().take().unwrap_or_else(|| b"remember".to_vec());
-        self.picked.push((purpose.to_string(), "notes.txt".into(), file));
+        self.picked.push((purpose.clone(), "notes.txt".into(), file));
         true
     }
-    fn take_picked(&mut self) -> Vec<(String, String, Vec<u8>)> {
+    fn take_picked(&mut self) -> Vec<(crate::Picked, String, Vec<u8>)> {
         std::mem::take(&mut self.picked)
     }
 }
@@ -535,17 +757,9 @@ impl crate::Services for WebLike {
 struct Ticking(std::sync::Arc<std::sync::Mutex<i64>>, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
 
 impl crate::Services for Ticking {
+    stub_services!(pick_files, save_path, open_path);
     fn clock(&self) -> (i64, i32) {
         (*self.0.lock().unwrap(), 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
-        Ok(())
     }
     fn notify(&mut self, title: &str, body: &str) {
         self.1.lock().unwrap().push((title.into(), body.into()));
@@ -568,110 +782,3 @@ mod typing;
 mod updates;
 mod windows;
 mod writing;
-
-/// Issue #8: the classic ribbon on every tab and module, light and dark, in a wide window and
-/// a narrow one (it scrolls rather than dropping labels): drawn without trouble and taller than
-/// the simplified one; switched off, the simplified ribbon comes back.
-#[test]
-fn the_classic_ribbon_draws_every_tab() {
-    let (mut a, dir) = app("classic-ribbon");
-    let ctx = egui::Context::default();
-    let sized = |ctx: &egui::Context, a: &mut MailApp, w: f32| {
-        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-    };
-    for _ in 0..3 {
-        frame(&ctx, &mut a, vec![]);
-    }
-    let simplified = a.ui.ribbon_rect.expect("the ribbon is drawn").height();
-    a.run("view.classicRibbon", json!({"on": true}));
-    assert!(a.session.prefs.classic_ribbon);
-    for dark in [Some(false), Some(true)] {
-        a.ui.dark = dark;
-        for w in [1280.0, 520.0] {
-            for module in ["mail", "calendar", "people", "tasks", "notes"] {
-                a.run("view.module", json!({"name": module}));
-                for tab in [crate::RibbonTab::Home, crate::RibbonTab::SendReceive, crate::RibbonTab::View] {
-                    a.ui.tab = tab;
-                    for _ in 0..3 {
-                        sized(&ctx, &mut a, w);
-                    }
-                }
-            }
-            a.run("view.module", json!({"name": "mail"}));
-            a.ui.tab = crate::RibbonTab::Home;
-            sized(&ctx, &mut a, w);
-            assert!(a.ui.ribbon_rect.unwrap().height() > simplified + 30.0, "{} vs {simplified}", a.ui.ribbon_rect.unwrap().height());
-        }
-    }
-    a.run("view.classicRibbon", json!({}));
-    frame(&ctx, &mut a, vec![]);
-    frame(&ctx, &mut a, vec![]);
-    assert!((a.ui.ribbon_rect.unwrap().height() - simplified).abs() < 1.0);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Issue #22: the ribbon's tabs and the search box share the top bar, one row where there were
-/// two, with the ribbon's buttons right under it, as tall on every tab and in every module, in a
-/// wide window, the narrowest and a narrow one; the File page has the window to itself.
-#[test]
-fn the_tabs_and_search_share_one_bar() {
-    let (mut a, dir) = app("one-bar");
-    let ctx = egui::Context::default();
-    let sized = |ctx: &egui::Context, a: &mut MailApp, w: f32| {
-        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-    };
-    for _ in 0..3 {
-        frame(&ctx, &mut a, vec![]);
-    }
-    let bar = a.ui.top_bar_rect.expect("the top bar is drawn");
-    let ribbon = a.ui.ribbon_rect.expect("the ribbon is drawn");
-    assert_eq!(bar.top(), 0.0);
-    assert!((bar.height() - crate::app::frame::TOP_BAR_H).abs() < 0.5, "{bar:?}");
-    assert!(ribbon.top() >= bar.bottom() && ribbon.top() - bar.bottom() < 8.0, "{bar:?} {ribbon:?}");
-    // The bar and the ribbon together: 40 points less than the bar, the tabs and the buttons were.
-    assert!(ribbon.bottom() < 82.0, "{ribbon:?}");
-    let height = ribbon.height();
-    for dark in [Some(false), Some(true)] {
-        a.ui.dark = dark;
-        for plain in [false, true] {
-            a.session.prefs.plain_top_bar = plain;
-            for w in [2560.0, 1280.0, 760.0, 520.0] {
-                for module in ["mail", "calendar", "people", "tasks", "notes"] {
-                    a.run("view.module", json!({"name": module}));
-                    for tab in [crate::RibbonTab::Home, crate::RibbonTab::SendReceive, crate::RibbonTab::View] {
-                        a.ui.tab = tab;
-                        for _ in 0..2 {
-                            sized(&ctx, &mut a, w);
-                        }
-                        let r = a.ui.ribbon_rect.unwrap();
-                        assert!((r.height() - height).abs() < 1.0, "{module} {tab:?} at {w}: {} vs {height}", r.height());
-                        // Nothing pushed past the window's edge: the narrow one has the box on a
-                        // row of its own.
-                        assert!((a.ui.top_bar_rect.unwrap().width() - w).abs() < 1.0, "{module} {tab:?} at {w}: {:?}", a.ui.top_bar_rect);
-                        assert_eq!(a.ui.bar_two_rows, w < 700.0, "{module} {tab:?} at {w}");
-                    }
-                }
-            }
-        }
-    }
-    a.session.prefs.plain_top_bar = false;
-    a.run("view.module", json!({"name": "mail"}));
-    // Searching: the Search tab joins the others on the bar (and stays while the search does),
-    // the ribbon as tall.
-    a.run("search.run", json!({"query": "storyboard"}));
-    a.ui.tab = crate::RibbonTab::Search;
-    for _ in 0..3 {
-        frame(&ctx, &mut a, vec![]);
-    }
-    assert_eq!(a.ui.tab, crate::RibbonTab::Search);
-    assert!((a.ui.ribbon_rect.unwrap().height() - height).abs() < 1.0);
-    a.run("search.clear", json!({}));
-    a.act(crate::Action::Backstage(crate::backstage::Page::Info));
-    frame(&ctx, &mut a, vec![]);
-    assert!(a.ui.top_bar_rect.is_none() && a.ui.ribbon_rect.is_none(), "the File page has no bar");
-    let _ = std::fs::remove_dir_all(dir);
-}

@@ -7,49 +7,47 @@ use mailcraft_model::job::progress::Work;
 use crate::*;
 
 impl Store {
+    /// A document kept with an account's cache ([`Store::save_account_doc`]) removed; one not there
+    /// is no matter.
+    pub fn remove_account_doc(&self, account: &str, name: &str) -> Result<()> {
+        let path = self.account_dir(account).join(safe_doc(name));
+        match self.files.remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+            _ => Ok(()),
+        }
+    }
+
     /// The data file an account is kept in, when the cache keeps them so.
     pub fn data_file(&self, account: &str) -> Option<PathBuf> {
-        if self.is_online_only(account) {
-            return None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((x, a)) = self.in_data_file(account) {
+            return x.file(&a);
         }
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.file(&safe_segment(account)),
-            _ => None,
-        }
+        let _ = account;
+        None
     }
 
     /// How an account's data file is doing: how much of it is kept mail, and what compacting it
     /// would give back. Only read, and quick (one walk of the file's list of what it keeps, not
     /// of the mail); `None` when the account has no data file.
     pub fn data_file_health(&self, account: &str) -> Result<Option<DataFileHealth>> {
-        if self.is_online_only(account) {
-            return Ok(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((x, a)) = self.in_data_file(account) {
+            return x.health(&a).map_err(|source| StoreError::Io { path: a, source });
         }
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => {
-                let a = safe_segment(account);
-                x.health(&a).map_err(|source| StoreError::Io { path: a, source })
-            }
-            _ => Ok(None),
-        }
+        let _ = account;
+        Ok(None)
     }
 
     /// An account's data file was just compacted: it's sealed, and what it has over its kept mail
     /// now is taken as the least it can have, so [`DataFileHealth::reclaimable`] counts from it.
     pub fn data_file_compacted(&self, account: &str) -> Result<()> {
-        if self.is_online_only(account) {
-            return Ok(());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((x, a)) = self.in_data_file(account) {
+            return x.compacted(&a).map_err(|source| StoreError::Io { path: a, source });
         }
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => {
-                let a = safe_segment(account);
-                x.compacted(&a).map_err(|source| StoreError::Io { path: a, source })
-            }
-            _ => Ok(()),
-        }
+        let _ = account;
+        Ok(())
     }
 
     /// What an account's data file keeps raw that compresses (a build before 0.32 kept base64
@@ -60,35 +58,27 @@ impl Store {
     /// gets smaller only once compacted (the space freed is used again meanwhile). `None` when the
     /// account has no data file, or is removed while it runs (its file isn't made again).
     pub fn recompress_data_file(&self, account: &str, cancel: &AtomicBool, progress: &mut dyn FnMut(Work)) -> Result<Option<Recompressed>> {
-        if self.is_online_only(account) {
-            return Ok(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((x, a)) = self.in_data_file(account) {
+            // A removal waits for the batch being written, and the run stops after it.
+            let seen = self.removals(account);
+            let kept = |write: &mut dyn FnMut() -> io::Result<()>| self.while_kept(account, seen, write);
+            return match x.recompress(&a, cancel, progress, &kept) {
+                Err(_) if self.removals(account) != seen => Ok(None),
+                done => done.map_err(|source| StoreError::Io { path: a, source }),
+            };
         }
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => {
-                let a = safe_segment(account);
-                // A removal waits for the batch being written, and the run stops after it.
-                let seen = self.removals(account);
-                let kept = |write: &mut dyn FnMut() -> io::Result<()>| self.while_kept(account, seen, write);
-                match x.recompress(&a, cancel, progress, &kept) {
-                    Err(_) if self.removals(account) != seen => Ok(None),
-                    done => done.map_err(|source| StoreError::Io { path: a, source }),
-                }
-            }
-            _ => {
-                let _ = (cancel, progress);
-                Ok(None)
-            }
-        }
+        let _ = (account, cancel, progress);
+        Ok(None)
     }
 
     /// The folder the data files are in, when the cache keeps them so.
     pub fn data_files_dir(&self) -> Option<PathBuf> {
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => Some(x.dir().to_path_buf()),
-            _ => None,
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(x) = self.data_files() {
+            return Some(x.dir().to_path_buf());
         }
+        None
     }
 
     /// Keep an account online only (issue #4): its mail, folder lists, changes waiting for the
@@ -102,18 +92,14 @@ impl Store {
         }
         let dir = self.account_dir(account);
         let (from, to) = if on { (&self.files.main, &self.files.held) } else { (&self.files.held, &self.files.main) };
-        let mut items = Vec::new();
-        for p in from.walk(&dir) {
-            if let Ok(bytes) = from.read(&p) {
-                items.push((p, bytes));
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        to.write_many(&items)?;
-        #[cfg(target_arch = "wasm32")]
-        for (p, bytes) in &items {
-            to.write(p, bytes)?;
-        }
+        // Each file read just as it's written: an account of gigabytes isn't held twice.
+        to.write_each(&from.walk(&dir), &mut |p| match from.read(p) {
+            Ok(bytes) => Ok(Some(bytes)),
+            // Gone since the folder was listed: nothing of it to carry over.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            // Left behind, its only copy would go with the rest below: nothing is switched.
+            Err(e) => Err(io_err(p)(e)),
+        })?;
         {
             let mut online = self.files.online();
             if on {
@@ -135,6 +121,31 @@ impl Store {
     /// Whether an account is kept online only.
     pub fn is_online_only(&self, account: &str) -> bool {
         self.files.online().contains(&safe_segment(account))
+    }
+
+    /// The data files, and `account`'s name among them, when the account is kept in one now:
+    /// `None` for an account kept online only (held in memory: its data file is gone, and nothing
+    /// may make one) and for a store without data files. What reads, changes or begins something
+    /// on an account's data file goes through this.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn in_data_file(&self, account: &str) -> Option<(&packed::Packs, String)> {
+        if self.is_online_only(account) {
+            return None;
+        }
+        self.data_files().map(|x| (x, safe_segment(account)))
+    }
+
+    /// The data files, when the store keeps accounts in them, however each account is kept now:
+    /// for what isn't about an account's data file as it is now: ending what began before the
+    /// account went online only or came back (a bulk write left on would give the file its bulk
+    /// cache and seal its commits once it's back), counts a writer compares with what it saw as
+    /// it began, and measures since the store opened.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn data_files(&self) -> Option<&packed::Packs> {
+        match &self.files.main {
+            Files::Packed(x) => Some(x),
+            _ => None,
+        }
     }
 
     /// Drop an online-only account's held files; `false` when it isn't one.
@@ -226,12 +237,12 @@ impl Store {
             return Ok(None);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Files::Packed(x) = &self.files.main {
+        if let Some((x, a)) = self.in_data_file(account) {
             // Kept where it is, no data folder's: another may take it on.
-            if let Err(e) = x.set_owner(&safe_segment(account), false) {
+            if let Err(e) = x.set_owner(&a, false) {
                 log::warn!("{account}: its data file couldn't be noted as no data folder's: {e}");
             }
-            let kept = x.let_go(&safe_segment(account));
+            let kept = x.let_go(&a);
             // A folder from before data files, if one is still there.
             let _ = fs::remove_dir_all(self.account_dir(account));
             return Ok(kept);

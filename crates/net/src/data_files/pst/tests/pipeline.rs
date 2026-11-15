@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use mailcraft_model::job::StopHow;
 use mailcraft_model::{Folder, FolderRole};
 use mailcraft_pst::write::{self, BatchMessage, NewAttachment, NewMessage, NewRecipient, RecipientType};
 use mailcraft_store::Store;
@@ -13,15 +14,17 @@ use mailcraft_store::Store;
 use super::super::lanes::MAX_PANICS;
 use super::super::lanes::tests::Fault;
 use super::super::out::Out;
-use super::super::{ImportOptions, ImportSink, Imported, PlannedFolder, Progress, SkipReason, import_into, import_with};
+use super::super::resume::{self, Checkpoint, Found};
+use super::super::{ImportOptions, ImportSink, Imported, PlannedFolder, Progress, SkipReason, Stop, import_into, import_with};
+use crate::data_files::scratch::scratch;
+use crate::data_files::test_data::filetime;
+use crate::fakes::random::Rng;
 
 /// A data file with mail in three folders, two nested: plain and HTML messages, some with a file
 /// of 10-300 KiB or a picture the HTML shows, some with no message id. `big` gives every third
 /// message a file of about a megabyte instead.
 pub(super) fn data_file(name: &str, per_folder: usize, big: bool) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-lanes-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch(&format!("pst-lanes-{name}"));
     let pst = dir.join("in.pst");
     let recipients = [NewRecipient { name: "Zoe", email: "zoe@studio.example", recipient_type: RecipientType::To, ..Default::default() }];
     let body = "Here is the week's plan, as agreed. ".repeat(20);
@@ -63,7 +66,7 @@ pub(super) fn data_file(name: &str, per_folder: usize, big: bool) -> (PathBuf, P
                     body: if k % 4 == 2 { "" } else { &body },
                     html_body: (k % 2 == 1).then_some("<p>The plan</p><img src=\"cid:c@run.example\">"),
                     message_id: &o.1,
-                    delivery_time: (1_700_000_000 + (f * per_folder + k) as i64 * 60 + 11_644_473_600) * 10_000_000,
+                    delivery_time: filetime(1_700_000_000 + (f * per_folder + k) as i64 * 60),
                     message_class: "IPM.Note",
                     properties: &[],
                 },
@@ -84,6 +87,31 @@ pub(super) fn data_file(name: &str, per_folder: usize, big: bool) -> (PathBuf, P
 fn file_bytes(k: usize, big: bool) -> Vec<u8> {
     let len = if big { 900 * 1024 + k * 1024 } else { 10 * 1024 + (k * 7919) % (290 * 1024) };
     (0..len).map(|i| (i.wrapping_mul(31).wrapping_add(k) % 251) as u8).collect()
+}
+
+/// A store in `dir`'s folder `name`, kept in a data file as the app keeps one.
+pub(super) fn store_at(dir: &Path, name: &str) -> Store {
+    Store::open_packed(dir.join(name).join("app"), dir.join(name).join("Files")).unwrap()
+}
+
+/// An import into `store`'s `a1` with `o`, stopped as `how` once `at` items are read.
+pub(super) fn stopped_at(pst: &Path, store: &Store, at: usize, how: StopHow, o: ImportOptions) -> Imported {
+    let stop = Stop::default();
+    let o = ImportOptions { stop: stop.clone(), ..o };
+    import_with(pst, store, "a1", &o, &mut |p| {
+        if p.read >= at {
+            stop.raise(how);
+        }
+    })
+    .unwrap()
+}
+
+/// The checkpoint an import into `store`'s `a1` left: the test fails without one.
+pub(super) fn checkpoint(store: &Store) -> Checkpoint {
+    match resume::load(store, "a1") {
+        Found::Some(cp) => *cp,
+        _ => panic!("no checkpoint"),
+    }
 }
 
 fn lanes(n: usize) -> ImportOptions {
@@ -123,7 +151,7 @@ pub(super) fn run(pst: &Path, store: &Store, account: &str, opts: &ImportOptions
 /// one from the file and its place in it, not from the order the lanes finished in.
 #[test]
 fn parallel_import_is_identical_to_sequential() {
-    let (dir, pst) = data_file("same", 120, false);
+    let (_, pst) = data_file("same", 120, false);
     let (one, four) = (Store::memory(), Store::memory());
     let a = run(&pst, &one, "p1", &lanes(1));
     let b = run(&pst, &four, "p1", &lanes(4));
@@ -143,14 +171,13 @@ fn parallel_import_is_identical_to_sequential() {
     };
     assert!(!ids(&one).is_empty());
     assert!(ids(&one).iter().all(|i| i.starts_with("pst.p1.")), "{:?}", ids(&one));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A budget of one byte: every item waits until it's the one the writer needs next, and the
 /// import still finishes, the same as with room to spare.
 #[test]
 fn a_one_byte_budget_still_finishes() {
-    let (dir, pst) = data_file("tiny", 40, false);
+    let (_, pst) = data_file("tiny", 40, false);
     let roomy = Store::memory();
     run(&pst, &roomy, "t1", &lanes(1));
     let store = Store::memory();
@@ -159,14 +186,13 @@ fn a_one_byte_budget_still_finishes() {
     let done = within_a_minute(move || run(&path, &tight, "t1", &ImportOptions { lanes: 4, budget_bytes: 1, ..ImportOptions::default() }));
     assert_eq!((done.messages, done.skipped), (120, 0));
     assert_eq!(everything(&store, "t1"), everything(&roomy, "t1"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Items of about a megabyte the file says are tiny: each is charged for what it is once read,
 /// waiting for room as any other, and the import is the same.
 #[test]
 fn an_item_bigger_than_the_file_says_is_charged_for_what_it_is() {
-    let (dir, pst) = data_file("understated", 12, true);
+    let (_, pst) = data_file("understated", 12, true);
     let plain = Store::memory();
     run(&pst, &plain, "u1", &lanes(1));
     let store = Store::memory();
@@ -174,16 +200,19 @@ fn an_item_bigger_than_the_file_says_is_charged_for_what_it_is() {
     let opts = ImportOptions { lanes: 4, budget_bytes: 4 << 20, fault: Some(Fault::Understate), ..ImportOptions::default() };
     let done = within_a_minute(move || run(&path, &s, "u1", &opts));
     assert_eq!((done.messages, done.skipped), (36, 0));
-    assert!(done.stats.budget_wait_ms > 0 || done.stats.peak_budget_bytes > 0, "{:?}", done.stats);
+    // Charged 3.5 times its 900 KB once read, no two fit in the 4 MB together: a lane waits for
+    // room while the one before is made and written. Charged for the byte the file says, none
+    // would wait. (The writer's peak shows nothing: it holds one item at a time either way.)
+    // Counted, not timed: a wait may be shorter than the millisecond the time is told in.
+    assert!(done.stats.budget_waits > 0, "the megabyte items waited for room: {:?}", done.stats);
     assert_eq!(everything(&store, "u1"), everything(&plain, "u1"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The reader panicking on one item costs that item: it's counted as unreadable, the lane reads
 /// on with its handle opened again, and every other message comes in.
 #[test]
 fn a_lane_panic_skips_one_item() {
-    let (dir, pst) = data_file("panic-one", 30, false);
+    let (_, pst) = data_file("panic-one", 30, false);
     let store = Store::memory();
     let (path, s) = (pst.clone(), store.clone());
     let opts = ImportOptions { lanes: 4, fault: Some(Fault::PanicAt(17)), ..ImportOptions::default() };
@@ -192,14 +221,13 @@ fn a_lane_panic_skips_one_item() {
     assert_eq!(done.skips.get(&SkipReason::MessageUnreadable), Some(&1));
     let listed: usize = done.folders.iter().map(|f| store.load_folder("x1", &f.path).unwrap().messages.len()).sum();
     assert_eq!(listed, 89);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A reader that panics on every item: after a run of them the file is taken as damaged and
 /// reading stops, keeping what there is (the folders), and saying it stopped early.
 #[test]
 fn a_run_of_panics_stops_the_import() {
-    let (dir, pst) = data_file("panic-all", 60, false);
+    let (_, pst) = data_file("panic-all", 60, false);
     let store = Store::memory();
     let (path, s) = (pst.clone(), store.clone());
     let opts = ImportOptions { lanes: 4, fault: Some(Fault::PanicAlways), ..ImportOptions::default() };
@@ -208,14 +236,13 @@ fn a_run_of_panics_stops_the_import() {
     assert!(done.skipped >= MAX_PANICS && done.skipped < 180, "stopped reading: {done:?}");
     assert_eq!(done.skips.get(&SkipReason::StoppedEarly), Some(&1));
     assert!(done.folders.iter().any(|f| f.role == FolderRole::Inbox));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The planner panicking part-way: the folders it handed out are kept, with the messages read
 /// from them, listed and counted; the rest of the file isn't read.
 #[test]
 fn a_planner_panic_keeps_the_folders_read() {
-    let (dir, pst) = data_file("planner", 50, false);
+    let (_, pst) = data_file("planner", 50, false);
     let store = Store::memory();
     let (path, s) = (pst.clone(), store.clone());
     let opts = ImportOptions { lanes: 4, fault: Some(Fault::PlannerAfter(70)), ..ImportOptions::default() };
@@ -226,7 +253,6 @@ fn a_planner_panic_keeps_the_folders_read() {
     let projects = done.folders.iter().find(|f| f.path == "Projects").unwrap();
     assert_eq!(projects.total, 20, "a folder left part-way still gets its list");
     assert_eq!(store.load_folders("x3").unwrap(), done.folders);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The reader failing on a folder as the file is planned, before any item is read: that folder
@@ -234,7 +260,7 @@ fn a_planner_panic_keeps_the_folders_read() {
 /// in, rather than the import failing as a damaged file.
 #[test]
 fn a_folder_that_fails_as_it_is_planned_leaves_the_others() {
-    let (dir, pst) = data_file("plan", 30, false);
+    let (_, pst) = data_file("plan", 30, false);
     let store = Store::memory();
     let (path, s) = (pst.clone(), store.clone());
     let opts = ImportOptions { lanes: 4, fault: Some(Fault::PlanAt(2)), ..ImportOptions::default() };
@@ -245,14 +271,13 @@ fn a_folder_that_fails_as_it_is_planned_leaves_the_others() {
     assert_eq!(store.load_folder("x5", "INBOX").unwrap().messages.len(), 30);
     assert_eq!(done.skips.get(&SkipReason::FolderUnreadable), Some(&1), "{done:?}");
     assert_eq!(store.load_folders("x5").unwrap(), done.folders);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The writer panicking part-way: the import comes back (the lanes and the planner are told to
 /// stop, and nothing waits on the writer), with what was written kept.
 #[test]
 fn a_writer_panic_comes_back() {
-    let (dir, pst) = data_file("writer", 60, false);
+    let (_, pst) = data_file("writer", 60, false);
     let store = Store::memory();
     let (path, s) = (pst.clone(), store.clone());
     let opts = ImportOptions { lanes: 4, budget_bytes: 64 * 1024, fault: Some(Fault::WriterAfter(30)), ..ImportOptions::default() };
@@ -260,7 +285,6 @@ fn a_writer_panic_comes_back() {
     assert!(done.messages >= 30 && done.messages < 180, "{done:?}");
     let listed: usize = done.folders.iter().map(|f| store.load_folder("x4", &f.path).unwrap().messages.len()).sum();
     assert_eq!(listed, done.messages, "what was written is listed");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// What a sink is told.
@@ -292,7 +316,7 @@ impl ImportSink for Told {
 /// it; it's in the list on disk by then. The progress has the file's totals from the start.
 #[test]
 fn each_folder_is_said_once_as_it_finishes() {
-    let (dir, pst) = data_file("deltas", 210, false);
+    let (_, pst) = data_file("deltas", 210, false);
     let store = Store::memory();
     let mut told = Told::default();
     let done = import_into(&pst, &store, "d1", &lanes(4), &mut told).unwrap();
@@ -307,14 +331,13 @@ fn each_folder_is_said_once_as_it_finishes() {
     let last = told.progress.last().unwrap();
     assert_eq!((last.read, last.total), (600, 630));
     assert!(last.bytes_done <= last.bytes_total);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The folders a file holds are said before any comes in, each with the path it comes in under
 /// and its items; going on after a pause, again, with the paths the folders done went to.
 #[test]
 fn the_folders_planned_are_said_first_with_their_paths() {
-    let (dir, pst) = data_file("outline", 210, false);
+    let (_, pst) = data_file("outline", 210, false);
     let store = Store::memory();
     let mut told = Told::default();
     let done = import_into(&pst, &store, "o1", &lanes(4), &mut told).unwrap();
@@ -339,7 +362,6 @@ fn the_folders_planned_are_said_first_with_their_paths() {
     let mut again = Told::default();
     import_into(&pst, &store, "o1", &ImportOptions { resume: true, ..lanes(2) }, &mut again).unwrap();
     assert_eq!(again.planned, told.planned, "going on");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Folders finished close together go into the account's folder list in one write, not one
@@ -370,4 +392,144 @@ fn folders_finished_together_are_listed_in_one_write() {
     assert_eq!(writes.len(), 501, "each said once");
     writes.dedup();
     assert!(writes.len() <= secs + 2, "{} writes in {secs} s", writes.len());
+}
+
+/// Where a folder of the file goes, found by looking through every folder made before it: the
+/// import's first way, which the outline and the folders made must still agree with.
+fn placed_by_scan(made: &[(String, FolderRole)], parent: Option<&str>, name: &str) -> (String, FolderRole) {
+    let name = name.trim().replace('/', "∕");
+    let name = if name.is_empty() { "Folder".to_string() } else { name };
+    let mut role = if parent.is_none() { FolderRole::from_name(&name, None) } else { FolderRole::Other };
+    if role != FolderRole::Other && made.iter().any(|f| f.1 == role) {
+        role = FolderRole::Other;
+    }
+    let base = match (role, parent) {
+        (FolderRole::Inbox, _) => "INBOX".to_string(),
+        (_, Some(p)) => format!("{p}/{}", mailcraft_model::utf7::encode(&name)),
+        (_, None) => mailcraft_model::utf7::encode(&name),
+    };
+    let (mut path, mut n) = (base.clone(), 2);
+    while made.iter().any(|f| f.0.eq_ignore_ascii_case(&path)) {
+        path = format!("{base} ({n})");
+        n += 1;
+    }
+    (path, role)
+}
+
+/// The outline told ahead of an import (the paths its folders will get).
+#[derive(Default)]
+struct Outline(Vec<PlannedFolder>);
+
+impl ImportSink for Outline {
+    fn progress(&mut self, _: Progress) {}
+    fn planned(&mut self, folders: &[PlannedFolder]) {
+        self.0 = folders.to_vec();
+    }
+}
+
+/// Folders of every kind of name (the usual ones in any case, names made `Name (2)` already,
+/// names that clean up the same, under one folder or another), in random trees: the outline
+/// says, and the import makes, each where looking through every folder made before put it, with
+/// the same role.
+#[test]
+fn folders_go_where_they_always_went() {
+    const NAMES: [&str; 18] = [
+        "Inbox",
+        "INBOX",
+        "inbox",
+        "Sent Items",
+        "sent items",
+        "Drafts",
+        "Deleted Items",
+        "Junk Email",
+        "Archive",
+        "archive",
+        "Work",
+        "Work (2)",
+        "work (3)",
+        "a/b",
+        "a∕b",
+        "  ",
+        "Ünïcode",
+        "Outbox",
+    ];
+    let mut random = Rng::new(0x2545_f491_4f6c_dd1d);
+    let mut next = |n: usize| usize::try_from(random.next_u64() % n as u64).unwrap();
+    for round in 0..40 {
+        // A tree: each folder at the top, or under one before it.
+        let count = 1 + next(120);
+        let tree: Vec<(Option<usize>, &str)> =
+            (0..count).map(|i| (if i == 0 || next(3) == 0 { None } else { Some(next(i)) }, NAMES[next(NAMES.len())])).collect();
+        let mut made: Vec<(String, FolderRole)> = Vec::new();
+        for (parent, name) in &tree {
+            let parent = parent.map(|p| made[p].0.clone());
+            let placed = placed_by_scan(&made, parent.as_deref(), name);
+            made.push(placed);
+        }
+        let store = Store::memory();
+        let mut sink = Outline::default();
+        let mut out = Out::new(&store, "o1", &ImportOptions::default(), &mut sink);
+        let outline: Vec<super::super::order::Outlined> = tree
+            .iter()
+            .enumerate()
+            .map(|(index, (parent, name))| super::super::order::Outlined {
+                index,
+                parent: *parent,
+                node: u32::try_from(index).unwrap(),
+                name: name.to_string(),
+                items: 0,
+            })
+            .collect();
+        out.outline(&outline);
+        let mut paths: Vec<String> = Vec::new();
+        for (parent, name) in &tree {
+            let parent = parent.map(|p| paths[p].clone());
+            let path = out.add_folder(parent.as_deref(), name);
+            paths.push(path);
+        }
+        let roles: Vec<FolderRole> = out.folders.iter().map(|f| f.role).collect();
+        drop(out);
+        let told: Vec<String> = sink.0.iter().map(|f| f.path.clone()).collect();
+        let want: Vec<String> = made.iter().map(|f| f.0.clone()).collect();
+        assert_eq!(told, want, "round {round}: the outline");
+        assert_eq!(paths, want, "round {round}: the folders made");
+        assert_eq!(roles, made.iter().map(|f| f.1).collect::<Vec<_>>(), "round {round}: their roles");
+    }
+}
+
+/// MEASURE: a file of many folders placed (the outline told, each folder made, then written):
+/// distinct names, and one name over and over under one folder.
+#[test]
+#[ignore = "a measurement"]
+fn measure_placing_many_folders() {
+    for (label, names) in
+        [("distinct names", (0..20_000).map(|n| format!("Folder {n}")).collect::<Vec<_>>()), ("one name", vec!["Folder".to_string(); 3_000])]
+    {
+        let store = Store::memory();
+        let mut sink = Outline::default();
+        let mut out = Out::new(&store, "m1", &ImportOptions::default(), &mut sink);
+        let outline: Vec<super::super::order::Outlined> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| super::super::order::Outlined {
+                index,
+                parent: None,
+                node: u32::try_from(index).unwrap(),
+                name: name.clone(),
+                items: 0,
+            })
+            .collect();
+        let began = std::time::Instant::now();
+        out.outline(&outline);
+        let outlined = began.elapsed();
+        let paths: Vec<String> = names.iter().map(|name| out.add_folder(None, name)).collect();
+        let added = began.elapsed() - outlined;
+        for path in &paths {
+            out.save_folder(path);
+        }
+        let saved = began.elapsed() - outlined - added;
+        drop(out);
+        assert_eq!(sink.0.len(), names.len().min(2000));
+        println!("MEASURE {} folders, {label}: outline {outlined:?}, made {added:?}, written {saved:?}", names.len());
+    }
 }

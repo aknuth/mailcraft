@@ -1,29 +1,9 @@
 //! Engine tests: read marks, flags and categories on a data file's (a local account's) mail,
 //! written on the store's thread for marks rather than in the window's frame.
 
-use mailcraft_model::{MessageKey, Summary};
+use mailcraft_model::MessageKey;
 
 use super::*;
-
-/// The sample's Projects made a folder of `n` unread messages in `store`, and a session on it.
-fn big_projects(store: &Store, n: u32) -> Session {
-    sample::seed_if_empty(store, NOW).unwrap();
-    let mut st = store.load_folder("sample", "Projects").unwrap();
-    st.validity = 7;
-    st.messages = (1..=n)
-        .map(|uid| Summary {
-            key: MessageKey { account: "sample".into(), folder: "Projects".into(), validity: 7, uid },
-            subject: format!("Report {uid}"),
-            date: NOW - i64::from(uid) * 60,
-            ..Default::default()
-        })
-        .map(Into::into)
-        .collect();
-    store.save_folder("sample", "Projects", &st).unwrap();
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    s.run("folder.open", &json!({"account": "sample", "folder": "Projects"})).unwrap();
-    s
-}
 
 /// A message marked read in a folder of 10,941 of a data file's account writes nothing on the
 /// window's thread: it's written on the store's thread for marks, a few bytes with the folder's
@@ -73,7 +53,6 @@ fn a_message_marked_read_and_moved_at_once_keeps_its_mark() {
     let held = s.folder("sample", &m.key.folder).map(|f| f.unread);
     let saved = store.load_folders("sample").unwrap().into_iter().find(|f| f.path == m.key.folder).map(|f| f.unread);
     assert_eq!(saved, held);
-    done(s);
 }
 
 /// While the store's thread for marks is held (its commits slow, as a 38 GB file's were for
@@ -83,14 +62,14 @@ fn a_message_marked_read_and_moved_at_once_keeps_its_mark() {
 /// disk. A hold of Down once had frames of 0.5 and 1.8 s while a mark's commit took 3 s.
 #[test]
 fn the_window_never_waits_for_marks_being_written() {
-    use std::time::{Duration, Instant};
     let store = Store::memory();
     let mut s = big_projects(&store, 2000);
     let first = s.row_keys()[0].to_id();
     s.run("list.open", &json!({"key": first})).unwrap();
     assert!(store.flush_marks());
     let paused = store.pause_marks();
-    let began = Instant::now();
+    // Paused by this thread: a wait for them could only be given up, and is logged.
+    let waits = waits_logged();
     for _ in 0..5 {
         s.run("list.next", &json!({})).unwrap();
     }
@@ -101,7 +80,7 @@ fn the_window_never_waits_for_marks_being_written() {
     s.run("compose.saveDraft", &json!({})).unwrap();
     let drafts = s.folder("sample", "Drafts").map(|f| f.total);
     s.run("folder.open", &json!({"account": "sample", "folder": "Projects"})).unwrap();
-    assert!(began.elapsed() < Duration::from_secs(5), "the window waited {:?}", began.elapsed());
+    assert_eq!(waits_logged(), waits, "the window waited for the marks");
     assert!(store.marks_waiting(), "nothing written yet");
     drop(paused);
     assert!(store.flush_marks());
@@ -111,7 +90,6 @@ fn the_window_never_waits_for_marks_being_written() {
     let count = |p: &str| listed.iter().find(|f| f.path == p).map(|f| (f.unread, f.total));
     assert_eq!(count("Projects"), Some((1994, 2000)));
     assert_eq!(count("Drafts").map(|c| c.1), drafts, "the Drafts counted after them");
-    done(s);
 }
 
 /// While a read mark's commit holds the lock every change of a list is made under (on a 38 GB
@@ -123,7 +101,7 @@ fn the_window_never_waits_for_marks_being_written() {
 /// the disk its file is still written, and flushed, on the window's thread; docs/gaps.md.)
 #[test]
 fn the_window_never_waits_while_a_mark_is_committed() {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let store = Store::memory();
     let mut s = big_projects(&store, 2000);
     s.set_cache_limit(100);
@@ -143,7 +121,8 @@ fn the_window_never_waits_while_a_mark_is_committed() {
         })
     };
     held.1.recv().unwrap();
-    let began = Instant::now();
+    // Held until it's let go of below (or 20 s): a wait for it can't end sooner, and is logged.
+    let waits = waits_logged();
     for _ in 0..5 {
         s.run("list.next", &json!({})).unwrap();
     }
@@ -154,8 +133,7 @@ fn the_window_never_waits_while_a_mark_is_committed() {
     assert!(!s.cache.contains_key(&("sample".to_string(), "Projects".to_string())), "let go of by the cache");
     s.run("folder.open", &json!({"account": "sample", "folder": "Projects"})).unwrap();
     s.tick();
-    let took = began.elapsed();
-    assert!(took < Duration::from_secs(2), "the window waited {took:?}");
+    assert_eq!(waits_logged(), waits, "the window waited for the marks or the lists' lock");
     assert!(s.list.is_empty(), "not read while its marks wait");
     release.0.send(()).unwrap();
     holder.join().unwrap();
@@ -165,7 +143,6 @@ fn the_window_never_waits_while_a_mark_is_committed() {
     assert_eq!(s.list.iter().filter(|m| m.flags.seen).count(), 6, "with the marks");
     let listed = store.load_folders("sample").unwrap();
     assert_eq!(listed.iter().find(|f| f.path == "Projects").map(|f| (f.unread, f.total)), Some((1994, 2000)));
-    done(s);
 }
 
 /// A folder said changed on disk (an import going on, a mark that couldn't be kept) while read
@@ -199,7 +176,6 @@ fn a_folder_changed_while_its_marks_are_written_keeps_the_message_read() {
     assert_eq!(s.list.iter().filter(|m| m.flags.seen).count(), 4, "with the marks");
     assert_eq!(s.reading.as_ref().map(|r| r.key.clone()), read);
     assert_eq!(s.selection, selection);
-    done(s);
 }
 
 /// Delete All on a folder whose read marks are still being written, let go of by the cache
@@ -239,7 +215,48 @@ fn delete_all_waits_for_a_folders_marks_being_written() {
     holder.join().unwrap();
     assert!(store.flush_marks());
     assert!(store.load_folder("sample", "Projects").unwrap().messages.is_empty());
-    done(s);
+}
+
+/// A search that waits (the CLI's, `--cmd`) over a folder whose read marks are still being
+/// written waits for them, as reading the folder does, and then reads it: it went round, a unit
+/// at a time and nothing between, for as long as the marks took (forever, were they stuck).
+#[test]
+fn a_waiting_search_waits_for_a_folders_marks_without_spinning() {
+    let store = Store::memory();
+    let mut s = big_projects(&store, 300);
+    s.set_cache_limit(100);
+    let first = s.row_keys()[0].to_id();
+    s.run("list.open", &json!({"key": first})).unwrap();
+    assert!(store.flush_marks());
+    let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+    let holder = {
+        let store = store.clone();
+        let (held, release) = (held.0, release.1);
+        std::thread::spawn(move || {
+            let _paused = store.pause_marks();
+            held.send(()).unwrap();
+            let _ = release.recv_timeout(std::time::Duration::from_secs(20));
+        })
+    };
+    held.1.recv().unwrap();
+    s.run("list.next", &json!({})).unwrap();
+    s.run("folder.open", &json!({"account": "sample", "folder": "Archive"})).unwrap();
+    assert!(!s.cache.contains_key(&("sample".to_string(), "Projects".to_string())), "let go of by the cache");
+    assert!(store.marks_waiting_for("sample", Some("Projects")));
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        release.0.send(()).unwrap();
+    });
+    let units = s.search_stats().units;
+    s.run_search("subject:report", SearchScope::All);
+    releaser.join().unwrap();
+    holder.join().unwrap();
+    assert!(s.search_progress().unwrap().done);
+    let spent = s.search_stats().units - units;
+    assert!(spent < 100, "{spent} units");
+    let found: Vec<_> = s.list.iter().filter(|m| m.key.folder == "Projects").collect();
+    assert_eq!(found.len(), 300);
+    assert_eq!(found.iter().filter(|m| m.flags.seen).count(), 2, "with the marks");
 }
 
 /// What a Down step costs the window in a data file's folder of 10,941 unread messages, in a real
@@ -247,11 +264,10 @@ fn delete_all_waits_for_a_folders_marks_being_written() {
 /// --ignored --nocapture`): the step with its read mark handed over, and the mark written on the
 /// store's thread (each step waits for it, timed apart).
 #[test]
-#[ignore]
+#[ignore = "a measurement: run in release"]
 fn down_steps_on_a_big_data_file_folder() {
     use std::time::{Duration, Instant};
-    let root = std::env::temp_dir().join(format!("mailcraft-engine-down-data-file-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch("down-data-file");
     let store = Store::open_packed(&root, root.join("files")).unwrap();
     let mut s = big_projects(&store, 10_941);
     s.defer_bodies(true);
@@ -277,7 +293,6 @@ fn down_steps_on_a_big_data_file_folder() {
     println!("the read mark on disk (the store's thread): median {m:?}, max {mmax:?}");
     drop(s);
     drop(store);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// What a Down step costs the window in a data file's folder of 10,941 unread messages while an
@@ -287,12 +302,11 @@ fn down_steps_on_a_big_data_file_folder() {
 /// waits for the disk the import keeps busy (its p99 45 to 230 ms when the window made it); the
 /// window doesn't wait for it.
 #[test]
-#[ignore]
+#[ignore = "a measurement: run in release"]
 fn down_steps_during_an_import() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-    let root = std::env::temp_dir().join(format!("mailcraft-engine-down-import-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch("down-import");
     let store = Store::open_packed(&root, root.join("files")).unwrap();
     let mut s = big_projects(&store, 10_941);
     s.defer_bodies(true);
@@ -304,15 +318,7 @@ fn down_steps_during_an_import() {
         let (store, stop) = (store.clone(), stop.clone());
         std::thread::spawn(move || {
             // Noise that doesn't compress, 100 KiB a message, 2 MiB a batch.
-            let mut x = 0x9E37_79B9_7F4A_7C15u64;
-            let one: Vec<u8> = (0..100 << 10)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    x.to_le_bytes()[0]
-                })
-                .collect();
+            let one: Vec<u8> = Xorshift(XORSHIFT_SEED).take(100 << 10).map(|x| x.to_le_bytes()[0]).collect();
             let (mut uid, mut batches) = (100_000u32, 0u32);
             while !stop.load(Ordering::Relaxed) {
                 let batch = (0..20)
@@ -351,5 +357,4 @@ fn down_steps_during_an_import() {
     assert_eq!(s.list.iter().filter(|m| m.flags.seen).count(), 101);
     drop(s);
     drop(store);
-    let _ = std::fs::remove_dir_all(&root);
 }

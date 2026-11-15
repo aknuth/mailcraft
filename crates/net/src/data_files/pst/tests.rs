@@ -2,7 +2,27 @@ use super::item::{File, item_of};
 use super::props::{decode, one_off_address, val};
 use super::rebuild::to_raw;
 use super::*;
+use crate::data_files::scratch::scratch;
+use crate::pst_pim::Named;
+use mailcraft_mime::tnef_fixtures::{SPEC_LZFU, STORYBOARD_RTF, stored_rtf};
 use mailcraft_pst::write;
+
+/// A value of `props` by its id, as an item's reading asks for one.
+fn get<'a>(props: &HashMap<u16, Val<'a>>, id: u16) -> Option<Val<'a>> {
+    props.get(&id).cloned()
+}
+
+/// The names of a rebuilt message's files, read back from its source (which must parse: a
+/// message that doesn't carries no file either, and would pass for one that has none).
+fn files_of(raw: &[u8]) -> Vec<String> {
+    mailcraft_mime::parse(raw).expect("the rebuilt message parses").attachments.into_iter().map(|a| a.name).collect()
+}
+
+/// An item from its properties alone, with no recipients.
+fn item_with<'a>(props: &HashMap<u16, Val<'a>>, files: Vec<File>, named: &Named) -> Item {
+    let none: [fn(u16) -> Option<Val<'a>>; 0] = [];
+    item_of(&|id| get(props, id), &none, files, named)
+}
 
 /// A one-off entry id holding `name`, `kind` and `address`, in UTF-16 or 8-bit.
 fn one_off(name: &str, kind: &str, address: &str, unicode: bool) -> Vec<u8> {
@@ -43,18 +63,14 @@ fn a_recipient_s_address_from_its_one_off_entry_id() {
     let props: HashMap<u16, Val<'static>> = HashMap::from([(0x001A, Val::Text("IPM.Note".into()))]);
     let entry = one_off("Cy Lima", "SMTP", "cy@example.com", true);
     let cy = HashMap::from([(0x3001, Val::Text("".into())), (0x0FFF, Val::Bin(&entry)), (0x0C15, Val::Int(2))]);
-    fn get<'a>(m: &HashMap<u16, Val<'a>>, id: u16) -> Option<Val<'a>> {
-        m.get(&id).cloned()
-    }
-    let it = item_of(&|id| get(&props, id), &[|id| get(&cy, id)], Vec::new(), &crate::pst_pim::Named::default());
+    let it = item_of(&|id| get(&props, id), &[|id| get(&cy, id)], Vec::new(), &Named::default());
     assert_eq!(it.cc.iter().map(|a| (a.name.as_str(), a.email.as_str())).collect::<Vec<_>>(), [("Cy Lima", "cy@example.com")]);
 }
 
 /// Outlook's notes come in as notes: their text, colour and time; an empty one doesn't.
 #[test]
 fn notes_come_in_as_notes() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-notes-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("pst-notes");
     let store = Store::open(&dir).unwrap();
     let mut progress = |_| {};
     let mut out = Out::new(&store, "d1", &ImportOptions::default(), &mut progress);
@@ -77,7 +93,6 @@ fn notes_come_in_as_notes() {
     assert_eq!((n.text.as_str(), n.color, n.modified), ("Poster\nAsk about 170 gsm", 1, 1_700_000_500));
     assert_eq!(pim.notes[1].note.color, NOTE_YELLOW, "no colour: Outlook's yellow");
     assert!(pim.notes.iter().all(|s| !s.dirty && s.href.is_empty()), "kept on this computer");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A message too big for the batch being gathered goes into a transaction of its own, not on top
@@ -208,25 +223,24 @@ fn utf8_is_utf8_unless_another_charset_is_declared() {
 /// ISO-2022-KR has no decoder: its ASCII is kept, and the message is counted.
 #[test]
 fn an_unsupported_charset_is_counted() {
-    let none: [fn(u16) -> Option<Val<'static>>; 0] = [];
-    let named = crate::pst_pim::Named::default();
+    let named = Named::default();
     let props: HashMap<u16, Val<'static>> =
         HashMap::from([(0x001A, Val::Text("IPM.Note".into())), (0x1013, Val::Bin(b"<p>Hi \x0e\x30\x21\x0f</p>")), (0x3FDE, Val::Int(50225))]);
-    let it = item_of(&|id| props.get(&id).cloned(), &none, Vec::new(), &named);
+    let it = item_with(&props, Vec::new(), &named);
     assert!(it.charset_unsupported);
     assert!(it.html.as_deref().is_some_and(|h| h.starts_with("<p>Hi ")));
     let props: HashMap<u16, Val<'static>> = HashMap::from([(0x1013, Val::Bin(b"<p>Hi</p>")), (0x3FDE, Val::Int(1252))]);
-    assert!(!item_of(&|id| props.get(&id).cloned(), &none, Vec::new(), &named).charset_unsupported);
+    assert!(!item_with(&props, Vec::new(), &named).charset_unsupported);
     // Labelled ISO-2022-KR but read whole (plain ASCII, or UTF-8): nothing lost, not counted.
     for body in [b"<p>Hi</p>".as_slice(), "<p>café</p>".as_bytes()] {
         let props: HashMap<u16, Val<'_>> = HashMap::from([(0x1013, Val::Bin(body)), (0x3FDE, Val::Int(50225))]);
-        let it = item_of(&|id| props.get(&id).cloned(), &none, Vec::new(), &named);
+        let it = item_with(&props, Vec::new(), &named);
         assert!(!it.charset_unsupported, "{:?}", it.html);
     }
     // A message attached to one that lost text counts for it.
     let lost = Item { charset_unsupported: true, ..Default::default() };
     let props: HashMap<u16, Val<'static>> = HashMap::from([(0x001A, Val::Text("IPM.Note".into()))]);
-    let it = item_of(&|id| props.get(&id).cloned(), &none, vec![item::File::Message(Box::new(lost))], &named);
+    let it = item_with(&props, vec![File::Message(Box::new(lost))], &named);
     assert!(it.charset_unsupported);
 }
 
@@ -234,8 +248,7 @@ fn an_unsupported_charset_is_counted() {
 /// still came in: it isn't among the items left out.
 #[test]
 fn an_unsupported_charset_is_in_the_report() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-charset-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("pst-charset");
     let store = Store::open(&dir).unwrap();
     let mut progress = |_| {};
     let mut out = Out::new(&store, "d1", &ImportOptions::default(), &mut progress);
@@ -253,7 +266,6 @@ fn an_unsupported_charset_is_in_the_report() {
     let done = out.finish();
     assert_eq!((done.messages, done.skipped), (2, 0));
     assert_eq!(done.skips.into_iter().collect::<Vec<_>>(), [(SkipReason::CharsetUnsupported, 1)]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -291,9 +303,8 @@ fn an_item_reads_from_its_values() {
     ]);
     let ben = HashMap::from([(0x3001, Val::Text("Ben".into())), (0x39FE, Val::Text("ben@example.com".into())), (0x0C15, Val::Int(2))]);
     let nobody = HashMap::from([(0x3001, Val::Text("No address".into()))]);
-    let get = |m: &HashMap<u16, Val<'static>>, id: u16| m.get(&id).cloned();
     let recipients = [&ben, &nobody].map(|r| move |id| get(r, id));
-    let it = item_of(&|id| get(&props, id), &recipients, Vec::new(), &crate::pst_pim::Named::default());
+    let it = item_of(&|id| get(&props, id), &recipients, Vec::new(), &Named::default());
     assert_eq!(it.subject, "FW: Hello");
     assert_eq!((it.from.name.as_str(), it.from.email.as_str(), it.date), ("Ana", "ana@example.com", 1_704_067_200));
     assert!(it.flags.seen && !it.flags.draft && it.flags.flagged && it.flags.answered);
@@ -302,34 +313,15 @@ fn an_item_reads_from_its_values() {
     assert!(it.to.is_empty() && it.bcc.is_empty() && it.extra.is_none());
 }
 
-/// `PidTagRtfCompressed` stored as it is (`MELA`), as Outlook may keep a short body.
-fn stored_rtf(rtf: &[u8]) -> Vec<u8> {
-    let len = u32::try_from(rtf.len()).unwrap();
-    let mut out = (len + 12).to_le_bytes().to_vec();
-    out.extend(len.to_le_bytes());
-    out.extend(0x414C_454Du32.to_le_bytes());
-    out.extend(0u32.to_le_bytes());
-    out.extend(rtf);
-    out
-}
-
-/// An item from its properties alone, with no recipients.
-fn item_with<'a>(props: &HashMap<u16, Val<'a>>, files: Vec<File>) -> Item {
-    let none: [fn(u16) -> Option<Val<'a>>; 0] = [];
-    item_of(&|id| props.get(&id).cloned(), &none, files, &crate::pst_pim::Named::default())
-}
-
 /// A body Outlook kept only as RTF comes in as the HTML it wraps, and the picture that HTML
 /// names by `cid:` goes inline instead of being a file.
 #[test]
 fn an_rtf_only_body_comes_in_with_its_pictures_inline() {
-    let rtf = stored_rtf(
-        br#"{\rtf1\ansi\ansicpg1252\fromhtml1 \deff0{\fonttbl{\f0\fswiss Calibri;}}{\*\htmltag19 <html>}{\*\htmltag34 <body>}{\*\htmltag <p>}\htmlrtf {\htmlrtf0 Hi Riley, the {\*\htmltag <b>}\htmlrtf\b\htmlrtf0 storyboard{\*\htmltag </b>}\htmlrtf\b0\htmlrtf0  is attached.{\*\htmltag <img src="cid:logo@studio.example">}\htmlrtf\par\htmlrtf0}{\*\htmltag </p></body></html>}}"#,
-    );
+    let rtf = stored_rtf(STORYBOARD_RTF);
     let props = HashMap::from([(0x001A, Val::Text("IPM.Note".into())), (0x0037, Val::Text("Storyboard".into())), (0x1009, Val::Bin(&rtf))]);
     let logo =
         File::Data { name: "logo.png".into(), mime: "image/png".into(), cid: "logo@studio.example".into(), data: b"\x89PNG\r\n\x1a\nfake".to_vec() };
-    let it = item_with(&props, vec![logo]);
+    let it = item_with(&props, vec![logo], &Named::default());
     let html = it.html.as_deref().unwrap_or_default();
     assert!(html.contains("<b>storyboard</b>") && html.contains("cid:logo@studio.example"), "{html}");
     let raw = to_raw(it, "rtf@x").unwrap();
@@ -339,12 +331,7 @@ fn an_rtf_only_body_comes_in_with_its_pictures_inline() {
     assert_eq!(inline, [(true, Some("logo@studio.example"))], "the picture is inline");
 
     // Compressed (LZFu, MS-OXRTFCP 3.1.1): RTF of its own reads as simple HTML.
-    let compressed = [
-        0x2d, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00, 0x4c, 0x5a, 0x46, 0x75, 0xf1, 0xc5, 0xc7, 0xa7, 0x03, 0x00, 0x0a, 0x00, 0x72, 0x63, 0x70,
-        0x67, 0x31, 0x32, 0x35, 0x42, 0x32, 0x0a, 0xf3, 0x20, 0x68, 0x65, 0x6c, 0x09, 0x00, 0x20, 0x62, 0x77, 0x05, 0xb0, 0x6c, 0x64, 0x7d, 0x0a,
-        0x80, 0x0f, 0xa0,
-    ];
-    let it = item_with(&HashMap::from([(0x1009, Val::Bin(&compressed[..]))]), Vec::new());
+    let it = item_with(&HashMap::from([(0x1009, Val::Bin(&SPEC_LZFU[..]))]), Vec::new(), &Named::default());
     assert!(it.html.as_deref().is_some_and(|h| h.contains("hello world")), "{:?}", it.html);
     let p = mime::parse(&to_raw(it, "lzfu@x").unwrap()).unwrap();
     assert!(p.text.contains("hello world"), "{}", p.text);
@@ -359,7 +346,7 @@ fn rtf_fills_in_only_what_is_missing() {
     let with = |extra: &[(u16, Val<'static>)], rtf: &[u8]| {
         let mut props: HashMap<u16, Val<'_>> = extra.iter().cloned().collect();
         props.insert(0x1009, Val::Bin(rtf));
-        item_with(&props, Vec::new())
+        item_with(&props, Vec::new(), &Named::default())
     };
     let it = with(&[(0x1000, Val::Text("Plain text".into()))], &wrapped);
     assert_eq!(it.body, "Plain text");
@@ -407,8 +394,7 @@ fn rtf_fills_in_only_what_is_missing() {
 fn a_headerless_item_keeps_forwarded_importance_and_references() {
     let read = |props: &[(u16, Val<'static>)]| {
         let props: HashMap<u16, Val<'static>> = props.iter().cloned().collect();
-        let none: [fn(u16) -> Option<Val<'static>>; 0] = [];
-        item_of(&|id| props.get(&id).cloned(), &none, Vec::new(), &crate::pst_pim::Named::default())
+        item_with(&props, Vec::new(), &Named::default())
     };
     // Forwarded by its last verb, or by its icon when it has none; a reply stays a reply.
     let it = read(&[(0x1081, Val::Int(0x0068))]);
@@ -444,8 +430,7 @@ fn a_headerless_item_keeps_forwarded_importance_and_references() {
 fn categories_named_by_a_string_become_keywords() {
     let read = |v: Val<'static>| {
         let props: HashMap<u16, Val<'static>> = HashMap::from([(0x8010, v)]);
-        let none: [fn(u16) -> Option<Val<'static>>; 0] = [];
-        item_of(&|id| props.get(&id).cloned(), &none, Vec::new(), &crate::pst_pim::Named::with_keywords(0x8010)).flags.keywords
+        item_with(&props, Vec::new(), &Named::with_keywords(0x8010)).flags.keywords
     };
     let names = ["Work", "To do", "work", " ", "$Junk"].map(String::from).to_vec();
     assert_eq!(read(Val::Texts(names)), ["work", "to=20do"]);
@@ -453,8 +438,7 @@ fn categories_named_by_a_string_become_keywords() {
     assert_eq!(read(Val::Texts((0..100).map(|i| format!("c{i}")).collect())).len(), 64);
     // A file without the name knows no categories.
     let props: HashMap<u16, Val<'static>> = HashMap::from([(0x8010, Val::Texts(vec!["Work".into()]))]);
-    let none: [fn(u16) -> Option<Val<'static>>; 0] = [];
-    assert!(item_of(&|id| props.get(&id).cloned(), &none, Vec::new(), &crate::pst_pim::Named::default()).flags.keywords.is_empty());
+    assert!(item_with(&props, Vec::new(), &Named::default()).flags.keywords.is_empty());
 }
 
 /// The header of a rebuilt message: its lines, each ASCII without control characters (but tab),
@@ -488,8 +472,9 @@ fn a_headerless_item_gets_thread_and_sensitivity_headers() {
     assert!(!lines.iter().any(|l| l.to_ascii_lowercase().starts_with("bcc")), "{lines:#?}");
     let index_line = lines.iter().find(|l| l.starts_with("Thread-Index: ")).unwrap();
     let kept = crate::ews::unb64(&index_line["Thread-Index: ".len()..]).unwrap();
-    assert_eq!(kept.len(), 22 + 5 * 50, "whole blocks, at most 50");
+    assert_eq!(kept.len(), 22 + 5 * mailcraft_model::thread::MAX_INDEX_BLOCKS, "whole blocks, as many as threading reads");
     assert_eq!(kept[..], index[..kept.len()]);
+    assert_ne!(mailcraft_model::thread::index_keys(&kept), Default::default(), "threading reads what's kept");
     assert!(lines.contains(&"Sensitivity: Company-Confidential".to_string()), "{lines:#?}");
     let m = mailparse_header(&raw, "Thread-Topic");
     assert_eq!(m, "Plan Bcc: evil@example.com for the café");
@@ -500,6 +485,16 @@ fn a_headerless_item_gets_thread_and_sensitivity_headers() {
     // Nothing but spaces: no header.
     let (raw, _) = rebuilt(&[(0x0070, Val::Text("\r\n \t".into())), (0x0036, Val::Int(9))], &[]).unwrap();
     assert!(!clean_header(&raw).iter().any(|l| l.starts_with("Thread-Topic") || l.starts_with("Sensitivity")));
+}
+
+/// An item's References keep as many ids as threading reads, the last ones (nearest the item).
+#[test]
+fn references_keep_the_ids_threading_reads() {
+    let cap = mailcraft_model::thread::MAX_REFERENCES;
+    let all: String = (0..cap + 40).map(|n| format!("<r{n}@x> ")).collect();
+    let ids = super::item::message_ids(&all);
+    assert_eq!(ids.len(), cap);
+    assert_eq!((ids[0].as_str(), ids[cap - 1].as_str()), ("r40@x", &*format!("r{}@x", cap + 39)));
 }
 
 /// Names, addresses and ids from a header-less item stay inside their own header lines: a Bcc
@@ -526,11 +521,8 @@ fn names_addresses_and_ids_stay_inside_their_lines() {
         (0x1042, Val::Text(long.as_str().into())),
         (0x1039, Val::Text(references.as_str().into())),
     ]);
-    fn get<'a>(m: &HashMap<u16, Val<'a>>, id: u16) -> Option<Val<'a>> {
-        m.get(&id).cloned()
-    }
     let rows = [&hidden, &named, &quoted, &broken, &to].map(|r| move |id| get(r, id));
-    let it = item_of(&|id| get(&props, id), &rows, Vec::new(), &crate::pst_pim::Named::default());
+    let it = item_of(&|id| get(&props, id), &rows, Vec::new(), &Named::default());
     assert_eq!(it.bcc.len(), 3, "an address with a line break is none");
     let raw = to_raw(it, "f@x").unwrap();
     let lines = clean_header(&raw);
@@ -588,11 +580,8 @@ fn an_unusual_address_still_comes_in() {
     let quoted = HashMap::from([(0x39FE, Val::Text("\"a b\"@x.example".into()))]);
     let dotted = HashMap::from([(0x3003, Val::Text("first.last+tag@x.example.".into())), (0x0C15, Val::Int(2))]);
     let props: HashMap<u16, Val<'static>> = HashMap::from([(0x001A, Val::Text("IPM.Note".into()))]);
-    fn get<'a>(m: &HashMap<u16, Val<'a>>, id: u16) -> Option<Val<'a>> {
-        m.get(&id).cloned()
-    }
     let rows = [&quoted, &dotted].map(|r| move |id| get(r, id));
-    let it = item_of(&|id| get(&props, id), &rows, Vec::new(), &crate::pst_pim::Named::default());
+    let it = item_of(&|id| get(&props, id), &rows, Vec::new(), &Named::default());
     assert_eq!(it.to.iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), ["\"a b\"@x.example"]);
     assert_eq!(it.cc.iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), ["first.last+tag@x.example."]);
     let raw = to_raw(Item { subject: "s".into(), body: "b".into(), date: 1_704_067_200, ..it }, "f@x").unwrap();
@@ -609,28 +598,23 @@ fn a_recipient_without_an_address_is_counted() {
         HashMap::from([(0x39FE, Val::Text("/o=Org/cn=Recipients/cn=ex".into()))]),
         HashMap::from([(0x39FE, Val::Text("cy@x.example".into()))]),
     ];
-    fn get<'a>(m: &HashMap<u16, Val<'a>>, id: u16) -> Option<Val<'a>> {
-        m.get(&id).cloned()
-    }
     let read = |headers: &str| {
         let props: HashMap<u16, Val<'_>> = HashMap::from([(0x001A, Val::Text("IPM.Note".into())), (0x007D, Val::Text(headers.into()))]);
         let rows = rows.each_ref().map(|r| move |id| get(r, id));
-        item_of(&|id| get(&props, id), &rows, Vec::new(), &crate::pst_pim::Named::default())
+        item_of(&|id| get(&props, id), &rows, Vec::new(), &Named::default())
     };
     let it = read("");
     assert_eq!((it.recipients_without_address, it.to.len()), (2, 1));
     assert_eq!(read("From: a@x.example\r\nTo: b@x.example\r\n").recipients_without_address, 0);
 
     // The report counts them, not as items left out.
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-recipients-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch("pst-recipients");
     let store = Store::open(&dir).unwrap();
     let mut progress = |_| {};
     let mut out = Out::new(&store, "r1", &ImportOptions::default(), &mut progress);
     let path = out.add_folder(None, "Inbox");
     out.add_message(&path, Item { subject: "s".into(), body: "b".into(), date: 1_704_067_200, ..read("") });
     let done = out.finish();
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!((done.messages, done.skipped), (1, 0));
     assert_eq!(done.skips.into_iter().collect::<Vec<_>>(), [(SkipReason::RecipientWithoutAddress, 2)]);
 }
@@ -677,35 +661,28 @@ fn a_sent_item_keeps_its_bcc_and_gets_an_id() {
 
 #[test]
 fn an_offline_copy_is_explained() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-ost-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = scratch("ost");
     let file = dir.join("me@example.com.ost");
     std::fs::write(&file, b"!BDN\0\0\0\0SO$\0rest").unwrap();
     let store = Store::open(dir.join("cache")).unwrap();
     let e = import(&file, &store, "a1", &mut |_| {}).unwrap_err();
     assert!(e.contains(".ost") && e.contains("add the account"), "{e}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn junk_is_refused_and_nothing_is_written() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-junk-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-junk");
     let file = dir.join("junk.pst");
     std::fs::write(&file, b"!BDN this is not really a data file").unwrap();
     let store = Store::open(dir.join("cache")).unwrap();
     assert!(import(&file, &store, "a1", &mut |_| {}).is_err());
     assert!(import(&dir.join("missing.pst"), &store, "a1", &mut |_| {}).is_err());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn imports_a_data_file() {
     use mailcraft_pst::write::{NewAttachment, NewMessage, NewRecipient, RecipientType};
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst");
     let file = dir.join("Archive 2024.pst");
     let recipients = [
         NewRecipient { name: "Ana Ruiz", email: "ana@example.com", recipient_type: RecipientType::To, ..Default::default() },
@@ -781,10 +758,10 @@ fn imports_a_data_file() {
     assert_eq!(packed.load_folders("a1").unwrap(), all);
     assert_eq!(packed.read_body(&key), Some(raw));
     drop(packed);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 mod chunked;
+mod classes;
 mod embedded;
 mod files;
 mod indexing;
@@ -801,51 +778,39 @@ mod resume;
 mod sent_ids;
 
 mod real_files {
-    /// Import a real data file named by `MAILCRAFT_PST` (counts only).
-    #[test]
-    #[ignore]
-    fn imports_the_file_in_mailcraft_pst() {
-        let Ok(path) = std::env::var("MAILCRAFT_PST") else { return };
-        let dir = std::env::temp_dir().join(format!("mailcraft-real-pst-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = mailcraft_store::Store::open(&dir).unwrap();
-        let t = std::time::Instant::now();
-        let r = super::import(std::path::Path::new(&path), &store, "r1", &mut |_| {});
-        match r {
-            Ok(done) => {
-                eprintln!(
-                    "messages {} contacts {} events {} skipped {} in {:?}",
-                    done.messages,
-                    done.contacts,
-                    done.events,
-                    done.skipped,
-                    t.elapsed()
-                );
-                eprintln!("skips {:?}", done.skips);
-                let (mut parsed, mut html, mut files, mut dated) = (0, 0, 0, 0);
-                // Attached messages by level (0 = attached to an item) and the files inside them.
-                let (mut attached, mut inner) = ([0usize; 4], 0);
-                for f in &done.folders {
-                    eprintln!("  {:30} {:?} total {} unread {}", f.path, f.role, f.total, f.unread);
-                    for m in store.load_folder("r1", &f.path).unwrap().messages {
-                        dated += usize::from(m.date > 0);
-                        let raw = store.read_body(&m.key).unwrap_or_default();
-                        if let Some(p) = mailcraft_mime::parse(&raw) {
-                            parsed += 1;
-                            html += usize::from(p.had_html);
-                            files += p.attachments.len();
-                            count_attached(&raw, 0, &mut attached, &mut inner);
-                        }
-                    }
-                }
-                eprintln!("parsed {parsed} (html {html}, attachments {files}, dated {dated})");
-                eprintln!("attached messages by level {attached:?}, files inside them {inner}");
-            }
-            Err(e) => eprintln!("FAILED: {e}"),
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    use crate::data_files::scratch::scratch;
 
+    /// Import a real data file named by `MAILCRAFT_PST` (counts only: no folder name, subject or
+    /// address is printed). Fails when the variable is unset, the import fails or brings no mail.
+    #[test]
+    #[ignore = "run by hand: needs MAILCRAFT_PST"]
+    fn imports_the_file_in_mailcraft_pst() {
+        let path = std::env::var("MAILCRAFT_PST").expect("MAILCRAFT_PST names the data file to import");
+        let store = mailcraft_store::Store::open(scratch("real-pst")).unwrap();
+        let t = std::time::Instant::now();
+        let done = super::import(std::path::Path::new(&path), &store, "r1", &mut |_| {}).unwrap_or_else(|e| panic!("the import failed: {e}"));
+        eprintln!("messages {} contacts {} events {} skipped {} in {:?}", done.messages, done.contacts, done.events, done.skipped, t.elapsed());
+        eprintln!("skips {:?}", done.skips);
+        let (mut parsed, mut html, mut files, mut dated) = (0, 0, 0, 0);
+        // Attached messages by level (0 = attached to an item) and the files inside them.
+        let (mut attached, mut inner) = ([0usize; 4], 0);
+        for (i, f) in done.folders.iter().enumerate() {
+            eprintln!("  folder {i:3} {:?} total {} unread {}", f.role, f.total, f.unread);
+            for m in store.load_folder("r1", &f.path).unwrap().messages {
+                dated += usize::from(m.date > 0);
+                let raw = store.read_body(&m.key).unwrap_or_default();
+                if let Some(p) = mailcraft_mime::parse(&raw) {
+                    parsed += 1;
+                    html += usize::from(p.had_html);
+                    files += p.attachments.len();
+                    count_attached(&raw, 0, &mut attached, &mut inner);
+                }
+            }
+        }
+        eprintln!("parsed {parsed} (html {html}, attachments {files}, dated {dated})");
+        eprintln!("attached messages by level {attached:?}, files inside them {inner}");
+        assert!(done.messages > 0, "the import brought no mail");
+    }
     /// Counts the attached messages in `raw`, `level` down, and the other files inside them.
     fn count_attached(raw: &[u8], level: usize, attached: &mut [usize; 4], inner: &mut usize) {
         let Some(p) = mailcraft_mime::parse(raw) else { return };

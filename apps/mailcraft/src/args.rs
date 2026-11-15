@@ -33,11 +33,7 @@ The command-line client is mailcraft-cli (mailcraft-cli --help).";
 
 /// `--version`: the version, plus the commit and date of release builds (packaging/common.sh).
 pub fn version_line() -> String {
-    let v = format!("mailcraft {}", env!("CARGO_PKG_VERSION"));
-    match (option_env!("MAILCRAFT_BUILD_SHA"), option_env!("MAILCRAFT_BUILD_DATE")) {
-        (Some(sha), Some(date)) if !sha.is_empty() => format!("{v} ({}, {date})", sha.get(..9).unwrap_or(sha)),
-        _ => v,
-    }
+    mailcraft_engine::version_line("mailcraft")
 }
 
 /// Started by the system for a link or a file: `--open` first, as the Windows installer
@@ -157,8 +153,9 @@ fn scheme(arg: &str) -> Option<&str> {
 }
 
 /// The path of a `file:` link on this computer (`file:///home/zoe/a%20b.eml`,
-/// `file://localhost/…`, `file:///C:/…`), or `None` for one to another computer.
-fn from_file_link(link: &str) -> Option<String> {
+/// `file://localhost/…`, `file:///C:/…`), or `None` for one to another computer. Pictures in
+/// copied HTML are found with it too (`desktop::office_file`).
+pub(crate) fn from_file_link(link: &str) -> Option<String> {
     let rest = link.get(5..)?;
     let path = match rest.strip_prefix("//") {
         Some(r) => {

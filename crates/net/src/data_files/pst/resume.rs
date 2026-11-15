@@ -11,11 +11,13 @@
 //! list's tail), the rows the reader failed on (never read again), and the counts so far.
 //!
 //! Going on, sources written after the checkpoint (a crash before the next) are removed, and the
-//! same rows are read again into the same numbers. The file is checked to be the one it was first:
-//! the same size and time it last changed, or else the same record key and the same folders,
-//! each with the same items and bytes (Outlook writes a file's header when it opens it, changing
-//! its time and nothing else). Where it isn't, or isn't there, the import waits on the user. A
-//! checkpoint is read from a file, so it's hostile: one that doesn't add up isn't gone on from.
+//! same rows are read again into the same numbers. The file is checked to be the one it was first
+//! by its record key and fingerprint alone: the same folders brought in, each with the same items
+//! and bytes (Outlook writes a file's header when it opens it, changing its time and nothing
+//! else). Its size and the time it last changed are noted, not checked: a message added in the
+//! second it was last written in can leave both as they were. Where it isn't the one, or isn't
+//! there, the import waits on the user. A checkpoint is read from a file, so it's hostile: one
+//! that doesn't add up isn't gone on from.
 
 use std::collections::HashSet;
 
@@ -52,7 +54,7 @@ pub enum CheckState {
 
 /// The data file read: where it was, how big, when it last changed, its record key, and the
 /// fingerprint of what it holds ([`plan::Plan::fingerprint`]). The last two say whether a file is
-/// still the one ([`Checkpoint::same_file`]); its size and date are kept for the record.
+/// still the one ([`Skip::same_file`]); its size and date are kept for the record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Source {
@@ -364,10 +366,12 @@ pub(super) fn facts(path: &Path) -> (u64, i64) {
 
 /// Why a file can't be gone on with, from the error opening it gave.
 pub(super) fn blocked_by(e: &io::Error) -> Blocked {
-    match (e.kind(), e.raw_os_error()) {
-        (io::ErrorKind::NotFound, _) => Blocked::SourceMissing,
-        (_, Some(32 | 33)) => Blocked::Locked,
-        _ => Blocked::SourceChanged,
+    if e.kind() == io::ErrorKind::NotFound {
+        Blocked::SourceMissing
+    } else if super::open::locked_by_another(e) {
+        Blocked::Locked
+    } else {
+        Blocked::SourceChanged
     }
 }
 
@@ -457,7 +461,7 @@ impl Out<'_> {
         note.resumed = cp.current;
         note.resumed_deferred = cp.deferred;
         self.sent = super::out::sent_ids::SentIds::from_map(&cp.sent);
-        self.folders = cp.folders;
+        self.set_folders(cp.folders);
         self.room_kept();
         skip
     }
@@ -744,7 +748,7 @@ impl Out<'_> {
             log::warn!("import: the checkpoint couldn't be written: {e}");
             // Failed at the disk, or refused once the data file was opened again: nothing more is
             // written, and the import goes on from the last one written.
-            self.writes_stopped();
+            self.note_reopened();
         }
         self.checkpointed(wrote.is_ok());
     }

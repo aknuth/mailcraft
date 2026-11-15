@@ -49,6 +49,24 @@ END:VCALENDAR]]></c:calendar-data></d:prop>
     assert_eq!(absolute("https://h.example/dav/cal/", "/dav/cal/1.ics").unwrap(), "https://h.example/dav/cal/1.ics");
 }
 
+/// A response past the depth cap is left out with all it holds: its end doesn't end the response
+/// it's in, whose properties after it are still read.
+#[test]
+fn past_the_depth_cap_a_response_keeps_its_properties() {
+    // `multistatus`, `response` and 62 `x`s fill the 64 levels.
+    let (opens, closes) = ("<x>".repeat(62), "</x>".repeat(62));
+    let xml = format!(
+        "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/a/</d:href>{opens}<d:response><d:href>/evil/</d:href></d:response>{closes}\
+         <d:propstat><d:prop><d:displayname>Kept</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>\
+         <d:response><d:href>/b/</d:href></d:response></d:multistatus>"
+    );
+    let items = multistatus(&xml);
+    let hrefs: Vec<&str> = items.iter().map(|i| i.href.as_str()).collect();
+    assert_eq!(hrefs, ["/a/", "/b/"]);
+    assert_eq!(items[0].props.get("displayname").map(String::as_str), Some("Kept"));
+    assert!(items[0].hrefs.is_empty(), "nothing past the cap is read: {:?}", items[0].hrefs);
+}
+
 /// Item names are one per uid, short, and safe in an address.
 #[test]
 fn item_names_dont_collide() {
@@ -175,4 +193,109 @@ fn a_calendar_shared_with_the_user_is_named_by_its_owner() {
     // A name that says whose it is already isn't said twice.
     items[2].props.insert("displayname".into(), "Accounting@example.com's calendar".into());
     assert_eq!(syncing::calendar_name(&items[2]), "Accounting@example.com's calendar");
+}
+
+/// A first sync of a calendar and an address book of 20,000 items each (every item read), and
+/// one with 20,000 events changed here in a calendar of another server (none sent: what's timed
+/// is finding each one's parts). Run by hand, in release:
+/// `cargo test --release -p mailcraft-net --lib measure_big_collections -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_big_collections() {
+    use crate::fakes::fake_dav::{BOOK, CAL, PASSWORD, USER, serve};
+    use mailcraft_model::zone::Zone;
+    const N: usize = 20_000;
+    let uid = |i: usize| format!("{i:08x}-5f2c-4b1e-9a7d-3c6e8f0a1b2c");
+    let event = |i: usize| {
+        let start = 1_800_000_000 + i64::try_from(i).unwrap_or_default() * 3600;
+        CalEvent { uid: uid(i), summary: format!("Event {i}"), start, end: start + 1800, ..Default::default() }
+    };
+    let at = Where { email: USER, imap_host: "imap.example", mails: true, ..Default::default() };
+    let pim_at = |base: &str| {
+        let mut pim = Pim {
+            caldav_home: Some(format!("{base}/dav/cal/")),
+            carddav_home: Some(format!("{base}/dav/card/")),
+            dav_checked: Some(100),
+            ..Default::default()
+        };
+        pim.ensure_defaults();
+        pim
+    };
+    let dav = Dav::new(USER, PASSWORD);
+
+    let server = serve();
+    {
+        let mut d = server.data.lock().unwrap();
+        for i in 0..N {
+            d.put(&format!("{CAL}{}.ics", uid(i)), &ical::write(&[event(i)], None, 0));
+            d.put(&format!("{BOOK}{}.vcf", uid(i)), &vcard::write(&vcard::Card { uid: uid(i), name: format!("Person {i}"), ..Default::default() }));
+        }
+    }
+    let t = std::time::Instant::now();
+    let out = sync(&dav, &at, &pim_at(&server.base), 100, Zone::UTC).unwrap();
+    let read = t.elapsed();
+    assert_eq!((out.events.len(), out.cards.len(), out.kept.len(), out.errors.len()), (N, N, 0, 0));
+    let digest = mailcraft_store::fnv64(&format!("{out:?}").replace(&server.base, ""));
+    println!("MEASURE first read of {N} events and {N} cards: {:.0} ms (result {digest:016x})", read.as_secs_f64() * 1000.0);
+
+    let empty = serve();
+    let mut pim = pim_at(&empty.base);
+    pim.events = (0..N)
+        .map(|i| StoredEvent {
+            calendar: "https://old.example/cal/".into(),
+            href: format!("https://old.example/cal/{}.ics", uid(i)),
+            etag: "\"1\"".into(),
+            event: event(i),
+            dirty: true,
+        })
+        .collect();
+    let t = std::time::Instant::now();
+    let out = sync(&dav, &at, &pim, 100, Zone::UTC).unwrap();
+    let pushed = t.elapsed();
+    assert_eq!((out.pushed_events.len(), out.errors.len()), (0, 0));
+    let digest = mailcraft_store::fnv64(&format!("{out:?}").replace(&empty.base, ""));
+    println!("MEASURE sync with {N} events changed for another server: {:.0} ms (result {digest:016x})", pushed.as_secs_f64() * 1000.0);
+}
+
+/// An invitation whose uid holds control characters, kept, stored in the calendar at `calendar`
+/// as MailCraft stores it, then looked for by the uid kept: found, and read back with that uid.
+/// The item is deleted after.
+fn an_odd_uid_is_found(dav: &Dav, calendar: &str, tag: &str) {
+    let invitation = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:odd\u{1}uid\u{1b}-{tag}\r\nDTSTAMP:20261101T090000Z\r\n\
+         DTSTART:20261102T090000Z\r\nDTEND:20261102T100000Z\r\nSUMMARY:Odd\u{1} one\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    );
+    let kept = ical::parse(&invitation, 0).events.remove(0);
+    assert_eq!(kept.uid, format!("odd\u{1}uid\u{1b}-{tag}"));
+    let href = format!("{}/odd-{tag}.ics", calendar.trim_end_matches('/'));
+    dav.put(&href, "text/calendar; charset=utf-8", &ical::write_for_server(std::slice::from_ref(&kept), 0), None).unwrap();
+    let found = dav.find_uid(calendar, &kept.uid).unwrap();
+    assert_eq!(found, std::slice::from_ref(&href));
+    let read = dav.multiget(Kind::Calendars, calendar, &found).unwrap();
+    let back: Vec<CalEvent> = read.iter().flat_map(|(_, _, data)| ical::parse(data, 0).events).collect();
+    assert!(back.iter().any(|e| e.uid == ical::stored_uid(&kept.uid) && e.summary == "Odd one"), "{read:?}");
+    let _ = dav.remove(&href, "");
+}
+
+/// Found in the audit: an invitation's uid with a control character was kept so and written so;
+/// the server kept it without, and the meeting wasn't found by the uid kept here.
+#[test]
+fn an_invitations_odd_uid_is_found_where_it_was_stored() {
+    use crate::fakes::fake_dav::{CAL, PASSWORD, USER, serve};
+    let server = serve();
+    an_odd_uid_is_found(&Dav::new(USER, PASSWORD), &format!("{}{CAL}", server.base), "fake");
+}
+
+/// The same on a real CalDAV server on this computer (Radicale; a made-up account):
+/// `MAILCRAFT_REAL_CALDAV="http://127.0.0.1:21232/odd/work/ odd pw"` (the calendar, made first).
+#[test]
+#[ignore = "needs a real CalDAV server in MAILCRAFT_REAL_CALDAV"]
+fn real_an_invitations_odd_uid_is_found_where_it_was_stored() {
+    let Ok(v) = std::env::var("MAILCRAFT_REAL_CALDAV") else {
+        eprintln!("MAILCRAFT_REAL_CALDAV isn't set: skipped");
+        return;
+    };
+    let p: Vec<&str> = v.split_whitespace().collect();
+    let [url, user, password] = p.as_slice() else { panic!("MAILCRAFT_REAL_CALDAV: url user password") };
+    an_odd_uid_is_found(&Dav::new(user, password), url, &std::process::id().to_string());
 }

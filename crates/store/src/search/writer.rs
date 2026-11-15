@@ -14,7 +14,8 @@ use std::collections::{BTreeMap, HashMap};
 use mailcraft_model::search::{IndexDoc, TOKENIZER_VERSION};
 
 use super::format::{
-    MAX_META, MAX_NAME_BYTES, MAX_SEGMENTS, Meta, SegBuilder, SegFiles, SegInfo, TextPage, encode_blob, encode_docs, encode_meta, encode_text_page,
+    MAX_META, MAX_NAME_BYTES, MAX_SEGMENTS, Meta, SegBuilder, SegFiles, SegInfo, TEXT_REC_HEAD, TextPage, encode_blob, encode_docs, encode_meta,
+    encode_text_page,
 };
 use super::*;
 
@@ -24,6 +25,28 @@ mod words;
 
 pub use merge::{RENUMBER_SLACK, TOMBSTONE_AGE};
 pub(crate) use words::{Words, add_words, doc_words, file_word, merge_lists};
+
+/// Texts put in text pages one after another: what the page being filled holds.
+#[derive(Clone, Copy, Debug, Default)]
+struct TextPacker {
+    bytes: usize,
+    count: usize,
+}
+
+impl TextPacker {
+    /// Whether a text of `len` bytes goes in a new page: this one has some and the text would
+    /// take it past [`TEXT_PAGE`] (a longer text has a page of its own), or it has as many as a
+    /// page counts.
+    fn full(&self, len: usize) -> bool {
+        self.count > 0 && (self.bytes.saturating_add(len.saturating_add(TEXT_REC_HEAD)) > TEXT_PAGE || self.count >= usize::from(u16::MAX))
+    }
+
+    /// A text of `len` bytes put in the page.
+    fn put(&mut self, len: usize) {
+        self.bytes = self.bytes.saturating_add(len.saturating_add(TEXT_REC_HEAD));
+        self.count = self.count.saturating_add(1);
+    }
+}
 
 /// One account's index being written. One at a time per account: another
 /// [`open`](Writer::open) while it's held is [`StoreError::Busy`].
@@ -48,7 +71,7 @@ pub struct Writer {
     words: Words,
     word_bytes: usize,
     word_docs: u32,
-    /// Texts of the docs added since, by doc.
+    /// Texts of the docs added since, by doc, rising (each added takes the next id).
     texts: Vec<(u32, Vec<u8>)>,
     text_bytes: usize,
     /// Texts to take out of their pages, by page.
@@ -64,6 +87,8 @@ pub struct Writer {
     stamp: u64,
     /// A commit failed: files it wrote may be left to remove.
     orphans: bool,
+    /// Begun anew as it opened, what it had set aside as damaged ([`Writer::remade`]).
+    remade: bool,
     /// Stop a commit after its files, before its meta (a crash there).
     #[cfg(test)]
     pub(crate) stop_before_meta: bool,
@@ -145,11 +170,13 @@ impl Writer {
     pub fn open(store: &Store, account: &str) -> Result<Writer> {
         let held = Held::take(store, account)?;
         let base = dir(store, account);
-        let loaded = match load(store, account, &base) {
-            Ok(l) => l,
+        let (loaded, remade) = match load(store, account, &base) {
+            // None, beside one set aside: it was damaged, and hasn't been made again since.
+            Ok(None) => (None, store.files.is_file(&meta_path(store, account).with_extension("bin.bad"))),
+            Ok(l) => (l, false),
             Err(e) if is_damaged(&e) => {
                 set_aside_held(store, account)?;
-                None
+                (None, true)
             }
             Err(e) => return Err(e),
         };
@@ -158,6 +185,7 @@ impl Writer {
             None => (fresh(store, account), Vec::new()),
         };
         let mut w = Writer::with(store, account, base, meta, docs, held);
+        w.remade = remade;
         w.clean(store);
         if w.meta.tokenizer != TOKENIZER_VERSION {
             match w.rebuild(store) {
@@ -166,6 +194,7 @@ impl Writer {
                     set_aside_held(store, account)?;
                     let base = w.base.clone();
                     w = Writer::with(store, account, base, fresh(store, account), Vec::new(), w.held);
+                    w.remade = true;
                     w.clean(store);
                 }
                 Err(e) => return Err(e),
@@ -174,10 +203,16 @@ impl Writer {
         Ok(w)
     }
 
+    /// Whether it was begun anew as it opened, what it had set aside as damaged: it has none of
+    /// the account's folders, whichever were asked for.
+    pub fn remade(&self) -> bool {
+        self.remade
+    }
+
     fn with(store: &Store, account: &str, base: PathBuf, meta: Meta, docs: Vec<DocRec>, held: Held) -> Writer {
         let folders = meta.folders.clone();
         let folder_bytes = folders.iter().map(String::len).fold(0, usize::saturating_add);
-        let folder_ix = folders.iter().enumerate().filter_map(|(i, f)| Some((f.clone(), u16::try_from(i).ok()?))).collect();
+        let folder_ix = folder_ix(&folders);
         let by_key = by_key(&docs);
         let marks = meta.marks.iter().copied().collect();
         Writer {
@@ -204,6 +239,7 @@ impl Writer {
             marks_changed: false,
             stamp: 0,
             orphans: false,
+            remade: false,
             #[cfg(test)]
             stop_before_meta: false,
             #[cfg(test)]
@@ -392,9 +428,10 @@ impl Writer {
     pub fn remove(&mut self, doc: u32) {
         let Some(d) = self.docs.get_mut(doc as usize).filter(|d| d.live()) else { return };
         let (folder, uid, text) = (d.folder, d.uid, d.text);
+        let no_source = d.bits & NO_SOURCE != 0;
         d.folder = DEAD;
         d.text = NO_TEXT;
-        if d.bits & NO_SOURCE != 0 {
+        if no_source {
             // It never had words: no segment is to be merged for it.
             d.bits |= PURGED;
         }
@@ -402,7 +439,10 @@ impl Writer {
             self.by_key.remove(&(folder, uid));
         }
         if text == NO_TEXT {
-            if let Some(i) = self.texts.iter().position(|(t, _)| *t == doc) {
+            // Added since the last flush, its text is waiting among the others (added, so by
+            // doc); one with no source has none.
+            let waiting = if no_source { None } else { self.texts.binary_search_by_key(&doc, |(t, _)| *t).ok() };
+            if let Some(i) = waiting {
                 let (_, blob) = self.texts.remove(i);
                 self.text_bytes = self.text_bytes.saturating_sub(blob.capacity());
             }
@@ -480,17 +520,6 @@ pub struct Indexed {
     pub source: bool,
     /// Whether it carries files, as far as the index knows ([`DocInfo::files_known`]).
     pub files: Option<bool>,
-}
-
-/// Each live doc by its folder and uid.
-fn by_key(docs: &[DocRec]) -> HashMap<(u16, u32), u32> {
-    let mut by_key = HashMap::with_capacity(docs.len());
-    for (i, d) in docs.iter().enumerate() {
-        if d.live() {
-            by_key.insert((d.folder, d.uid), u32::try_from(i).unwrap_or(u32::MAX));
-        }
-    }
-    by_key
 }
 
 /// An account's index as committed: its meta and doc table; `None` when it has none.

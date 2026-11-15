@@ -14,6 +14,8 @@ pub struct AddressForm {
     pub reply_to: String,
     /// One of the account's signatures; `None`: the account's own for new mail and replies.
     pub signature: Option<String>,
+    /// New mail is written from it (issue #88), not from the account's own address.
+    pub new_mail: bool,
     pub error: Option<String>,
 }
 
@@ -32,6 +34,7 @@ impl AddressForm {
             name: i.name.clone(),
             reply_to: i.reply_to.clone(),
             signature: i.signature.clone(),
+            new_mail: i.new_mail,
             error: None,
         }
     }
@@ -43,6 +46,7 @@ impl AddressForm {
             "name": self.name.trim(),
             "replyTo": self.reply_to.trim(),
             "signature": self.signature,
+            "newMail": self.new_mail,
         })
     }
 }
@@ -73,7 +77,7 @@ pub(super) fn draw(ui: &mut Ui, f: &mut AddressForm, s: &Session, t: &Tokens, ac
         ui.label(tl!("Replies go to"));
         ui.add(egui::TextEdit::singleline(&mut f.reply_to).hint_text(f.address.trim().to_string()).min_size(size).desired_width(size.x));
         ui.end_row();
-        ui.label(tl!("Signature"));
+        let l = ui.label(tl!("Signature"));
         let own = tl!("(the account's own)").to_string();
         let names: Vec<String> = config.map(|c| c.signatures.iter().map(|g| g.name.clone()).collect()).unwrap_or_default();
         egui::ComboBox::from_id_salt("account-address-signature")
@@ -84,9 +88,16 @@ pub(super) fn draw(ui: &mut Ui, f: &mut AddressForm, s: &Session, t: &Tokens, ac
                 for n in &names {
                     ui.selectable_value(&mut f.signature, Some(n.clone()), n.as_str());
                 }
-            });
+            })
+            .response
+            .labelled_by(l.id);
         ui.end_row();
     });
+    ui.add_space(6.0);
+    // As the reporter of issue #88 asked: the address a new message starts from.
+    let own = config.map(|c| c.email.clone()).unwrap_or_default();
+    ui.checkbox(&mut f.new_mail, tl!("Write new mail from this address"))
+        .on_hover_text(tf!("A new message starts from this address, not from {email}. Pick another in From as ever.", email = own));
     if let Some(r) = first
         && ui.memory(|m| m.focused().is_none())
     {

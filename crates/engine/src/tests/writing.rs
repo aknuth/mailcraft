@@ -72,9 +72,24 @@ fn compose_reply_and_send_locally() {
     let sent = String::from_utf8_lossy(&sent);
     let part = sent.split("Content-Type: message/rfc822").nth(1).unwrap();
     assert!(part.contains("Subject: Character turnarounds") && !part[..300.min(part.len())].contains("base64"));
-    done(s);
 }
 
+/// A TrueType font the system has, when it has one of these (as the print crate's tests find one).
+fn system_font() -> Option<Vec<u8>> {
+    // Windows' fonts are in its folder (`%WINDIR%`), which needn't be `C:\Windows`.
+    let windows = std::env::var_os("WINDIR").map_or_else(|| std::path::PathBuf::from("C:\\Windows"), std::path::PathBuf::from).join("Fonts");
+    let candidates = [
+        windows.join("segoeui.ttf"),
+        windows.join("arial.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(),
+        "/System/Library/Fonts/Supplemental/Arial.ttf".into(),
+    ];
+    candidates.iter().find_map(|p| std::fs::read(p).ok())
+}
+
+/// The open message saved as `.eml`, and as PDF: in Helvetica with no fonts given, and with the
+/// fonts the app gives (`print_fonts`) embedded. Windows and macOS always have one to give; a
+/// Linux without DejaVu has none, and checks the first only.
 #[test]
 fn messages_save_as_eml_and_pdf() {
     let mut s = sample_session("export");
@@ -85,19 +100,39 @@ fn messages_save_as_eml_and_pdf() {
     let eml = dir.join("m.eml");
     s.run("message.saveAs", &json!({"path": eml.to_string_lossy()})).unwrap();
     assert_eq!(mailcraft_mime::parse(&std::fs::read(&eml).unwrap()).unwrap().subject, "Storyboard review on Thursday");
-    if let Some(font) =
-        ["C:\\Windows\\Fonts\\segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"].iter().find_map(|p| std::fs::read(p).ok())
-    {
-        s.print_fonts = Some((font, None));
-    }
     let pdf = dir.join("m.pdf");
-    s.run("message.exportPdf", &json!({"path": pdf.to_string_lossy()})).unwrap();
-    let bytes = std::fs::read(&pdf).unwrap();
-    assert!(bytes.starts_with(b"%PDF-") && bytes.ends_with(b"%%EOF\n"));
-    if let Ok(keep) = std::env::var("MAILCRAFT_KEEP_PDF") {
-        let _ = std::fs::copy(&pdf, keep);
-    }
-    done(s);
+    let export = |s: &mut Session| {
+        s.run("message.exportPdf", &json!({"path": pdf.to_string_lossy()})).unwrap();
+        let bytes = std::fs::read(&pdf).unwrap();
+        assert!(bytes.starts_with(b"%PDF-") && bytes.ends_with(b"%%EOF\n"));
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    assert!(s.print_fonts.is_none());
+    let plain = export(&mut s);
+    assert!(plain.contains("/BaseFont /Helvetica") && !plain.contains("/FontFile2"), "no fonts given: Helvetica");
+    let Some(font) = system_font() else {
+        if cfg!(any(windows, target_os = "macos")) {
+            panic!("no system font to embed");
+        }
+        return;
+    };
+    s.print_fonts = Some((font, None));
+    let embedded = export(&mut s);
+    assert!(embedded.contains("/FontFile2"), "the font given is embedded");
+}
+
+/// Hand-run: the open message saved as PDF, with a system font, to the file
+/// `MAILCRAFT_KEEP_PDF` names, to look at (`cargo test -p mailcraft-engine --lib
+/// a_pdf_to_look_at -- --ignored`).
+#[test]
+#[ignore = "writes a PDF to look at, where MAILCRAFT_KEEP_PDF says"]
+fn a_pdf_to_look_at() {
+    let keep = std::env::var_os("MAILCRAFT_KEEP_PDF").expect("MAILCRAFT_KEEP_PDF: where the PDF goes");
+    let mut s = sample_session("export-kept");
+    let k = key_of(&s, "Storyboard review on Thursday");
+    s.run("list.open", &k).unwrap();
+    s.print_fonts = system_font().map(|f| (f, None));
+    s.run("message.exportPdf", &json!({"path": std::path::PathBuf::from(keep).to_string_lossy()})).unwrap();
 }
 
 #[test]
@@ -113,7 +148,15 @@ fn attachments_preview_and_save_all() {
     assert!(s.run("attachment.preview", &json!({"index": 0})).is_err(), "a picture isn't text");
     let dir = s.store.as_ref().unwrap().root().join("out");
     std::fs::create_dir_all(&dir).unwrap();
-    s.run("attachment.saveAll", &json!({"dir": dir.to_string_lossy()})).unwrap();
+    let saved = s.run("attachment.saveAll", &json!({"dir": dir.to_string_lossy()})).unwrap();
+    // Each file's own bytes (all of them come from one parse of the message).
+    let r = s.reading.as_ref().unwrap();
+    let raw = s.readable_raw(&r.key).unwrap();
+    let files: Vec<&mailcraft_mime::AttachmentInfo> = r.parsed.as_ref().unwrap().attachments.iter().filter(|a| !a.inline).collect();
+    assert_eq!(saved["saved"].as_array().map(Vec::len), Some(files.len()));
+    for (path, a) in saved["saved"].as_array().unwrap().iter().zip(files) {
+        assert_eq!(std::fs::read(path.as_str().unwrap()).unwrap(), mailcraft_mime::attachment_data(&raw, a.index).unwrap(), "{}", a.name);
+    }
     let again = s.run("attachment.saveAll", &json!({"dir": dir.to_string_lossy()})).unwrap();
     assert!(again["saved"][0].as_str().unwrap().contains("(2)"), "names already taken get a number");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
@@ -128,7 +171,75 @@ fn attachments_preview_and_save_all() {
     assert_eq!(mailcraft_mime::craft_app_for("application/pdf", "a.pdf"), Some(("pdfcraft", "PdfCraft")));
     assert_eq!(mailcraft_mime::craft_app_for("application/octet-stream", "q.XLSX").map(|a| a.0), Some("gridcraft"));
     assert_eq!(mailcraft_mime::text_preview_kind("message/rfc822", "fwd.eml"), Some("message"));
-    done(s);
+}
+
+/// Save all attachments numbers a name that's taken up to (999); with all of those taken too,
+/// it's refused, and no file there is written over.
+#[test]
+fn saving_all_never_writes_over_a_file() {
+    let mut s = sample_session("save-all-full");
+    s.run("list.open", &key_of(&s, "Character turnarounds")).unwrap();
+    let name = s.reading.as_ref().and_then(|r| r.parsed.as_ref()).and_then(|p| p.attachments.iter().find(|a| !a.inline)).map(|a| a.name.clone());
+    let name = mailcraft_mime::sanitize_filename(&name.unwrap());
+    let (stem, ext) = name.rsplit_once('.').unwrap();
+    let dir = s.store.as_ref().unwrap().root().join("full");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&name), b"mine").unwrap();
+    for n in 2..=999 {
+        std::fs::write(dir.join(format!("{stem} ({n}).{ext}")), b"mine").unwrap();
+    }
+    let r = s.run("attachment.saveAll", &json!({"dir": dir.to_string_lossy()}));
+    assert!(matches!(&r, Err(CmdError::Failed(m)) if m.contains("(999)")), "{r:?}");
+    assert_eq!(std::fs::read(dir.join(format!("{stem} (999).{ext}"))).unwrap(), b"mine");
+    let r = s.run("attachment.save", &json!({"index": 0, "path": dir.join("tool.exe").to_string_lossy(), "open": true}));
+    assert!(matches!(&r, Err(CmdError::Disabled(m)) if m.contains("could run a program")), "{r:?}");
+}
+
+/// A file picked in the browser, or a picture pasted, is handed over as it is and named by the
+/// command (a JSON list of its bytes made each byte a value of 24 bytes); each is taken once,
+/// and only the last few are kept.
+#[test]
+fn files_handed_over_are_attached_as_they_are() {
+    let mut s = sample_session("handed");
+    s.run("mail.new", &json!({})).unwrap();
+    let file: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+    let n = s.hand(file.clone());
+    s.run("compose.attach", &json!({"name": "big.bin", "handed": n})).unwrap();
+    const DOT: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15,
+        0xC4, 0x89,
+    ];
+    let picture = s.hand(DOT.to_vec());
+    s.run("compose.insertPicture", &json!({"name": "dot.png", "handed": picture})).unwrap();
+    let c = s.compose.as_ref().unwrap();
+    assert_eq!(c.attachments.last().map(|a| (a.name.as_str(), &a.data)), Some(("big.bin", &file)));
+    assert_eq!(c.inline.last().map(|p| p.data.as_slice()), Some(DOT));
+    // Taken once; one never handed over is an error, not an empty file.
+    assert!(matches!(s.run("compose.attach", &json!({"name": "again.bin", "handed": n})), Err(CmdError::Params(_))));
+    assert!(matches!(s.run("compose.attach", &json!({"name": "x.bin", "handed": 999})), Err(CmdError::Params(_))));
+    let kept: Vec<u64> = (0..6u8).map(|i| s.hand(vec![i])).collect();
+    assert_eq!(s.handed.len(), 4, "only the last few are kept");
+    assert!(s.run("compose.attach", &json!({"name": "old.bin", "handed": kept[0]})).is_err());
+    s.run("compose.attach", &json!({"name": "new.bin", "handed": kept[5]})).unwrap();
+}
+
+/// A file handed over for a command that's refused before it looks for it (no message is being
+/// written, there's no such command) isn't kept: nothing would take it, and it stayed, up to
+/// 25 MB of it, until four more were handed over. Others handed over stay for their commands.
+#[test]
+fn a_file_handed_to_a_refused_command_is_let_go() {
+    let mut s = sample_session("handed-refused");
+    let other = s.hand(vec![7; 10]);
+    let n = s.hand(vec![1; 1000]);
+    let r = s.run("compose.attach", &json!({"name": "a.bin", "handed": n}));
+    assert!(matches!(r, Err(CmdError::Disabled(_))), "{r:?}");
+    assert_eq!(s.handed.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [other]);
+    let n = s.hand(vec![2; 1000]);
+    assert!(matches!(s.run("compose.nothing", &json!({"handed": n})), Err(CmdError::Unknown(_))));
+    assert_eq!(s.handed.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [other]);
+    s.run("mail.new", &json!({})).unwrap();
+    s.run("compose.attach", &json!({"name": "b.bin", "handed": other})).unwrap();
+    assert!(s.handed.is_empty());
 }
 
 #[test]
@@ -188,7 +299,6 @@ fn formatted_messages_go_out_as_html_with_pictures() {
     s.run("list.open", &k).unwrap();
     let p = s.reading.as_ref().unwrap().parsed.clone().unwrap();
     assert!(!p.had_html && p.text.contains("**these**"));
-    done(s);
 }
 
 #[test]
@@ -207,7 +317,7 @@ fn offline_sends_wait_in_the_outbox() {
     // The network layer couldn't send: it put the message in the Outbox.
     let item = mailcraft_store::OutboxItem { id: send_id, from, recipients, queued: NOW, error: Some("offline".into()), ..Default::default() };
     store.outbox_add(&id, &item, &raw).unwrap();
-    s.apply(Event::Queued { account: id.clone(), id: send_id, error: "offline".into() });
+    s.apply(Event::Queued { account: id.clone(), id: send_id, error: "offline".into(), kind: Default::default() });
     assert!(s.compose.is_none(), "a queued message is done for the user");
     assert!(s.notices.last().unwrap().text.contains("Outbox"));
     assert_eq!(s.outbox.len(), 1);
@@ -234,7 +344,7 @@ fn offline_sends_wait_in_the_outbox() {
 
     // Deleting from the Outbox cancels the send.
     store.outbox_add(&id, &item, &raw).unwrap();
-    s.apply(Event::Queued { account: id.clone(), id: send_id, error: "later".into() });
+    s.apply(Event::Queued { account: id.clone(), id: send_id, error: "later".into(), kind: Default::default() });
     assert_eq!(s.list.len(), 1);
     s.run("list.selectAll", &json!({})).unwrap();
     s.run("mail.delete", &json!({})).unwrap();
@@ -242,7 +352,6 @@ fn offline_sends_wait_in_the_outbox() {
     // A later success from the Outbox is just a notice.
     s.apply(Event::Sent { account: id.clone(), id: 999 });
     assert_eq!(s.notices.last().unwrap().text, "Message sent");
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -269,7 +378,6 @@ fn new_mail_opens_in_a_window_and_closing_keeps_a_draft() {
     s.run("mail.new", &json!({})).unwrap();
     s.run("compose.update", &json!({"subject": "Gone"})).unwrap();
     assert_eq!(s.run("compose.close", &json!({"save": false})).unwrap()["saved"], false);
-    done(s);
 }
 
 /// View › Arrange by, as Outlook's: sorted and grouped by sender, size, flag…, and the other way
@@ -316,7 +424,6 @@ fn working_offline_comes_first_and_stops_send_receive() {
     s.run("mail.workOffline", &json!({"on": false})).unwrap();
     assert!(matches!(s.take_jobs().as_slice(), [Job::WorkOffline { on: false }]));
     assert!(s.run("mail.sync", &json!({})).is_ok());
-    let _ = std::fs::remove_dir_all(s.store.as_ref().unwrap().root());
 }
 
 #[test]
@@ -357,7 +464,6 @@ fn delay_delivery_holds_mail_in_the_outbox_until_its_time() {
     s.run("outbox.send", &json!({"key": k.to_id()})).unwrap();
     assert!(s.outbox.iter().all(|(_, i)| i.not_before == 0 || i.not_before <= NOW + 3601));
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::FlushOutbox { .. })));
-    done(s);
 }
 
 /// A new message to someone (a contact card's Send email): To filled in, ready for more.
@@ -366,12 +472,11 @@ fn new_mail_to_someone() {
     let mut s = sample_session("new-mail-to");
     s.run("mail.new", &json!({"to": "Zoe Park <zoe@studio.example>"})).unwrap();
     assert_eq!(s.compose.as_ref().unwrap().to, "Zoe Park <zoe@studio.example>; ");
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
     assert!(s.run("mail.new", &json!({"to": "not an address"})).is_err());
     assert!(s.compose.is_none(), "nothing opens for a bad address");
     s.run("mail.new", &json!({"to": "  "})).unwrap();
     assert_eq!(s.compose.as_ref().unwrap().to, "");
-    done(s);
 }
 
 /// Several messages written at once, as Outlook keeps every New Email window: starting another
@@ -441,30 +546,73 @@ fn attaching_reads_plain_files_only() {
     let dir = s.store.as_ref().unwrap().root().to_path_buf();
     let e = s.run("compose.attach", &json!({"path": dir.to_string_lossy()})).unwrap_err().to_string();
     assert!(e.contains("isn't a file"), "{e}");
-    let device = if cfg!(windows) { r"\.\NUL" } else { "/dev/zero" };
-    let started = std::time::Instant::now();
-    assert!(s.run("compose.attach", &json!({"path": device})).is_err());
-    assert!(started.elapsed() < std::time::Duration::from_secs(5), "refused, not read");
+    let device = if cfg!(windows) { r"\\.\NUL" } else { "/dev/zero" };
+    // Refused for what it is, before any of it is read: read, `/dev/zero` is too big and `NUL`
+    // is attached empty. Windows gives no facts about `NUL` at all ("Incorrect function"): then
+    // the refusal is that, which a missing file's isn't.
+    let e = s.run("compose.attach", &json!({"path": device})).unwrap_err().to_string();
+    match std::fs::metadata(device) {
+        Ok(_) => assert!(e.contains("isn't a file"), "{e}"),
+        Err(why) => {
+            assert_ne!(why.kind(), std::io::ErrorKind::NotFound, "{device} is there");
+            assert!(e.contains(&why.to_string()), "{e}");
+        }
+    }
+    assert_eq!(s.compose.as_ref().map(|c| c.attachments.len()), Some(0));
     let file = dir.join("ok.txt");
     std::fs::write(&file, b"hi").unwrap();
     s.run("compose.attach", &json!({"path": file.to_string_lossy()})).unwrap();
     assert_eq!(s.compose.as_ref().map(|c| c.attachments.len()), Some(1));
-    done(s);
 }
 
-/// Issue #11 (#16's test): a signature can hold pictures. Kept in its HTML with the account, they
-/// go into new messages (each under a name of the message's own) and are sent with them; a
-/// signature put in again doesn't add them twice.
+/// A file over 25 MB is refused in the words of attaching, however it comes, and so is one that
+/// takes the message past 25 MB.
+#[test]
+fn attachments_over_25_mb_are_refused() {
+    let mut s = sample_session("attach-big");
+    s.run("mail.new", &json!({})).unwrap();
+    let dir = s.store.as_ref().unwrap().root().to_path_buf();
+    let big = dir.join("big.bin");
+    std::fs::File::create(&big).unwrap().set_len((25 << 20) + 1).unwrap();
+    let path = big.to_string_lossy().into_owned();
+    assert_eq!(s.run("compose.attach", &json!({ "path": path })), Err(CmdError::Failed(format!("{path} is larger than 25 MB"))));
+    let n = s.hand(vec![0; (25 << 20) + 1]);
+    assert_eq!(s.run("compose.attach", &json!({"name": "big.bin", "handed": n})), Err(CmdError::Failed("attachments are limited to 25 MB".into())));
+    let n = s.hand(vec![0; 25 << 20]);
+    s.run("compose.attach", &json!({"name": "full.bin", "handed": n})).unwrap();
+    let e = s.run("compose.attach", &json!({"name": "one.txt", "data": [1]}));
+    assert_eq!(e, Err(CmdError::Failed("attachments are limited to 25 MB in total".into())));
+    assert_eq!(s.compose.as_ref().map(|c| c.attachments.len()), Some(1));
+}
+
+/// An edit refused for one of its params changes nothing of the message: the recipients and
+/// text given with an importance that isn't one weren't to be put in either.
+#[test]
+fn a_refused_edit_changes_nothing() {
+    let mut s = sample_session("refused-edit");
+    s.run("mail.new", &json!({})).unwrap();
+    s.run("compose.update", &json!({"to": "ann@x.example", "subject": "Plan", "body": "Hi", "importance": "high"})).unwrap();
+    let before = s.compose.clone();
+    let e =
+        s.run("compose.update", &json!({"to": "bob@x.example", "subject": "Other", "body": "Gone", "bcc": "eve@x.example", "importance": "urgent"}));
+    assert!(matches!(&e, Err(CmdError::Params(m)) if m.contains("urgent")), "{e:?}");
+    assert_eq!(s.compose, before);
+}
+
+/// Issue #11 (#16's test): a signature can hold pictures. Kept in its HTML with the account (its
+/// plain-text twin has none), they go into new messages and replies at their width, each under a
+/// name of the message's own, and are sent with them; a signature put in again doesn't add them
+/// twice.
 #[test]
 fn a_signature_holds_pictures() {
     use crate::session::Compose;
     use mailcraft_mime::{self as mime, rich::Styles};
     let mut s = sample_session("signature-pictures");
     let png = sample::sample_png();
-    // The signature editor's text: a logo before the name.
+    // The signature editor's text: a logo, 96 pixels wide, before the name.
     let mut sig = Compose { body: "Riley".into(), styles: Styles::plain("Riley"), ..Default::default() };
     sig.inline.push(mime::InlinePicture { cid: "logo@x".into(), name: "logo.png".into(), mime: "image/png".into(), data: png.clone() });
-    crate::cmd::insert_picture_at(&mut sig, 0, "logo@x", None);
+    crate::cmd::insert_picture_at(&mut sig, 0, "logo@x", Some(96));
     assert_eq!(sig.body.as_str(), "\u{FFFC}Riley");
     let html = mime::embed_pictures(&mime::rich::to_html(&sig.body, &sig.styles), &sig.inline);
     s.run("account.setSignature", &json!({"account": "sample", "signature": "Riley", "html": html})).unwrap();
@@ -475,7 +623,9 @@ fn a_signature_holds_pictures() {
     s.run("mail.new", &json!({})).unwrap();
     let c = s.compose.clone().unwrap();
     let at = c.body.find('\u{FFFC}').map(|b| c.body[..b].chars().count()).expect("the logo is in the message");
-    let cid = c.styles.style(at).picture.expect("as a picture");
+    let style = c.styles.style(at);
+    assert_eq!(style.picture_width, Some(96));
+    let cid = style.picture.expect("as a picture");
     assert!(cid.starts_with("signature1.") && cid.ends_with("@mailcraft"), "{cid}");
     assert_eq!(c.inline.iter().filter(|p| p.cid == cid).map(|p| &p.data).collect::<Vec<_>>(), [&png]);
     s.run("compose.insertSignature", &json!({})).unwrap();
@@ -490,8 +640,23 @@ fn a_signature_holds_pictures() {
     let raw = s.store.as_ref().unwrap().read_body(&k).unwrap();
     let p = mime::parse(&raw).unwrap();
     let logo = p.attachments.iter().find(|a| a.content_id.as_deref() == Some(cid.as_str())).expect("the logo goes with it");
+    assert!(logo.inline && logo.mime == "image/png", "{logo:?}");
     assert_eq!(mime::attachment_data(&raw, logo.index), Some(png));
-    assert!(p.images.contains(&format!("cid:{cid}")), "{:?}", p.images);
+    assert_eq!(p.images, [format!("cid:{cid}")], "the HTML shows it, once");
+
+    // A reply brings it too: under a `cid:` of its own, not the one of the quoted message's
+    // picture (it looked the same, so the quote's stood in for it: another sender's photo).
+    s.run("list.open", &json!({"key": k.to_id()})).unwrap();
+    s.run("mail.reply", &json!({})).unwrap();
+    let c = s.compose.as_ref().unwrap();
+    let cids: Vec<&str> = c.inline.iter().map(|p| p.cid.as_str()).collect();
+    assert_eq!(cids.len(), 2, "the quote's and the signature's: {cids:?}");
+    assert!(cids.contains(&cid.as_str()), "{cids:?}");
+    let own = cids.iter().find(|c| **c != cid).unwrap();
+    assert!(own.starts_with("signature1.") && own.ends_with(&format!(".{}@mailcraft", c.signature_tag)), "{own}");
+    let (_, html, pictures) = c.bodies();
+    assert_eq!(pictures.len(), 2);
+    assert!(html.unwrap().contains(own), "shown in the signature");
 }
 
 /// A wide picture goes in on a line of its own (issue #10: a second one after it went past the
@@ -524,48 +689,6 @@ fn wide_pictures_go_on_a_line_of_their_own() {
     assert_eq!(s.compose.as_ref().unwrap().body.chars().count(), n + 1, "the picture alone");
 }
 
-/// Issue #11: a signature keeps its pictures: saved with it, in new messages and replies with
-/// it, and sent with the message; the plain text one has none.
-#[test]
-fn a_signature_has_pictures() {
-    let mut s = sample_session("signature-picture");
-    let png = crate::sample::sample_png();
-    let pic = mailcraft_mime::InlinePicture { cid: "logo@x".into(), name: "logo.png".into(), mime: "image/png".into(), data: png.clone() };
-    let html = mailcraft_mime::embed_pictures("<p><b>Riley</b> <img src=\"cid:logo@x\" width=\"96\"></p>", &[pic]);
-    s.run("account.setSignature", &json!({"account": "sample", "signature": "Riley", "html": html})).unwrap();
-    let a = s.default_signature("sample", false).unwrap();
-    assert!(a.html.contains("data:image/png;base64,"), "kept with it");
-    assert_eq!(a.text, "Riley ", "its text has no picture mark");
-    s.run("mail.new", &json!({})).unwrap();
-    let c = s.compose.as_ref().unwrap();
-    let at = c.body.chars().position(|ch| ch == mailcraft_mime::rich::PICTURE).expect("the picture in the signature");
-    let style = c.styles.style(at);
-    assert_eq!(style.picture_width, Some(96));
-    assert_eq!(c.inline.iter().map(|p| p.data.clone()).collect::<Vec<_>>(), vec![png.clone()]);
-    s.run("compose.update", &json!({"to": "ann@x.example", "subject": "Logo"})).unwrap();
-    s.run("compose.send", &json!({})).unwrap();
-    s.run("folder.open", &json!({"account": "sample", "folder": "Sent"})).unwrap();
-    let k = key_of(&s, "Logo");
-    s.run("list.open", &k).unwrap();
-    let p = s.reading.as_ref().unwrap().parsed.clone().unwrap();
-    assert_eq!(p.images.len(), 1, "sent with the message");
-    assert!(p.attachments.iter().any(|a| a.inline && a.mime == "image/png"));
-    // A reply brings it too: under a `cid:` of its own, not the one of the quoted message's
-    // picture (it looked the same, so the quote's stood in for it: another sender's photo).
-    let sent_cid = p.images[0].trim_start_matches("cid:").to_string();
-    s.run("mail.reply", &json!({})).unwrap();
-    let c = s.compose.as_ref().unwrap();
-    let cids: Vec<&str> = c.inline.iter().map(|p| p.cid.as_str()).collect();
-    assert_eq!(cids.len(), 2, "the quote's and the signature's: {cids:?}");
-    assert!(cids.contains(&sent_cid.as_str()), "{cids:?}");
-    let own = cids.iter().find(|c| **c != sent_cid).unwrap();
-    assert!(own.starts_with("signature1.") && own.ends_with(&format!(".{}@mailcraft", c.signature_tag)), "{own}");
-    let (_, html, pictures) = c.bodies();
-    assert_eq!(pictures.len(), 2);
-    assert!(html.unwrap().contains(own), "shown in the signature");
-    done(s);
-}
-
 /// Issue #11: replies and forwards can open in a window of their own each time (they start in
 /// the reading pane, as Outlook's); new messages keep their own setting.
 #[test]
@@ -587,7 +710,6 @@ fn replies_can_open_in_a_window_of_their_own() {
     assert!(!s.compose.as_ref().unwrap().window, "a new message as its own setting says");
     assert_eq!(s.run("view.favorites", &json!({"on": false})).unwrap()["on"], json!(false));
     assert!(!s.prefs.show_favorites && s.prefs.reply_window);
-    done(s);
 }
 
 /// A reply or forward keeps the pictures in the message it quotes (they came out as
@@ -600,13 +722,9 @@ fn replies_keep_the_quoted_pictures_and_date() {
 Content-Type: multipart/related; boundary=\"R\"\r\n\r\n--R\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
 <p>Here is the <b>logo</b>:</p><p><img src=\"cid:logo@studio.example\" width=\"40\"></p><p><img src=\"https://cdn.example/poster.jpg\"><img src=\"https://tracker.example/p.gif\" width=\"1\" height=\"1\"></p>\r\n\
 --R\r\nContent-Type: image/png\r\nContent-ID: <logo@studio.example>\r\nContent-Disposition: inline; filename=\"logo.png\"\r\n\r\nPNGDATA\r\n--R--\r\n";
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 9300 };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW - 3600).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let key = mailcraft_model::MessageKey { uid: 9300, ..next_key(&s, "sample", "INBOX") };
+    let summary = mailcraft_mime::summary_from_full(raw, key, mailcraft_model::Flags::default(), 0, NOW - 3600);
+    let key = file_in(&mut s, summary, Some(raw));
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     assert_eq!(s.reading.as_ref().and_then(|r| r.parsed.as_ref()).map(|p| p.date), Some(NOW - 3600));
@@ -629,7 +747,6 @@ Content-Type: multipart/related; boundary=\"R\"\r\n\r\n--R\r\nContent-Type: text
         assert!(!text.contains("1970"), "{cmd}: {text}");
         s.run("compose.discard", &json!({})).unwrap();
     }
-    done(s);
 }
 
 /// A picture sent inline beside plain text (as Apple Mail sends one) goes with a forward as a
@@ -640,13 +757,8 @@ fn a_forward_keeps_an_inline_picture_beside_plain_text() {
     let raw = b"From: Sam Okafor <sam@studio.example>\r\nTo: riley@studio.example\r\nSubject: Photo\r\nDate: Thu, 29 Oct 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\n\
 Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: text/plain\r\n\r\nThe set, from above.\r\n\
 --M\r\nContent-Type: image/jpeg; name=\"set.jpg\"\r\nContent-ID: <set@studio.example>\r\nContent-Disposition: inline; filename=\"set.jpg\"\r\n\r\nJPEGDATA\r\n--M--\r\n";
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 9301 };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let key = mailcraft_model::MessageKey { uid: 9301, ..next_key(&s, "sample", "INBOX") };
+    let key = file_whole(&mut s, key, raw);
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     s.run("mail.forward", &json!({})).unwrap();
@@ -655,7 +767,6 @@ Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: text/p
     s.run("compose.discard", &json!({})).unwrap();
     s.run("mail.reply", &json!({})).unwrap();
     assert!(s.compose.as_ref().unwrap().attachments.is_empty(), "a reply leaves files out, as Outlook's");
-    done(s);
 }
 
 /// A forwarded text file in Windows-1252 goes as it came and keeps its charset: it went out as
@@ -666,13 +777,8 @@ fn a_forward_keeps_a_text_files_charset() {
     let raw = b"From: Sam Okafor <sam@studio.example>\r\nTo: riley@studio.example\r\nSubject: Menu\r\nDate: Thu, 29 Oct 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\n\
 Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: text/plain\r\n\r\nThe menu.\r\n\
 --M\r\nContent-Type: text/plain; charset=windows-1252\r\nContent-Disposition: attachment; filename=\"menu.txt\"\r\n\r\nCaf\xe9 au lait\r\n--M--\r\n";
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 9302 };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let key = mailcraft_model::MessageKey { uid: 9302, ..next_key(&s, "sample", "INBOX") };
+    let key = file_whole(&mut s, key, raw);
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     s.run("mail.forward", &json!({})).unwrap();
@@ -683,7 +789,6 @@ Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n--M\r\nContent-Type: text/p
     let d = mailcraft_mime::Draft { subject: c.subject.clone(), body: c.body.clone(), attachments: c.attachments.clone(), ..Default::default() };
     let sent = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new("Riley", "riley@studio.example"), NOW, "<fwd@x>").unwrap();
     assert!(mailcraft_mime::attachment_text(&sent, 0).is_some_and(|t| t.starts_with("Caf\u{e9} au lait")));
-    done(s);
 }
 
 /// Found testing #52 on GreenMail: two messages sent by runs started in the same second had the

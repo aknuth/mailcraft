@@ -7,8 +7,10 @@ use mailcraft_engine::model::ical::{Privacy, ShowAs};
 use mailcraft_engine::{AgendaItem, CalMode, Session};
 use serde_json::json;
 
+mod days;
 mod found;
 mod showing;
+use days::days;
 #[cfg(test)]
 pub(crate) use found::open_hit;
 pub(crate) use found::{CalSearch, found};
@@ -23,9 +25,24 @@ pub use side::nav;
 
 /// Height of an hour in the day and week views.
 const HOUR: f32 = 46.0;
-pub(crate) const MONTHS: [&str; 12] =
-    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/// A month's name (1 = January) in the interface's language; nothing for a month no calendar has.
+pub(crate) fn month_name(m: u32) -> &'static str {
+    crate::i18n::tc("month", m.checked_sub(1).and_then(|i| MONTHS.get(i as usize)).copied().unwrap_or(""))
+}
+
+/// The calendar on a day (`calendar.goto`).
+pub(crate) fn goto(day: i64) -> Action {
+    Action::Run("calendar.goto", json!({"date": dates::day_string(day)}))
+}
+
+/// The Calendar opened on a day, in the day view: from the To-Do Bar's month, an invitation.
+pub(crate) fn show_day(day: i64, acts: &mut Vec<Action>) {
+    acts.push(Action::Run("view.module", json!({"name": "calendar"})));
+    acts.push(Action::Run("calendar.view", json!({"mode": "day"})));
+    acts.push(goto(day));
+}
 
 /// A calendar's colour: an account's own calendar in the account's colour, others in the
 /// calendar palette (`Session::calendar_color`).
@@ -58,18 +75,17 @@ fn day_of(t: i64, s: &Session) -> i64 {
 /// `October 2026`, `12 – 18 October 2026`, `Monday, 12 October 2026`.
 pub fn title(s: &Session) -> String {
     let (d0, d1) = s.cal_days();
-    let month = |m: u32| crate::i18n::tc("month", MONTHS.get(m as usize - 1).copied().unwrap_or("")).to_string();
     match s.cal_mode {
         CalMode::Month => {
             let (y, m, _) = civil_from_days(s.cal_day());
-            tf!("{month} {year}", month = month(m), year = y)
+            tf!("{month} {year}", month = month_name(m), year = y)
         }
         CalMode::WorkWeek | CalMode::Week => {
             let ((y0, m0, a), (y1, m1, b)) = (civil_from_days(d0), civil_from_days(d1 - 1));
             if (y0, m0) == (y1, m1) {
-                tf!("{from} – {to} {month} {year}", from = a, to = b, month = month(m1), year = y1)
+                tf!("{from} – {to} {month} {year}", from = a, to = b, month = month_name(m1), year = y1)
             } else {
-                tf!("{from} {month_from} – {to} {month} {year}", from = a, month_from = month(m0), to = b, month = month(m1), year = y1)
+                tf!("{from} {month_from} – {to} {month} {year}", from = a, month_from = month_name(m0), to = b, month = month_name(m1), year = y1)
             }
         }
         CalMode::Day => long_date(d0),
@@ -79,10 +95,7 @@ pub fn title(s: &Session) -> String {
 /// A day written out: `Thursday, 22 October 2026`, in the interface's language.
 pub fn long_date(day: i64) -> String {
     let (y, m, d) = civil_from_days(day);
-    let month = crate::i18n::tc("month", MONTHS.get(m as usize - 1).copied().unwrap_or("")).to_string();
-    let wd = (day + 3).rem_euclid(7) as usize;
-    let day_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].get(wd).copied().unwrap_or("");
-    tf!("{weekday}, {day} {month} {year}", weekday = tl!(day_name), day = d, month = month, year = y)
+    tf!("{weekday}, {day} {month} {year}", weekday = tl!(dates::weekday_long(day)), day = d, month = month_name(m), year = y)
 }
 
 /// The months of the side pane, one under another (Outlook's date navigator, pulled down for
@@ -100,7 +113,7 @@ fn months(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>) {
         if k > 0 {
             ui.add_space(8.0);
         }
-        mini_month(s, st, ui, acts, (shown, shown + k), k == 0, false, &busy);
+        mini_month(s, st, ui, acts, MiniMonth { first: shown, month: shown + k, arrows: k == 0, bar: false, busy: &busy });
     }
     // The grip: dragged down, one more month for each month's height; up, one fewer.
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 12.0), Sense::click_and_drag());
@@ -140,14 +153,14 @@ pub(crate) fn bar_month(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut V
         y * 12 + i64::from(m) - 1
     });
     let busy = busy_days(s, grid_start(shown), grid_start(shown) + 42);
-    mini_month(s, st, ui, acts, (shown, shown), true, true, &busy);
+    mini_month(s, st, ui, acts, MiniMonth { first: shown, month: shown, arrows: true, bar: true, busy: &busy });
 }
 
 /// The first day a small month's grid shows (`month`: months since year 0): the Monday on or
 /// before its first.
 fn grid_start(month: i64) -> i64 {
     let first = days_from_civil(month.div_euclid(12), u32::try_from(month.rem_euclid(12) + 1).unwrap_or(1), 1);
-    first - (first + 3).rem_euclid(7)
+    first - i64::from(dates::weekday_index(first))
 }
 
 /// The days from `from` up to `to` that have an event on them (Outlook's bold days).
@@ -161,30 +174,27 @@ pub(crate) fn busy_days(s: &Session, from: i64, to: i64) -> std::collections::BT
     days
 }
 
-/// A small month (`months`: the first one shown and this one, in months since year 0): click a
-/// day to show it. The first of them has the arrows that move them all. The `busy` days, those
-/// with events, are bold. `bar`: the To-Do Bar's, which marks no days as shown and opens the
-/// calendar on the day clicked.
-#[allow(clippy::too_many_arguments)]
-fn mini_month(
-    s: &Session,
-    st: &mut UiState,
-    ui: &mut Ui,
-    acts: &mut Vec<Action>,
-    months: (i64, i64),
+/// A small month to draw (months counted since year 0).
+struct MiniMonth<'a> {
+    /// The first of the small months shown.
+    first: i64,
+    /// This one.
+    month: i64,
+    /// It has the arrows that move them all (the first of them does).
     arrows: bool,
+    /// The To-Do Bar's, which marks no days as shown and opens the calendar on the day clicked.
     bar: bool,
-    busy: &std::collections::BTreeSet<i64>,
-) {
-    let (shown, month) = months;
+    /// The days with events, bold.
+    busy: &'a std::collections::BTreeSet<i64>,
+}
+
+/// A small month: click a day to show it.
+fn mini_month(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>, m: MiniMonth) {
+    let MiniMonth { first: shown, month, arrows, bar, busy } = m;
     let t = st.tokens;
     let (y, m) = (month.div_euclid(12), u32::try_from(month.rem_euclid(12) + 1).unwrap_or(1));
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(tf!("{month} {year}", month = crate::i18n::tc("month", MONTHS.get(m as usize - 1).copied().unwrap_or("")), year = y))
-                .font(theme::bold(13.0))
-                .color(t.text),
-        );
+        ui.label(RichText::new(tf!("{month} {year}", month = month_name(m), year = y)).font(theme::bold(13.0)).color(t.text));
         if !arrows {
             return;
         }
@@ -201,7 +211,7 @@ fn mini_month(
     let w = ((ui.available_width() - 4.0) / 7.0).clamp(20.0, 34.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for d in DAYS {
+        for d in dates::WEEKDAYS {
             let (r, _) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
             ui.painter().text(
                 r.center(),
@@ -240,15 +250,13 @@ fn mini_month(
                 let font = if busy.contains(&d) { theme::bold(12.0) } else { theme::regular(12.0) };
                 ui.painter().text(r.center(), Align2::CENTER_CENTER, dd.to_string(), font, c);
                 if resp.clicked() {
-                    let (yy, mm, ddd) = civil_from_days(d);
                     if bar {
-                        acts.push(Action::Run("view.module", json!({"name": "calendar"})));
-                        acts.push(Action::Run("calendar.view", json!({"mode": "day"})));
+                        show_day(d, acts);
                         st.todo_month = None;
                     } else {
+                        acts.push(goto(d));
                         st.mini_month = None;
                     }
-                    acts.push(Action::Run("calendar.goto", json!({"date": format!("{yy:04}-{mm:02}-{ddd:02}")})));
                 }
             }
         });
@@ -380,14 +388,25 @@ fn chip(ui: &mut Ui, t: &Tokens, rect: Rect, item: &AgendaItem, text: &str) -> e
     resp
 }
 
+/// The month view's rows at their shortest: a day's number over its "n more" link.
+const MONTH_ROW_MIN: f32 = 42.0;
+
+/// A calendar's name as shown: the local one's in the language shown.
+fn calendar_name(id: &str, name: &str) -> String {
+    if id == mailcraft_engine::model::pim::LOCAL { tl!("Calendar").to_string() } else { name.to_string() }
+}
+
 fn month(s: &Session, t: &Tokens, ui: &mut Ui, items: &[AgendaItem], d0: i64, acts: &mut Vec<Action>) {
     let (_, shown_month, _) = civil_from_days(s.cal_day());
     let now = today(s);
     let area = ui.available_rect_before_wrap().shrink2(vec2(10.0, 4.0));
     let head = 22.0;
     let cw = area.width() / 7.0;
-    let rh = ((area.height() - head) / 6.0).max(60.0);
-    for (i, d) in DAYS.iter().enumerate() {
+    // Six weeks in the pane's height: a short pane's days show fewer events each, the rest
+    // behind "n more" (as tall as a day's number and that link). Only `area` is allocated: rows
+    // kept 60 points tall ran the last weeks past the pane's edge, where nothing scrolls.
+    let rh = ((area.height() - head) / 6.0).max(MONTH_ROW_MIN);
+    for (i, d) in dates::WEEKDAYS.iter().enumerate() {
         ui.painter().text(pos2(area.min.x + cw * (i as f32 + 0.5), area.min.y + 10.0), Align2::CENTER_CENTER, tl!(d), theme::regular(12.0), t.dim);
     }
     for w in 0..6 {
@@ -436,9 +455,8 @@ fn month(s: &Session, t: &Tokens, ui: &mut Ui, items: &[AgendaItem], d0: i64, ac
                     egui::Link::new(RichText::new(tf!("{n} more", n = todays.len() - shown)).small()),
                 );
                 if more.clicked() {
-                    let (y, mm, ddd) = civil_from_days(d);
                     acts.push(Action::Run("calendar.view", json!({"mode": "day"})));
-                    acts.push(Action::Run("calendar.goto", json!({"date": format!("{y:04}-{mm:02}-{ddd:02}")})));
+                    acts.push(goto(d));
                 }
             }
             if bg.double_clicked() {
@@ -447,239 +465,4 @@ fn month(s: &Session, t: &Tokens, ui: &mut Ui, items: &[AgendaItem], d0: i64, ac
         }
     }
     ui.allocate_rect(area, Sense::hover());
-}
-
-/// A new event at `at`, in calendar `cal` (account, calendar id) when it can take one.
-fn new_event_in(s: &Session, at: i64, cal: Option<&(String, String, String, u8)>) -> Action {
-    let mut d = Dialog::new_event(s, Some(at));
-    if let (Dialog::Event(f), Some((account, id, _, _))) = (&mut d, cal)
-        && let Some(i) = f.calendars.iter().position(|(a, c, _)| a == account && c == id)
-    {
-        f.calendar = i;
-    }
-    Action::Dialog(d)
-}
-
-/// The space between calendars shown side by side.
-const PANE_GAP: f32 = 10.0;
-
-#[allow(clippy::too_many_arguments)]
-fn days(s: &Session, st: &mut UiState, ui: &mut Ui, items: &[AgendaItem], d0: i64, d1: i64, acts: &mut Vec<Action>) {
-    let t = st.tokens;
-    let n = (d1 - d0).max(1);
-    // Wide enough for "All day" in the language shown ("Toute la journée" ran out of it, under
-    // the folder pane's edge).
-    let all_day = ui.painter().layout_no_wrap(tl!("All day").to_string(), theme::regular(11.0), t.faint).size().x;
-    let gutter = (all_day + 14.0).clamp(52.0, 110.0);
-    let now = today(s);
-    let full = ui.available_rect_before_wrap();
-    // Side by side (Outlook's): each calendar shown a pane of its own, its days in it, under a
-    // heading in its colour.
-    let cals: Vec<(String, String, String, u8)> = if s.prefs.calendars_side_by_side { s.shown_calendars() } else { Vec::new() };
-    let k = if cals.len() > 1 { cals.len() } else { 1 };
-    let gaps = PANE_GAP * (k - 1) as f32;
-    let pane = ((full.width() - gutter - 16.0 - gaps) / k as f32).max(40.0 * n as f32);
-    let cw = pane / n as f32;
-    let col_of = |it: &AgendaItem| if k > 1 { cals.iter().position(|(a, c, _, _)| *a == it.account && *c == it.calendar).unwrap_or(0) } else { 0 };
-    // Where calendar `j`'s pane starts, and day `i`'s column in it (from the left edge).
-    let pane_x = |j: usize| gutter + (pane + PANE_GAP) * j as f32;
-    let day_x = |i: i64, j: usize| pane_x(j) + cw * i as f32;
-    let tint = |j: usize| cals.get(j).map(|(_, _, _, c)| color(*c, &t));
-    // The calendars' headings: the name on its colour, × to hide it.
-    if k > 1 {
-        let (names, _) = ui.allocate_exact_size(vec2(full.width(), 24.0), Sense::hover());
-        for (j, (account, id, name, c)) in cals.iter().enumerate() {
-            let r = Rect::from_min_size(pos2(names.min.x + pane_x(j), names.min.y), vec2(pane, 24.0)).shrink2(vec2(0.0, 1.0));
-            ui.painter().rect_filled(r, 3.0, color(*c, &t).gamma_multiply(if t.dark { 0.45 } else { 0.3 }));
-            let mut label = if id == mailcraft_engine::model::pim::LOCAL { tl!("Calendar").to_string() } else { name.clone() };
-            // Two accounts' "Calendar": which is whose.
-            if cals.iter().filter(|(_, _, n, _)| n == name).count() > 1
-                && let Some(email) = s.account(account).map(|a| a.config.email.clone())
-            {
-                label = format!("{label} · {email}");
-            }
-            ui.painter().with_clip_rect(r.shrink2(vec2(6.0, 0.0)).with_max_x(r.max.x - 24.0)).text(
-                pos2(r.min.x + 8.0, r.center().y),
-                Align2::LEFT_CENTER,
-                label.clone(),
-                theme::bold(12.0),
-                t.text,
-            );
-            let x = Rect::from_center_size(pos2(r.max.x - 12.0, r.center().y), vec2(18.0, 18.0));
-            let resp = ui.interact(x, ui.scope_id().with(("hide-calendar", account, id)), Sense::click());
-            crate::widgets::named(ui, &resp, &format!("{label}: {}", tl!("Close")), true, None);
-            if resp.hovered() {
-                ui.painter().rect_filled(x, 3.0, t.hover);
-            }
-            icons::paint(ui.painter(), x.shrink(4.0), Icon::Close, if resp.hovered() { t.text } else { t.dim });
-            if resp.on_hover_text(tf!("Hide {calendar}", calendar = label)).clicked() {
-                acts.push(Action::Run("calendar.show", json!({"account": account, "calendar": id, "shown": false})));
-            }
-        }
-    }
-    // Day headings, in every pane.
-    let (head, _) = ui.allocate_exact_size(vec2(full.width(), 40.0), Sense::hover());
-    for j in 0..k {
-        for i in 0..n {
-            let d = d0 + i;
-            let x = head.min.x + day_x(i, j);
-            let (_, _, dd) = civil_from_days(d);
-            let wd = DAYS.get(((d + 3).rem_euclid(7)) as usize).copied().unwrap_or("");
-            ui.painter().text(
-                pos2(x + cw / 2.0, head.min.y + 10.0),
-                Align2::CENTER_CENTER,
-                tl!(wd),
-                theme::regular(12.0),
-                if d == now { t.accent } else { t.dim },
-            );
-            let c = pos2(x + cw / 2.0, head.min.y + 28.0);
-            if d == now {
-                ui.painter().circle_filled(c, 12.0, t.accent);
-            }
-            ui.painter().text(c, Align2::CENTER_CENTER, dd.to_string(), theme::bold(15.0), if d == now { t.on_accent } else { t.text });
-        }
-    }
-    // All-day events, across their days (in their calendar's pane).
-    let all_day: Vec<&AgendaItem> = items.iter().filter(|i| i.all_day || i.end - i.start >= 86_400).collect();
-    if !all_day.is_empty() {
-        let mut lanes: Vec<Vec<(usize, i64, i64)>> = Vec::new();
-        let mut placed: Vec<(usize, &AgendaItem)> = Vec::new();
-        for it in &all_day {
-            let (a, b) = (day_of(it.start, s).max(d0), day_of(it.end.max(it.start + 1) - 1, s).min(d1 - 1));
-            let j = col_of(it);
-            let lane = lanes.iter().position(|l| l.iter().all(|(pj, x, y)| *pj != j || b < *x || a > *y)).unwrap_or(lanes.len());
-            if lane == lanes.len() {
-                lanes.push(Vec::new());
-            }
-            if let Some(l) = lanes.get_mut(lane) {
-                l.push((j, a, b));
-            }
-            placed.push((lane, it));
-        }
-        let (strip, _) = ui.allocate_exact_size(vec2(full.width(), 20.0 * lanes.len().min(4) as f32 + 6.0), Sense::hover());
-        ui.painter().text(pos2(strip.min.x + gutter - 6.0, strip.min.y + 10.0), Align2::RIGHT_CENTER, tl!("All day"), theme::regular(11.0), t.faint);
-        for (lane, it) in placed.into_iter().filter(|(l, _)| *l < 4) {
-            let (a, b) = (day_of(it.start, s).max(d0), day_of(it.end.max(it.start + 1) - 1, s).min(d1 - 1));
-            let r = Rect::from_min_size(
-                pos2(strip.min.x + day_x(a - d0, col_of(it)) + 2.0, strip.min.y + 3.0 + 20.0 * lane as f32),
-                vec2(cw * (b - a + 1) as f32 - 4.0, 18.0),
-            );
-            if chip(ui, &t, r, it, &title_of(it)).clicked()
-                && let Some(act) = open(s, it)
-            {
-                acts.push(act);
-            }
-        }
-    }
-    let line = ui.available_rect_before_wrap();
-    ui.painter().line_segment([line.left_top(), line.right_top()], egui::Stroke::new(1.0, t.border));
-    // The hours.
-    let mut scroll = egui::ScrollArea::vertical().auto_shrink(false).id_salt(("calendar-hours", s.cal_mode == CalMode::Day));
-    // Each view (day, week) opens on the working day the first time it's shown.
-    let view = usize::from(s.cal_mode == CalMode::Day);
-    if !st.cal_scrolled[view] {
-        scroll = scroll.vertical_scroll_offset(HOUR * 7.5);
-        st.cal_scrolled[view] = true;
-    }
-    scroll.show(ui, |ui| {
-        let (grid, _) = ui.allocate_exact_size(vec2(ui.available_width(), HOUR * 24.0), Sense::hover());
-        // Each calendar's pane faintly in its colour.
-        for j in 0..k {
-            if let Some(c) = tint(j).filter(|_| k > 1) {
-                let r = Rect::from_min_size(pos2(grid.min.x + pane_x(j), grid.min.y), vec2(pane, grid.height()));
-                ui.painter().rect_filled(r, 0.0, c.gamma_multiply(if t.dark { 0.1 } else { 0.07 }));
-            }
-        }
-        for h in 0..24 {
-            let y = grid.min.y + HOUR * h as f32;
-            for j in 0..k {
-                let x0 = grid.min.x + pane_x(j);
-                ui.painter().line_segment([pos2(x0, y), pos2(x0 + pane, y)], egui::Stroke::new(1.0, t.border));
-            }
-            if h > 0 {
-                // As the clock is set (issue #46): `13:00`, or `1 PM`.
-                let label = crate::i18n::date(&mailcraft_engine::model::dates::hour_label(h, s.clock.style));
-                ui.painter().text(pos2(grid.min.x + gutter - 6.0, y), Align2::RIGHT_CENTER, label, theme::regular(11.0), t.faint);
-            }
-        }
-        for j in 0..k {
-            for i in 0..=n {
-                let x = grid.min.x + day_x(i, j);
-                ui.painter().line_segment([pos2(x, grid.min.y), pos2(x, grid.max.y)], egui::Stroke::new(1.0, t.border));
-            }
-        }
-        // Click an empty half hour to add an event there (in that pane's calendar).
-        for j in 0..k {
-            for i in 0..n {
-                let col = Rect::from_min_size(pos2(grid.min.x + day_x(i, j), grid.min.y), vec2(cw, grid.height()));
-                let r = ui.interact(col, ui.scope_id().with(("hours", d0 + i, j)), Sense::click());
-                // The half hour under the pointer lights up: a click adds an event there.
-                if let Some(p) = r.hover_pos() {
-                    let half = ((p.y - grid.min.y) / (HOUR / 2.0)).floor().clamp(0.0, 47.0);
-                    let slot = Rect::from_min_size(pos2(col.min.x, grid.min.y + half * HOUR / 2.0), vec2(cw, HOUR / 2.0)).shrink(1.0);
-                    ui.painter().rect_filled(slot, 2.0, t.hover_row);
-                }
-                if r.clicked()
-                    && let Some(p) = r.interact_pointer_pos()
-                {
-                    let half = ((p.y - grid.min.y) / (HOUR / 2.0)).floor().clamp(0.0, 47.0) as i64;
-                    acts.push(new_event_in(s, s.local_midnight(d0 + i) + half * 1800, cals.get(j).filter(|_| k > 1)));
-                }
-            }
-        }
-        // Events, side by side when they overlap (each calendar in its own pane, side by side).
-        for (i, j) in (0..n).flat_map(|i| (0..k).map(move |j| (i, j))) {
-            let d = d0 + i;
-            let (day0, day1) = (s.local_midnight(d), s.local_midnight(d + 1));
-            let mut todays: Vec<&AgendaItem> = items
-                .iter()
-                .filter(|it| !it.all_day && it.end - it.start < 86_400 && it.start < day1 && it.end.max(it.start + 1) > day0 && col_of(it) == j)
-                .collect();
-            todays.sort_by_key(|it| (it.start, -(it.end - it.start)));
-            let mut lane_end: Vec<i64> = Vec::new();
-            let mut lanes: Vec<usize> = Vec::new();
-            for it in &todays {
-                let lane = lane_end.iter().position(|e| *e <= it.start).unwrap_or(lane_end.len());
-                if lane == lane_end.len() {
-                    lane_end.push(it.end);
-                } else if let Some(e) = lane_end.get_mut(lane) {
-                    *e = it.end;
-                }
-                lanes.push(lane);
-            }
-            let width = (cw - 6.0) / lane_end.len().max(1) as f32;
-            for (it, lane) in todays.iter().zip(lanes) {
-                let top = ((it.start.max(day0) - day0) as f32 / 3600.0) * HOUR;
-                let bottom = ((it.end.min(day1) - day0) as f32 / 3600.0) * HOUR;
-                let r = Rect::from_min_size(
-                    pos2(grid.min.x + day_x(i, j) + 3.0 + width * lane as f32, grid.min.y + top + 1.0),
-                    vec2(width - 2.0, (bottom - top - 2.0).max(18.0)),
-                );
-                // The place beside the time when both fit on one line (a short event still shows it),
-                // else on a line of its own.
-                let mut text = format!("{}\n{} – {}", title_of(it), hm(it.start, s), hm(it.end, s));
-                if !it.location.is_empty() {
-                    let both = format!("{} – {} · {}", hm(it.start, s), hm(it.end, s), it.location);
-                    let w = ui.fonts_mut(|f| f.layout_no_wrap(both, theme::regular(12.0), t.text).size().x);
-                    text.push_str(if w <= r.width() - 8.0 { " · " } else { "\n" });
-                    text.push_str(&it.location);
-                }
-                if chip(ui, &t, r, it, &text).clicked()
-                    && let Some(a) = open(s, it)
-                {
-                    acts.push(a);
-                }
-            }
-        }
-        // Now, in every pane.
-        let n_day = today(s);
-        if n_day >= d0 && n_day < d1 {
-            let y = grid.min.y + ((s.clock.now - s.local_midnight(n_day)) as f32 / 3600.0) * HOUR;
-            for j in 0..k {
-                let x0 = grid.min.x + day_x(n_day - d0, j);
-                ui.painter().line_segment([pos2(x0, y), pos2(x0 + cw, y)], egui::Stroke::new(2.0, t.danger));
-                ui.painter().circle_filled(pos2(x0, y), 4.0, t.danger);
-            }
-        }
-    });
 }

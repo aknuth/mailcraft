@@ -19,27 +19,32 @@ pub(super) fn deliver(s: &mut Session, n: u32, from: (&str, &str), method: &str,
 /// Put a message carrying this calendar file (its type and bytes), with the method in its subject,
 /// in the sample Inbox and open it.
 fn deliver_ics(s: &mut Session, n: u32, from: (&str, &str), method: &str, mime: &str, data: Vec<u8>) {
-    let d = mailcraft_mime::Draft {
-        to: vec![mailcraft_model::EmailAddress::new("Riley", "riley@studio.example")],
-        subject: format!("{method} {n}"),
-        body: "See the calendar.".into(),
-        attachments: vec![mailcraft_mime::OutAttachment { name: "invite.ics".into(), mime: mime.into(), data, ..Default::default() }],
-        ..Default::default()
-    };
-    let raw = mailcraft_mime::build(&d, &mailcraft_model::EmailAddress::new(from.0, from.1), NOW, &format!("<i{n}@x>")).unwrap();
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = mailcraft_model::MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid: 9000 + n };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(&raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    store.write_body(&key, &raw).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let raw = calendar_mail(from, &format!("{method} {n}"), mime, data, &format!("<i{n}@x>"));
+    let key = mailcraft_model::MessageKey { uid: 9000 + n, ..next_key(s, "sample", "INBOX") };
+    let key = file_whole(s, key, &raw);
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
 }
 
 pub(super) fn me(partstat: &str) -> Attendee {
     Attendee { email: "riley@studio.example".into(), name: "Riley".into(), partstat: partstat.into(), rsvp: true }
+}
+
+/// Who sends the invitations of [`invitation`].
+pub(super) const ZOE: (&str, &str) = ("Zoe Park", "zoe@studio.example");
+
+/// An hour's meeting two days out that Zoe invites Riley to, not answered yet.
+pub(super) fn invitation(uid: &str, summary: &str, sequence: u32) -> CalEvent {
+    CalEvent {
+        uid: uid.into(),
+        summary: summary.into(),
+        start: NOW + 2 * 86_400,
+        end: NOW + 2 * 86_400 + 3600,
+        organizer: Some(Attendee { email: ZOE.1.into(), name: ZOE.0.into(), ..Default::default() }),
+        attendees: vec![me("NEEDS-ACTION")],
+        sequence,
+        ..Default::default()
+    }
 }
 
 pub(super) fn parts<'a>(s: &'a Session, uid: &str) -> Vec<&'a StoredEvent> {
@@ -152,7 +157,6 @@ fn answering_one_occurrence_keeps_the_series() {
     let all = parts(&s, &uid);
     assert_eq!(all.len(), 1, "{all:?}");
     assert_eq!(all[0].event.summary, "Mix review (new room)");
-    done(s);
 }
 
 #[test]
@@ -255,7 +259,6 @@ fn invitations_from_others_or_out_of_date_are_not_applied() {
     let sent = mailcraft_mime::parse(raw.as_bytes()).unwrap();
     assert_eq!((sent.from.name.as_str(), sent.from.email.as_str()), ("The Shop", "shop@studio.example"));
     assert!(raw.contains("shop@studio.example") && raw.contains("PARTSTAT=ACCEPTED"), "{raw}");
-    done(s);
 }
 
 /// An invitation in a charset other than UTF-8 is read in it (the calendar file's bytes come as
@@ -278,7 +281,6 @@ fn an_invitation_in_another_charset_is_read_in_it() {
     assert!(latin.contains(&0xe9));
     deliver_ics(&mut s, 1, ANA, "REQUEST", "text/calendar; method=REQUEST; charset=windows-1252", latin);
     assert_eq!(s.invite().unwrap().event.summary, "Caf\u{e9} review");
-    done(s);
 }
 
 /// The card asks for the invitation on the first frame of every message opened: one with no
@@ -309,5 +311,4 @@ fn a_message_without_an_invitation_is_not_read_again_for_one() {
     let reads = store.reads();
     assert_eq!(s.invite().unwrap().event.summary, "Card review");
     assert_eq!(store.reads(), reads + 1, "read once for the calendar's bytes");
-    done(s);
 }

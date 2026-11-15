@@ -66,14 +66,19 @@ fn meeting(uid: &str, calendar: &str, partstat: &str) -> StoredEvent {
 }
 
 /// bob's calendars as SOGo lists them: ann's (subscribed to, read-only) first, then his own.
-fn synced(s: &mut Session, id: &str, synced: &[&str], events: Vec<StoredEvent>) {
+fn sogo_synced(s: &mut Session, id: &str, synced: &[&str], events: Vec<StoredEvent>) {
+    synced_as(s, id, synced, events, true);
+}
+
+/// [`sogo_synced`], ann's calendar listed as someone else's (`foreign`) or only as one he may read.
+fn synced_as(s: &mut Session, id: &str, synced: &[&str], events: Vec<StoredEvent>, foreign: bool) {
     let sync = DavSync {
         caldav_home: Some("https://mail.mc31.test/SOGo/dav/bob@mc31.test/Calendar/".into()),
         calendars: Some(vec![
             CalendarInfo {
                 id: ANNS.into(),
                 name: "Personal Calendar (Ann)".into(),
-                foreign: true,
+                foreign,
                 read_only: true,
                 ctag: "1".into(),
                 ..Default::default()
@@ -95,19 +100,19 @@ fn synced(s: &mut Session, id: &str, synced: &[&str], events: Vec<StoredEvent>) 
 #[test]
 fn a_meeting_in_a_colleagues_calendar_too_keeps_the_users_own_copy() {
     let (mut s, id) = super::invite_placing::imap_session("sogo-two-copies");
-    synced(&mut s, &id, &[ANNS, OWN], vec![meeting("m1", ANNS, "NEEDS-ACTION"), meeting("m1", OWN, "NEEDS-ACTION")]);
-    let cals = |s: &Session| super::invite_placing::parts(s, &id, "m1").iter().map(|e| e.calendar.clone()).collect::<Vec<_>>();
+    sogo_synced(&mut s, &id, &[ANNS, OWN], vec![meeting("m1", ANNS, "NEEDS-ACTION"), meeting("m1", OWN, "NEEDS-ACTION")]);
+    let cals = |s: &Session| super::invite_placing::account_parts(s, &id, "m1").iter().map(|e| e.calendar.clone()).collect::<Vec<_>>();
     assert_eq!(cals(&s), [OWN], "bob's copy, not ann's");
     // ann's calendar read again (his unchanged): still his.
-    synced(&mut s, &id, &[ANNS], vec![meeting("m1", ANNS, "NEEDS-ACTION")]);
+    sogo_synced(&mut s, &id, &[ANNS], vec![meeting("m1", ANNS, "NEEDS-ACTION")]);
     assert_eq!(cals(&s), [OWN]);
     // Answered from the calendar: in his own, sent to his own.
     s.run("event.respond", &json!({"uid": "m1", "answer": "accepted"})).unwrap();
-    let mine = super::invite_placing::parts(&s, &id, "m1")[0].clone();
+    let mine = super::invite_placing::account_parts(&s, &id, "m1")[0].clone();
     assert!(mine.calendar == OWN && mine.dirty && mine.event.attendees[0].partstat == "ACCEPTED", "{mine:?}");
     // Gone from his calendar (he deleted it in SOGo's web pages): ann's shows.
-    synced(&mut s, &id, &[ANNS, OWN], vec![meeting("m1", ANNS, "ACCEPTED")]);
-    let still = super::invite_placing::parts(&s, &id, "m1");
+    sogo_synced(&mut s, &id, &[ANNS, OWN], vec![meeting("m1", ANNS, "ACCEPTED")]);
+    let still = super::invite_placing::account_parts(&s, &id, "m1");
     assert_eq!(still.len(), 1, "{still:?}");
 }
 
@@ -117,19 +122,51 @@ fn a_meeting_in_a_colleagues_calendar_too_keeps_the_users_own_copy() {
 #[test]
 fn an_invitation_already_in_a_colleagues_calendar_goes_in_the_users_own() {
     let (mut s, id) = super::invite_placing::imap_session("sogo-invited-too");
-    synced(&mut s, &id, &[ANNS, OWN], vec![meeting("m2", ANNS, "ACCEPTED")]);
-    assert_eq!(super::invite_placing::parts(&s, &id, "m2")[0].calendar, ANNS);
+    sogo_synced(&mut s, &id, &[ANNS, OWN], vec![meeting("m2", ANNS, "ACCEPTED")]);
+    assert_eq!(super::invite_placing::account_parts(&s, &id, "m2")[0].calendar, ANNS);
     let mut inv = meeting("m2", OWN, "NEEDS-ACTION").event;
     inv.organizer = Some(ical::Attendee { email: "zoe@studio.example".into(), name: "Zoe".into(), ..Default::default() });
     super::invite_placing::arrive(&mut s, &id, 1, "REQUEST", &[inv]);
-    let parts = super::invite_placing::parts(&s, &id, "m2");
+    let parts = super::invite_placing::account_parts(&s, &id, "m2");
     assert_eq!(parts.len(), 1, "{parts:?}");
     assert!(parts[0].calendar == OWN && parts[0].dirty && parts[0].href.is_empty(), "{:?}", parts[0]);
     s.run("event.respond", &json!({"uid": "m2", "answer": "tentative"})).unwrap();
-    assert!(super::invite_placing::parts(&s, &id, "m2").iter().all(|e| e.calendar == OWN));
+    assert!(super::invite_placing::account_parts(&s, &id, "m2").iter().all(|e| e.calendar == OWN));
     // ann's copy read again afterwards doesn't come back beside it.
-    synced(&mut s, &id, &[ANNS], vec![meeting("m2", ANNS, "ACCEPTED")]);
-    assert_eq!(super::invite_placing::parts(&s, &id, "m2").len(), 1);
+    sogo_synced(&mut s, &id, &[ANNS], vec![meeting("m2", ANNS, "ACCEPTED")]);
+    assert_eq!(super::invite_placing::account_parts(&s, &id, "m2").len(), 1);
+}
+
+/// The same, for a weekly meeting with one occurrence moved, ann's calendar one bob may only
+/// read but not listed as someone else's (a server that doesn't say whose it is): none of her
+/// copy stays beside his once the invitation is in his own calendar. Her moved occurrence did,
+/// shown beside his series.
+#[test]
+fn an_invitation_already_in_a_read_only_calendar_is_shown_once() {
+    let (mut s, id) = super::invite_placing::imap_session("read-only-invited-too");
+    let mut series = meeting("m3", ANNS, "ACCEPTED");
+    series.event.rrule = Some("FREQ=WEEKLY".into());
+    let mut moved = series.clone();
+    moved.event.rrule = None;
+    moved.event.recurrence_id = Some(series.event.start + 7 * 86_400);
+    moved.event.start += 7 * 86_400 + 3600;
+    moved.event.end += 7 * 86_400 + 3600;
+    synced_as(&mut s, &id, &[ANNS, OWN], vec![series.clone(), moved.clone()], false);
+    assert_eq!(super::invite_placing::account_parts(&s, &id, "m3").len(), 2);
+    let theirs = series.clone();
+    let mut inv = series.event;
+    inv.organizer = Some(ical::Attendee { email: "zoe@studio.example".into(), name: "Zoe".into(), ..Default::default() });
+    super::invite_placing::arrive(&mut s, &id, 1, "REQUEST", &[inv]);
+    let parts = super::invite_placing::account_parts(&s, &id, "m3");
+    assert_eq!(parts.iter().map(|e| e.calendar.as_str()).collect::<Vec<_>>(), [OWN]);
+    // Her calendar read again afterwards (changed, or all of it): her copy doesn't come back
+    // beside his, with his calendar read in the same sync or not.
+    for synced in [&[ANNS][..], &[ANNS, OWN]] {
+        let own: Vec<StoredEvent> = super::invite_placing::account_parts(&s, &id, "m3").into_iter().cloned().collect();
+        synced_as(&mut s, &id, synced, [vec![theirs.clone(), moved.clone()], own].concat(), false);
+        let parts = super::invite_placing::account_parts(&s, &id, "m3");
+        assert_eq!(parts.iter().map(|e| e.calendar.as_str()).collect::<Vec<_>>(), [OWN], "{synced:?}");
+    }
 }
 
 /// A change the server refused for good (SOGo's roles let bob change ann's public events, not
@@ -138,9 +175,9 @@ fn an_invitation_already_in_a_colleagues_calendar_goes_in_the_users_own() {
 #[test]
 fn a_change_the_server_refused_gives_way_to_its_copy() {
     let (mut s, id) = super::invite_placing::imap_session("sogo-refused");
-    synced(&mut s, &id, &[ANNS, OWN], vec![meeting("c1", OWN, "ACCEPTED")]);
+    sogo_synced(&mut s, &id, &[ANNS, OWN], vec![meeting("c1", OWN, "ACCEPTED")]);
     s.run("event.update", &json!({"uid": "c1", "summary": "Bob was here"})).unwrap();
-    assert!(super::invite_placing::parts(&s, &id, "c1")[0].dirty);
+    assert!(super::invite_placing::account_parts(&s, &id, "c1")[0].dirty);
     let sync = DavSync {
         caldav_home: Some("https://mail.mc31.test/SOGo/dav/bob@mc31.test/Calendar/".into()),
         calendars: Some(vec![CalendarInfo { id: OWN.into(), name: "Personal Calendar".into(), ctag: "2".into(), ..Default::default() }]),
@@ -152,7 +189,7 @@ fn a_change_the_server_refused_gives_way_to_its_copy() {
         ..Default::default()
     };
     s.apply(Event::DavSynced { account: id.clone(), sync: Box::new(sync) });
-    let parts = super::invite_placing::parts(&s, &id, "c1");
+    let parts = super::invite_placing::account_parts(&s, &id, "c1");
     assert_eq!(parts.len(), 1);
     assert!(!parts[0].dirty && parts[0].event.summary == "Planning", "{:?}", parts[0]);
 }
@@ -170,7 +207,7 @@ fn sogos_invitation_is_answered_though_its_copy_was_stamped_later() {
     copy.event.organizer = zoe.clone();
     copy.event.dtstamp = NOW + 180;
     copy.event.extra = vec!["CLASS:PUBLIC".into()];
-    synced(&mut s, &id, &[ANNS, OWN], vec![copy]);
+    sogo_synced(&mut s, &id, &[ANNS, OWN], vec![copy]);
     let mut mailed = meeting("m3", OWN, "NEEDS-ACTION").event;
     mailed.summary = "Planning (as mailed)".into();
     mailed.organizer = zoe;
@@ -179,14 +216,14 @@ fn sogos_invitation_is_answered_though_its_copy_was_stamped_later() {
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     assert_eq!(s.invite().unwrap().problem, None);
     s.run("invite.respond", &json!({"answer": "accepted"})).unwrap();
-    let parts = super::invite_placing::parts(&s, &id, "m3");
+    let parts = super::invite_placing::account_parts(&s, &id, "m3");
     assert_eq!(parts.len(), 1);
     let e = &parts[0];
     assert!(e.calendar == OWN && e.dirty && e.href.ends_with("m3.ics"), "{e:?}");
     assert_eq!((e.event.summary.as_str(), e.event.attendees[0].partstat.as_str()), ("Planning", "ACCEPTED"), "the calendar's version, answered");
     assert!(e.event.extra.iter().any(|l| l == "CLASS:PUBLIC"));
     // A meeting only a colleague's calendar holds isn't answered there.
-    synced(&mut s, &id, &[ANNS], vec![meeting("m4", ANNS, "NEEDS-ACTION")]);
+    sogo_synced(&mut s, &id, &[ANNS], vec![meeting("m4", ANNS, "NEEDS-ACTION")]);
     assert!(s.run("event.respond", &json!({"uid": "m4", "answer": "accepted"})).is_err());
-    assert!(!super::invite_placing::parts(&s, &id, "m4")[0].dirty);
+    assert!(!super::invite_placing::account_parts(&s, &id, "m4")[0].dirty);
 }

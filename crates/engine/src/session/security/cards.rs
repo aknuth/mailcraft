@@ -13,9 +13,13 @@ pub struct CardSearch {
     pub modules: Vec<String>,
     pub searching: bool,
     pub keys: Vec<HeldKey>,
+    /// What each of `keys`' certificates says (`None`: it can't be read), read once as they
+    /// came, not each time they're shown.
+    infos: Vec<Option<smime::cert::CertInfo>>,
     pub error: Option<String>,
-    /// The PIN the search logged in with, for the key chosen from it (memory only).
-    pin: Option<String>,
+    /// The PIN the search logged in with, for the key chosen from it (memory only; its `Debug`
+    /// form, as the rest's, never shows it).
+    pin: Option<mailcraft_model::Secret>,
 }
 
 impl Session {
@@ -34,6 +38,11 @@ impl CardSearch {
     pub fn pin_given(&self) -> bool {
         self.pin.is_some()
     }
+
+    /// What the certificate of the key found at `index` says, when it can be read.
+    pub fn info(&self, index: usize) -> Option<&smime::cert::CertInfo> {
+        self.infos.get(index).and_then(Option::as_ref)
+    }
 }
 
 impl Session {
@@ -44,17 +53,17 @@ impl Session {
         if module.as_deref() == Some("") {
             return Err(CmdError::Params("which module? (the .dll, .so or .dylib the card came with)".into()));
         }
-        let pin = pin.filter(|p| !p.is_empty());
+        let pin = pin.filter(|p| !p.is_empty()).map(mailcraft_model::Secret);
         self.cards = CardSearch { modules: std::mem::take(&mut self.cards.modules), searching: true, pin: pin.clone(), ..Default::default() };
-        self.jobs.push(Job::FindHeldKeys { module, pin: pin.map(mailcraft_model::Secret) });
+        self.jobs.push(Job::FindHeldKeys { module, pin });
         Ok(serde_json::json!({ "searching": true }))
     }
 
     /// Use the key found at `index` for `account`'s mail.
     pub fn use_held_key(&mut self, account: &str, index: usize) -> CmdResult {
-        let config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let config = self.config_of(account)?;
         let key = self.cards.keys.get(index).cloned().ok_or_else(|| CmdError::Params(format!("no certificate {index} was found")))?;
-        let pin = self.cards.pin.clone().map(mailcraft_model::Secret);
+        let pin = self.cards.pin.clone();
         self.jobs.push(Job::UseHeldKey { account: config, at: key.at, cert: key.cert, pin });
         Ok(serde_json::json!({ "using": key.label }))
     }
@@ -62,6 +71,7 @@ impl Session {
     pub(super) fn heard_held_keys(&mut self, keys: Vec<HeldKey>, error: Option<String>) {
         self.cards.searching = false;
         self.cards.error = error.or_else(|| keys.is_empty().then(|| "no certificate with its key was found".to_string()));
+        self.cards.infos = keys.iter().map(|k| smime::cert::info(&k.cert).ok()).collect();
         self.cards.keys = keys;
     }
 }

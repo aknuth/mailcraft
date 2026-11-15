@@ -7,7 +7,7 @@ mod filing;
 
 pub(super) use drafts::{DraftOrder, KeptDrafts, Order, Stopped, keep_draft};
 #[cfg(test)]
-pub(super) use drafts::{PENDING_DRAFTS, PendingDraft};
+pub(super) use drafts::{KEPT_DRAFTS, PENDING_DRAFTS, PendingDraft, kept_raws, sweep_kept};
 pub(super) use filing::{Filed, Filing, LOOK_ASIDE_EVERY, SetAside};
 
 impl Worker {
@@ -37,7 +37,10 @@ impl Worker {
                 let kept = self.store.load_folder(&self.acc.id, &folder).map(|f| f.messages.len()).unwrap_or(0);
                 let now = self.windows.get(&folder).copied().unwrap_or(0).max(self.opts.window).max(kept);
                 self.windows.insert(folder.clone(), now.saturating_add(more as usize).min(1_000_000));
-                if let Err(e) = self.store.save_account_doc(&self.acc.id, WINDOWS, &self.windows) {
+                let windows = &self.windows;
+                if let Some(Err(e)) =
+                    self.store.while_kept(&self.acc.id, self.removals, || self.store.save_account_doc(&self.acc.id, WINDOWS, windows))
+                {
                     log::warn!("{}: {WINDOWS}: {e}", self.acc.id);
                 }
                 if self.conn.is_none() {
@@ -64,9 +67,11 @@ impl Worker {
                 }
             }
             Job::Apply { op, .. } => {
-                // POP: a move is carried out here (there's no server copy to come back); what's
-                // deleted for good is noted, for removing the server's copy when the account says.
-                {
+                // Made while the account is kept ([`Store::while_kept`]): one removed meanwhile has
+                // nothing of it written again (its files would come back).
+                let made = self.store.while_kept(&self.acc.id, self.removals, || {
+                    // POP: a move is carried out here (there's no server copy to come back); what's
+                    // deleted for good is noted, for removing the server's copy when the account says.
                     let gone: Vec<mailcraft_model::MessageKey> = match &op {
                         Op::Expunge { keys } => keys.clone(),
                         Op::EmptyFolder { path } => {
@@ -74,21 +79,23 @@ impl Worker {
                         }
                         _ => Vec::new(),
                     };
-                    if let Err(e) = crate::pop::deleted_for_good(&self.store, &self.acc.id, &gone) {
-                        self.notice(e.to_string());
-                    }
+                    let noted = crate::pop::deleted_for_good(&self.store, &self.acc.id, &gone);
+                    let applied = match &op {
+                        Op::Move { keys, to } => crate::pop::move_locally(&self.store, &self.acc.id, keys, to),
+                        _ => self.store.apply_op(&self.acc.id, &op).map_err(NetError::from),
+                    };
+                    (noted, applied)
+                });
+                let Some((noted, applied)) = made else { return };
+                if let Err(e) = noted {
+                    self.notice(e.to_string());
                 }
-                let applied = match &op {
-                    Op::Move { keys, to } if self.acc.pop.is_some() => crate::pop::move_locally(&self.store, &self.acc.id, keys, to),
-                    _ => self.store.apply_op(&self.acc.id, &op).map_err(NetError::from),
-                };
                 match applied {
                     Ok(changed) => {
                         if let Op::RenameFolder { from, to } = &op {
                             self.renamed(from, to);
                         }
-                        if op.is_folder_op() {
-                            self.reload_folders();
+                        if op.is_folder_op() && self.reload_folders() {
                             self.publish_folders();
                         }
                         for folder in changed {
@@ -97,7 +104,7 @@ impl Worker {
                     }
                     Err(e) => self.notice(e.to_string()),
                 }
-                if let Err(e) = self.store.add_op(&self.acc.id, op) {
+                if let Some(Err(e)) = self.store.while_kept(&self.acc.id, self.removals, || self.store.add_op(&self.acc.id, op)) {
                     self.notice(e.to_string());
                 }
                 if self.conn.is_some() {
@@ -189,8 +196,6 @@ impl Worker {
         }
     }
 
-    /// Read (and first change, when `set`) the automatic replies: JMAP's own, or a Sieve script
-    /// through ManageSieve on the IMAP host.
     /// Connected for a job that needs the server, with one try when it isn't. A refused sign-in
     /// isn't tried again (the password known to be wrong was sent with each such job), and a
     /// try that fails shows as the account's status (left at "Connecting…" otherwise).
@@ -215,6 +220,8 @@ impl Worker {
         })
     }
 
+    /// Read (and first change, when `set`) the automatic replies: JMAP's own, or a Sieve script
+    /// through ManageSieve on the IMAP host.
     pub(super) fn vacation(&mut self, set: Option<&mailcraft_model::job::Vacation>) -> Result<mailcraft_model::job::Vacation> {
         // Not connected: one try, and a failure shows as the account's status (it said
         // "Connecting…" for good when the vacation page was opened on an account that can't).
@@ -231,29 +238,12 @@ impl Worker {
                 return Err(NetError::Refused("it shows once the account is connected".into()));
             }
         }
-        if let Some(Conn::Pop) = &self.conn {
-            return Err(NetError::No("POP accounts have no automatic replies on the server".into()));
+        if let Some(r) = self.conn.as_ref().and_then(|c| c.vacation(set)) {
+            return r;
         }
-        if let Some(Conn::Jmap(c)) = &self.conn {
-            if let Some(v) = set {
-                c.set_vacation(v)?;
-            }
-            return c.vacation();
-        }
-        if let Some(Conn::Graph(c)) = &self.conn {
-            if let Some(v) = set {
-                c.set_vacation(v)?;
-            }
-            return c.vacation();
-        }
-        if let Some(Conn::Ews(c)) = &self.conn {
-            if let Some(v) = set {
-                c.set_vacation(v)?;
-            }
-            return c.vacation();
-        }
+        // IMAP: a Sieve script, through ManageSieve on the IMAP host.
         let secret = self.secret()?;
-        let user = if self.acc.username.is_empty() { self.acc.email.clone() } else { self.acc.username.clone() };
+        let user = self.acc.login_name().to_string();
         let mut s = crate::sieve::Client::connect_trusting(&self.acc.imap, self.sieve_port, &self.acc.trusted_certificates).map_err(|e| match e {
             NetError::Io(_) => NetError::No("this server doesn't offer automatic replies (no ManageSieve)".into()),
             e => e,
@@ -286,7 +276,11 @@ impl Worker {
     /// changed as a result. Not once the account was removed.
     pub(super) fn reapply_waiting(&mut self, path: &str) -> bool {
         let mut any = false;
-        for op in self.store.load_ops(&self.acc.id).unwrap_or_default() {
+        let waiting = self.store.load_ops(&self.acc.id).unwrap_or_else(|e| {
+            log::warn!("the changes waiting couldn't be read, so none is put back over {path}: {e}");
+            Vec::new()
+        });
+        for op in waiting {
             let touches = match &op {
                 Op::EmptyFolder { path: p } => p == path,
                 o if o.is_folder_op() => false,
@@ -311,16 +305,14 @@ impl Worker {
         let trash = self.folders.iter().find(|f| f.role == FolderRole::Trash).map(|f| f.path.clone());
         // A change refused once is tried again after the folders are listed anew (see below).
         let mut retried = false;
+        // Read once, then kept in step with ops.json as each change comes off it (one queued
+        // meanwhile, by the window, is read in then): not read whole again for every change.
+        let mut waiting = self.store.waiting_ops(&self.acc.id).unwrap_or_default();
         // Cap the loop in case removal keeps failing.
         for _ in 0..100_000 {
-            let Some(op) = self.store.load_ops(&self.acc.id).unwrap_or_default().into_iter().next() else { break };
+            let Some(op) = waiting.first().cloned() else { break };
             let r = match self.conn.as_mut() {
-                Some(Conn::Imap(c)) => apply_remote_with(c, &op, trash.as_deref()),
-                Some(Conn::Jmap(c)) => jmap::apply_remote(c, &self.jstate, &op),
-                Some(Conn::Graph(c)) => crate::graph::apply_remote(c, &self.jstate, &op),
-                Some(Conn::Ews(c)) => crate::ews::apply_remote(c, &self.jstate, &op),
-                // POP: changes are made here only (the cache has them already).
-                Some(Conn::Pop) => Ok(()),
+                Some(c) => c.apply_remote(&self.jstate, &op, trash.as_deref()),
                 None => Err(NetError::Closed("not connected".into())),
             };
             match r {
@@ -336,7 +328,7 @@ impl Worker {
                         Op::EmptyFolder { path } => destinations.push(path.clone()),
                         Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::Expunge { .. } => {}
                     }
-                    if let Err(e) = self.store.remove_op(&self.acc.id, &op) {
+                    if let Err(e) = self.store.op_made(&self.acc.id, &mut waiting) {
                         self.notice(e.to_string());
                         break;
                     }
@@ -346,7 +338,7 @@ impl Worker {
                     // it's made too: the folder list on disk has it already (found in review: a
                     // folder made after another was renamed was shown gone between the two).
                     if op.is_folder_op() && relist {
-                        let more = self.store.load_ops(&self.acc.id).unwrap_or_default().iter().any(Op::is_folder_op);
+                        let more = waiting.iter().any(Op::is_folder_op);
                         let listed = self.relist_with(false, !more);
                         relist = more || !listed;
                     }
@@ -363,17 +355,23 @@ impl Worker {
                     retried = false;
                     // The server refused: drop the change and resync so the cache matches the
                     // server again (forcing a full flag check).
-                    if let Err(e) = self.store.remove_op(&self.acc.id, &op) {
+                    if let Err(e) = self.store.op_made(&self.acc.id, &mut waiting) {
                         self.notice(e.to_string());
                         break;
                     }
                     let mut folders: Vec<String> = op.keys().iter().map(|k| k.folder.clone()).collect();
+                    folders.sort();
                     folders.dedup();
                     for f in &folders {
-                        if let Ok(mut st) = self.store.load_folder(&self.acc.id, f) {
+                        // Not once the account was removed: its files would come back.
+                        let marked = self.store.while_kept(&self.acc.id, self.removals, || {
+                            let mut st = self.store.load_folder(&self.acc.id, f).ok()?;
                             st.highest_modseq = 0;
                             st.uid_next = 0;
-                            let _ = self.store.save_folder(&self.acc.id, f, &st);
+                            Some(self.store.save_folder(&self.acc.id, f, &st))
+                        });
+                        if let Some(Some(Err(e))) = marked {
+                            log::warn!("{}: {f} isn't marked to be read in full again: {e}", self.acc.id);
                         }
                     }
                     relist |= op.is_folder_op();

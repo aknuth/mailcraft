@@ -9,7 +9,7 @@ use std::rc::Rc;
 use mailcraft_engine::Session;
 use mailcraft_engine::model::dates::Clock;
 use mailcraft_engine::store::Store;
-use mailcraft_ui_egui::{MailApp, Services};
+use mailcraft_ui_egui::{MailApp, Picked, Services};
 use wasm_bindgen::JsCast as _;
 
 use crate::backend::WebBackend;
@@ -38,7 +38,7 @@ pub fn start() {
             log::error!("missing <canvas id=\"{CANVAS_ID}\">");
             return;
         };
-        let sample = query().contains("sample");
+        let sample = flag("sample");
         // The cache from the last visit.
         let (db, kept) = if sample {
             (None, Vec::new())
@@ -58,7 +58,7 @@ pub fn start() {
             }
         };
         let mut options = eframe::WebOptions::default();
-        if query().contains("webgl")
+        if flag("webgl")
             && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
@@ -91,7 +91,9 @@ pub fn start() {
                         }
                         s
                     };
-                    if db.is_some() {
+                    // What changed goes to IndexedDB each frame; without it, local storage is
+                    // written again only when something it keeps changed.
+                    if !sample {
                         store.track_changes();
                     }
                     let mut session = Session::open(Some(store.clone()), Clock::new(now, offset));
@@ -122,7 +124,7 @@ pub fn start() {
                     if let Some(key) = param("open") {
                         app.show_message_page(&key);
                     }
-                    Ok(Box::new(WebShell { app, store, sample, db, restore, restored: false }))
+                    Ok(Box::new(WebShell { app, store, sample, db, restore, bringing: None, lists: Default::default() }))
                 }),
             )
             .await;
@@ -142,8 +144,13 @@ fn query() -> String {
 /// A `?name=value` parameter of the page's address, decoded.
 fn param(name: &str) -> Option<String> {
     let q = query();
-    let raw = q.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix(&format!("{name}=")))?;
+    let raw = crate::query::value(&q, name)?;
     js_sys::decode_uri_component(raw).ok().map(String::from)
+}
+
+/// Whether the page's address has `?name` (`?sample`, `?webgl`) as a parameter of its own.
+fn flag(name: &str) -> bool {
+    crate::query::has(&query(), name)
 }
 
 /// Unix seconds and the local UTC offset in seconds.
@@ -169,32 +176,65 @@ struct WebShell {
     db: Option<web_sys::IdbDatabase>,
     /// A backup to put in the place of what's kept (issue #83), once the window asks.
     restore: Restoring,
-    /// One was: nothing of this page's is kept over it while the page loads anew.
-    restored: bool,
+    /// One being brought in: nothing of this page's is kept over it meanwhile.
+    bringing: Option<Bringing>,
+    /// Without IndexedDB: whether the lists in local storage are behind the cache.
+    lists: crate::lists_kept::Lists,
 }
 
+/// A backup whose files the browser is taking: its settings, kept once it has them all, and what
+/// the browser said, once it has.
+struct Bringing {
+    state: serde_json::Value,
+    said: Said,
+}
+
+/// What the browser said of a backup's files: nothing yet, then whether it has them.
+type Said = Rc<RefCell<Option<Result<(), String>>>>;
+
 impl WebShell {
-    /// What's kept gives way to a backup's files and settings, and the page starts again
-    /// from them.
-    fn bring_in(&mut self, files: &[(String, Vec<u8>)], state: &serde_json::Value, frame: &mut eframe::Frame) {
+    /// What's kept gives way to a backup's files, then ([`WebShell::brought_in`]) its settings,
+    /// and the page starts again from them.
+    fn bring_in(&mut self, files: &[(String, Vec<u8>)], state: serde_json::Value, ctx: &egui::Context) {
         let Some(db) = &self.db else { return };
-        let reload = || {
-            if let Some(w) = web_sys::window() {
-                let _ = w.location().reload();
-            }
+        let said: Said = Rc::default();
+        let (tell, ctx) = (said.clone(), ctx.clone());
+        let then = move |r| {
+            *tell.borrow_mut() = Some(r);
+            ctx.request_repaint();
         };
-        match crate::idb::replace(db, files, reload) {
-            Ok(()) => {
-                self.restored = true;
+        match crate::idb::replace(db, files, then) {
+            Ok(()) => self.bringing = Some(Bringing { state, said }),
+            Err(e) => self.app.session.notice(format!("The backup couldn't be brought in: {e}"), true),
+        }
+    }
+
+    /// Whether a backup is still being brought in: once its files are in, its settings are put
+    /// with them and the page loads anew; if they couldn't be, what's kept stays and is kept up
+    /// again, and the user is told.
+    fn brought_in(&mut self, frame: &mut eframe::Frame) -> bool {
+        let Some(b) = &self.bringing else { return false };
+        let said = b.said.borrow_mut().take();
+        match said {
+            None => true,
+            Some(Ok(())) => {
                 if let Some(storage) = frame.storage_mut() {
                     storage.remove_string(FILES_KEY);
-                    if let Ok(j) = serde_json::to_string(state) {
+                    if let Ok(j) = serde_json::to_string(&b.state) {
                         storage.set_string(UI_KEY, j);
                     }
                     storage.flush();
                 }
+                if let Some(w) = web_sys::window() {
+                    let _ = w.location().reload();
+                }
+                true
             }
-            Err(e) => self.app.session.notice(format!("The backup couldn't be brought in: {e}"), true),
+            Some(Err(e)) => {
+                self.bringing = None;
+                self.app.session.notice(format!("The backup couldn't be brought in: {e}"), true);
+                false
+            }
         }
     }
 }
@@ -202,12 +242,12 @@ impl WebShell {
 impl eframe::App for WebShell {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui);
-        if self.restored {
+        if self.brought_in(frame) {
             return;
         }
         let asked = self.restore.borrow_mut().take();
         if let Some((files, state)) = asked {
-            self.bring_in(&files, &state, frame);
+            self.bring_in(&files, state, ui.ctx());
             return;
         }
         // What changed in the cache this frame goes to IndexedDB.
@@ -224,7 +264,7 @@ impl eframe::App for WebShell {
     /// Keep the settings, and without IndexedDB the account and folder lists (not mail, never
     /// passwords).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if self.sample || self.restored {
+        if self.sample || self.bringing.is_some() {
             return;
         }
         if let Ok(j) = serde_json::to_string(&self.app.saved_state()) {
@@ -235,6 +275,11 @@ impl eframe::App for WebShell {
             return;
         }
         let keep = |p: &str| p.ends_with(".json") && !p.ends_with(".bad") && !p.contains("/outbox/");
+        // Nothing kept here changed: what's there is still right (it was all copied, measured and
+        // written again every ten seconds). A change that wasn't written still counts.
+        if !self.lists.due(self.store.take_changed_paths().iter().any(|p| keep(p))) {
+            return;
+        }
         let mut files: Vec<(String, String)> =
             self.store.snapshot(keep).into_iter().filter_map(|(p, v)| Some((p, String::from_utf8(v).ok()?))).collect();
         // Folder contents only while there's room; they come back with the next sync.
@@ -242,10 +287,14 @@ impl eframe::App for WebShell {
         if size(&files) > MAX_KEPT {
             files.retain(|(p, _)| !p.ends_with("/state.json"));
         }
-        if size(&files) <= MAX_KEPT
-            && let Ok(j) = serde_json::to_string(&files)
-        {
-            storage.set_string(FILES_KEY, j);
+        if size(&files) > MAX_KEPT {
+            // Too much to keep as it is: nothing to try again until it changes.
+            self.lists.written(true);
+        } else if let Ok(j) = serde_json::to_string(&files) {
+            storage.set_string(FILES_KEY, j.clone());
+            // Local storage refuses what it has no room for without a word: read back, and
+            // written again at the next save if it isn't there.
+            self.lists.written(storage.get_string(FILES_KEY).as_deref() == Some(j.as_str()));
         }
     }
 
@@ -255,12 +304,12 @@ impl eframe::App for WebShell {
 }
 
 /// Files chosen in the picker: (purpose, name, bytes).
-type Picked = Rc<RefCell<Vec<(String, String, Vec<u8>)>>>;
+type PickedFiles = Rc<RefCell<Vec<(Picked, String, Vec<u8>)>>>;
 /// A backup's files and settings the window asked to bring in.
 type Restoring = Rc<RefCell<Option<(Vec<(String, Vec<u8>)>, serde_json::Value)>>>;
 
 struct WebServices {
-    picked: Picked,
+    picked: PickedFiles,
     ctx: egui::Context,
     font: Rc<RefCell<FontFetch>>,
     restore: Restoring,
@@ -308,7 +357,7 @@ impl Services for WebServices {
         let path = w.location().pathname().unwrap_or_else(|_| "/".into());
         // The same mailbox (the sample stays the sample) in a window of its own, message-sized and
         // a little in from this one's corner, as web mail opens one (not a tab, not maximised).
-        let sample = if query().contains("sample") { "sample&" } else { "" };
+        let sample = if flag("sample") { "sample&" } else { "" };
         let url = format!("{path}?{sample}open={}", String::from(js_sys::encode_uri_component(key)));
         let at = |v: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>| v.ok().and_then(|x| x.as_f64()).unwrap_or(0.0) as i32 + 60;
         let features = format!("popup=yes,width=940,height=740,left={},top={}", at(w.screen_x()), at(w.screen_y()));
@@ -337,18 +386,14 @@ impl Services for WebServices {
         self.ctx.request_repaint();
         Ok(())
     }
-    fn pick_later(&mut self, purpose: &str) -> bool {
-        let (picked, ctx, purpose) = (self.picked.clone(), self.ctx.clone(), purpose.to_string());
-        let dialog = if purpose == "backup" {
-            rfd::AsyncFileDialog::new().add_filter("MailCraft backup", &["mailcraft-backup"])
-        } else if purpose == "rules" || purpose == "categories" {
-            rfd::AsyncFileDialog::new().add_filter("MailCraft file", &["json"])
-        } else if purpose == "picture" {
-            rfd::AsyncFileDialog::new().add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
-        } else if purpose.starts_with("certificate:") {
-            rfd::AsyncFileDialog::new().add_filter("Certificate with its key", &["p12", "pfx"])
-        } else {
-            rfd::AsyncFileDialog::new()
+    fn pick_later(&mut self, purpose: &Picked) -> bool {
+        let (picked, ctx, purpose) = (self.picked.clone(), self.ctx.clone(), purpose.clone());
+        let dialog = match purpose {
+            Picked::Backup => rfd::AsyncFileDialog::new().add_filter("MailCraft backup", &["mailcraft-backup"]),
+            Picked::Rules | Picked::Categories => rfd::AsyncFileDialog::new().add_filter("MailCraft file", &["json"]),
+            Picked::Picture => rfd::AsyncFileDialog::new().add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]),
+            Picked::Certificate(_) => rfd::AsyncFileDialog::new().add_filter("Certificate with its key", &["p12", "pfx"]),
+            Picked::Attach => rfd::AsyncFileDialog::new(),
         };
         wasm_bindgen_futures::spawn_local(async move {
             let Some(files) = dialog.pick_files().await else { return };
@@ -360,7 +405,7 @@ impl Services for WebServices {
         });
         true
     }
-    fn take_picked(&mut self) -> Vec<(String, String, Vec<u8>)> {
+    fn take_picked(&mut self) -> Vec<(Picked, String, Vec<u8>)> {
         std::mem::take(&mut self.picked.borrow_mut())
     }
     fn cjk_font(&mut self, lang: &str) -> Option<(Vec<u8>, u32)> {

@@ -6,10 +6,25 @@ use mailcraft_model::job::Secret;
 use mailcraft_model::{AccountConfig, Event, Flag, FolderRole, Job, MessageKey, Op, Security, ServerConfig, SyncStatus};
 
 use super::*;
+use crate::waiting::{events_until, eventually, until};
 use crate::worker::apply_remote;
 
 mod opening;
 mod reactions;
+
+/// The account these tests sign in with (`a1`, me@studio.example, password `pw`): its mail on
+/// the fake at `imap_port`, its sending at `smtp_port` (1 where nothing is sent: no server).
+fn imap_account(imap_port: u16, smtp_port: u16) -> AccountConfig {
+    let at = |port| ServerConfig { host: "127.0.0.1".into(), port, security: Security::None };
+    AccountConfig {
+        id: "a1".into(),
+        email: "me@studio.example".into(),
+        username: "me@studio.example".into(),
+        imap: at(imap_port),
+        smtp: at(smtp_port),
+        ..Default::default()
+    }
+}
 
 #[test]
 fn wrong_password_is_an_auth_error() {
@@ -92,7 +107,6 @@ fn full_sync_cycle() {
     assert_eq!(cache.validity, 101);
     assert!(cache.messages.iter().all(|m| m.key.validity == 101));
     assert_eq!(cache.messages.len(), 3);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -134,7 +148,6 @@ fn qresync_learns_expunges_and_flags_from_select() {
     let r = sync_folder(&mut c, &store, "a1", "INBOX", &opts).unwrap();
     assert!(r.reset);
     assert_eq!(store.load_folder("a1", "INBOX").unwrap().messages.len(), 4);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -152,7 +165,6 @@ fn without_condstore_flags_are_compared() {
     let r = sync_folder(&mut c, &store, "a1", "INBOX", &SyncOptions::default()).unwrap();
     assert_eq!(r.changed, 1);
     assert!(store.load_folder("a1", "INBOX").unwrap().messages[0].flags.seen);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -189,7 +201,6 @@ fn first_sync_takes_a_window() {
     assert_eq!(sync_folder(&mut c, &store, "a1", "INBOX", &more).unwrap().new, 0, "once");
     let all = SyncOptions { window: usize::MAX, ..opts };
     assert_eq!(sync_folder(&mut c, &store, "a1", "INBOX", &all).unwrap().new, 3, "all of it");
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Permanent delete on a Gmail-style server: moved into Trash and expunged there. Other
@@ -201,7 +212,7 @@ fn gmail_permanent_delete_moves_to_trash_then_expunges() {
         let mut s = st.lock().unwrap();
         s.caps = "IMAP4rev1 UIDPLUS MOVE X-GM-EXT-1";
         for (name, attr, validity) in [("[Gmail]/All Mail", "\\All", 500), ("[Gmail]/Trash", "\\Trash", 600)] {
-            s.boxes.push(Mailbox { name: name.into(), attr, validity, uid_next: 1, msgs: Vec::new(), expunged: Vec::new() });
+            s.boxes.push(Mailbox::new(name, attr, validity));
         }
         for subject in ["a", "b", "c", "d"] {
             s.add("INBOX", subject, &[]);
@@ -245,6 +256,29 @@ fn a_move_says_the_new_uids() {
     assert_eq!(st.lock().unwrap().mailbox("INBOX").map(|b| b.msgs.len()), Some(0));
 }
 
+/// A move into a folder the server hasn't is refused as a real server refuses it (`NO
+/// [TRYCREATE]`, RFC 3501 §6.4.7, RFC 6851), with MOVE and without: nothing moved, copied or
+/// marked deleted. Found in review: the in-memory server took it and lost the mail.
+#[test]
+fn a_move_into_a_folder_not_there_is_refused_and_moves_nothing() {
+    for caps in ["IMAP4rev1 UIDPLUS MOVE", "IMAP4rev1 UIDPLUS"] {
+        let st = State::new();
+        st.lock().unwrap().caps = caps;
+        for s in ["a", "b"] {
+            st.lock().unwrap().add("INBOX", s, &[]);
+        }
+        let mut c = login(&st);
+        let key = |uid| MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 100, uid };
+        let r = apply_remote(&mut c, &Op::Move { keys: vec![key(1), key(2)], to: "Gone".into() });
+        assert!(matches!(r, Err(crate::NetError::NoFolder(_))), "{caps}: {r:?}");
+        let mut s = st.lock().unwrap();
+        let inbox = s.mailbox("INBOX").unwrap();
+        assert_eq!(inbox.msgs.len(), 2, "{caps}");
+        assert!(inbox.msgs.iter().all(|m| m.flags.is_empty()), "{caps}: marked deleted");
+        assert!(s.boxes.iter().filter(|b| b.name != "INBOX").all(|b| b.msgs.is_empty()), "{caps}: copied");
+    }
+}
+
 #[test]
 fn remote_changes_flags_moves_deletes_and_appends() {
     let st = State::new();
@@ -277,7 +311,7 @@ fn remote_changes_flags_moves_deletes_and_appends() {
 /// disabled"); `MAILCRAFT_FAKE_CLOSED` (an address) takes that address's token but won't
 /// open its mailbox. Run: `cargo test -p mailcraft-net serve_imap_for_the_app -- --ignored`.
 #[test]
-#[ignore]
+#[ignore = "a server for looking at the app, run by hand: it never ends"]
 fn serve_imap_for_the_app() {
     let st = State::new();
     {
@@ -305,26 +339,9 @@ fn serve_imap_for_the_app() {
             }
         }
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:1143").unwrap();
-    for sock in listener.incoming().flatten() {
-        let st = st.clone();
-        std::thread::spawn(move || {
-            let mut fake = Fake::connect(&st);
-            let mut sock = sock;
-            let mut buf = [0u8; 8192];
-            loop {
-                let out: Vec<u8> = fake.out.drain(..).collect();
-                if !out.is_empty() && sock.write_all(&out).is_err() {
-                    return;
-                }
-                match sock.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let _ = fake.write(&buf[..n]);
-                    }
-                }
-            }
-        });
+    serve_tcp_on(std::net::TcpListener::bind("127.0.0.1:1143").unwrap(), &st);
+    loop {
+        std::thread::park();
     }
 }
 
@@ -358,7 +375,6 @@ fn keywords_round_trip_with_the_server() {
     sync_folder(&mut c, &store, "a1", "INBOX", &SyncOptions::default()).unwrap();
     let m = store.load_folder("a1", "INBOX").unwrap().messages[0].clone();
     assert!(m.flags.has("$label2") && m.flags.pinned(), "{:?}", m.flags);
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -383,33 +399,10 @@ fn remote_folder_changes() {
     assert!(s.log.iter().any(|l| l.starts_with("SUBSCRIBE \"Clients\"")));
 }
 
-fn until(pool: &crate::worker::Pool, what: &str, mut f: impl FnMut(&Event) -> bool) -> Vec<Event> {
-    let end = Instant::now() + Duration::from_secs(20);
-    let mut seen = Vec::new();
-    while Instant::now() < end {
-        if let Some(e) = pool.wait(Duration::from_millis(100)) {
-            let hit = f(&e);
-            seen.push(e);
-            if hit {
-                return seen;
-            }
-        }
-    }
-    panic!("timed out waiting for {what}; saw {seen:?}");
-}
-
 #[test]
 fn mailbox_settings_over_imap_and_managesieve() {
     let st = State::new();
-    st.lock().unwrap().mailbox("Archive").unwrap().msgs.push(Msg {
-        uid: 1,
-        flags: Vec::new(),
-        raw: b"Subject: old
-
-x"
-        .to_vec(),
-        modseq: 1,
-    });
+    st.lock().unwrap().mailbox("Archive").unwrap().msgs.push(Msg { uid: 1, flags: Vec::new(), raw: b"Subject: old\r\n\r\nx".to_vec(), modseq: 1 });
     st.lock().unwrap().mailbox("Archive").unwrap().uid_next = 2;
     let imap_port = serve_tcp(&st);
     let (sieve_port, sieve) = crate::sieve::tests::serve(crate::sieve::tests::Fake {
@@ -422,14 +415,7 @@ x"
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
     pool.sieve_port = sieve_port;
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: 1, security: Security::None },
-        ..Default::default()
-    };
+    let account = imap_account(imap_port, 1);
     pool.submit(Job::Start { account, password: Some(Secret("pw".into())) });
     let seen = until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     assert!(seen.iter().any(|e| matches!(e, Event::Quota { limit: 1_048_576, used, .. } if *used >= 1024)), "GETQUOTAROOT, in bytes");
@@ -443,16 +429,11 @@ x"
 
     // Emptying a folder removes what isn't downloaded too.
     pool.submit(Job::Apply { account: "a1".into(), op: Op::EmptyFolder { path: "Archive".into() } });
-    let end = Instant::now() + Duration::from_secs(10);
-    while !st.lock().unwrap().mailbox("Archive").unwrap().msgs.is_empty() {
-        assert!(Instant::now() < end, "never emptied");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the Archive emptied", || st.lock().unwrap().mailbox("Archive").unwrap().msgs.is_empty());
     pool.submit(Job::Remove { account: "a1".into() });
     // An offline account answers at once.
     pool.submit(Job::GetVacation { account: "a1".into() });
     until(&pool, "offline answer", |e| matches!(e, Event::Vacation { vacation: None, error: Some(_), .. }));
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Send / Receive › Work Offline: connections close; changes, sent mail and drafts wait on
@@ -464,24 +445,12 @@ fn working_offline_keeps_drafts_and_mail_until_back() {
     let store = store("offline");
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: 1, security: Security::None },
-        ..Default::default()
-    };
+    let account = imap_account(imap_port, 1);
     // Working offline before it starts: it never connects.
     pool.submit(Job::WorkOffline { on: true });
     pool.submit(Job::Start { account, password: Some(Secret("pw".into())) });
     until(&pool, "offline", |e| matches!(e, Event::Status { status: SyncStatus::Offline, .. }));
-    let draft = b"From: me@studio.example
-Subject: Kept
-
-written offline
-"
-    .to_vec();
+    let draft = b"From: me@studio.example\r\nSubject: Kept\r\n\r\nwritten offline\r\n".to_vec();
     pool.submit(Job::SaveDraft { account: "a1".into(), raw: draft, folder: "INBOX".into(), replaces: None });
     // Kept on this computer is kept: the message held for it can go (#53); then it's said where.
     until(&pool, "draft saved", |e| matches!(e, Event::DraftSaved { account, error: None, .. } if account == "a1"));
@@ -489,10 +458,7 @@ written offline
     pool.submit(Job::Send {
         account: "a1".into(),
         id: 7,
-        raw: b"Subject: x
-
-y"
-        .to_vec(),
+        raw: b"Subject: x\r\n\r\ny".to_vec(),
         from: "me@studio.example".into(),
         recipients: vec!["a@b.example".into()],
         sent_folder: None,
@@ -502,22 +468,19 @@ y"
     assert!(st.lock().unwrap().mailbox("INBOX").unwrap().msgs.is_empty(), "nothing reached the server");
     // Back online: the kept draft goes up first.
     pool.submit(Job::WorkOffline { on: false });
-    let end = Instant::now() + Duration::from_secs(20);
-    while st.lock().unwrap().mailbox("INBOX").unwrap().msgs.is_empty() {
-        assert!(Instant::now() < end, "the draft never reached the server");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the draft on the server", || !st.lock().unwrap().mailbox("INBOX").unwrap().msgs.is_empty());
     let saved = st.lock().unwrap().mailbox("INBOX").unwrap().msgs[0].raw.clone();
     assert!(String::from_utf8_lossy(&saved).contains("written offline"));
     assert!(store.outbox("a1").iter().any(|i| i.id == 7), "sent mail waits in the Outbox");
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
+mod big_folder;
 mod counts;
 mod folder_ops;
 mod hostile;
 mod idle;
+mod replaying;
 mod searching;
 mod sent;
 
@@ -548,11 +511,8 @@ fn an_online_only_account_syncs_and_reads_with_nothing_on_disk() {
     let account = |id: &str, port: u16, online_only: bool| AccountConfig {
         id: id.into(),
         email: format!("{id}@studio.example"),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: 1, security: Security::None },
         online_only,
-        ..Default::default()
+        ..imap_account(port, 1)
     };
     let (a1, a2) = (account("a1", serve_tcp(&online), true), account("a2", serve_tcp(&kept), false));
     store.save_accounts(&[a1.clone(), a2.clone()]).unwrap();
@@ -565,16 +525,11 @@ fn an_online_only_account_syncs_and_reads_with_nothing_on_disk() {
     pool.submit(Job::Start { account: a2, password: Some(Secret("pw".into())) });
     // A slow machine (FreeBSD's test VM) gets time; a timeout says what was still missing, and
     // what the accounts reported meanwhile.
-    let end = Instant::now() + Duration::from_secs(60);
     let synced = |a: &str| store.load_folder(a, "INBOX").is_ok_and(|f| f.messages.len() == 3);
     let downloaded = || store.load_folder("a2", "INBOX").map(|f| f.messages.iter().filter(|m| store.has_body(&m.key)).count()).unwrap_or(0);
-    let mut seen = Vec::new();
-    while !(synced("a1") && synced("a2") && downloaded() == 3) {
-        assert!(Instant::now() < end, "never synced: a1 {}, a2 {}, a2's bodies {}/3; events: {seen:?}", synced("a1"), synced("a2"), downloaded());
-        if let Some(e) = pool.wait(Duration::from_millis(100)) {
-            seen.push(e);
-        }
-    }
+    events_until(&pool, "a1's Inbox synced", |_| synced("a1"));
+    events_until(&pool, "a2's Inbox synced", |_| synced("a2"));
+    events_until(&pool, "a2's three bodies downloaded", |_| downloaded() == 3);
     let inbox = store.load_folder("a1", "INBOX").unwrap();
     assert!(inbox.messages.iter().any(|m| m.subject == "ONLINE-SUBJECT-2"));
     assert!(inbox.messages.iter().all(|m| !store.has_body(&m.key)), "nothing downloaded ahead of reading");
@@ -593,11 +548,7 @@ fn an_online_only_account_syncs_and_reads_with_nothing_on_disk() {
     let kept_file = store.data_file("a2").unwrap();
     drop(pool);
     drop(store);
-    let end = Instant::now() + Duration::from_secs(20);
-    while std::fs::read(&kept_file).is_err() {
-        assert!(Instant::now() < end, "the data file stayed open");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the data file let go of", || std::fs::read(&kept_file).is_ok());
     for i in 1..=3 {
         assert!(!on_disk(&t, format!("ONLINE-SUBJECT-{i}").as_bytes()) && !on_disk(&t, format!("ONLINE-BODY-{i}").as_bytes()), "{i}");
         assert!(on_disk(&t, format!("KEPT-SUBJECT-{i}").as_bytes()) && on_disk(&t, format!("KEPT-BODY-{i}").as_bytes()), "{i}");
@@ -620,14 +571,7 @@ fn outbox_holds_mail_until_smtp_is_back() {
     let store = store("outbox");
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: smtp_port, security: Security::None },
-        ..Default::default()
-    };
+    let account = imap_account(imap_port, smtp_port);
     // Not started yet: a send goes straight to the Outbox.
     let raw = b"From: me@studio.example\r\nTo: zoe@studio.example\r\nSubject: queued\r\nMessage-ID: <q@x>\r\n\r\nhi\r\n".to_vec();
     let send = |id: u64| Job::Send {
@@ -671,13 +615,8 @@ fn outbox_holds_mail_until_smtp_is_back() {
     until(&pool, "second sent", |e| matches!(e, Event::Sent { id: 2, .. }));
     assert!(log2.join().unwrap().contains("RCPT TO:<zoe@studio.example>"));
     assert_eq!(store.outbox("a1").iter().map(|i| i.id).collect::<Vec<_>>(), vec![3], "the held-back one waits");
-    let end = Instant::now() + Duration::from_secs(10);
-    while st.lock().unwrap().mailbox("Sent").unwrap().msgs.len() < 2 {
-        assert!(Instant::now() < end, "copies never reached Sent");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("both copies in Sent", || st.lock().unwrap().mailbox("Sent").unwrap().msgs.len() >= 2);
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
@@ -693,15 +632,7 @@ fn worker_pool_end_to_end_over_tcp() {
     let store = store("e2e");
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        name: "Me".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: smtp_port, security: Security::None },
-        ..Default::default()
-    };
+    let account = AccountConfig { name: "Me".into(), ..imap_account(imap_port, smtp_port) };
 
     // Wrong password first: the worker reports it and stops retrying.
     pool.submit(Job::Start { account: account.clone(), password: Some(Secret("nope".into())) });
@@ -724,11 +655,7 @@ fn worker_pool_end_to_end_over_tcp() {
     pool.submit(Job::Apply { account: "a1".into(), op: Op::SetFlag { keys: vec![key.clone()], flag: Flag::Seen, on: true } });
     until(&pool, "flag change", |e| matches!(e, Event::FolderChanged { .. }));
     assert!(store.load_folder("a1", "INBOX").unwrap().find(1).unwrap().flags.seen);
-    let end = Instant::now() + Duration::from_secs(10);
-    while !st.lock().unwrap().mailbox("INBOX").unwrap().msgs[0].flags.iter().any(|f| f == "\\Seen") {
-        assert!(Instant::now() < end, "the server never got the flag");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the flag on the server", || st.lock().unwrap().mailbox("INBOX").unwrap().msgs[0].flags.iter().any(|f| f == "\\Seen"));
 
     // Send: SMTP submission, then a copy filed in Sent.
     let raw = b"From: me@studio.example\r\nTo: zoe@studio.example\r\nSubject: e2e\r\nMessage-ID: <e2e@x>\r\n\r\nhi\r\n".to_vec();
@@ -747,7 +674,6 @@ fn worker_pool_end_to_end_over_tcp() {
     assert_eq!(store.load_folder("a1", "Sent").unwrap().messages[0].subject, "e2e");
 
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// Issue #3: an outgoing server whose user name and password aren't the incoming server's.
@@ -761,15 +687,8 @@ fn the_outgoing_server_signs_in_with_its_own_user_name_and_password() {
     let store = store("smtp-own-sign-in");
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: smtp_port, security: Security::None },
-        smtp_username: Some("relay-user".into()),
-        ..Default::default()
-    };
+    // Its own user name for sending: the point of the test.
+    let account = AccountConfig { smtp_username: Some("relay-user".into()), ..imap_account(imap_port, smtp_port) };
     pool.submit(Job::Start { account: account.clone(), password: Some(Secret("pw".into())) });
     until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     let send = |id: u64| Job::Send {
@@ -789,11 +708,10 @@ fn the_outgoing_server_signs_in_with_its_own_user_name_and_password() {
     pool.submit(send(2));
     until(&pool, "sent", |e| matches!(e, Event::Sent { id: 2, .. }));
     let log = smtp_log.join().unwrap();
-    let own = crate::imap::base64(b"\0relay-user\0smtp-secret");
+    let own = mailcraft_model::base64::encode(b"\0relay-user\0smtp-secret");
     assert!(log.contains(&own), "SMTP signed in as relay-user: {log}");
-    assert!(!log.contains(&crate::imap::base64(b"\0me@studio.example\0pw")), "not as the IMAP user");
+    assert!(!log.contains(&mailcraft_model::base64::encode(b"\0me@studio.example\0pw")), "not as the IMAP user");
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// A folder whose PERMANENTFLAGS has no `\*` (a shared folder without the right to write, on
@@ -839,20 +757,9 @@ fn a_draft_on_a_server_without_drafts_makes_the_folder() {
     let store = store("drafts-made");
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: ServerConfig { host: "127.0.0.1".into(), port: imap_port, security: Security::None },
-        smtp: ServerConfig { host: "127.0.0.1".into(), port: 1, security: Security::None },
-        ..Default::default()
-    };
+    let account = imap_account(imap_port, 1);
     pool.submit(Job::Start { account, password: Some(Secret("pw".into())) });
-    let end = Instant::now() + Duration::from_secs(20);
-    while store.load_folders("a1").map_or(true, |f| f.is_empty()) {
-        assert!(Instant::now() < end, "never listed its folders");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("its folders listed", || store.load_folders("a1").is_ok_and(|f| !f.is_empty()));
     assert!(st.lock().unwrap().mailbox("Drafts").is_none());
     let draft = b"From: me@studio.example\r\nSubject: Plans\r\nMessage-ID: <plans@studio.example>\r\n\r\nto finish\r\n".to_vec();
     pool.submit(Job::SaveDraft { account: "a1".into(), raw: draft, folder: "Drafts".into(), replaces: None });
@@ -862,16 +769,9 @@ fn a_draft_on_a_server_without_drafts_makes_the_folder() {
         "draft saved",
         |e| matches!(e, Event::DraftSaved { account, message_id, error: None } if account == "a1" && message_id == "plans@studio.example"),
     );
-    let end = Instant::now() + Duration::from_secs(20);
-    while st.lock().unwrap().mailbox("Drafts").is_none_or(|m| m.msgs.is_empty()) {
-        assert!(Instant::now() < end, "the draft never reached the server");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let end = Instant::now() + Duration::from_secs(20);
-    while !store.load_folders("a1").is_ok_and(|f| f.iter().any(|f| f.path == "Drafts" && f.role == FolderRole::Drafts)) {
-        assert!(Instant::now() < end, "Drafts never listed as Drafts");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually("the draft on the server", || st.lock().unwrap().mailbox("Drafts").is_some_and(|m| !m.msgs.is_empty()));
+    eventually("Drafts listed as Drafts", || {
+        store.load_folders("a1").is_ok_and(|f| f.iter().any(|f| f.path == "Drafts" && f.role == FolderRole::Drafts))
+    });
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
 }

@@ -7,8 +7,10 @@
 
 use std::borrow::Cow;
 
+use super::mso_hidden;
 use super::reading::{Comments, RAW_TEXT, raw_text_end, tag_end_at};
-use super::{decoded, mso_hidden};
+use crate::html::{Refs, decode_refs};
+use mailcraft_model::work::scanned;
 
 /// The attribute what's hidden from Outlook is marked with ([`marked_hidden`]).
 pub(crate) const HIDDEN_MARK: &str = "data-mailcraft-hidden";
@@ -18,7 +20,8 @@ pub(crate) const HIDDEN_RULE: &str = "[data-mailcraft-hidden] { display: none !i
 
 /// How what's hidden from Outlook is hidden.
 pub(super) enum Hide {
-    /// `display:none;` written into its style, for any program to read.
+    /// `display:none;` written into its style, for any program to read ([`super::as_outlook_reads`],
+    /// for the tests and the fuzz target).
     Style,
     /// Marked ([`HIDDEN_MARK`]), for the text converters, which read no style for the text.
     Mark,
@@ -46,9 +49,9 @@ pub(super) fn hidden_in_place(html: &str, how: Hide) -> Cow<'_, str> {
     // Up to where `html` is in `out`.
     let mut copied = 0;
     let mut i = 0;
-    while let Some(off) = lower.get(i..).and_then(|rest| rest.find('<')) {
+    while let Some(off) = lower.get(i..).and_then(|rest| scanned(rest, rest.find('<'))) {
         let at = i + off;
-        let past = |from: usize| lower.get(from..).and_then(|r| r.find('>')).map_or(lower.len(), |g| from + g + 1);
+        let past = |from: usize| lower.get(from..).and_then(|r| scanned(r, r.find('>'))).map_or(lower.len(), |g| from + g + 1);
         match b.get(at + 1) {
             // A comment, or a declaration or processing instruction (read as one to its `>`).
             Some(b'!') if lower.get(at..).is_some_and(|r| r.starts_with("<!--")) => {
@@ -73,14 +76,15 @@ pub(super) fn hidden_in_place(html: &str, how: Hide) -> Cow<'_, str> {
             }
         }
         // A start tag: its name up to a space, `/` or `>`, as a browser reads it.
-        let name_end =
-            (at + 1..lower.len()).find(|&n| b.get(n).is_some_and(|c| c.is_ascii_whitespace() || *c == b'/' || *c == b'>')).unwrap_or(lower.len());
+        let name_end = (at + 1..lower.len()).find(|&n| b.get(n).is_some_and(|c| c.is_ascii_whitespace() || *c == b'/' || *c == b'>'));
+        mailcraft_model::work::steps(name_end.unwrap_or(lower.len()).saturating_sub(at));
+        let name_end = name_end.unwrap_or(lower.len());
         // One not ended is no tag: a browser drops it, and all after it with it.
         let Some(end) = tag_end_at(b, name_end).map(|g| g + 1) else { break };
         let name = lower.get(at + 1..name_end).unwrap_or("");
         if lower.get(at..end).is_some_and(|t| t.contains("mso-hide"))
             && let Some(value) = style_at(html, name_end, end)
-            && mso_hidden(&decoded(html.get(value.clone()).unwrap_or("")))
+            && mso_hidden(&decode_refs(html.get(value.clone()).unwrap_or(""), Refs::Value))
         {
             let (to, what) = match how {
                 Hide::Style => (value.start, "display:none;".to_string()),

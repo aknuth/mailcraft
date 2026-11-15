@@ -5,6 +5,8 @@
 //! the original under a reply as it came, with what was changed in it; and the message it
 //! answers, which gets its Replied flag once it's sent. Saving it again replaces the saved copy.
 
+use mailcraft_model::thread::norm_id;
+
 use super::signatures::{signature_block, style_signature};
 use super::*;
 use crate::session::security::is_sealed;
@@ -15,8 +17,8 @@ impl Session {
         // By the copy it was opened from, or the one it was saved as since (a save on a server
         // is another copy, with the same Message-ID): opened a second time from that, sending
         // one left the other to be sent again, or kept as a draft of mail already sent.
-        let id = self.summary(key).map(|m| mailcraft_model::thread::norm_id(&m.message_id)).filter(|i| !i.is_empty());
-        let saved_as = |c: &Compose| c.account == key.account && id.as_ref().is_some_and(|i| mailcraft_model::thread::norm_id(&c.draft_id) == *i);
+        let id = self.summary(key).map(|m| norm_id(&m.message_id)).filter(|i| !i.is_empty());
+        let saved_as = |c: &Compose| c.account == key.account && id.as_ref().is_some_and(|i| norm_id(&c.draft_id) == *i);
         let open = self.all_composes().find(|c| c.draft.as_ref() == Some(key) || saved_as(c)).map(|c| c.id);
         if let Some(id) = open {
             self.activate_compose(id);
@@ -54,8 +56,11 @@ impl Session {
         // Pictures its text shows stay in it; the rest are its files.
         let mut attachments = Vec::new();
         let mut inline = Vec::new();
+        // All its files from one parse of it.
+        let wanted: Vec<usize> = p.attachments.iter().map(|a| a.index).collect();
+        let mut outs: HashMap<usize, OutAttachment> = mime::attachments_out(raw, &wanted).into_iter().collect();
         for a in &p.attachments {
-            let Some(out) = mime::attachment_out(raw, a.index) else { continue };
+            let Some(out) = outs.remove(&a.index) else { continue };
             let shown =
                 a.content_id.clone().filter(|c| a.inline && !c.is_empty() && html.as_deref().is_some_and(|h| h.contains(&format!("cid:{c}"))));
             match shown {
@@ -73,7 +78,7 @@ impl Session {
             to: addr::format_field(&p.to),
             cc: addr::format_field(&p.cc),
             bcc: addr::format_field(&p.bcc),
-            show_cc: !p.bcc.is_empty(),
+            show_bcc: !p.bcc.is_empty(),
             reply_to: addr::format_field(&p.reply_to),
             show_reply_to: !p.reply_to.is_empty(),
             subject: p.subject.clone(),
@@ -122,40 +127,53 @@ impl Session {
         Ok(c)
     }
 
-    /// The message with Message-ID `id` in one of `account`'s folders (Drafts first), from what
-    /// this computer lists of them.
+    /// The message with Message-ID `id` in one of `account`'s folders (Drafts first): looked for
+    /// in the lists read already, then in the lists as this computer keeps them, read from disk
+    /// (a sync may have listed it there first). Every list was read from disk, each time.
     pub(crate) fn find_message(&self, account: &str, id: &str) -> Option<MessageKey> {
-        let store = self.store.as_ref()?;
         let a = self.account(account)?;
-        let id = id.trim().trim_matches(['<', '>']);
+        let id = norm_id(id);
         if id.is_empty() {
             return None;
         }
-        let drafts = a.folder(FolderRole::Drafts).map(|f| f.path.clone());
-        let order = drafts.iter().cloned().chain(a.folders.iter().map(|f| f.path.clone()).filter(|p| Some(p) != drafts.as_ref()));
-        for folder in order {
-            let Ok(st) = store.load_folder(account, &folder) else { continue };
-            if let Some(m) = st.messages.iter().find(|m| m.message_id.trim().trim_matches(['<', '>']) == id) {
-                return Some(m.key.clone());
-            }
-        }
-        None
+        let drafts = a.folder(FolderRole::Drafts).map(|f| f.path.as_str());
+        let order: Vec<&str> = drafts.into_iter().chain(a.folders.iter().map(|f| f.path.as_str()).filter(|p| Some(*p) != drafts)).collect();
+        let read = |folder: &str| self.cache.get(&(account.to_string(), folder.to_string()));
+        order.iter().find_map(|f| read(f).and_then(|st| with_id(st, &id))).or_else(|| order.iter().find_map(|f| self.kept_with_id(account, f, &id)))
     }
 
     /// The copy of `c` saved in Drafts, when there is one: the one it was opened from or last
     /// saved as, or (saved to a server, which gives the copy its place) the one with the Message-ID
-    /// it was last saved with.
+    /// it was last saved with, as this computer keeps Drafts (a sync may have listed it there
+    /// before the list read is told).
     pub(super) fn saved_copy(&self, c: &Compose) -> Option<MessageKey> {
         c.draft.clone().or_else(|| {
-            let folder = self.account(&c.account)?.folder(FolderRole::Drafts)?.path.clone();
-            let id = c.draft_id.trim().trim_matches(['<', '>']);
+            let folder = &self.account(&c.account)?.folder(FolderRole::Drafts)?.path;
+            let id = norm_id(&c.draft_id);
             if id.is_empty() {
                 return None;
             }
-            let st = self.store.as_ref()?.load_folder(&c.account, &folder).ok()?;
-            st.messages.iter().find(|m| m.message_id.trim().trim_matches(['<', '>']) == id).map(|m| m.key.clone())
+            self.kept_with_id(&c.account, folder, &id)
         })
     }
+
+    /// The message with Message-ID `id` (as [`norm_id`] gives it) in `folder` as this computer
+    /// keeps its list.
+    fn kept_with_id(&self, account: &str, folder: &str, id: &str) -> Option<MessageKey> {
+        with_id(&self.store.as_ref()?.load_folder(account, folder).ok()?, id)
+    }
+}
+
+/// The message in `st` with Message-ID `id` (as [`norm_id`] gives it), compared the same way.
+fn with_id(st: &FolderState, id: &str) -> Option<MessageKey> {
+    st.messages.iter().find(|m| same_id(&m.message_id, id)).map(|m| m.key.clone())
+}
+
+/// `norm_id(found) == id`, without making a string of each of a folder's ids: one with nothing
+/// for [`norm_id`] to take out (as a list keeps them) is compared as it is.
+fn same_id(found: &str, id: &str) -> bool {
+    let kept_whole = found.len() <= 998 && !found.chars().any(|c| matches!(c, '<' | '>') || c.is_control() || c.is_whitespace());
+    if kept_whole { found == id } else { norm_id(found) == id }
 }
 
 /// The text of a saved message (`own`: its HTML without the original under it) into `c`, its
@@ -178,8 +196,8 @@ fn own_text(c: &mut Compose, own: &str) {
     let tag = c
         .inline
         .iter()
-        .filter_map(|p| p.cid.strip_prefix("signature").and_then(|r| r.split_once('.')).and_then(|(_, r)| r.strip_suffix("@mailcraft")))
-        .find(|t| code.contains(&format!(".{t}@mailcraft")))
+        .filter(|p| code.contains(&format!("cid:{}", p.cid)))
+        .find_map(|p| mime::signature_cid_tag(&p.cid))
         .unwrap_or_default()
         .to_string();
     let theirs: Vec<mime::InlinePicture> = c.inline.iter().filter(|p| code.contains(&format!("cid:{}", p.cid))).cloned().collect();
@@ -209,8 +227,8 @@ fn own_text(c: &mut Compose, own: &str) {
 fn rule_over_quote(c: &mut Compose) {
     let lines: Vec<&str> = c.body.split('\n').collect();
     let at = (1..lines.len()).find(|&i| {
-        lines.get(i).is_some_and(|l| l.starts_with("From: "))
-            && lines.get(i + 1).is_some_and(|l| l.starts_with("Sent: "))
+        lines.get(i).is_some_and(|l| is_labelled(l, mime::markup::FROM_LABEL))
+            && lines.get(i + 1).is_some_and(|l| is_labelled(l, mime::markup::SENT_LABEL))
             && lines.get(i - 1).is_some_and(|l| l.trim().is_empty())
     });
     let Some(at) = at else { return };
@@ -218,4 +236,9 @@ fn rule_over_quote(c: &mut Compose) {
     if let Some(p) = c.styles.paras.get_mut(at - 1) {
         p.rule = true;
     }
+}
+
+/// Whether a line starts with a header label (`From:`) and the space after it, as a reply writes them.
+fn is_labelled(line: &str, label: &str) -> bool {
+    line.strip_prefix(label).is_some_and(|rest| rest.starts_with(' '))
 }

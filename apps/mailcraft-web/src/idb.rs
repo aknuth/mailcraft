@@ -8,12 +8,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{IdbDatabase, IdbRequest, IdbTransactionMode};
 
+use crate::js;
+
 const DB: &str = "mailcraft";
 const FILES: &str = "files";
-
-fn js(e: &JsValue) -> String {
-    e.as_string().or_else(|| e.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message()))).unwrap_or_else(|| format!("{e:?}"))
-}
 
 /// A request's result, once it has one.
 pub(crate) async fn done(req: &IdbRequest) -> Result<JsValue, String> {
@@ -34,13 +32,18 @@ pub(crate) async fn done(req: &IdbRequest) -> Result<JsValue, String> {
 
 /// Open the database (made on first use).
 pub async fn open() -> Result<IdbDatabase, String> {
+    open_named(DB, FILES).await
+}
+
+/// Open the database `name` with its one object store `store` (both made on first use).
+pub(crate) async fn open_named(name: &str, store: &'static str) -> Result<IdbDatabase, String> {
     let factory = web_sys::window().ok_or("no window")?.indexed_db().map_err(|e| js(&e))?.ok_or("no IndexedDB")?;
-    let req = factory.open_with_u32(DB, 1).map_err(|e| js(&e))?;
+    let req = factory.open_with_u32(name, 1).map_err(|e| js(&e))?;
     let upgrade_req = req.clone();
     let upgrade = Closure::once_into_js(move |_: web_sys::Event| {
         if let Some(db) = upgrade_req.result().ok().and_then(|r| r.dyn_into::<IdbDatabase>().ok())
-            && !db.object_store_names().contains(FILES)
-            && let Err(e) = db.create_object_store(FILES)
+            && !db.object_store_names().contains(store)
+            && let Err(e) = db.create_object_store(store)
         {
             log::error!("IndexedDB: {}", js(&e));
         }
@@ -61,18 +64,30 @@ pub async fn load(db: &IdbDatabase) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 /// Every file kept gives way to `files` (a backup's, issue #83), in one transaction: all of it,
-/// or what was there stays. `then` runs once the browser has them.
-pub fn replace(db: &IdbDatabase, files: &[(String, Vec<u8>)], then: impl FnOnce() + 'static) -> Result<(), String> {
+/// or what was there stays. `then` is told how it went once the browser says: `Ok` when it has
+/// them all, else why not.
+pub fn replace(db: &IdbDatabase, files: &[(String, Vec<u8>)], then: impl Fn(Result<(), String>) + 'static) -> Result<(), String> {
     let tx = db.transaction_with_str_and_mode(FILES, IdbTransactionMode::Readwrite).map_err(|e| js(&e))?;
-    let store = tx.object_store(FILES).map_err(|e| js(&e))?;
-    store.clear().map_err(|e| js(&e))?;
-    for (path, bytes) in files {
-        store.put_with_key(&js_sys::Uint8Array::from(bytes.as_slice()), &JsValue::from_str(path)).map_err(|e| js(&e))?;
+    let fill = || -> Result<(), String> {
+        let store = tx.object_store(FILES).map_err(|e| js(&e))?;
+        store.clear().map_err(|e| js(&e))?;
+        for (path, bytes) in files {
+            store.put_with_key(&js_sys::Uint8Array::from(bytes.as_slice()), &JsValue::from_str(path)).map_err(|e| js(&e))?;
+        }
+        Ok(())
+    };
+    if let Err(e) = fill() {
+        // Left alone, it would finish with what it had: the files cleared.
+        let _ = tx.abort();
+        return Err(e);
     }
-    let done = Closure::once_into_js(move |_: web_sys::Event| then());
+    let then = std::rc::Rc::new(then);
+    let told = then.clone();
+    let done = Closure::once_into_js(move |_: web_sys::Event| told(Ok(())));
     tx.set_oncomplete(Some(done.unchecked_ref()));
-    let failed = Closure::once_into_js(|_: web_sys::Event| log::error!("the backup wasn't brought in: the browser's storage refused it (full?)"));
-    tx.set_onerror(Some(failed.unchecked_ref()));
+    // A failed write ends the transaction this way too, as does storage running out as it ends.
+    let failed = Closure::once_into_js(move |_: web_sys::Event| then(Err("the browser's storage refused it (full?)".into())));
+    tx.set_onabort(Some(failed.unchecked_ref()));
     Ok(())
 }
 

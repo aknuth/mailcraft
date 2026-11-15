@@ -8,11 +8,13 @@
 //!
 //! Answers are hostile input: line lengths, message sizes and counts are capped.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::time::{Duration, Instant};
 
 use mailcraft_mime as mime;
-use mailcraft_model::{AccountConfig, Flags, Folder, FolderRole, MessageKey, Security, ServerConfig, sort_newest_first};
-use mailcraft_store::{FolderState, Store};
+use mailcraft_model::{AccountConfig, Flags, Folder, FolderRole, MessageKey, Security, ServerConfig, Summary, sort_newest_first};
+use mailcraft_store::{Filing, FolderState, Store};
 
 use crate::stream::{self, Stream};
 use crate::sync::{SyncReport, if_kept};
@@ -24,8 +26,14 @@ const MAX_LINE: usize = 64 << 10;
 const MAX_MESSAGE: usize = 64 << 20;
 /// Messages listed at most.
 const MAX_MESSAGES: usize = 200_000;
+/// New mail is saved (its sources, the Inbox's list and the record of what came) once this many
+/// messages, or this many bytes of them, have come, or this long after the last save, and at the
+/// end: saved after each message, a first download of N messages wrote N ever longer lists.
+const SAVE_EVERY: usize = 500;
+const SAVE_BYTES: usize = 16 << 20;
+const SAVE_AFTER: Duration = Duration::from_secs(5);
 /// The ids of downloaded messages, kept with the account.
-/// Before: the ids downloaded, a list (still read, once).
+/// Before: the ids downloaded, a list (still read whenever no state is kept, [`STATE_DOC`]).
 const SEEN_DOC: &str = "pop-seen.json";
 /// What's known of each message on the server (by its `UIDL` id): see [`Kept`].
 const STATE_DOC: &str = "pop-state.json";
@@ -39,6 +47,10 @@ pub struct Kept {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gone: bool,
+    /// Recorded as it was saved, the Inbox's list perhaps not yet naming it: a download stopped
+    /// there is settled the next time (`settle`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
 }
 
 /// When the server's copy goes, as the account says.
@@ -82,7 +94,7 @@ pub fn deleted_for_good(store: &Store, account: &str, keys: &[MessageKey]) -> Re
     if keys.is_empty() {
         return Ok(());
     }
-    let ids: Vec<String> = keys.iter().map(MessageKey::to_id).collect();
+    let ids: HashSet<String> = keys.iter().map(MessageKey::to_id).collect();
     let mut state: State = store.load_account_doc(account, STATE_DOC)?;
     let mut changed = false;
     for k in state.values_mut().filter(|k| k.key.as_ref().is_some_and(|id| ids.contains(id))) {
@@ -99,9 +111,10 @@ pub fn deleted_for_good(store: &Store, account: &str, keys: &[MessageKey]) -> Re
 fn moved(store: &Store, account: &str, pairs: &[(MessageKey, MessageKey)]) -> Result<()> {
     let mut state: State = store.load_account_doc(account, STATE_DOC)?;
     let mut changed = false;
-    for (old, new) in pairs {
-        let (old, new) = (old.to_id(), new.to_id());
-        for k in state.values_mut().filter(|k| k.key.as_deref() == Some(old.as_str())) {
+    // A new key is in the folder moved to, never one moved from: none moves twice.
+    let to: HashMap<String, String> = pairs.iter().map(|(old, new)| (old.to_id(), new.to_id())).collect();
+    for k in state.values_mut() {
+        if let Some(new) = k.key.as_ref().and_then(|id| to.get(id)) {
             k.key = Some(new.clone());
             changed = true;
         }
@@ -125,18 +138,22 @@ pub struct Client<S: Read + Write> {
     r: BufReader<S>,
 }
 
+/// What [`Client::piece`] read.
+enum Piece {
+    Line(Vec<u8>),
+    /// The answer's end (a line of just `.`).
+    End,
+    /// A line longer than it had room for.
+    TooLong,
+}
+
 fn proto(m: impl Into<String>) -> NetError {
     NetError::Protocol(m.into())
 }
 
 impl Client<Stream> {
-    /// Connect as the server settings say (no sign-in yet).
-    pub fn connect(cfg: &ServerConfig) -> Result<Client<Stream>> {
-        Self::connect_trusting(cfg, &[])
-    }
-
-    /// [`Self::connect`] for an account's server: `trusted` are the certificates the user chose
-    /// to trust for one on this computer ([`stream::tls_trusting`]).
+    /// Connect as the server settings say (no sign-in yet): `trusted` are the certificates the
+    /// user chose to trust for the account's server on this computer ([`stream::tls_trusting`]).
     pub fn connect_trusting(cfg: &ServerConfig, trusted: &[String]) -> Result<Client<Stream>> {
         let sock = stream::tcp(&cfg.host, cfg.port)?;
         match cfg.security {
@@ -145,11 +162,8 @@ impl Client<Stream> {
             Security::StartTls => {
                 let mut c = Client::greet(Stream::Plain(sock))?;
                 c.ok("STLS").map_err(|_| NetError::Tls("the server does not offer STLS".into()))?;
-                if !c.r.buffer().is_empty() {
-                    return Err(NetError::Tls("unexpected data before TLS negotiation".into()));
-                }
-                let Stream::Plain(sock) = c.r.into_inner() else { return Err(NetError::Tls("connection already encrypted".into())) };
-                Ok(Client { r: BufReader::new(stream::tls_trusting(sock, &cfg.host, trusted)?) })
+                let unread = c.r.buffer().len();
+                Ok(Client { r: BufReader::new(stream::starttls(c.r.into_inner(), unread, &cfg.host, trusted)?) })
             }
         }
     }
@@ -167,14 +181,11 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn line(&mut self) -> Result<String> {
-        let mut buf = Vec::new();
-        let n = (&mut self.r).take(MAX_LINE as u64).read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            return Err(NetError::Closed("the server closed the connection".into()));
-        }
-        if !buf.ends_with(b"\n") {
-            return Err(proto("a line too long"));
-        }
+        let mut buf = match super::capped_line(&mut self.r, MAX_LINE)? {
+            super::Capped::Line(buf) => buf,
+            super::Capped::Closed => return Err(NetError::Closed("the server closed the connection".into())),
+            super::Capped::TooLong => return Err(proto("a line too long")),
+        };
         while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
             buf.pop();
         }
@@ -202,25 +213,41 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    /// The next line of a multi-line answer, dot-stuffing undone, read whole when it takes at
+    /// most `room` bytes (its line break included).
+    fn piece(&mut self, room: usize) -> Result<Piece> {
+        // A whole line, however long, only the room capping it: read in pieces of a short line's
+        // length, each was taken for a line (a break put inside it), and a piece that was just
+        // `.` for the end.
+        let mut buf = Vec::new();
+        let n = (&mut self.r).take(u64::try_from(room).unwrap_or(u64::MAX)).read_until(b'\n', &mut buf)?;
+        if !buf.ends_with(b"\n") {
+            return if n == room { Ok(Piece::TooLong) } else { Err(NetError::Closed("the server closed the connection".into())) };
+        }
+        let line = buf.strip_suffix(b"\r\n").or_else(|| buf.strip_suffix(b"\n")).unwrap_or(&buf);
+        if line == b"." {
+            return Ok(Piece::End);
+        }
+        let line = line.strip_prefix(b".").filter(|_| line.starts_with(b"..")).unwrap_or(line);
+        Ok(Piece::Line(line.to_vec()))
+    }
+
     /// A multi-line answer's body (dot-stuffing undone), bytes at most `max`.
     fn multi(&mut self, max: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        let too_big = || proto(format!("larger than {} MB", max >> 20));
         loop {
-            let mut buf = Vec::new();
-            let n = (&mut self.r).take(MAX_LINE as u64 + 2).read_until(b'\n', &mut buf)?;
-            if n == 0 {
-                return Err(NetError::Closed("the server closed the connection".into()));
+            match self.piece(max.saturating_sub(out.len()).saturating_add(3))? {
+                Piece::End => return Ok(out),
+                Piece::TooLong => return Err(too_big()),
+                Piece::Line(line) => {
+                    if out.len() + line.len() + 2 > max {
+                        return Err(too_big());
+                    }
+                    out.extend_from_slice(&line);
+                    out.extend_from_slice(b"\r\n");
+                }
             }
-            let line = buf.strip_suffix(b"\r\n").or_else(|| buf.strip_suffix(b"\n")).unwrap_or(&buf);
-            if line == b"." {
-                return Ok(out);
-            }
-            let line = line.strip_prefix(b".").filter(|_| line.starts_with(b"..")).unwrap_or(line);
-            if out.len() + line.len() + 2 > max {
-                return Err(proto(format!("larger than {} MB", max >> 20)));
-            }
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
         }
     }
 
@@ -233,22 +260,33 @@ impl<S: Read + Write> Client<S> {
 
     /// Sign in with an OAuth token (`AUTH XOAUTH2`).
     pub fn login_xoauth2(&mut self, user: &str, token: &str) -> Result<()> {
-        let blob = crate::imap::base64(format!("user={user}\x01auth=Bearer {token}\x01\x01").as_bytes());
-        self.ok(&format!("AUTH XOAUTH2 {blob}")).map(drop).map_err(|e| auth(&e))
+        self.ok(&format!("AUTH XOAUTH2 {}", crate::oauth::xoauth2(user, token))).map(drop).map_err(|e| auth(&e))
     }
 
-    /// Message numbers and unique ids.
+    /// Message numbers and unique ids. Read a line at a time, the cap on their count: capped at
+    /// 4 MB as a whole, ordinary ids passed it near 130,000 messages. More than the cap is an
+    /// error rather than a list cut short, whose missing ids were forgotten as gone.
     pub fn uidl(&mut self) -> Result<Vec<(u32, String)>> {
         self.ok("UIDL")?;
-        let body = self.multi(MAX_LINE * 64)?;
-        Ok(String::from_utf8_lossy(&body)
-            .lines()
-            .take(MAX_MESSAGES)
-            .filter_map(|l| {
-                let (n, id) = l.trim().split_once(' ')?;
-                Some((n.parse().ok()?, id.trim().chars().take(70).collect()))
-            })
-            .collect())
+        let mut out = Vec::new();
+        let mut lines = 0usize;
+        loop {
+            let line = match self.piece(MAX_LINE)? {
+                Piece::End => return Ok(out),
+                Piece::TooLong => return Err(proto("a UIDL line too long")),
+                Piece::Line(line) => line,
+            };
+            lines += 1;
+            if lines > MAX_MESSAGES {
+                return Err(proto(format!("the server lists more than {MAX_MESSAGES} messages")));
+            }
+            let line = String::from_utf8_lossy(&line);
+            if let Some((n, id)) = line.trim().split_once(' ')
+                && let Ok(n) = n.parse()
+            {
+                out.push((n, id.trim().chars().take(70).collect()));
+            }
+        }
     }
 
     pub fn retr(&mut self, n: u32) -> Result<Vec<u8>> {
@@ -280,7 +318,7 @@ fn auth(e: &NetError) -> NetError {
 /// Sign in to an account's POP server.
 pub fn open(acc: &AccountConfig, secret: &str) -> Result<Client<Stream>> {
     let cfg = acc.pop.as_ref().ok_or_else(|| proto("not a POP account"))?;
-    let user = if acc.username.is_empty() { acc.email.as_str() } else { acc.username.as_str() };
+    let user = acc.login_name();
     let mut c = Client::connect_trusting(cfg, &acc.trusted_certificates)?;
     if acc.oauth.is_some() {
         c.login_xoauth2(user, secret)?;
@@ -306,14 +344,16 @@ pub fn folders(store: &Store, account: &str) -> Result<Vec<Folder>> {
     Ok(list)
 }
 
-/// Download what's new into the Inbox, and remove from the server what the account says should go
-/// (`keep`): at once, so many days after downloading, or once deleted here for good.
+/// [`fetch_new_as`] for an account as it is now (the tests').
+#[cfg(test)]
 pub fn fetch_new<S: Read + Write>(c: &mut Client<S>, store: &Store, account: &str, inbox: &str, keep: &Keep, now: i64) -> Result<SyncReport> {
     fetch_new_as(c, store, account, inbox, keep, now, store.removals(account))
 }
 
-/// [`fetch_new`] for a worker that started when its account had been removed `seen` times: a
-/// removal since has it write nothing of the account again, nor remove anything from the server.
+/// Download what's new into the Inbox, and remove from the server what the account says should go
+/// (`keep`): at once, so many days after downloading, or once deleted here for good. For a worker
+/// that started when its account had been removed `seen` times: a removal since has it write
+/// nothing of the account again, nor remove anything from the server.
 pub fn fetch_new_as<S: Read + Write>(
     c: &mut Client<S>,
     store: &Store,
@@ -330,41 +370,161 @@ pub fn fetch_new_as<S: Read + Write>(
         fs.validity = 1;
         fs.uid_next = fs.uid_next.max(1);
     }
-    let mut report = SyncReport::default();
-    for (n, id) in &listed {
-        if let Some(k) = state.get(id) {
-            if keep.removes(k, now) {
-                c.dele(*n)?;
-            }
-            continue;
+    settle(store, account, inbox, seen, &mut state, &fs)?;
+    // The numbers the new mail takes are set aside first, the list saved so: a message recorded
+    // but not yet listed (stopped part-way) keeps its number from any other filed here meanwhile.
+    let mut new: HashSet<&str> = listed.iter().map(|(_, id)| id.as_str()).filter(|id| !state.contains_key(*id)).collect();
+    let next = fs.free_uid(account, inbox)?;
+    if !new.is_empty() {
+        let mut end = next;
+        for _ in 0..new.len() {
+            FolderState::take_uid(&mut end, account, inbox)?;
         }
-        let raw = c.retr(*n)?;
-        let mut next = fs.free_uid(account, inbox)?;
-        let uid = FolderState::take_uid(&mut next, account, inbox)?;
-        let key = MessageKey { account: account.to_string(), folder: inbox.to_string(), validity: fs.validity, uid };
-        if_kept(store, account, seen, || store.write_body(&key, &raw))?;
-        let size = u32::try_from(raw.len()).unwrap_or(u32::MAX);
-        state.insert(id.clone(), Kept { at: now, key: Some(key.to_id()), gone: false });
-        fs.messages.push(mime::summary_from_full(&raw, key, Flags::default(), size, 0).into());
-        fs.uid_next = next;
-        report.new += 1;
-        // Saved as it goes: a dropped connection loses nothing already downloaded.
-        sort_newest_first(&mut fs.messages);
-        if_kept(store, account, seen, || {
-            store.save_folder(account, inbox, &fs)?;
-            store.save_account_doc(account, STATE_DOC, &state)
-        })?;
+        fs.uid_next = end;
+        if_kept(store, account, seen, || store.save_folder(account, inbox, &fs))?;
+    }
+    let mut d = Download { store, account, inbox, seen, now, state, fs, next, came: Vec::new(), bytes: 0, since: Instant::now(), saved: 0 };
+    if let Err(e) = d.fetch(c, &listed, &mut new, keep) {
+        // What came before the failure is kept; the failure is what's told.
+        let _ = d.save();
+        return Err(e);
+    }
+    for n in d.save()? {
         if keep.remove_now {
-            c.dele(*n)?;
+            c.dele(n)?;
         }
     }
     // Forget the ids the server no longer has (one removed now is still listed until QUIT, so it
     // goes from here next time).
-    state.retain(|id, _| listed.iter().any(|(_, l)| l == id));
-    if_kept(store, account, seen, || store.save_account_doc(account, STATE_DOC, &state))?;
-    report.total = u32::try_from(fs.messages.len()).unwrap_or(u32::MAX);
-    report.unread = fs.unread();
-    Ok(report)
+    let on_server: HashSet<&str> = listed.iter().map(|(_, id)| id.as_str()).collect();
+    d.state.retain(|id, _| on_server.contains(id.as_str()));
+    if_kept(store, account, seen, || store.save_account_doc(account, STATE_DOC, &d.state))?;
+    Ok(SyncReport { new: d.saved, total: u32::try_from(d.fs.messages.len()).unwrap_or(u32::MAX), unread: d.fs.unread(), ..Default::default() })
+}
+
+/// A download stopped part-way (an error, or the app closed) after recording messages and before
+/// the Inbox's list named them ([`Download::save`]): each recorded so that the list doesn't name
+/// is forgotten, to come again, its source (if written) removed; one the list names, or moved or
+/// deleted for good since, stays.
+fn settle(store: &Store, account: &str, inbox: &str, seen: u64, state: &mut State, fs: &FolderState) -> Result<()> {
+    if !state.values().any(|k| k.pending) {
+        return Ok(());
+    }
+    let listed: HashSet<u32> = fs.messages.iter().filter(|m| m.key.validity == fs.validity).map(|m| m.key.uid).collect();
+    let mut lost = Vec::new();
+    state.retain(|_, k| {
+        if !std::mem::take(&mut k.pending) || k.gone {
+            return true;
+        }
+        match k.key.as_deref().and_then(MessageKey::from_id) {
+            Some(key) if key.account == account && key.folder == inbox && key.validity == fs.validity && !listed.contains(&key.uid) => {
+                lost.push(key);
+                false
+            }
+            _ => true,
+        }
+    });
+    if_kept(store, account, seen, || store.save_account_doc(account, STATE_DOC, state))?;
+    store.while_kept(account, seen, || lost.iter().for_each(|key| store.remove_body(key)));
+    Ok(())
+}
+
+/// A message downloaded and not yet saved.
+struct Came {
+    /// Its number on the server, this session.
+    n: u32,
+    id: String,
+    summary: Summary,
+    raw: Vec<u8>,
+}
+
+/// New mail on its way into the Inbox, saved a batch at a time ([`Download::save`]).
+struct Download<'a> {
+    store: &'a Store,
+    account: &'a str,
+    inbox: &'a str,
+    seen: u64,
+    now: i64,
+    state: State,
+    fs: FolderState,
+    /// The next of the numbers set aside.
+    next: u32,
+    came: Vec<Came>,
+    bytes: usize,
+    since: Instant,
+    saved: usize,
+}
+
+impl Download<'_> {
+    /// Download what `new` names (each once), saving as it goes, and remove from the server what
+    /// the account says should go.
+    fn fetch<S: Read + Write>(&mut self, c: &mut Client<S>, listed: &[(u32, String)], new: &mut HashSet<&str>, keep: &Keep) -> Result<()> {
+        for (n, id) in listed {
+            if !new.remove(id.as_str()) {
+                if let Some(k) = self.state.get(id)
+                    && keep.removes(k, self.now)
+                {
+                    c.dele(*n)?;
+                }
+                continue;
+            }
+            let raw = c.retr(*n)?;
+            let uid = FolderState::take_uid(&mut self.next, self.account, self.inbox)?;
+            let key = MessageKey { account: self.account.to_string(), folder: self.inbox.to_string(), validity: self.fs.validity, uid };
+            let size = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+            let summary = mime::summary_from_full(&raw, key, Flags::default(), size, 0);
+            self.bytes = self.bytes.saturating_add(raw.len());
+            self.came.push(Came { n: *n, id: id.clone(), summary, raw });
+            if self.came.len() >= SAVE_EVERY || self.bytes >= SAVE_BYTES || self.since.elapsed() >= SAVE_AFTER {
+                for n in self.save()? {
+                    if keep.remove_now {
+                        c.dele(n)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Save what came: its record first, each marked pending; then the sources and the list
+    /// naming them; then the record again, no longer pending. Stopped anywhere between (an error,
+    /// or the app closed), nothing is lost or listed twice: one recorded that the list doesn't
+    /// name comes again ([`settle`]), its number given to no other. Returns the server's numbers
+    /// of the messages saved (to remove there only once saved here).
+    fn save(&mut self) -> Result<Vec<u32>> {
+        self.since = Instant::now();
+        if self.came.is_empty() {
+            return Ok(Vec::new());
+        }
+        let came = std::mem::take(&mut self.came);
+        self.bytes = 0;
+        let (store, account, seen) = (self.store, self.account, self.seen);
+        for c in &came {
+            self.state.insert(c.id.clone(), Kept { at: self.now, key: Some(c.summary.key.to_id()), gone: false, pending: true });
+        }
+        if_kept(store, account, seen, || store.save_account_doc(account, STATE_DOC, &self.state))?;
+        let packs = store.packs(account);
+        let mut numbers = Vec::with_capacity(came.len());
+        let mut ids = Vec::with_capacity(came.len());
+        let mut sources = Vec::with_capacity(came.len());
+        for c in came {
+            numbers.push(c.n);
+            ids.push(c.id);
+            sources.push((c.summary.key.clone(), Store::prepare(packs, c.raw)));
+            self.fs.messages.push(c.summary.into());
+        }
+        if_kept(store, account, seen, || store.write_prepared(sources, true))?;
+        sort_newest_first(&mut self.fs.messages);
+        if_kept(store, account, seen, || store.save_folder(account, self.inbox, &self.fs))?;
+        for id in &ids {
+            if let Some(k) = self.state.get_mut(id) {
+                k.pending = false;
+            }
+        }
+        if_kept(store, account, seen, || store.save_account_doc(account, STATE_DOC, &self.state))?;
+        self.saved += numbers.len();
+        Ok(numbers)
+    }
 }
 
 /// A folder kept on this computer: its counts (an error rather than none when its list can't be
@@ -376,19 +536,11 @@ pub fn local_counts(store: &Store, account: &str, folder: &str) -> Result<SyncRe
 
 /// Put a message in a folder on this computer (a draft, or the copy of one sent); its key.
 pub fn file_locally(store: &Store, account: &str, folder: &str, raw: &[u8], flags: Flags, now: i64) -> Result<MessageKey> {
-    let mut fs = store.load_folder(account, folder)?;
-    if fs.validity == 0 {
-        fs.validity = 1;
-    }
-    let mut next = fs.free_uid(account, folder)?;
-    let uid = FolderState::take_uid(&mut next, account, folder)?;
-    let key = MessageKey { account: account.to_string(), folder: folder.to_string(), validity: fs.validity, uid };
-    store.write_body(&key, raw)?;
+    let mut filing = Filing::new(store, account, folder)?;
+    let key = filing.key()?;
     let size = u32::try_from(raw.len()).unwrap_or(u32::MAX);
-    fs.messages.push(mime::summary_from_full(raw, key.clone(), flags, size, now).into());
-    fs.uid_next = next;
-    sort_newest_first(&mut fs.messages);
-    store.save_folder(account, folder, &fs)?;
+    filing.add(mime::summary_from_full(raw, key.clone(), flags, size, now), Some(raw.to_vec()))?;
+    filing.finish()?;
     Ok(key)
 }
 
@@ -412,8 +564,8 @@ pub fn move_locally(store: &Store, account: &str, keys: &[MessageKey], to: &str)
     let mut pairs = Vec::new();
     let mut changed = Vec::new();
     for (folder, src) in &mut lists {
-        let (going, staying): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut src.messages).into_iter().partition(|m| keys.iter().any(|k| k.folder == *folder && k.uid == m.key.uid));
+        let uids: HashSet<u32> = keys.iter().filter(|k| k.folder == *folder).map(|k| k.uid).collect();
+        let (going, staying): (Vec<_>, Vec<_>) = std::mem::take(&mut src.messages).into_iter().partition(|m| uids.contains(&m.key.uid));
         src.messages = staying;
         if going.is_empty() {
             continue;
@@ -456,367 +608,7 @@ pub fn move_locally(store: &Store, account: &str, keys: &[MessageKey], to: &str)
 }
 
 #[cfg(test)]
-pub(crate) mod fake {
-    //! A POP3 server on localhost for tests: one maildrop, `USER`/`PASS`, `UIDL`, `RETR`, `DELE`.
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
-
-    pub struct Server {
-        pub port: u16,
-        /// (unique id, message); deleted ones go at `QUIT`.
-        pub drop: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
-    }
-
-    pub fn serve(messages: Vec<(String, Vec<u8>)>) -> Server {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        let drop = Arc::new(Mutex::new(messages));
-        let shared = drop.clone();
-        std::thread::spawn(move || {
-            for conn in l.incoming() {
-                let Ok(mut s) = conn else { continue };
-                let shared = shared.clone();
-                std::thread::spawn(move || {
-                    let mut r = BufReader::new(s.try_clone().unwrap());
-                    let _ = s.write_all(b"+OK test POP3 ready\r\n");
-                    let (mut user, mut authed, mut deleted) = (String::new(), false, Vec::<usize>::new());
-                    loop {
-                        let mut line = String::new();
-                        if r.read_line(&mut line).unwrap_or(0) == 0 {
-                            return;
-                        }
-                        let line = line.trim_end().to_string();
-                        let (cmd, arg) = line.split_once(' ').unwrap_or((line.as_str(), ""));
-                        let d = shared.lock().unwrap().clone();
-                        let out = match cmd.to_ascii_uppercase().as_str() {
-                            "USER" => {
-                                user = arg.to_string();
-                                "+OK\r\n".to_string()
-                            }
-                            "PASS" if user == "me@pop.example" && arg == "pw" => {
-                                authed = true;
-                                "+OK signed in\r\n".to_string()
-                            }
-                            "PASS" => "-ERR [AUTH] wrong password\r\n".to_string(),
-                            _ if !authed => "-ERR sign in first\r\n".to_string(),
-                            "UIDL" => {
-                                let mut o = "+OK\r\n".to_string();
-                                for (i, (id, _)) in d.iter().enumerate().filter(|(i, _)| !deleted.contains(i)) {
-                                    o.push_str(&format!("{} {id}\r\n", i + 1));
-                                }
-                                o + ".\r\n"
-                            }
-                            "RETR" => match arg.parse::<usize>().ok().and_then(|n| d.get(n.wrapping_sub(1))) {
-                                Some((_, m)) => {
-                                    let body: String = String::from_utf8_lossy(m)
-                                        .split("\r\n")
-                                        .map(|l| if l.starts_with('.') { format!(".{l}\r\n") } else { format!("{l}\r\n") })
-                                        .collect();
-                                    format!("+OK\r\n{body}.\r\n")
-                                }
-                                None => "-ERR no such message\r\n".to_string(),
-                            },
-                            "DELE" => {
-                                if let Ok(n) = arg.parse::<usize>() {
-                                    deleted.push(n - 1);
-                                }
-                                "+OK\r\n".to_string()
-                            }
-                            "QUIT" => {
-                                let mut all = shared.lock().unwrap();
-                                let mut i = 0;
-                                all.retain(|_| {
-                                    i += 1;
-                                    !deleted.contains(&(i - 1))
-                                });
-                                let _ = s.write_all(b"+OK bye\r\n");
-                                return;
-                            }
-                            _ => "-ERR unknown\r\n".to_string(),
-                        };
-                        let _ = s.write_all(out.as_bytes());
-                    }
-                });
-            }
-        });
-        Server { port, drop }
-    }
-}
+pub(crate) mod fake;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mail(subject: &str, extra: &str) -> Vec<u8> {
-        format!("From: Ana <ana@pop.example>\r\nTo: me@pop.example\r\nSubject: {subject}\r\nMessage-ID: <{subject}@x>\r\n\r\nHello.\r\n{extra}")
-            .into_bytes()
-    }
-
-    /// Found in review: a mailbox another session holds, or a server that asks to wait, was
-    /// taken for a refused password, which was then asked for and the account checked no more.
-    #[test]
-    fn a_busy_mailbox_isnt_a_wrong_password() {
-        for busy in ["[IN-USE] mailbox locked", "[in-use] Do not hammer", "[LOGIN-DELAY] wait 30 seconds", "[SYS/TEMP] try later"] {
-            assert!(matches!(auth(&NetError::No(busy.into())), NetError::Later(m) if m == busy), "{busy}");
-        }
-        assert!(matches!(auth(&NetError::No("[AUTH] wrong password".into())), NetError::Auth(_)));
-        assert!(matches!(auth(&NetError::No(String::new())), NetError::Auth(_)));
-    }
-
-    #[test]
-    fn new_mail_comes_down_once_and_stays_on_the_server_unless_asked() {
-        let server = fake::serve(vec![("u1".into(), mail("One", "")), ("u2".into(), mail("Two", ".a line starting with a dot\r\n"))]);
-        let dir = std::env::temp_dir().join(format!("mailcraft-pop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        let cfg = ServerConfig { host: "127.0.0.1".into(), port: server.port, security: Security::None };
-        let acc = AccountConfig { id: "p1".into(), email: "me@pop.example".into(), pop: Some(cfg), ..Default::default() };
-        assert!(matches!(open(&acc, "wrong"), Err(NetError::Auth(_))));
-        let list = folders(&store, "p1").unwrap();
-        assert_eq!(list.iter().filter(|f| f.role == FolderRole::Inbox).count(), 1);
-        let mut c = open(&acc, "pw").unwrap();
-        let keep = Keep::default();
-        let r = fetch_new(&mut c, &store, "p1", "INBOX", &keep, 1_000).unwrap();
-        c.quit().unwrap();
-        assert_eq!((r.new, r.total, r.unread), (2, 2, 2));
-        let st = store.load_folder("p1", "INBOX").unwrap();
-        let two = st.messages.iter().find(|m| m.subject == "Two").unwrap();
-        let raw = String::from_utf8(store.read_body(&two.key).unwrap()).unwrap();
-        assert!(raw.contains("\r\n.a line starting with a dot\r\n"), "dot-stuffing undone: {raw}");
-        // Again: nothing new; the server still has both.
-        let mut c = open(&acc, "pw").unwrap();
-        assert_eq!(fetch_new(&mut c, &store, "p1", "INBOX", &keep, 1_000).unwrap().new, 0);
-        c.quit().unwrap();
-        assert_eq!(server.drop.lock().unwrap().len(), 2);
-        // New mail, and removing from the server.
-        server.drop.lock().unwrap().push(("u3".into(), mail("Three", "")));
-        let mut c = open(&acc, "pw").unwrap();
-        assert_eq!(fetch_new(&mut c, &store, "p1", "INBOX", &Keep { remove_now: true, ..keep }, 1_000).unwrap().new, 1);
-        c.quit().unwrap();
-        assert!(server.drop.lock().unwrap().is_empty(), "removed after downloading");
-        assert_eq!(store.load_folder("p1", "INBOX").unwrap().messages.len(), 3);
-        // A copy filed here.
-        let k = file_locally(&store, "p1", "Sent Items", &mail("Sent", ""), Flags { seen: true, ..Default::default() }, 1).unwrap();
-        assert!(store.has_body(&k));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// As Outlook's POP settings: a copy stays on the server for so many days, or until it's
-    /// deleted here for good.
-    #[test]
-    fn server_copies_go_after_days_or_once_deleted_for_good() {
-        let day = 86_400;
-        let server = fake::serve(vec![("u1".into(), mail("One", "")), ("u2".into(), mail("Two", "")), ("u3".into(), mail("Three", ""))]);
-        let dir = std::env::temp_dir().join(format!("mailcraft-pop-keep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        let cfg = ServerConfig { host: "127.0.0.1".into(), port: server.port, security: Security::None };
-        let acc = AccountConfig { id: "p1".into(), email: "me@pop.example".into(), pop: Some(cfg), ..Default::default() };
-        folders(&store, "p1").unwrap();
-        let keep = Keep { remove_now: false, days: Some(14), with_trash: true };
-        let sync = |now: i64| {
-            let mut c = open(&acc, "pw").unwrap();
-            let r = fetch_new(&mut c, &store, "p1", "INBOX", &keep, now).unwrap();
-            c.quit().unwrap();
-            r
-        };
-        assert_eq!(sync(0).new, 3);
-        let on_server = || server.drop.lock().unwrap().iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-        // One moved to Deleted Items and deleted there for good: its server copy goes.
-        let inbox = store.load_folder("p1", "INBOX").unwrap();
-        let one = inbox.messages.iter().find(|m| m.subject == "One").unwrap().key.clone();
-        move_locally(&store, "p1", &[one], "Deleted Items").unwrap();
-        let moved = store.load_folder("p1", "Deleted Items").unwrap().messages[0].key.clone();
-        deleted_for_good(&store, "p1", &[moved]).unwrap();
-        assert_eq!(sync(day).new, 0);
-        assert_eq!(on_server(), ["u2", "u3"]);
-        // Thirteen days on, both stay; fourteen, they go (and aren't downloaded again).
-        sync(13 * day);
-        assert_eq!(on_server().len(), 2);
-        server.drop.lock().unwrap().push(("u4".into(), mail("Four", "")));
-        assert_eq!(sync(14 * day).new, 1);
-        assert_eq!(on_server(), ["u4"], "the new one stays its fourteen days");
-        assert_eq!(store.load_folder("p1", "INBOX").unwrap().messages.len(), 3, "this computer keeps them all");
-        // From before: the seen list carries over, nothing downloaded twice.
-        store.save_account_doc("p1", STATE_DOC, &State::new()).unwrap();
-        store.save_account_doc("p1", SEEN_DOC, &vec!["u4".to_string()]).unwrap();
-        assert_eq!(sync(15 * day).new, 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A move the cache can't read or write leaves the mail where it was, its source with it;
-    /// working again, it moves.
-    #[test]
-    fn a_move_that_cant_read_or_write_keeps_the_mail() {
-        let store = Store::failing();
-        folders(&store, "p1").unwrap();
-        let one = file_locally(&store, "p1", "INBOX", &mail("One", ""), Flags::default(), 1).unwrap();
-        let two = file_locally(&store, "p1", "INBOX", &mail("Two", ""), Flags::default(), 2).unwrap();
-        let kept = file_locally(&store, "p1", "Archive", &mail("Kept", ""), Flags::default(), 3).unwrap();
-        let path = store.body_path(&kept);
-        let dir = path.parent().and_then(std::path::Path::parent).and_then(std::path::Path::file_name).unwrap().to_string_lossy();
-        let archive_list = format!("{dir}/state.json");
-        let count = |f: &str| store.load_folder("p1", f).unwrap().messages.len();
-        let whole = |f: &str| store.load_folder("p1", f).unwrap().messages.iter().all(|m| store.read_body(&m.key).is_some());
-        for (reads, writes) in [(Some(".eml"), None), (None, Some(".eml")), (None, Some(archive_list.as_str())), (Some("state.json"), None)] {
-            store.fail(reads, writes);
-            let r = move_locally(&store, "p1", &[one.clone(), two.clone()], "Archive");
-            store.fail(None, None);
-            assert!(r.is_err(), "{reads:?} {writes:?}: {r:?}");
-            assert_eq!((count("INBOX"), count("Archive")), (2, 1), "{reads:?} {writes:?}");
-            assert!(whole("INBOX") && whole("Archive"), "{reads:?} {writes:?}");
-        }
-        assert_eq!(move_locally(&store, "p1", &[one, two], "Archive").unwrap(), ["INBOX", "Archive"]);
-        assert_eq!((count("INBOX"), count("Archive")), (0, 3));
-        assert!(whole("Archive"));
-        // A list at the last number takes no more, rather than filing two under one.
-        let mut full = store.load_folder("p1", "Archive").unwrap();
-        full.uid_next = u32::MAX;
-        store.save_folder("p1", "Archive", &full).unwrap();
-        let moving: Vec<_> = full.messages.iter().map(|m| m.key.clone()).take(2).collect();
-        assert!(move_locally(&store, "p1", &moving, "INBOX").is_ok(), "the Inbox has numbers");
-        let back = store.load_folder("p1", "INBOX").unwrap().messages.iter().map(|m| m.key.clone()).collect::<Vec<_>>();
-        assert!(move_locally(&store, "p1", &back, "Archive").is_err());
-        assert!(file_locally(&store, "p1", "Archive", &mail("Late", ""), Flags::default(), 4).is_err());
-        assert_eq!((count("INBOX"), count("Archive")), (2, 1));
-        assert!(whole("INBOX") && whole("Archive"));
-    }
-
-    /// Answers to read, and what's written thrown away.
-    struct Canned(std::io::Cursor<Vec<u8>>);
-    impl Read for Canned {
-        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-            self.0.read(b)
-        }
-    }
-    impl Write for Canned {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    fn canned(s: &[u8]) -> Canned {
-        Canned(std::io::Cursor::new(s.to_vec()))
-    }
-
-    #[test]
-    fn a_pop_account_works_through_the_pool() {
-        use mailcraft_model::job::Secret;
-        use mailcraft_model::{Event, Flag, Job, Op, SyncStatus};
-        use std::time::{Duration, Instant};
-        let server = fake::serve(vec![("u1".into(), mail("Welcome", "")), ("u2".into(), mail("Invoice", ""))]);
-        let (smtp_port, smtp) = crate::smtp::tests::serve_once();
-        let dir = std::env::temp_dir().join(format!("mailcraft-pop-pool-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir).unwrap();
-        crate::fakes::fake_dav::looked_for_today(&store, "p1");
-        let mut pool = crate::worker::Pool::new(store.clone(), std::sync::Arc::new(crate::worker::MemoryCredentials::default()));
-        let acc = AccountConfig {
-            id: "p1".into(),
-            name: "Me".into(),
-            email: "me@pop.example".into(),
-            username: "me@pop.example".into(),
-            pop: Some(ServerConfig { host: "127.0.0.1".into(), port: server.port, security: Security::None }),
-            smtp: ServerConfig { host: "127.0.0.1".into(), port: smtp_port, security: Security::None },
-            ..Default::default()
-        };
-        assert!(!acc.is_local() && !acc.is_api());
-        let until = |pool: &crate::worker::Pool, what: &str, f: &dyn Fn(&Event) -> bool| {
-            let end = Instant::now() + Duration::from_secs(20);
-            let mut seen = Vec::new();
-            while Instant::now() < end {
-                if let Some(e) = pool.wait(Duration::from_millis(100)) {
-                    let hit = f(&e);
-                    seen.push(e);
-                    if hit {
-                        return seen;
-                    }
-                }
-            }
-            panic!("timed out waiting for {what}; saw {seen:?}");
-        };
-        pool.submit(Job::Start { account: acc.clone(), password: Some(Secret("wrong".into())) });
-        until(&pool, "sign in again", &|e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
-        pool.submit(Job::Start { account: acc.clone(), password: Some(Secret("pw".into())) });
-        let seen = until(&pool, "online", &|e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
-        let folders = seen.iter().rev().find_map(|e| if let Event::Folders { folders, .. } = e { Some(folders.clone()) } else { None }).unwrap();
-        let mut paths: Vec<&str> = folders.iter().map(|f| f.path.as_str()).collect();
-        paths.sort_unstable();
-        assert_eq!(paths, ["Deleted Items", "Drafts", "INBOX", "Junk Email", "Sent Items"]);
-        let inbox = store.load_folder("p1", "INBOX").unwrap();
-        assert_eq!(inbox.messages.len(), 2);
-        // Changes stay here.
-        let k = inbox.messages[0].key.clone();
-        pool.submit(Job::Apply { account: "p1".into(), op: Op::SetFlag { keys: vec![k.clone()], flag: Flag::Seen, on: true } });
-        pool.submit(Job::Apply { account: "p1".into(), op: Op::Move { keys: vec![k], to: "Deleted Items".into() } });
-        let here = |folder: &str, n: usize| {
-            let end = Instant::now() + Duration::from_secs(10);
-            while store.load_folder("p1", folder).map_or(0, |f| f.messages.len()) < n && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            store.load_folder("p1", folder).unwrap()
-        };
-        assert_eq!(here("Deleted Items", 1).messages.len(), 1);
-        assert_eq!(server.drop.lock().unwrap().len(), 2, "the server keeps its copies");
-        // A draft and a sent copy are filed here.
-        pool.submit(Job::SaveDraft { account: "p1".into(), raw: mail("Draft", ""), folder: "Drafts".into(), replaces: None });
-        assert!(here("Drafts", 1).messages.iter().any(|m| m.flags.draft));
-        let raw = b"From: me@pop.example\r\nTo: ana@pop.example\r\nSubject: Hi\r\nMessage-ID: <s@x>\r\n\r\nhi\r\n".to_vec();
-        pool.submit(Job::Send {
-            account: "p1".into(),
-            id: 1,
-            raw,
-            from: "me@pop.example".into(),
-            recipients: vec!["ana@pop.example".into()],
-            sent_folder: Some("Sent Items".into()),
-        });
-        until(&pool, "sent", &|e| matches!(e, Event::Sent { id: 1, .. }));
-        assert!(smtp.join().unwrap().contains("RCPT TO:<ana@pop.example>"));
-        assert_eq!(here("Sent Items", 1).messages.len(), 1);
-        pool.submit(Job::Remove { account: "p1".into() });
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// What was downloaded can't be read: nothing comes down again (it all did, as new), and the
-    /// record isn't written over; a folder that can't be read has no counts rather than 0.
-    #[test]
-    fn a_store_that_cant_be_read_downloads_nothing_twice() {
-        let server = fake::serve(vec![("u1".into(), mail("One", "")), ("u2".into(), mail("Two", ""))]);
-        let store = Store::failing();
-        let cfg = ServerConfig { host: "127.0.0.1".into(), port: server.port, security: Security::None };
-        let acc = AccountConfig { id: "p1".into(), email: "me@pop.example".into(), pop: Some(cfg), ..Default::default() };
-        folders(&store, "p1").unwrap();
-        let keep = Keep { remove_now: false, days: None, with_trash: false };
-        let sync = || {
-            let mut c = open(&acc, "pw").unwrap();
-            let r = fetch_new(&mut c, &store, "p1", "INBOX", &keep, 0);
-            let _ = c.quit();
-            r
-        };
-        assert_eq!(sync().unwrap().new, 2);
-        store.fail(Some(STATE_DOC), None);
-        assert!(sync().is_err());
-        store.fail(Some("state.json"), None);
-        assert!(local_counts(&store, "p1", "Deleted Items").is_err());
-        store.fail(None, None);
-        assert_eq!(sync().unwrap().new, 0);
-        assert_eq!(store.load_folder("p1", "INBOX").unwrap().messages.len(), 2);
-        assert_eq!(local_counts(&store, "p1", "INBOX").unwrap().total, 2);
-    }
-
-    #[test]
-    fn hostile_answers_are_refused() {
-        assert!(Client::greet(canned(b"* IMAP\r\n")).is_err());
-        let long = format!("+OK hi\r\n{}", "x".repeat(MAX_LINE + 10));
-        let mut c = Client::greet(canned(long.as_bytes())).unwrap();
-        assert!(c.line().is_err());
-        let mut c = Client::greet(canned(b"+OK\r\n+OK\r\n1 a\r\n")).unwrap();
-        assert!(c.uidl().is_err(), "an answer that never ends");
-        let mut c = Client::greet(canned(b"+OK\r\n-ERR [AUTH] no\r\n")).unwrap();
-        assert!(matches!(c.login("u", "p"), Err(NetError::Auth(_))));
-        assert!(Client::greet(canned(b"+OK\r\n")).unwrap().send("USER a\r\nPASS b").is_err(), "no command injection");
-    }
-}
+mod tests;

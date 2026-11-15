@@ -5,7 +5,7 @@
 //! never loses half a response. Parsing is `imap-proto`'s. Server input is hostile: line and
 //! literal sizes are capped and nothing indexes unchecked.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
@@ -35,17 +35,14 @@ pub enum Part<'a> {
 
 /// An IMAP `astring` argument: quoted when printable ASCII, else a literal (8-bit allowed).
 pub fn quoted(s: &str) -> Option<String> {
-    if s.chars().all(|c| (' '..='~').contains(&c)) { Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))) } else { None }
+    s.chars().all(|c| (' '..='~').contains(&c)).then(|| super::quote(s))
 }
 
 /// Mailbox names are 7-bit (modified UTF-7) and go quoted. One a server listed in UTF-8 goes
 /// quoted too, whole: its letters outside ASCII were left out, which named another mailbox
 /// (`Büro` became `Bro`). Control characters never go: a line end would start a command.
 fn mailbox_arg(name: &str) -> String {
-    quoted(name).unwrap_or_else(|| {
-        let kept: String = name.chars().filter(|c| !c.is_control()).collect();
-        format!("\"{}\"", kept.replace('\\', "\\\\").replace('"', "\\\""))
-    })
+    quoted(name).unwrap_or_else(|| super::quote(&name.chars().filter(|c| !c.is_control()).collect::<String>()))
 }
 
 /// Compress UIDs into an IMAP sequence set (`1:4,7,9:12`).
@@ -74,11 +71,6 @@ pub fn uid_set(uids: &[u32]) -> String {
     out
 }
 
-/// Split UIDs into chunks whose sets stay short (servers limit command length).
-pub fn uid_chunks(uids: &[u32], per: usize) -> Vec<Vec<u32>> {
-    uids.chunks(per.max(1)).map(<[u32]>::to_vec).collect()
-}
-
 /// Unix seconds as an INTERNALDATE in UTC (`14-Oct-2026 07:30:00 +0000`); none for a time
 /// before 1970 or past the year 9999, which no server takes.
 pub fn internal_date(t: i64) -> Option<String> {
@@ -92,14 +84,17 @@ pub fn internal_date(t: i64) -> Option<String> {
     Some(format!("{d:02}-{month}-{y:04} {:02}:{:02}:{:02} +0000", secs / 3600, secs / 60 % 60, secs % 60))
 }
 
-/// Parse an INTERNALDATE (`14-Oct-2026 09:30:00 +0200`) to Unix seconds.
+/// Parse an INTERNALDATE (`14-Oct-2026 09:30:00 +0200`) to Unix seconds. The server's numbers
+/// are digits only, the year from 1 to 9999 (RFC 3501 gives it four digits).
 pub fn parse_internal_date(s: &str) -> Option<i64> {
+    // Digits only: `parse` alone takes a sign, and an unbounded year overflowed the day count.
+    let num = |x: &str| -> Option<i64> { (!x.is_empty() && x.len() <= 4 && x.bytes().all(|b| b.is_ascii_digit())).then(|| x.parse().ok())? };
     let s = s.trim();
     let (date, rest) = s.split_once(' ')?;
     let mut d = date.trim().split('-');
-    let day: u32 = d.next()?.trim().parse().ok()?;
+    let day = num(d.next()?.trim())?;
     let mon = d.next()?;
-    let year: i64 = d.next()?.parse().ok()?;
+    let year = num(d.next()?)?;
     let month =
         ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].iter().position(|m| m.eq_ignore_ascii_case(mon))? as u32
             + 1;
@@ -107,26 +102,45 @@ pub fn parse_internal_date(s: &str) -> Option<i64> {
     let time = parts.next()?;
     let zone = parts.next().unwrap_or("+0000");
     let mut t = time.split(':');
-    let h: i64 = t.next()?.parse().ok()?;
-    let m: i64 = t.next()?.parse().ok()?;
-    let sec: i64 = t.next().unwrap_or("0").parse().ok()?;
+    let h = num(t.next()?)?;
+    let m = num(t.next()?)?;
+    let sec = num(t.next().unwrap_or("0"))?;
     let sign = if zone.starts_with('-') { -1 } else { 1 };
     let z = zone.trim_start_matches(['+', '-']);
-    let zh: i64 = z.get(..2)?.parse().ok()?;
-    let zm: i64 = z.get(2..4)?.parse().ok()?;
-    if !(1..=31).contains(&day) || h > 23 || m > 59 || sec > 60 {
+    let zh = num(z.get(..2)?)?;
+    let zm = num(z.get(2..4)?)?;
+    if !(1..=31).contains(&day) || year < 1 || h > 23 || m > 59 || sec > 60 {
         return None;
     }
+    let day = u32::try_from(day).ok()?;
     let days = mailcraft_model::dates::days_from_civil(year, month, day);
     Some(days * 86_400 + h * 3600 + m * 60 + sec - sign * (zh * 3600 + zm * 60))
 }
 
-fn auth_error(e: NetError) -> NetError {
+/// The UIDs a `UID SEARCH` found, in order, each once.
+fn searched(rs: Vec<Response<'static>>) -> Vec<u32> {
+    let mut out = Vec::new();
+    for r in rs {
+        if let Response::MailboxData(MailboxDatum::Search(v)) = r {
+            out.extend(v);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// A sign-in the server refused (`NO`, `BAD`) as a refused sign-in, in the server's words, or in
+/// `unsaid` when it gave none.
+fn auth_error(e: NetError, unsaid: &str) -> NetError {
     match e {
-        NetError::No(m) | NetError::Bad(m) => NetError::Auth(if m.is_empty() { "the sign-in was refused".into() } else { m }),
+        NetError::No(m) | NetError::Bad(m) => NetError::Auth(if m.is_empty() { unsaid.into() } else { m }),
         other => other,
     }
 }
+
+/// An OAuth sign-in refused without a word.
+const TOKEN_REFUSED: &str = "the sign-in was refused";
 
 fn info(o: &imap_proto::Outcome<'_>) -> String {
     o.information.as_deref().unwrap_or("").to_string()
@@ -227,13 +241,15 @@ fn caps_from(list: &[Capability<'_>]) -> HashSet<String> {
 }
 
 impl Client<Stream> {
-    /// Connect and read the greeting, upgrading with STARTTLS when configured.
+    /// [`Self::connect_trusting`] trusting no certificate by hand (the tests' servers).
+    #[cfg(test)]
     pub fn connect(cfg: &ServerConfig) -> Result<Client<Stream>> {
         Self::connect_trusting(cfg, &[])
     }
 
-    /// [`Self::connect`] for an account's server: `trusted` are the certificates the user chose
-    /// to trust for one on this computer ([`stream::tls_trusting`]).
+    /// Connect and read the greeting, upgrading with STARTTLS when configured: `trusted` are the
+    /// certificates the user chose to trust for the account's server on this computer
+    /// ([`stream::tls_trusting`]).
     pub fn connect_trusting(cfg: &ServerConfig, trusted: &[String]) -> Result<Client<Stream>> {
         let sock = stream::tcp(&cfg.host, cfg.port)?;
         match cfg.security {
@@ -248,22 +264,8 @@ impl Client<Stream> {
                     return Err(NetError::Tls("the server does not offer STARTTLS".into()));
                 }
                 c.conn.run(&[Part::Text("STARTTLS")])?;
-                if c.conn.pos != c.conn.buf.len() {
-                    // Plain-text data after STARTTLS would be an injection attempt (RFC 3207 §4.2 analogue).
-                    return Err(NetError::Tls("unexpected data before TLS negotiation".into()));
-                }
-                let Stream::Plain(sock) = c.conn.into_inner() else {
-                    return Err(NetError::Tls("connection already encrypted".into()));
-                };
-                let mut c = Client {
-                    conn: Conn::new(stream::tls_trusting(sock, &cfg.host, trusted)?),
-                    caps: HashSet::new(),
-                    selected: None,
-                    qresync: false,
-                    seen: Default::default(),
-                    exists: 0,
-                    news: false,
-                };
+                let unread = c.conn.unread();
+                let mut c = Client::new(stream::starttls(c.conn.into_inner(), unread, &cfg.host, trusted)?);
                 // Capabilities learned before TLS must be discarded (RFC 3501 §6.2.1).
                 c.capability()?;
                 Ok(c)
@@ -273,10 +275,14 @@ impl Client<Stream> {
 }
 
 impl<S: Read + Write> Client<S> {
+    /// A session on `s` that knows nothing of the server yet.
+    fn new(s: S) -> Client<S> {
+        Client { conn: Conn::new(s), caps: HashSet::new(), selected: None, qresync: false, seen: Default::default(), exists: 0, news: false }
+    }
+
     /// Wrap a connected stream and read the server greeting.
     pub fn from_stream(s: S) -> Result<Client<S>> {
-        let mut c =
-            Client { conn: Conn::new(s), caps: HashSet::new(), selected: None, qresync: false, seen: Default::default(), exists: 0, news: false };
+        let mut c = Client::new(s);
         match c.conn.read()? {
             Ok(Response::Data { status: Status::Ok | Status::PreAuth, outcome }) => {
                 if let Some(ResponseCode::Capabilities(list)) = &outcome.code {
@@ -310,14 +316,8 @@ impl<S: Read + Write> Client<S> {
 
     /// Sign in: `AUTHENTICATE PLAIN` with SASL-IR when offered, else `LOGIN`.
     pub fn login(&mut self, user: &str, pass: &str) -> Result<()> {
-        let as_auth = |e: NetError| match e {
-            NetError::No(m) | NetError::Bad(m) => {
-                NetError::Auth(if m.is_empty() { "the server rejected the user name or password".into() } else { m })
-            }
-            other => other,
-        };
         let res = if self.has("AUTH=PLAIN") && self.has("SASL-IR") {
-            let token = base64(format!("\0{user}\0{pass}").as_bytes());
+            let token = mailcraft_model::base64::encode(format!("\0{user}\0{pass}").as_bytes());
             self.cmd(&[Part::Text("AUTHENTICATE PLAIN "), Part::Text(&token)])
         } else if self.has("LOGINDISABLED") {
             return Err(NetError::Auth("the server does not allow sign-in on this connection (use TLS)".into()));
@@ -335,7 +335,7 @@ impl<S: Read + Write> Client<S> {
             }
             self.cmd(&parts)
         };
-        let rs = res.map_err(as_auth)?;
+        let rs = res.map_err(|e| auth_error(e, "the server rejected the user name or password"))?;
         self.after_login(&rs)
     }
 
@@ -348,7 +348,7 @@ impl<S: Read + Write> Client<S> {
             self.conn.send(format!("{tag} AUTHENTICATE XOAUTH2 {ir}\r\n").as_bytes())?;
         } else {
             self.conn.send(format!("{tag} AUTHENTICATE XOAUTH2\r\n").as_bytes())?;
-            self.conn.wait_continue(&tag, &mut collected).map_err(auth_error)?;
+            self.conn.wait_continue(&tag, &mut collected).map_err(|e| auth_error(e, TOKEN_REFUSED))?;
             self.conn.send(format!("{ir}\r\n").as_bytes())?;
         }
         // A refused token comes back as a challenge carrying the error: answer it empty, then
@@ -365,7 +365,7 @@ impl<S: Read + Write> Client<S> {
                 }
                 Ok(Response::Data { status: Status::Bye, outcome }) => return Err(NetError::Closed(info(&outcome))),
                 Ok(other) => collected.push(other),
-                Err(raw) => check_unknown(&tag, &raw).map_err(auth_error)?,
+                Err(raw) => check_unknown(&tag, &raw).map_err(|e| auth_error(e, TOKEN_REFUSED))?,
             }
         }
         self.after_login(&collected)
@@ -599,30 +599,12 @@ impl<S: Read + Write> Client<S> {
                 parts.push(Part::Literal(l));
             }
         }
-        let rs = self.cmd(&parts)?;
-        let mut out = Vec::new();
-        for r in rs {
-            if let Response::MailboxData(MailboxDatum::Search(v)) = r {
-                out.extend(v);
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        Ok(searched(self.cmd(&parts)?))
     }
 
     pub fn uid_search(&mut self, criteria: &str) -> Result<Vec<u32>> {
         let cmd = format!("UID SEARCH {criteria}");
-        let rs = self.cmd(&[Part::Text(&cmd)])?;
-        let mut out = Vec::new();
-        for r in rs {
-            if let Response::MailboxData(MailboxDatum::Search(v)) = r {
-                out.extend(v);
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        Ok(searched(self.cmd(&[Part::Text(&cmd)])?))
     }
 
     /// `UID FETCH set (items)` with an optional modifier (`(CHANGEDSINCE n)`).
@@ -633,6 +615,9 @@ impl<S: Read + Write> Client<S> {
         let cmd = if modifier.is_empty() { format!("UID FETCH {set} ({items})") } else { format!("UID FETCH {set} ({items}) {modifier}") };
         let rs = self.cmd(&[Part::Text(&cmd)])?;
         let mut out: Vec<Fetched> = Vec::new();
+        // Each UID's place in `out` (looked for in it, a big folder's flags were a pass over the
+        // answer per message).
+        let mut at: HashMap<u32, usize> = HashMap::new();
         for r in rs {
             let Response::Fetch(_, attrs) = r else { continue };
             let f = fetched(attrs);
@@ -640,7 +625,7 @@ impl<S: Read + Write> Client<S> {
             if f.uid == 0 {
                 continue;
             }
-            if let Some(existing) = out.iter_mut().find(|e| e.uid == f.uid) {
+            if let Some(existing) = at.get(&f.uid).and_then(|&i| out.get_mut(i)) {
                 existing.flags = f.flags.or(existing.flags.take());
                 existing.header = f.header.or(existing.header.take());
                 existing.body = f.body.or(existing.body.take());
@@ -648,6 +633,7 @@ impl<S: Read + Write> Client<S> {
                 existing.modseq = existing.modseq.max(f.modseq);
                 existing.internal_date = existing.internal_date.or(f.internal_date);
             } else {
+                at.insert(f.uid, out.len());
                 out.push(f);
             }
         }
@@ -884,24 +870,6 @@ fn is_change(r: &Response<'_>) -> bool {
             | Response::Vanished { .. }
             | Response::Fetch(..)
     )
-}
-
-/// Standard base64 (for SASL).
-pub fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk.first().copied().unwrap_or(0), chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for (i, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
-            if i <= chunk.len() {
-                out.push(char::from(T.get(((n >> shift) & 63) as usize).copied().unwrap_or(b'A')));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 /// One folder per special role, the rest ordinary folders: the one the server flags for it, else

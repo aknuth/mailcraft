@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use mailcraft_model::search::indexed;
+use mailcraft_model::search::{WholeText, indexed};
 use mailcraft_store::search::{Blob, DocInfo, Field, Reader};
 
 use super::folded::{Folded, TextOf};
@@ -39,7 +39,7 @@ impl Atom {
     }
 
     /// Whether `text` holds it.
-    fn in_text(&self, text: &str) -> bool {
+    fn in_text(&self, text: &WholeText<'_>) -> bool {
         match self {
             Atom::Word(f, w) => text.word(*f, w) == Tri::Yes,
             Atom::Phrase(f, words, raw) => text.phrase(*f, words, raw) == Tri::Yes,
@@ -146,8 +146,8 @@ struct IndexText<'a> {
 }
 
 impl IndexText<'_> {
-    fn not_found(&self, field: TextField) -> Tri {
-        indexed(false, field, self.info.truncated, self.info.has_text)
+    fn not_found(&self) -> Tri {
+        indexed(false, self.info.truncated)
     }
 }
 
@@ -166,7 +166,7 @@ impl TextSource for IndexText<'_> {
         if address && !prefix.starts_with(char::is_alphanumeric) {
             return Tri::Unknown;
         }
-        self.not_found(field)
+        self.not_found()
     }
 
     fn phrase(&self, field: TextField, phrase: &[String], _raw: &str) -> Tri {
@@ -176,14 +176,14 @@ impl TextSource for IndexText<'_> {
         for w in phrase {
             match self.terms.has(Field::from(field), w, self.doc) {
                 Some(true) => {}
-                Some(false) => return self.not_found(field),
+                Some(false) => return self.not_found(),
                 None => return Tri::Unknown,
             }
         }
         // Its places say what the text kept says: a doc cut short may still have it past the cut.
         match self.terms.phrase(Field::from(field), phrase, self.doc) {
             Some(true) => Tri::Yes,
-            Some(false) => self.not_found(field),
+            Some(false) => self.not_found(),
             None => Tri::Unknown,
         }
     }
@@ -247,7 +247,7 @@ pub(crate) fn classify(query: &Query, m: &Summary, st: &SummaryText, awaiting: b
     let doc = index.and_then(|ix| ix.doc(m));
     // Files as the index read them: pictures the text shows aren't counted (`has:attachment`).
     // One it couldn't read is the summary's to say, as for the Has files filter.
-    let files = known.and_then(|k| k.files).or_else(|| doc.and_then(|(_, i)| i.files_known()));
+    let files = known.and_then(|k| k.files).or_else(|| doc.and_then(|(_, i)| i.files_known));
     let eval = |text: &dyn TextSource| query.eval(&Doc { summary: m, summary_text: st, awaiting, files, text });
     let settled = |t: Tri| match t {
         Tri::Yes => Verdict::Yes,
@@ -281,12 +281,14 @@ pub(crate) fn classify(query: &Query, m: &Summary, st: &SummaryText, awaiting: b
 /// What `atoms` find in a message's source, read the way the index reads it.
 pub(crate) fn from_source(raw: &[u8], atoms: &[Atom]) -> Answers {
     let doc = mime::index_doc(raw);
+    // Read once for all the atoms.
+    let text = doc.read();
     let atoms = atoms
         .iter()
         .map(|a| {
             let t = match a {
-                Atom::Word(f, w) => doc.word(*f, w),
-                Atom::Phrase(f, words, r) => doc.phrase(*f, words, r),
+                Atom::Word(f, w) => text.word(*f, w),
+                Atom::Phrase(f, words, r) => text.phrase(*f, words, r),
             };
             (a.clone(), t)
         })
@@ -389,13 +391,7 @@ impl Verifying {
                     }
                     folding.slices.push(folded);
                 }
-                None => {
-                    for (a, f) in self.atoms.iter().zip(self.found.iter_mut()) {
-                        if !*f && a.field() == TextField::Body && a.in_text(chunk) {
-                            *f = true;
-                        }
-                    }
-                }
+                None => check_slice(&self.atoms, &mut self.found, chunk),
             }
             self.at = end.max(self.at.saturating_add(1));
             if self.at < text.len() {
@@ -432,6 +428,7 @@ impl Verifying {
 
     /// The files' names checked.
     fn check_names(&mut self, names: &[String]) {
+        let names: Vec<WholeText<'_>> = names.iter().map(|n| WholeText::new(n)).collect();
         for (a, f) in self.atoms.iter().zip(self.found.iter_mut()) {
             if a.field() == TextField::Names && names.iter().any(|n| a.in_text(n)) {
                 *f = true;
@@ -441,9 +438,20 @@ impl Verifying {
 
     /// What the text said, all of it checked.
     fn answers(&self) -> Answers {
-        let (truncated, has_text) = (self.info.truncated, self.info.has_text);
-        let atoms = self.atoms.iter().zip(&self.found).map(|(a, f)| (a.clone(), indexed(*f, a.field(), truncated, has_text))).collect();
-        Answers { atoms, files: self.info.files_known(), truncated }
+        let truncated = self.info.truncated;
+        let atoms = self.atoms.iter().zip(&self.found).map(|(a, f)| (a.clone(), indexed(*f, truncated))).collect();
+        Answers { atoms, files: self.info.files_known, truncated }
+    }
+}
+
+/// The body's atoms not found yet looked for in a slice of the text as written (lower-cased and
+/// folded once for them all).
+fn check_slice(atoms: &[Atom], found: &mut [bool], chunk: &str) {
+    let chunk = WholeText::new(chunk);
+    for (a, f) in atoms.iter().zip(found.iter_mut()) {
+        if !*f && a.field() == TextField::Body && a.in_text(&chunk) {
+            *f = true;
+        }
     }
 }
 

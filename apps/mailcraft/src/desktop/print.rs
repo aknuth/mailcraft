@@ -227,7 +227,7 @@ mod portal {
         /// Against the desktop's portal, run by hand (`MAILCRAFT_PORTAL=1`): it has a print
         /// portal, and its dialog opens for a one-page PDF (print it or cancel it).
         #[test]
-        #[ignore]
+        #[ignore = "opens the desktop's print dialog: run by hand with MAILCRAFT_PORTAL=1"]
         fn the_desktops_print_dialog_opens() {
             if std::env::var_os("MAILCRAFT_PORTAL").is_none() {
                 eprintln!("MAILCRAFT_PORTAL isn't set: skipped");

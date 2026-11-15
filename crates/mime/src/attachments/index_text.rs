@@ -69,6 +69,19 @@ struct Scope<'b> {
     maybe_shown: Vec<(Option<String>, Option<String>, Option<String>)>,
 }
 
+/// How a MIME entity is read.
+#[derive(Clone, Copy)]
+struct Reading<'d> {
+    /// How deep it is among the multiparts.
+    depth: usize,
+    /// Its text is taken (of an alternative's parts, only the one read as text).
+    text_on: bool,
+    /// A text part here is a body, as mail-parser takes it; elsewhere it's a file.
+    bodily: bool,
+    /// Its type when it says none (`message/rfc822` in a digest).
+    default: &'d str,
+}
+
 #[derive(Default)]
 struct Walk {
     doc: IndexDoc,
@@ -91,7 +104,7 @@ impl Walk {
             self.push_text(s);
         }
         let mut scope = Scope::default();
-        self.entity(part, raw, body, depth, text_on, true, "text/plain", &mut scope);
+        self.entity(part, raw, body, Reading { depth, text_on, bodily: true, default: "text/plain" }, &mut scope);
         if scope.maybe_shown.is_empty() {
             return;
         }
@@ -111,20 +124,9 @@ impl Walk {
         }
     }
 
-    /// One MIME entity: `whole` is its header and body, `body` the body alone. A text part is
-    /// a body only where mail-parser takes it as one (`bodily`); elsewhere it's a file.
-    #[allow(clippy::too_many_arguments)]
-    fn entity<'b>(
-        &mut self,
-        part: Option<MessagePart<'_>>,
-        whole: &'b [u8],
-        body: &'b [u8],
-        depth: usize,
-        text_on: bool,
-        bodily: bool,
-        default: &str,
-        scope: &mut Scope<'b>,
-    ) {
+    /// One MIME entity: `whole` is its header and body, `body` the body alone, read as `how` says.
+    fn entity<'b>(&mut self, part: Option<MessagePart<'_>>, whole: &'b [u8], body: &'b [u8], how: Reading<'_>, scope: &mut Scope<'b>) {
+        let Reading { depth, text_on, bodily, default } = how;
         self.stats.parts += 1;
         let mime = part.and_then(mime_of).unwrap_or_else(|| default.to_string());
         let attachment = part.and_then(|p| p.content_disposition()).is_some_and(|d| d.ctype().eq_ignore_ascii_case("attachment"));
@@ -203,7 +205,7 @@ impl Walk {
             let named = part.and_then(|p| p.attachment_name()).is_some_and(|n| !n.is_empty());
             let bodily = alternative || i == 0 || (mime != "multipart/related" && !named);
             let on = text_on && chosen.is_none_or(|c| c == i);
-            self.entity(part, whole, body, depth + 1, on, bodily, default, scope);
+            self.entity(part, whole, body, Reading { depth: depth + 1, text_on: on, bodily, default }, scope);
         }
         true
     }
@@ -333,23 +335,10 @@ fn parse_head(head: &[u8]) -> Option<mail_parser::Message<'_>> {
 /// An entity's header block (with its last line end) and body, split at the first empty line;
 /// with none it's all header. One that starts with an empty line has no headers.
 pub(super) fn split(raw: &[u8]) -> (&[u8], &[u8]) {
-    if let [b'\n', rest @ ..] | [b'\r', b'\n', rest @ ..] = raw {
-        return (&[], rest);
+    match crate::header_end(raw) {
+        Some(blank) => (raw.get(..blank.start).unwrap_or_default(), raw.get(blank.end..).unwrap_or_default()),
+        None => (raw, &[]),
     }
-    let mut from = 0;
-    while let Some(at) = memchr::memchr(b'\n', raw.get(from..).unwrap_or_default()).map(|i| i + from) {
-        let next = at + 1;
-        let blank = match raw.get(next..) {
-            Some([b'\n', ..]) => Some(1),
-            Some([b'\r', b'\n', ..]) => Some(2),
-            _ => None,
-        };
-        if let Some(len) = blank {
-            return (raw.get(..next).unwrap_or_default(), raw.get(next + len..).unwrap_or_default());
-        }
-        from = next;
-    }
-    (raw, &[])
 }
 
 /// A multipart body's parts, by its boundary (RFC 2046 §5.1.1): a delimiter is `--boundary` at
@@ -424,4 +413,41 @@ fn line_start(body: &[u8], at: usize) -> usize {
         }
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// [`split`] as it was, before it read the header's end with [`crate::header_end`].
+    fn old_split(raw: &[u8]) -> (&[u8], &[u8]) {
+        if let [b'\n', rest @ ..] | [b'\r', b'\n', rest @ ..] = raw {
+            return (&[], rest);
+        }
+        let mut from = 0;
+        while let Some(at) = memchr::memchr(b'\n', raw.get(from..).unwrap_or_default()).map(|i| i + from) {
+            let next = at + 1;
+            let blank = match raw.get(next..) {
+                Some([b'\n', ..]) => Some(1),
+                Some([b'\r', b'\n', ..]) => Some(2),
+                _ => None,
+            };
+            if let Some(len) = blank {
+                return (raw.get(..next).unwrap_or_default(), raw.get(next + len..).unwrap_or_default());
+            }
+            from = next;
+        }
+        (raw, &[])
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// The header's end read as everywhere else gives the split this read gave.
+        #[test]
+        fn splits_where_it_did(raw in proptest::collection::vec(prop_oneof![Just(b'\r'), Just(b'\n'), Just(b'a'), Just(b':'), Just(b' ')], 0..40)) {
+            prop_assert_eq!(split(&raw), old_split(&raw));
+        }
+    }
 }

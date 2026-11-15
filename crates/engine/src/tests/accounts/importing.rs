@@ -120,7 +120,6 @@ fn an_import_is_followed_from_start_to_end() {
     assert_eq!(s.run("account.importStatus", &json!({"account": id})).unwrap()["stage"], "done");
     assert!(s.run("account.importStatus", &json!({"account": "sample"})).is_err());
     assert!(s.run("account.resumeImport", &json!({"account": id})).is_err(), "done: nothing to go on with");
-    done(s);
 }
 
 /// An import paused as MailCraft closed (or cut short) goes on by itself the next time it opens,
@@ -196,7 +195,6 @@ fn an_import_interrupted_goes_on_and_one_stopped_waits_after_a_restart() {
     // The POP account connects once its file is in.
     s.apply(ended(&pop, 3, None));
     assert!(matches!(s.take_jobs().as_slice(), [Job::Start { account, .. }] if account.id == pop));
-    done(s);
 }
 
 /// A POP account's import stopped and kept as it is: its connection (which writes the Inbox)
@@ -230,7 +228,6 @@ fn a_pop_account_connects_only_once_its_stopped_import_is_kept() {
     // A late answer changes nothing.
     s.apply(Event::ImportKept { account: pop.clone(), error: None });
     assert!(s.take_jobs().is_empty());
-    done(s);
 }
 
 /// Removing an account while its data file is read: the import is told to throw it away, and
@@ -270,7 +267,6 @@ fn removing_an_importing_account_waits_for_its_import() {
     // The answer to that is the same word again: nothing more happens.
     s.apply(ended(&id, 0, Some(StopHow::Discard)));
     assert!(s.import_state(&other).is_some_and(|st| st.live));
-    done(s);
 }
 
 /// A removal whose import never said it stopped: finished the next time MailCraft opens, or
@@ -311,7 +307,6 @@ fn a_removal_left_waiting_is_finished() {
     let s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
     assert!(!store.account_path(&id).exists());
     assert!(!sources(&s).contains_key(&id));
-    done(s);
 }
 
 /// While a data file is imported into an account, or its import waits to go on, the account's
@@ -353,7 +348,6 @@ fn an_importing_accounts_folders_dont_change() {
     s.apply(Event::ImportKept { account: "sample".into(), error: None });
     s.run("folder.create", &json!({"account": "sample", "name": "New"})).unwrap();
     s.run("mail.move", &json!({"folder": "Archive"})).unwrap();
-    done(s);
 }
 
 /// What was asked before an import began doesn't move its account's mail while it runs: Undo of
@@ -380,7 +374,6 @@ fn undo_and_snoozes_wait_for_an_import() {
     assert!(in_inbox(&mut s, "Character turnarounds"), "back once the import is over");
     s.run("edit.undo", &json!({})).unwrap();
     assert!(in_inbox(&mut s, "Storyboard review on Thursday"), "the move undone");
-    done(s);
 }
 
 /// A data file's mail coming into the Inbox isn't new mail: stopped part-way and gone on with,
@@ -426,29 +419,31 @@ fn no_notices_or_rules_after_a_cancel_and_continue() {
     came_in(&mut s);
     assert_eq!(s.take_new_mail().into_iter().map(|m| m.subject).collect::<Vec<_>>(), ["m5"]);
     assert_eq!(store.load_folder(&id, "INBOX").unwrap().messages.len(), 4, "filed by the rule");
-    done(s);
 }
 
 /// A data file looked at before it's imported, and one already open as an account: caught by
-/// its path (however it's written) or its record key, unless asked to import another copy.
+/// its path (`\` or `/`, and on Windows and macOS any case) or its record key, unless asked to
+/// import another copy.
 #[test]
 fn a_data_file_already_open_is_caught() {
     let mut s = sample_session("import-twice");
     let first = import(&mut s, r"C:\Mail\Archive.pst");
     // Looked at: asked once, answered later, with the account it's open as.
-    let asked = s.run("account.inspectDataFile", &json!({"path": "c:/mail/ARCHIVE.pst"})).unwrap();
+    let asked = s.run("account.inspectDataFile", &json!({"path": "C:/Mail/Archive.pst"})).unwrap();
     assert_eq!(asked["pending"], true);
-    assert_eq!(s.take_jobs(), [Job::InspectDataFile { path: "c:/mail/ARCHIVE.pst".into() }]);
-    s.run("account.inspectDataFile", &json!({"path": "c:/mail/ARCHIVE.pst"})).unwrap();
+    assert_eq!(s.take_jobs(), [Job::InspectDataFile { path: "C:/Mail/Archive.pst".into() }]);
+    s.run("account.inspectDataFile", &json!({"path": "C:/Mail/Archive.pst"})).unwrap();
     assert!(s.take_jobs().is_empty(), "asked once");
-    let facts = DataFileFacts { path: "c:/mail/ARCHIVE.pst".into(), messages: 12, record_key: "00aa".into(), ..Default::default() };
-    s.apply(Event::DataFileInspected { path: "c:/mail/ARCHIVE.pst".into(), facts: Box::new(facts) });
-    let seen = s.run("account.inspectDataFile", &json!({"path": "c:/mail/ARCHIVE.pst"})).unwrap();
+    let facts = DataFileFacts { path: "C:/Mail/Archive.pst".into(), messages: 12, record_key: "00aa".into(), ..Default::default() };
+    s.apply(Event::DataFileInspected { path: "C:/Mail/Archive.pst".into(), facts: Box::new(facts) });
+    let seen = s.run("account.inspectDataFile", &json!({"path": "C:/Mail/Archive.pst"})).unwrap();
     assert_eq!((seen["messages"].as_u64(), seen["alreadyOpenAs"]["account"].as_str()), (Some(12), Some(first.as_str())));
-    let refused = s.run("account.importPst", &json!({"path": "C:/MAIL/archive.pst"})).unwrap_err().to_string();
+    let refused = s.run("account.importPst", &json!({"path": "C:/Mail/Archive.pst"})).unwrap_err().to_string();
     assert!(refused.contains(&first) && refused.contains("again"), "{refused}");
+    // Written in another case: the same file where file names ignore it (Windows, macOS).
+    assert_eq!(s.data_file_open_as("c:/MAIL/archive.pst").is_some(), cfg!(any(windows, target_os = "macos")));
     // Asked for: another copy. Its record key comes from the look.
-    let second = s.run("account.importPst", &json!({"path": "c:/mail/ARCHIVE.pst", "again": true})).unwrap()["account"].as_str().unwrap().to_string();
+    let second = s.run("account.importPst", &json!({"path": "C:/Mail/Archive.pst", "again": true})).unwrap()["account"].as_str().unwrap().to_string();
     assert_eq!(sources(&s)[&second].record_key, "00aa");
     s.take_jobs();
 
@@ -467,7 +462,6 @@ fn a_data_file_already_open_is_caught() {
     assert_eq!(s.take_jobs().len(), 10);
     s.run("account.inspectDataFile", &json!({"path": "E:/0.pst"})).unwrap();
     assert_eq!(s.take_jobs(), [Job::InspectDataFile { path: "E:/0.pst".into() }], "forgotten: asked again");
-    done(s);
 }
 
 /// A data file's account from before imports were followed, left with no folders (its import
@@ -490,7 +484,6 @@ fn a_data_file_account_with_nothing_in_it_is_found() {
     assert!(matches!(s.take_jobs().as_slice(), [Job::ImportPst { account, resume: false, .. }] if account == "a1"));
     assert!(s.import_state("a1").unwrap().live);
     assert_eq!(sources(&s)["a1"].path, "C:/Mail/Lost.pst");
-    done(s);
 }
 
 /// The note an import keeps in its data file decides over `imports.json`: one recorded as running
@@ -531,7 +524,6 @@ fn an_import_s_own_note_decides_over_the_record() {
     }
     assert!(s.import_state("a4").is_none() && s.import_state("a5").is_none());
     assert!(!sources(&s).contains_key("a4") && !sources(&s).contains_key("a5"));
-    done(s);
 }
 
 /// What the window reads: the imports it shows, the time left by the session's clock, what a
@@ -550,13 +542,13 @@ fn the_window_is_handed_what_it_shows() {
     assert!(s.import_eta_s(&id).is_some_and(|left| left > 0));
     assert_eq!(s.import_eta_s("sample"), None);
 
-    s.run("account.inspectDataFile", &json!({"path": "c:/mail/archive.pst"})).unwrap();
-    assert!(s.inspecting("c:/mail/archive.pst") && s.data_file_facts("c:/mail/archive.pst").is_none());
-    let facts = DataFileFacts { path: "c:/mail/archive.pst".into(), messages: 7, ..Default::default() };
-    s.apply(Event::DataFileInspected { path: "c:/mail/archive.pst".into(), facts: Box::new(facts) });
-    assert!(!s.inspecting("c:/mail/archive.pst"));
-    assert_eq!(s.data_file_facts("c:/mail/archive.pst").map(|f| f.messages), Some(7));
-    assert_eq!(s.data_file_open_as("c:/mail/archive.pst"), Some(id.clone()), "the same file");
+    s.run("account.inspectDataFile", &json!({"path": r"C:\Mail\Archive.pst"})).unwrap();
+    assert!(s.inspecting(r"C:\Mail\Archive.pst") && s.data_file_facts(r"C:\Mail\Archive.pst").is_none());
+    let facts = DataFileFacts { path: r"C:\Mail\Archive.pst".into(), messages: 7, ..Default::default() };
+    s.apply(Event::DataFileInspected { path: r"C:\Mail\Archive.pst".into(), facts: Box::new(facts) });
+    assert!(!s.inspecting(r"C:\Mail\Archive.pst"));
+    assert_eq!(s.data_file_facts(r"C:\Mail\Archive.pst").map(|f| f.messages), Some(7));
+    assert_eq!(s.data_file_open_as(r"C:\Mail\Archive.pst"), Some(id.clone()), "the same file");
     assert_eq!(s.data_file_open_as("D:/Other.pst"), None);
 
     // Stopped: nothing to show yet. Done: shown once.
@@ -574,5 +566,4 @@ fn the_window_is_handed_what_it_shows() {
     let failed = import(&mut s, "C:/Mail/Broken.pst");
     s.apply(Event::Imported { account: failed, messages: 0, skipped: 0, done: true, error: Some("damaged".into()), report: None });
     assert_eq!(s.take_finished_import(), None);
-    done(s);
 }

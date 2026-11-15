@@ -26,7 +26,7 @@ fn unnamed(ctx: &egui::Context, a: &mut MailApp) -> Vec<String> {
 /// (wordcraft's ribbon fields taught this: drawn buttons say nothing unless told).
 #[test]
 fn every_control_says_what_it_is() {
-    let (mut a, dir) = app("access");
+    let (mut a, _) = app("access");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     let mut seen = Vec::new();
@@ -60,14 +60,80 @@ fn every_control_says_what_it_is() {
     seen.sort();
     seen.dedup();
     assert!(seen.is_empty(), "{} controls a screen reader can't name:\n{}", seen.len(), seen.join("\n"));
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The drop-downs a frame in a window of `size` tells a screen reader of: each one's name (its
+/// own label, else the text of the label it's labelled by; never its value) and its value.
+fn drop_downs(ctx: &egui::Context, a: &mut MailApp, size: egui::Vec2) -> Vec<(Option<String>, Option<String>)> {
+    let out = sized_frame(ctx, a, size, vec![]);
+    let nodes = out.platform_output.accesskit_update.expect("AccessKit is on").nodes;
+    let text = |n: &Node| n.label().or(n.value()).filter(|l| !l.trim().is_empty()).map(str::to_string);
+    let named = |n: &Node| {
+        n.label().filter(|l| !l.trim().is_empty()).map(str::to_string).or_else(|| {
+            let by: Vec<String> = n.labelled_by().iter().filter_map(|id| nodes.iter().find(|(x, _)| x == id)).filter_map(|(_, l)| text(l)).collect();
+            (!by.is_empty()).then(|| by.join(" "))
+        })
+    };
+    nodes.iter().filter(|(_, n)| n.role() == Role::ComboBox).map(|(_, n)| (named(n), n.value().map(str::to_string))).collect()
+}
+
+/// Every drop-down is announced by what it's for, not only by what it shows (DeckCraft's
+/// drop-downs taught this): the shown text was its value and it had no name, so a screen reader
+/// read "combo box, Move to the folder" with nothing saying what was being chosen. The main window
+/// with a message being written, a rule (both its folder and its category rows), File › Options
+/// and an event.
+#[test]
+fn every_drop_down_says_what_it_is_for() {
+    let (mut a, _) = app("access-drop-downs");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let mut nameless = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut check = |a: &mut MailApp, what: &str, size: egui::Vec2| {
+        let _size = windows::layout::Dressed::new(size, "");
+        // The first frames lay out (the ribbon fits, the dialog settles); the last is read.
+        for _ in 0..3 {
+            frame(&ctx, a, vec![]);
+        }
+        let boxes = drop_downs(&ctx, a, size);
+        assert!(!boxes.is_empty(), "{what}: no drop-downs drawn");
+        for (name, value) in boxes {
+            match name {
+                Some(n) => {
+                    names.insert(n);
+                }
+                None => nameless.push(format!("{what}: showing {value:?}")),
+            }
+        }
+    };
+    let wide = egui::vec2(1280.0, 800.0);
+    a.run("mail.new", json!({}));
+    check(&mut a, "new message", wide);
+    a.run("compose.discard", json!({}));
+    a.ui.dialog = Some(Dialog::rule_from("zoe@studio.example"));
+    for action in [crate::dialogs::RuleDo::MoveTo, crate::dialogs::RuleDo::Categorize] {
+        if let Some(Dialog::EditRule(f)) = a.ui.dialog.as_mut() {
+            f.action = action;
+            f.target.clear();
+        }
+        check(&mut a, &format!("rule {action:?}"), wide);
+    }
+    a.ui.dialog = Some(Dialog::new_event(&a.session, None));
+    check(&mut a, "event", wide);
+    a.ui.dialog = None;
+    a.act(crate::Action::Backstage(crate::backstage::Page::Options));
+    check(&mut a, "File › Options", egui::vec2(1280.0, 2400.0));
+    assert!(nameless.is_empty(), "{} drop-downs a screen reader can't name:\n{}", nameless.len(), nameless.join("\n"));
+    for want in ["Font size", "When mail", "Then", "Folder", "Category", "Repeat", "Reminder", "Show as", "Dates", "Language"] {
+        assert!(names.contains(want), "no drop-down named {want}: {names:?}");
+    }
 }
 
 /// A question that must be answered is read as an alert, by its title; a form is a dialog
 /// (wordcraft's save prompt taught this).
 #[test]
 fn a_question_is_read_as_an_alert_by_its_title() {
-    let (mut a, dir) = app("access-alert");
+    let (mut a, _) = app("access-alert");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     for (d, role, title) in [
@@ -104,7 +170,6 @@ fn a_question_is_read_as_an_alert_by_its_title() {
         assert_eq!(named, vec![title.to_string()]);
         a.ui.dialog = None;
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Every update the window sends is one the system's screen-reader adapter takes: its focus is
@@ -121,7 +186,7 @@ fn every_update_keeps_its_focus_among_its_nodes() {
         fn focus_moved(&mut self, _: Option<&accesskit_consumer::NodeRef<'_>>, _: Option<&accesskit_consumer::NodeRef<'_>>) {}
         fn node_removed(&mut self, _: &accesskit_consumer::NodeRef<'_>) {}
     }
-    let (mut a, dir) = app("access-focus");
+    let (mut a, _) = app("access-focus");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     let mut tree: Option<accesskit_consumer::Tree> = None;
@@ -156,64 +221,42 @@ fn every_update_keeps_its_focus_among_its_nodes() {
     step(&mut a, vec![]);
     let tree = tree.expect("the window sends AccessKit updates");
     assert!(tree.state().has_node(tree.state().focus_id_in_tree()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Esc in a File page field leaves the field, and only the next Esc leaves the File page (as
 /// GridCraft's): it used to close the whole page while typing, the edit with it.
 #[test]
 fn esc_leaves_a_file_page_field_before_the_page() {
-    let (mut a, dir) = app("esc-backstage");
+    let (mut a, _) = app("esc-backstage");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     a.act(crate::Action::Backstage(crate::backstage::Page::Options));
+    let tall = egui::vec2(1280.0, 2400.0);
+    let _tall = windows::layout::Dressed::new(tall, "");
     let mut field = None;
     for _ in 0..4 {
-        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 2400.0))), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-        let nodes = out.platform_output.accesskit_update.expect("AccessKit is on").nodes;
-        field = nodes.iter().find(|(_, n)| n.role() == Role::TextInput && !n.is_disabled()).and_then(|(_, n)| n.bounds());
+        let nodes = named(&ctx, &mut a, tall);
+        field = nodes.into_iter().find(|n| n.role == Role::TextInput && !n.disabled).and_then(|n| n.centre());
     }
-    let r = field.expect("the Options page has a text field");
-    let at = egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
-    let tall = |events: Vec<Event>| RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 2400.0))),
-        events,
-        ..Default::default()
-    };
-    let press = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    for events in [vec![Event::PointerMoved(at)], vec![press(true)], vec![press(false)], vec![]] {
-        let mut out = ctx.run_ui(tall(events), |ui| a.ui(ui));
-        out.textures_delta.clear();
-    }
+    click(&ctx, &mut a, field.expect("the Options page has a text field"));
     assert!(ctx.text_edit_focused(), "the field has the keyboard");
-    let mut out = ctx.run_ui(tall(vec![key(Key::Escape, Modifiers::NONE)]), |ui| a.ui(ui));
-    out.textures_delta.clear();
+    frame(&ctx, &mut a, vec![key(Key::Escape, Modifiers::NONE)]);
     assert!(!ctx.text_edit_focused(), "Esc left the field");
     assert!(a.ui.backstage.is_some(), "and the File page is still open");
     for events in [vec![], vec![key(Key::Escape, Modifiers::NONE)]] {
-        let mut out = ctx.run_ui(tall(events), |ui| a.ui(ui));
-        out.textures_delta.clear();
+        frame(&ctx, &mut a, events);
     }
     assert!(a.ui.backstage.is_none(), "the next Esc leaves the File page");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #52: a message whose reply was left in Drafts is read as "[Draft]" first, as the list
 /// draws it, and Drafts says how many items it holds (never as unread).
 #[test]
 fn a_reply_left_in_drafts_is_said() {
-    let (mut a, dir) = app("access-drafts");
+    let (mut a, _) = app("access-drafts");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
-    let labels = |a: &mut MailApp| {
-        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-        let tree = out.platform_output.accesskit_update.expect("AccessKit is on");
-        tree.nodes.iter().filter_map(|(_, n)| n.label().map(str::to_string)).collect::<Vec<_>>()
-    };
+    let labels = |a: &mut MailApp| named(&ctx, a, egui::vec2(1280.0, 800.0)).into_iter().filter_map(|n| n.label).collect::<Vec<_>>();
     let m = a.session.list[0].clone();
     a.run("list.open", json!({"key": m.key.to_id()}));
     a.run("mail.reply", json!({}));
@@ -227,5 +270,49 @@ fn a_reply_left_in_drafts_is_said() {
     let subject = if m.subject.is_empty() { "(no subject)".to_string() } else { m.subject.clone() };
     assert!(seen.iter().any(|l| l.starts_with("[Draft], ") && l.contains(&subject)), "{seen:?}");
     assert!(seen.iter().any(|l| l.starts_with("Drafts, Items: ")), "{seen:?}");
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A ribbon button whose label carries a value (View › Arrange by: Date) shows it translated
+/// once: the button took the translation as English and looked it up again (in the
+/// pseudo-language, marked twice; a translation that is also an English key, swapped).
+#[test]
+fn a_ribbon_label_with_a_value_is_translated_once() {
+    use crate::i18n::pseudo;
+    let (mut a, _) = app("arrange-label");
+    let ctx = egui::Context::default();
+    a.ui.tab = crate::RibbonTab::View;
+    frame(&ctx, &mut a, vec![]);
+    let size = egui::vec2(1280.0, 800.0);
+    let field = a.session.prefs.arrange.label();
+    pseudo::set(true);
+    let texts = drawn_strings(&ctx, &mut a, size);
+    pseudo::set(false);
+    let shown: Vec<&String> = texts.iter().filter(|t| t.contains("Arrange by: ")).collect();
+    assert_eq!(shown, [&format!("⟦Arrange by: ⟦{field}⟧⟧")], "{texts:?}");
+    // In German, as its catalog writes it (in a window wide enough for every label).
+    a.ui.language = "de".into();
+    let wide = egui::vec2(2600.0, 800.0);
+    for _ in 0..3 {
+        let _ = drawn_strings(&ctx, &mut a, wide);
+    }
+    let texts = drawn_strings(&ctx, &mut a, wide);
+    let want = crate::i18n::tfmt("Arrange by: {field}", &[("field", crate::i18n::t(field))]);
+    assert!(want.starts_with("Anordnen nach: ") && texts.contains(&want), "{want}: {texts:?}");
+    crate::i18n::set_current(crate::i18n::Lang::EN);
+}
+
+/// The empty reading pane says what to do translated once (it translated its caller's
+/// translation again: marked twice in the pseudo-language).
+#[test]
+fn the_empty_reading_pane_is_translated_once() {
+    use crate::i18n::pseudo;
+    let (mut a, _) = app("empty-reading");
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.session.reading.is_none());
+    pseudo::set(true);
+    let texts = drawn_strings(&ctx, &mut a, egui::vec2(1280.0, 800.0));
+    pseudo::set(false);
+    let shown: Vec<&String> = texts.iter().filter(|t| t.contains("Select a message to read it")).collect();
+    assert_eq!(shown, ["⟦Select a message to read it⟧"], "{texts:?}");
 }

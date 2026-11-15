@@ -16,6 +16,7 @@ use mailcraft_ui_egui::Backend;
 use crate::fetch::{Fetch, events, sleep};
 
 mod indexing;
+mod jobs;
 mod smime;
 
 /// How often the Inbox is checked for new mail, and every how many checks everything is.
@@ -33,7 +34,8 @@ enum Task {
     Connect,
     SyncAll,
     SyncFolder(String),
-    Job(Job),
+    /// Boxed: a job is far larger than the other tasks, and accounts queue many.
+    Job(Box<Job>),
 }
 
 struct Account {
@@ -43,8 +45,6 @@ struct Account {
     client: Option<Rc<Client<Fetch>>>,
     state: State,
     folders: Vec<Folder>,
-    /// Changes made while signed out, replayed on connecting.
-    ops: Vec<Op>,
     queue: VecDeque<Task>,
     running: bool,
     /// Bumped on every start, so an old poller stops.
@@ -71,6 +71,8 @@ struct Shared {
     /// The passwords that opened them, for keeping them unlocked when that's asked (gap 7):
     /// in memory, and sealed with the browser's key only then.
     smime_passwords: HashMap<String, Vec<String>>,
+    /// Each account's sealing of them: only the latest seal is kept, none once keeping is off.
+    smime_sealing: HashMap<String, crate::sealing::Sealing>,
     /// The search indexes asked to be brought up to the mail.
     indexing: indexing::Indexing,
 }
@@ -94,6 +96,7 @@ impl WebBackend {
                 search: 0,
                 smime: HashMap::new(),
                 smime_passwords: HashMap::new(),
+                smime_sealing: HashMap::new(),
                 indexing: indexing::Indexing::default(),
             })),
         }
@@ -173,7 +176,7 @@ async fn run(sh: Rcs, id: String) {
             Task::Connect => connect(&sh, &id).await,
             Task::SyncAll => sync_all(&sh, &id).await,
             Task::SyncFolder(f) => sync_one(&sh, &id, &f).await,
-            Task::Job(j) => job(&sh, &id, j).await,
+            Task::Job(j) => jobs::job(&sh, &id, *j).await,
         }
     }
 }
@@ -193,7 +196,7 @@ fn failed(sh: &Rcs, id: &str, e: Error) {
             if let Some(a) = sh.borrow_mut().accounts.get_mut(id) {
                 a.client = None;
             }
-            status(sh, id, SyncStatus::Error { error: e.to_string() });
+            status(sh, id, SyncStatus::error(e.to_string()));
         }
         e => notice(sh, id, e.to_string()),
     }
@@ -202,24 +205,21 @@ fn failed(sh: &Rcs, id: &str, e: Error) {
 async fn connect(sh: &Rcs, id: &str) {
     let Some((config, password)) = sh.borrow().accounts.get(id).map(|a| (a.config.clone(), a.password.clone())) else { return };
     let Some(url) = config.jmap.clone() else {
-        return status(sh, id, SyncStatus::Error { error: "only JMAP accounts work in the browser; use the desktop app for this one".into() });
+        return status(sh, id, SyncStatus::error("only JMAP accounts work in the browser; use the desktop app for this one"));
     };
     let Some(password) = password else {
         return status(sh, id, SyncStatus::NeedsPassword { error: "enter the password: the browser doesn't keep it".into() });
     };
     status(sh, id, SyncStatus::Connecting);
-    let user = if config.username.is_empty() { config.email.clone() } else { config.username.clone() };
-    match Client::connect(Fetch, &url, &user, &password, false).await {
+    match Client::connect(Fetch, &url, config.login_name(), &password, false).await {
         Ok(c) => {
-            let ops = {
+            {
                 let mut s = sh.borrow_mut();
                 let Some(a) = s.accounts.get_mut(id) else { return };
                 a.client = Some(Rc::new(c));
-                std::mem::take(&mut a.ops)
-            };
-            for op in ops {
-                remote(sh, id, op).await;
             }
+            // What waited is only sent: the sync after it reads back all it touched.
+            replay(sh, id, false).await;
             sync_all(sh, id).await;
         }
         Err(e) => failed(sh, id, e),
@@ -238,9 +238,13 @@ async fn relist(sh: &Rcs, id: &str) -> bool {
             let store = store(sh);
             let old: Vec<Folder> = sh.borrow().accounts.get(id).map(|a| a.folders.clone()).unwrap_or_default();
             for f in old.iter().filter(|o| !list.iter().any(|f| f.path == o.path)) {
-                let _ = store.clear_folder(id, &f.path);
+                if let Err(e) = store.clear_folder(id, &f.path) {
+                    log::warn!("{id}: {}: {e}", f.path);
+                }
             }
-            let _ = store.save_folders(id, &list);
+            if let Err(e) = store.save_folders(id, &list) {
+                log::warn!("{id}: {e}");
+            }
             if let Some(a) = sh.borrow_mut().accounts.get_mut(id) {
                 a.folders = list.clone();
             }
@@ -261,7 +265,7 @@ async fn sync_all(sh: &Rcs, id: &str) {
     let paths: Vec<String> =
         sh.borrow().accounts.get(id).map(|a| a.folders.iter().filter(|f| f.selectable).map(|f| f.path.clone()).collect()).unwrap_or_default();
     // The Inbox first.
-    let inbox = sh.borrow().accounts.get(id).and_then(|a| a.folders.iter().find(|f| f.role == FolderRole::Inbox).map(|f| f.path.clone()));
+    let inbox = inbox(sh, id);
     for p in inbox.iter().chain(paths.iter().filter(|p| Some(*p) != inbox.as_ref())) {
         if client(sh, id).is_none() {
             return;
@@ -300,7 +304,9 @@ async fn sync_one(sh: &Rcs, id: &str, path: &str) {
                 (first, changed.then(|| a.folders.clone()))
             };
             if let Some(folders) = counts {
-                let _ = store.save_folders(id, &folders);
+                if let Err(e) = store.save_folders(id, &folders) {
+                    log::warn!("{id}: {e}");
+                }
                 emit(sh, Event::Folders { account: id.to_string(), folders });
             }
             if r.touched() || first {
@@ -327,12 +333,12 @@ async fn search_server(sh: &Rcs, id: &str, folders: &[String], query: String, se
     };
     let store = store(sh);
     let mut st = state(sh, id);
-    let (mut any, mut failed) = (false, None);
+    let (mut any, mut failed, seen) = (false, None, store.removals(id));
     for f in folders.iter().take(200) {
         if sh.borrow().search != search {
             break;
         }
-        match mailcraft_jmap::find_on_server(&c, &mut st, &store, id, f, &filter, mailcraft_jmap::FOUND_MAX).await {
+        match mailcraft_jmap::find_on_server(&c, &mut st, &store, (id, seen), f, &filter, mailcraft_jmap::FOUND_MAX).await {
             Ok((found, new)) => {
                 if new > 0 {
                     emit(sh, Event::FolderChanged { account: id.to_string(), folder: f.clone() });
@@ -350,35 +356,77 @@ async fn search_server(sh: &Rcs, id: &str, folders: &[String], query: String, se
     emit(sh, answer(Vec::new(), error, true));
 }
 
-/// A change on the server (after the cache has it); then what it touched is shown afresh.
+/// A change for the server (the cache has it already). It's queued with the cache, which is
+/// kept in IndexedDB, as the desktop keeps it on disk: held only by this page, it was lost to a
+/// reload or a closed tab before the account was signed in again (the browser never keeps the
+/// password), and the next sync put back what the server still had. Then the queue is sent.
 async fn remote(sh: &Rcs, id: &str, op: Op) {
-    let Some(c) = client(sh, id) else {
-        if let Some(a) = sh.borrow_mut().accounts.get_mut(id) {
-            a.ops.push(op);
+    if let Err(e) = store(sh).add_op(id, op.clone()) {
+        notice(sh, id, format!("a change couldn't be kept to send later: {e}"));
+        // Sent now if it can be; otherwise it's lost, as said.
+        if let Some(c) = client(sh, id)
+            && let Err(e) = send(sh, id, &c, &op, true).await
+        {
+            emit(sh, Event::OpFailed { account: id.to_string(), op, error: e.to_string() });
         }
         return;
-    };
-    let st = state(sh, id);
-    match mailcraft_jmap::apply_remote(&c, &st, &op).await {
-        Ok(()) => {
-            // The folders it touched, with the server's counts.
-            let mut touched: Vec<String> = op.keys().iter().map(|k| k.folder.clone()).collect();
-            match &op {
-                Op::Move { to, .. } => touched.push(to.clone()),
-                Op::EmptyFolder { path } => touched.push(path.clone()),
-                Op::CreateFolder { .. } | Op::RenameFolder { .. } | Op::DeleteFolder { .. } => {
-                    relist(sh, id).await;
+    }
+    replay(sh, id, true).await;
+}
+
+/// The changes waiting for the server, sent oldest first. Each leaves the queue once the server
+/// has taken it or refused it (a refusal is said); the one a lost connection or sign-in stopped
+/// stays, with those after it, for the next connection. `refresh`: the folders each touched are
+/// read back after it (not when a full sync follows anyway: each was a folder's sync, then all of
+/// them again).
+async fn replay(sh: &Rcs, id: &str, refresh: bool) {
+    let store = store(sh);
+    // Bounded, in case taking one off the queue keeps failing unseen.
+    for _ in 0..100_000 {
+        let Some(c) = client(sh, id) else { return };
+        let Some(op) = store.load_ops(id).unwrap_or_default().into_iter().next() else { return };
+        match send(sh, id, &c, &op, refresh).await {
+            Err(e) if e.stops_the_queue() => return failed(sh, id, e),
+            sent => {
+                if let Err(e) = store.remove_op(id, &op) {
+                    return notice(sh, id, e.to_string());
                 }
-                Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::Expunge { .. } => {}
-            }
-            touched.sort();
-            touched.dedup();
-            for f in touched {
-                sync_one(sh, id, &f).await;
+                if let Err(e) = sent {
+                    emit(sh, Event::OpFailed { account: id.to_string(), op, error: e.to_string() });
+                }
             }
         }
-        Err(e) => emit(sh, Event::OpFailed { account: id.to_string(), op, error: e.to_string() }),
     }
+}
+
+/// One change made on the server; then, with `refresh`, the folders it touched are shown afresh,
+/// with the server's counts. A change to the folders is listed again either way: the next change
+/// may name a folder it made or renamed.
+async fn send(sh: &Rcs, id: &str, c: &Client<Fetch>, op: &Op, refresh: bool) -> mailcraft_jmap::Result<()> {
+    mailcraft_jmap::apply_remote(c, &state(sh, id), op).await?;
+    if op.is_folder_op() {
+        relist(sh, id).await;
+    }
+    if !refresh {
+        return Ok(());
+    }
+    let mut touched: Vec<String> = op.keys().iter().map(|k| k.folder.clone()).collect();
+    match op {
+        Op::Move { to, .. } => touched.push(to.clone()),
+        Op::EmptyFolder { path } => touched.push(path.clone()),
+        Op::CreateFolder { .. }
+        | Op::RenameFolder { .. }
+        | Op::DeleteFolder { .. }
+        | Op::SetFlag { .. }
+        | Op::SetKeyword { .. }
+        | Op::Expunge { .. } => {}
+    }
+    touched.sort();
+    touched.dedup();
+    for f in touched {
+        sync_one(sh, id, &f).await;
+    }
+    Ok(())
 }
 
 fn sent_folder(sh: &Rcs, id: &str, given: Option<String>) -> Option<String> {
@@ -402,241 +450,11 @@ fn pgp(sh: &Rcs, id: &str, work: mailcraft_engine::model::PgpWork) {
         }
         PgpWork::SealDraft { raw, folder, replaces, .. } => {
             notice(sh, id, format!("the draft couldn't be encrypted, so it's saved as it is: {BROWSER_PGP}"));
-            enqueue(sh, id, Task::Job(Job::SaveDraft { account: id.to_string(), raw: raw.0, folder, replaces }));
+            enqueue(sh, id, Task::Job(Box::new(Job::SaveDraft { account: id.to_string(), raw: raw.0, folder, replaces })));
         }
         PgpWork::Import { .. } | PgpWork::Use { .. } | PgpWork::Forget { .. } => {
             emit(sh, Event::PgpKeys { account: id.to_string(), keys: Vec::new(), imported: None, error: Some(BROWSER_PGP.into()) })
         }
-    }
-}
-
-async fn job(sh: &Rcs, id: &str, j: Job) {
-    let store = store(sh);
-    match j {
-        Job::SyncAll { .. } => {
-            if client(sh, id).is_some() {
-                sync_all(sh, id).await;
-            } else {
-                connect(sh, id).await;
-            }
-        }
-        Job::SyncFolder { folder, .. } => sync_one(sh, id, &folder).await,
-        Job::FetchBody { key } => {
-            let r = match client(sh, id) {
-                Some(c) => mailcraft_jmap::fetch_body(&c, &state(sh, id), &store, &key).await,
-                None => {
-                    store.read_body(&key).map(|raw| (raw, None)).ok_or_else(|| Error::No("not downloaded yet, and the account is offline".into()))
-                }
-            };
-            match r {
-                Ok((raw, filled)) => {
-                    emit(sh, Event::Body { key, raw });
-                    if let Some(summary) = filled {
-                        emit(sh, Event::Filled { summary: Box::new(summary) });
-                    }
-                }
-                Err(e) => emit(sh, Event::BodyFailed { key, error: e.to_string() }),
-            }
-        }
-        Job::Apply { op, .. } => {
-            // The cache first, so the change shows at once.
-            match store.apply_op(id, &op) {
-                Ok(changed) => {
-                    if op.is_folder_op() {
-                        let folders = store.load_folders(id).unwrap_or_default();
-                        if let Some(a) = sh.borrow_mut().accounts.get_mut(id) {
-                            a.folders = folders.clone();
-                        }
-                        emit(sh, Event::Folders { account: id.to_string(), folders });
-                    }
-                    for folder in changed {
-                        emit(sh, Event::FolderChanged { account: id.to_string(), folder });
-                    }
-                }
-                Err(e) => notice(sh, id, e.to_string()),
-            }
-            remote(sh, id, op).await;
-        }
-        Job::Send { id: msg, raw, from, recipients, sent_folder: sent, .. } => {
-            let Some(c) = client(sh, id) else {
-                return emit(sh, Event::SendFailed { account: id.to_string(), id: msg, error: "the account is offline".into() });
-            };
-            let sent = sent_folder(sh, id, sent);
-            match mailcraft_jmap::send(&c, &state(sh, id), sent.as_deref(), &raw, &from, &recipients).await {
-                Ok(()) => {
-                    emit(sh, Event::Sent { account: id.to_string(), id: msg });
-                    if let Some(f) = sent {
-                        sync_one(sh, id, &f).await;
-                    }
-                }
-                Err(e) => emit(sh, Event::SendFailed { account: id.to_string(), id: msg, error: e.to_string() }),
-            }
-        }
-        // Copies of mail kept here, into a folder on the server (issue #82), marked as they were.
-        Job::FileCopies { folder, mail, moved, .. } => {
-            let (mut done, mut failed) = (Vec::new(), Vec::new());
-            for (key, flags) in mail {
-                let Some(c) = client(sh, id) else {
-                    failed.push((key, "the account is offline".to_string()));
-                    continue;
-                };
-                let Some(raw) = store.read_body(&key).filter(|raw| !mailcraft_engine::mime::is_text_first(raw)) else {
-                    failed.push((key, "it isn't downloaded".to_string()));
-                    continue;
-                };
-                let marks = [
-                    (flags.seen, "$seen"),
-                    (flags.flagged, "$flagged"),
-                    (flags.answered, "$answered"),
-                    (flags.draft, "$draft"),
-                    (flags.forwarded, "$forwarded"),
-                ];
-                let mut keywords: Vec<&str> = marks.iter().filter(|(on, _)| *on).map(|(_, k)| *k).collect();
-                keywords.extend(flags.keywords.iter().filter(|k| !k.is_empty() && k.len() <= 64).take(32).map(String::as_str));
-                match mailcraft_jmap::append(&c, &state(sh, id), &folder, &raw, &keywords).await {
-                    Ok(_) => done.push(key),
-                    Err(e) => failed.push((key, e.to_string())),
-                }
-            }
-            let any = !done.is_empty();
-            emit(sh, Event::CopiesFiled { account: id.to_string(), folder: folder.clone(), done, failed, moved });
-            if any {
-                sync_one(sh, id, &folder).await
-            }
-        }
-        // The browser has no closing to keep a draft through: it's filed as any other.
-        Job::SaveDraft { raw, folder, replaces, .. } | Job::KeepDraft { raw, folder, replaces, .. } => {
-            // Which draft it was, for the session holding the message until it's saved (#53).
-            let message_id = mailcraft_engine::model::thread::written_message_id(&raw);
-            let Some(c) = client(sh, id) else {
-                let error = Some("the draft wasn't saved on the server: the account is offline".to_string());
-                return emit(sh, Event::DraftSaved { account: id.to_string(), message_id, error });
-            };
-            let st = state(sh, id);
-            let r = async {
-                mailcraft_jmap::append(&c, &st, &folder, &raw, &["$draft", "$seen"]).await?;
-                if let Some(old) = replaces {
-                    mailcraft_jmap::apply_remote(&c, &st, &Op::Expunge { keys: vec![old] }).await?;
-                }
-                Ok::<(), Error>(())
-            }
-            .await;
-            match r {
-                Ok(()) => {
-                    emit(sh, Event::DraftSaved { account: id.to_string(), message_id, error: None });
-                    sync_one(sh, id, &folder).await
-                }
-                Err(e) => {
-                    emit(sh, Event::DraftSaved { account: id.to_string(), message_id, error: Some(e.to_string()) });
-                    failed(sh, id, e)
-                }
-            }
-        }
-        Job::FindIdentities { .. } => {
-            let (found, error) = match client(sh, id) {
-                Some(c) => match c.identities().await {
-                    Ok(found) => (found, None),
-                    Err(e) => (Vec::new(), Some(e.to_string())),
-                },
-                None => (Vec::new(), Some("the account is offline".to_string())),
-            };
-            emit(sh, Event::IdentitiesFound { account: id.to_string(), found, error })
-        }
-        Job::GetVacation { .. } | Job::SetVacation { .. } => {
-            let Some(c) = client(sh, id) else {
-                return emit(sh, Event::Vacation { account: id.to_string(), vacation: None, error: Some("the account is offline".into()) });
-            };
-            let mut failed_change = None;
-            if let Job::SetVacation { vacation, .. } = &j
-                && let Err(e) = c.set_vacation(vacation).await
-            {
-                failed_change = Some(e.to_string());
-            }
-            let (vacation, error) = match c.vacation().await {
-                Ok(v) => (Some(v), failed_change),
-                Err(e) => (None, Some(failed_change.unwrap_or_else(|| e.to_string()))),
-            };
-            emit(sh, Event::Vacation { account: id.to_string(), vacation, error });
-        }
-        // Nothing to do in the browser: no Outbox (sending needs the server), no CalDAV.
-        Job::FlushOutbox { .. } | Job::SyncDav { .. } => {}
-        // The browser's accounts are JMAP ones, with no organisation directory (issue #9).
-        Job::SearchDirectory { query, .. } => emit(
-            sh,
-            Event::Directory {
-                account: id.to_string(),
-                query,
-                people: Vec::new(),
-                error: Some("this account has no organisation directory".into()),
-                consent: false,
-            },
-        ),
-        Job::AllowDirectory { account } => {
-            emit(sh, Event::DirectoryAllowed { account: account.id, error: Some("this account has no organisation directory".into()) })
-        }
-        // Mail past what's kept (issue #4).
-        Job::SearchServer { folders, query, search, .. } => search_server(sh, id, &folders, query, search).await,
-        Job::MoreMail { folder, more, .. } => {
-            let windows = {
-                let mut s = sh.borrow_mut();
-                let (store, base) = (s.store.clone(), s.opts.window);
-                let Some(a) = s.accounts.get_mut(id) else { return };
-                let kept = store.load_folder(id, &folder).map(|f| f.messages.len()).unwrap_or(0);
-                let now = a.windows.get(&folder).copied().unwrap_or(0).max(base).max(kept);
-                a.windows.insert(folder.clone(), now.saturating_add(more as usize).min(1_000_000));
-                a.windows.clone()
-            };
-            if let Err(e) = store.save_account_doc(id, WINDOWS, &windows) {
-                log::warn!("{id}: {WINDOWS}: {e}");
-            }
-            sync_one(sh, id, &folder).await;
-        }
-        j @ (Job::ImportIdentity { .. }
-        | Job::ForgetIdentity { .. }
-        | Job::ForgetOlderIdentity { .. }
-        | Job::KeepUnlocked { .. }
-        | Job::UseOlderIdentity { .. }
-        | Job::Protect { .. }
-        | Job::Decrypt { .. }
-        | Job::SealDraft { .. }) => smime::job(sh, id, j),
-        Job::CheckRevocation { chain } => emit(
-            sh,
-            Event::Revocation {
-                cert: chain.into_iter().next().unwrap_or_default(),
-                status: mailcraft_engine::model::Revocation::Unknown { why: BROWSER_REVOCATION.into() },
-            },
-        ),
-        Job::Pgp { work, .. } => pgp(sh, id, work),
-        Job::FindHeldKeys { .. } => emit(sh, Event::HeldKeys { keys: Vec::new(), error: Some(BROWSER_SMIME.into()) }),
-        Job::UseHeldKey { .. } => emit(
-            sh,
-            Event::Identity { account: id.to_string(), chain: Vec::new(), older: Vec::new(), for_reading: false, error: Some(BROWSER_SMIME.into()) },
-        ),
-        Job::Start { .. }
-        | Job::SmtpPassword { .. }
-        | Job::DavPassword { .. }
-        | Job::CheckUpdates
-        | Job::StopSearch
-        | Job::Remove { .. }
-        | Job::FetchUrl { .. }
-        | Job::FetchCalendar { .. }
-        | Job::Discover { .. }
-        | Job::SignIn { .. }
-        | Job::ImportPst { .. }
-        | Job::RereadDataFile { .. }
-        | Job::InspectDataFile { .. }
-        | Job::FileMessages { .. }
-        | Job::ReadMessageFile { .. }
-        | Job::StopImport { .. }
-        | Job::KeepImport { .. }
-        | Job::ExportPst { .. }
-        | Job::DataFileHealth { .. }
-        | Job::CompactDataFile { .. }
-        | Job::CancelCompact { .. }
-        | Job::WorkOffline { .. }
-        | Job::SetSync { .. }
-        | Job::Index { .. }
-        | Job::StopIndex { .. } => {}
     }
 }
 
@@ -651,7 +469,7 @@ async fn poll(sh: Rcs, id: String, generation: u32) {
             return;
         }
         tick = tick.wrapping_add(1);
-        let inbox = sh.borrow().accounts.get(&id).and_then(|a| a.folders.iter().find(|f| f.role == FolderRole::Inbox).map(|f| f.path.clone()));
+        let inbox = inbox(&sh, &id);
         let pushing = sh.borrow().accounts.get(&id).is_some_and(|a| a.pushing);
         match (connected, inbox) {
             (false, _) if password => enqueue(&sh, &id, Task::Connect),
@@ -801,6 +619,7 @@ impl Backend for WebBackend {
                     already: 0,
                     occurrences: 0,
                     replaced: 0,
+                    folders_skipped: 0,
                     done: true,
                     error: Some("writing Outlook data files needs the desktop app".into()),
                 },
@@ -818,7 +637,6 @@ impl Backend for WebBackend {
                         Account {
                             state: State::load(&store, &id),
                             folders: store.load_folders(&id).unwrap_or_default(),
-                            ops: old.map(|a| a.ops).unwrap_or_default(),
                             config: account,
                             password,
                             client: None,
@@ -849,7 +667,7 @@ impl Backend for WebBackend {
                 }
                 let id = other.account().to_string();
                 if sh.borrow().accounts.contains_key(&id) {
-                    enqueue(sh, &id, Task::Job(other));
+                    enqueue(sh, &id, Task::Job(Box::new(other)));
                 } else if let Job::FetchBody { key } = other {
                     // The sample mailbox and other accounts with no server: the cache has it or nobody does.
                     let raw = store(sh).read_body(&key);
@@ -858,18 +676,7 @@ impl Backend for WebBackend {
                         None => emit(sh, Event::BodyFailed { key, error: "not downloaded".into() }),
                     }
                 } else if let Job::Apply { account, op } = other {
-                    match store(sh).apply_op(&account, &op) {
-                        Ok(changed) => {
-                            if op.is_folder_op() {
-                                let folders = store(sh).load_folders(&account).unwrap_or_default();
-                                emit(sh, Event::Folders { account: account.clone(), folders });
-                            }
-                            for folder in changed {
-                                emit(sh, Event::FolderChanged { account: account.clone(), folder });
-                            }
-                        }
-                        Err(e) => notice(sh, &account, e.to_string()),
-                    }
+                    jobs::apply_local(sh, &account, &op);
                 } else if let Job::Send { account, id, .. } = other {
                     emit(sh, Event::SendFailed { account, id, error: "this mailbox has no server to send through".into() });
                 }

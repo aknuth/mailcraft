@@ -12,7 +12,7 @@ use std::io::{Cursor, Read};
 
 use cfb::CompoundFile;
 
-use crate::pst::{Loose, LooseFile, Val, loose_message};
+use crate::pst::{Loose, LooseFile, Val, loose_message, without_nuls};
 use crate::pst_pim::Named;
 
 /// The largest file read.
@@ -125,14 +125,16 @@ impl Reader<'_> {
     /// The message in storage `dir` (`""`: the file's own), its attached messages read in turn.
     fn message(&mut self, dir: &str, header: usize, depth: usize) -> Read1 {
         let props = self.props(dir, header);
+        // Its files' 8-bit names, types and ids are in the message's code page, as its own are.
+        let cp = code_page(&props);
         let recipients =
             self.storages(dir, "__recip_version1.0_#", MAX_RECIPIENTS).into_iter().map(|r| self.props(&format!("{dir}/{r}"), PART_HEADER)).collect();
         let mut files = Vec::new();
         for a in self.storages(dir, "__attach_version1.0_#", MAX_ATTACHMENTS) {
             let at = format!("{dir}/{a}");
             let p = self.props(&at, PART_HEADER);
-            let text = |id: u16| p.iter().find(|x| x.id == id).and_then(|x| text_value(x, 0));
-            let name = text(0x3707).or_else(|| text(0x3704)).or_else(|| text(0x3001)).unwrap_or_default();
+            let text = |id: u16| p.iter().find(|x| x.id == id).and_then(|x| text_value(x, cp));
+            let name = crate::pst::given_name(&|id| text(id).unwrap_or_default()).unwrap_or_default();
             let mime = text(0x370E).unwrap_or_default();
             let cid = text(0x3712).unwrap_or_default();
             let inner = format!("{at}/__substg1.0_3701000D");
@@ -200,7 +202,7 @@ fn text_value(p: &Prop, code_page: u32) -> Option<String> {
         0x001E => eight_bit(b, code_page),
         _ => return None,
     };
-    Some(s.trim_end_matches('\0').to_string())
+    Some(without_nuls(s))
 }
 
 fn utf16(b: &[u8]) -> String {
@@ -225,8 +227,8 @@ fn val(p: &Prop, code_page: u32) -> Val<'_> {
         (Stored::Fixed(f), 0x000B) => Val::Bool(f[0] != 0),
         (Stored::Fixed(f), 0x0040) => Val::Time(i64::from_le_bytes(*f)),
         (Stored::Fixed(f), 0x0005) => Val::Float(u64::from_le_bytes(*f)),
-        (Stored::Many(list), 0x101F) => Val::Texts(list.iter().map(|b| utf16(b).trim_end_matches('\0').to_string()).collect()),
-        (Stored::Many(list), 0x101E) => Val::Texts(list.iter().map(|b| eight_bit(b, code_page).trim_end_matches('\0').to_string()).collect()),
+        (Stored::Many(list), 0x101F) => Val::Texts(list.iter().map(|b| without_nuls(utf16(b))).collect()),
+        (Stored::Many(list), 0x101E) => Val::Texts(list.iter().map(|b| without_nuls(eight_bit(b, code_page))).collect()),
         (Stored::Many(list), 0x1102) => Val::Bins(list.iter().map(Vec::as_slice).collect()),
         (Stored::Object, _) => Val::Object,
         _ => Val::Other,
@@ -245,17 +247,20 @@ fn vals(ps: &[Prop], cp: u32) -> Vec<(u16, Val<'_>)> {
     ps.iter().map(|p| (p.id, val(p, cp))).collect()
 }
 
-fn loose(m: &Read1) -> Loose<'_> {
-    let cp = code_page(&m.props);
+/// The message as the import reads one: its properties borrowed, its files' bytes moved (a file
+/// of tens of megabytes was copied here, and again on its way into the message built).
+fn loose(m: &mut Read1) -> Loose<'_> {
+    let Read1 { props, recipients, files } = m;
+    let (props, recipients): (&[Prop], &[Vec<Prop>]) = (props, recipients);
+    let cp = code_page(props);
     Loose {
-        props: vals(&m.props, cp),
-        recipients: m.recipients.iter().map(|r| vals(r, cp)).collect(),
-        files: m
-            .files
-            .iter()
+        props: vals(props, cp),
+        recipients: recipients.iter().map(|r| vals(r, cp)).collect(),
+        files: files
+            .iter_mut()
             .map(|f| match f {
                 ReadFile::Data { name, mime, cid, data } => {
-                    LooseFile::Data { name: name.clone(), mime: mime.clone(), cid: cid.clone(), data: data.clone() }
+                    LooseFile::Data { name: std::mem::take(name), mime: std::mem::take(mime), cid: std::mem::take(cid), data: std::mem::take(data) }
                 }
                 ReadFile::Message(inner) => LooseFile::Message(Box::new(loose(inner))),
             })
@@ -282,11 +287,11 @@ pub fn to_mime(bytes: &[u8]) -> Result<Vec<u8>, String> {
         let names = r.names();
         Ok((r.message("", TOP_HEADER, 0), names))
     });
-    let (m, named) = read.map_err(|_| "the file is damaged".to_string())??;
+    let (mut m, named) = read.map_err(|_| "the file is damaged".to_string())??;
     if m.props.is_empty() {
         return Err("the file holds no message".into());
     }
-    loose_message(&loose(&m), &named)
+    loose_message(loose(&mut m), &named)
 }
 
 #[cfg(test)]

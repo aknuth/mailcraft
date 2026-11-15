@@ -162,7 +162,7 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// (a message stored with bare LFs was signed with CRLF).
 fn first_part(raw: &[u8], boundary: &str) -> Option<Vec<u8>> {
     let raw = crlf(raw);
-    let body_at = find(&raw, b"\r\n\r\n", 0)? + 4;
+    let body_at = crate::header_end(&raw)?.end;
     let delimiter = format!("--{boundary}");
     let d = delimiter.as_bytes();
     // The first delimiter at the start of a line (or of the body).
@@ -175,13 +175,10 @@ fn first_part(raw: &[u8], boundary: &str) -> Option<Vec<u8>> {
 
 /// The header block and body of a message (line ends as they are).
 fn split(raw: &[u8]) -> (&[u8], &[u8]) {
-    let (head, sep) = match (find(raw, b"\r\n\r\n", 0), find(raw, b"\n\n", 0)) {
-        (Some(a), Some(b)) if b < a => (b, 2),
-        (Some(a), _) => (a, 4),
-        (None, Some(b)) => (b, 2),
-        (None, None) => (raw.len(), 0),
-    };
-    (raw.get(..head).unwrap_or(raw), raw.get(head + sep..).unwrap_or_default())
+    match crate::header_end(raw) {
+        Some(blank) => (crate::without_line_end(raw.get(..blank.start).unwrap_or(raw)), raw.get(blank.end..).unwrap_or_default()),
+        None => (raw, &[]),
+    }
 }
 
 /// Header fields, each with its folded lines, as (name, whole field).
@@ -234,12 +231,12 @@ fn entity_parts(entity: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// The value of parameter `name` in a header field (`Content-Type: text/plain; hp="cipher"`),
-/// lower-case, quotes taken off.
+/// as written, quotes taken off: a boundary is matched exactly, the others in any case.
 fn parameter(field: &[u8], name: &str) -> Option<String> {
-    let text = String::from_utf8_lossy(field).replace("\r\n", " ");
+    let text = String::from_utf8_lossy(field);
     text.split(';').skip(1).find_map(|p| {
         let (k, v) = p.split_once('=')?;
-        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().trim_matches('"').to_ascii_lowercase())
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().trim_matches('"').to_string())
     })
 }
 
@@ -253,7 +250,7 @@ pub fn with_entity_protected(raw: &[u8], entity: &[u8]) -> (Vec<u8>, bool) {
     let (head, body) = entity_parts(&entity);
     let inner = fields(head);
     let content_type = inner.iter().find(|(n, _)| n == "content-type").map(|(_, f)| f.as_slice()).unwrap_or_default();
-    let protected = parameter(content_type, "hp").is_some_and(|v| v == "clear" || v == "cipher");
+    let protected = parameter(content_type, "hp").is_some_and(|v| v.eq_ignore_ascii_case("clear") || v.eq_ignore_ascii_case("cipher"));
     let names: Vec<&str> =
         inner.iter().map(|(n, _)| n.as_str()).filter(|n| !n.starts_with("content-") && *n != "hp-outer" && *n != "mime-version").collect();
     let mut out = Vec::new();
@@ -294,15 +291,7 @@ fn without_legacy_display(content_type: &[u8], body: &[u8]) -> Vec<u8> {
     else {
         return body.to_vec();
     };
-    // The boundary as written (parameter() lower-cases it).
-    let ct = String::from_utf8_lossy(content_type).to_string();
-    let written = ct
-        .split(';')
-        .find_map(|p| {
-            p.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("boundary")).map(|(_, v)| v.trim().trim_matches('"').to_string())
-        })
-        .unwrap_or(boundary);
-    let d = format!("--{written}");
+    let d = format!("--{boundary}");
     let starts: Vec<usize> = {
         let mut v = Vec::new();
         let mut from = 0;
@@ -344,11 +333,13 @@ pub fn entity_of(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (outer_headers(&raw), entity)
 }
 
-/// A header field's value, decoded (`=?utf-8?…?=` words as text).
+/// A header field's value as unstructured text (RFC 5322 §3.2.5): unfolded, its encoded words
+/// (`=?utf-8?…?=`) decoded, trimmed; bytes that aren't UTF-8 read as the reading pane reads them.
 fn field_value(field: &[u8]) -> String {
-    let mut m = field.to_vec();
-    m.extend_from_slice(b"\r\n\r\n");
-    crate::parse(&m).map(|p| p.subject).unwrap_or_default()
+    let field = crate::html::readable_headers(field);
+    let Some(colon) = field.iter().position(|b| *b == b':') else { return String::new() };
+    let value = field.get(colon + 1..).unwrap_or_default();
+    mail_parser::HeaderForm::Text.parse(value).value().as_text().map(|t| t.trim().to_string()).unwrap_or_default()
 }
 
 /// Quoted-printable for a short text (RFC 2045 §6.7): 7-bit, lines under 76.
@@ -421,7 +412,7 @@ pub fn protect_headers(outer: &[u8], entity: &[u8], encrypted: bool, hide_subjec
     match hidden_subject.filter(|s| !s.trim().is_empty()) {
         // The content becomes the second part of a multipart/mixed, after the Legacy Display part.
         Some(subject) => {
-            let seed: u64 = entity.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+            let seed = mailcraft_model::hash::fnv1a(&entity);
             let boundary = format!("=_hp{seed:016x}");
             out.extend_from_slice(format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"; hp=\"{hp}\"\r\n\r\n").as_bytes());
             out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -467,25 +458,9 @@ pub fn safe_to_sign(entity: &[u8]) -> bool {
     entity.is_ascii() && entity.split(|b| *b == b'\n').all(|l| l.len() <= 998 && !l.strip_suffix(b"\r").unwrap_or(l).ends_with(b" "))
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 /// Base64 in lines of 76 (RFC 2045 §6.8), CRLF-ended.
-/// `data` in base64 (RFC 4648), on one line.
-pub(crate) fn base64(data: &[u8]) -> Vec<u8> {
-    let mut text = Vec::with_capacity(data.len() * 4 / 3 + 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk.first().copied().unwrap_or(0), chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            let c = if i <= chunk.len() { B64.get(((n >> (18 - 6 * i)) & 63) as usize).copied().unwrap_or(b'A') } else { b'=' };
-            text.push(c);
-        }
-    }
-    text
-}
-
 fn base64_lines(data: &[u8]) -> Vec<u8> {
-    let text = base64(data);
+    let text = mailcraft_model::base64::encode(data).into_bytes();
     let mut out = Vec::with_capacity(text.len() + text.len() / 38);
     for line in text.chunks(76) {
         out.extend_from_slice(line);
@@ -581,6 +556,29 @@ pub fn protect(
     hide_subject: bool,
     boundary: &str,
 ) -> Result<Vec<u8>, String> {
+    protect_with(
+        raw,
+        sign,
+        encrypt,
+        hide_subject,
+        |outer, entity, signature| signed_message(outer, entity, signature, boundary),
+        |outer, cms| encrypted_message(outer, cms, gcm),
+    )
+}
+
+/// `raw` signed and/or encrypted, S/MIME's way or PGP/MIME's ([`pgp::protect`]): its header
+/// fields protected inside ([`protect_headers`]), then signed if `sign` is given (`signed` writes
+/// the message around the entity and its signature) after making sure the entity would arrive
+/// byte for byte, then that whole signed entity encrypted if `encrypt` is given (`encrypted`
+/// writes the message around what it gives).
+fn protect_with(
+    raw: &[u8],
+    sign: Option<Crypto<'_>>,
+    encrypt: Option<Crypto<'_>>,
+    hide_subject: bool,
+    signed: impl Fn(&[u8], &[u8], &[u8]) -> Vec<u8>,
+    encrypted: impl Fn(&[u8], &[u8]) -> Vec<u8>,
+) -> Result<Vec<u8>, String> {
     let (outer, entity) = entity_of(raw);
     let (outer, mut entity) = protect_headers(&outer, &entity, encrypt.is_some(), hide_subject);
     let mut message = with_entity(raw, &entity);
@@ -589,12 +587,12 @@ pub fn protect(
             return Err("a part of it couldn't be sent byte for byte, so its signature wouldn't hold".into());
         }
         let signature = sign(&entity)?;
-        message = signed_message(&outer, &entity, &signature, boundary);
+        message = signed(&outer, &entity, &signature);
         entity = entity_of(&message).1;
     }
     if let Some(encrypt) = encrypt {
-        let cms = encrypt(&entity)?;
-        message = encrypted_message(&outer, &cms, gcm);
+        let sealed = encrypt(&entity)?;
+        message = encrypted(&outer, &sealed);
     }
     Ok(message)
 }

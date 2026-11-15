@@ -28,8 +28,7 @@ pub struct TaskForm {
     pub reminder_time: String,
     /// Times are shown on a 12-hour clock (File › Options).
     pub hours12: bool,
-    /// `""` (never), `daily`, `weekly`, `monthly`, `yearly`, or a rule kept as it was.
-    pub repeat: String,
+    pub repeat: Repeat,
     pub categories: Vec<String>,
     pub all_categories: Vec<(String, u8)>,
     pub done: bool,
@@ -38,11 +37,7 @@ pub struct TaskForm {
 
 /// A task's day (UTC midnight) as the form shows it.
 fn day_text(day: Option<i64>) -> String {
-    day.map(|d| {
-        let (y, m, dd) = dates::civil_from_days(d.div_euclid(86_400));
-        format!("{y:04}-{m:02}-{dd:02}")
-    })
-    .unwrap_or_default()
+    day.map(|d| dates::day_string(d.div_euclid(86_400))).unwrap_or_default()
 }
 
 /// What Status is called.
@@ -62,19 +57,6 @@ fn priority_label(p: TaskPriority) -> &'static str {
         TaskPriority::Low => "Low",
         TaskPriority::Normal => "Normal",
         TaskPriority::High => "High",
-    }
-}
-
-fn repeat_of(rule: Option<&str>) -> String {
-    match rule {
-        None => String::new(),
-        Some(r) => match r.to_ascii_uppercase().as_str() {
-            "FREQ=DAILY" => "daily".into(),
-            "FREQ=WEEKLY" => "weekly".into(),
-            "FREQ=MONTHLY" => "monthly".into(),
-            "FREQ=YEARLY" => "yearly".into(),
-            _ => r.to_string(),
-        },
     }
 }
 
@@ -114,7 +96,7 @@ impl TaskForm {
             reminder_date,
             reminder_time,
             hours12: s.clock.style.hours12,
-            repeat: repeat_of(t.rrule.as_deref()),
+            repeat: Repeat::from_rrule(t.rrule.as_deref()),
             categories: t.categories.clone(),
             all_categories: all_categories(s, &t.categories),
             done: t.is_done(),
@@ -138,7 +120,7 @@ impl TaskForm {
             "percent": self.percent.min(100),
             "priority": self.priority.code(),
             "reminder": reminder,
-            "repeat": if self.repeat.is_empty() { "none" } else { self.repeat.as_str() },
+            "repeat": self.repeat.param(),
             "categories": self.categories,
         });
         match &self.uid {
@@ -173,31 +155,26 @@ pub(super) fn category_chips(ui: &mut Ui, t: &Tokens, all: &[(String, u8)], chos
     });
 }
 
-/// A drop-down of a form, `width` wide.
-fn choice<T: PartialEq + Copy>(ui: &mut Ui, id: &str, width: f32, value: &mut T, options: &[T], label: impl Fn(T) -> &'static str) {
+/// A drop-down of a form, `width` wide, `name`d for a screen reader (its row's name is painted).
+fn choice<T: PartialEq + Copy>(ui: &mut Ui, id: &str, name: &str, width: f32, value: &mut T, options: &[T], label: impl Fn(T) -> &'static str) {
     ui.allocate_ui_with_layout(vec2(width, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        egui::ComboBox::from_id_salt(id).width(width - 6.0).selected_text(tl!(label(*value))).show_ui(ui, |ui| {
-            for o in options {
-                ui.selectable_value(value, *o, tl!(label(*o)));
-            }
-        });
+        egui::ComboBox::from_id_salt(id)
+            .width(width - 6.0)
+            .selected_text(tl!(label(*value)))
+            .show_ui(ui, |ui| {
+                for o in options {
+                    ui.selectable_value(value, *o, tl!(label(*o)));
+                }
+            })
+            .response
+            .accessible_name(name);
     });
 }
 
 pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -> bool {
     ui.set_width(540.0);
     form_header(ui, t, Ok(Icon::Task), if f.uid.is_some() { "Task" } else { "New task" });
-    let w = ui.available_width();
-    ui.add(
-        egui::TextEdit::singleline(&mut f.title)
-            .hint_text(tl!("Add a title"))
-            .font(theme::bold(16.0))
-            .desired_width(w)
-            .min_size(vec2(w, 36.0))
-            .margin(Margin::symmetric(10, 8))
-            .align(egui::Align2::LEFT_CENTER),
-    );
-    ui.add_space(12.0);
+    title_field(ui, &mut f.title);
     form_row(ui, t, true, Some(Icon::Calendar), "Start date", |ui| {
         field(ui, &mut f.start, tl!("None"), 120.0);
     });
@@ -206,7 +183,7 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
     });
     let before = f.status;
     form_row(ui, t, true, Some(Icon::Task), "Status", |ui| {
-        choice(ui, "task-status", 220.0, &mut f.status, &TaskStatus::ALL, status_label);
+        choice(ui, "task-status", tl!("Status"), 220.0, &mut f.status, &TaskStatus::ALL, status_label);
         ui.add_space(6.0);
         ui.allocate_ui_with_layout(vec2(ui.available_width(), FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.add(egui::DragValue::new(&mut f.percent).range(0..=100).suffix("%"));
@@ -223,7 +200,15 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
         };
     }
     form_row(ui, t, true, Some(Icon::Star), "Priority", |ui| {
-        choice(ui, "task-priority", 140.0, &mut f.priority, &[TaskPriority::Low, TaskPriority::Normal, TaskPriority::High], priority_label);
+        choice(
+            ui,
+            "task-priority",
+            tl!("Priority"),
+            140.0,
+            &mut f.priority,
+            &[TaskPriority::Low, TaskPriority::Normal, TaskPriority::High],
+            priority_label,
+        );
     });
     form_row(ui, t, true, Some(Icon::Clock), "Reminder", |ui| {
         ui.allocate_ui_with_layout(vec2(90.0, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -237,30 +222,7 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
             time_field(ui, &mut f.reminder_time, 9, f.hours12);
         }
     });
-    let custom = !matches!(f.repeat.as_str(), "" | "daily" | "weekly" | "monthly" | "yearly");
-    let label = |r: &str| -> String {
-        match r {
-            "" => tl!("Never").to_string(),
-            "daily" => tl!("Every day").to_string(),
-            "weekly" => tl!("Every week").to_string(),
-            "monthly" => tl!("Every month").to_string(),
-            "yearly" => tl!("Every year").to_string(),
-            _ => tl!("Custom").to_string(),
-        }
-    };
-    form_row(ui, t, true, Some(Icon::Sync), "Repeat", |ui| {
-        ui.allocate_ui_with_layout(vec2(200.0, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            egui::ComboBox::from_id_salt("task-repeat").width(194.0).selected_text(label(&f.repeat)).show_ui(ui, |ui| {
-                for r in ["", "daily", "weekly", "monthly", "yearly"] {
-                    ui.selectable_value(&mut f.repeat, r.to_string(), label(r));
-                }
-                if custom {
-                    let keep = f.repeat.clone();
-                    ui.selectable_value(&mut f.repeat, keep, tl!("Custom"));
-                }
-            });
-        });
-    });
+    repeat_row(ui, t, "task-repeat", &mut f.repeat);
     if !f.all_categories.is_empty() {
         form_row(ui, t, true, Some(Icon::Tag), "Categories", |ui| {
             category_chips(ui, t, &f.all_categories, &mut f.categories);
@@ -270,18 +232,23 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
         let name = f.accounts.get(f.account).map(|a| a.1.clone()).unwrap_or_default();
         form_row(ui, t, true, Some(Icon::Person), "Account", |ui| {
             ui.allocate_ui_with_layout(vec2(260.0, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("task-account").width(254.0).selected_text(name).show_ui(ui, |ui| {
-                    for (i, a) in f.accounts.iter().enumerate() {
-                        ui.selectable_value(&mut f.account, i, &a.1);
-                    }
-                });
+                egui::ComboBox::from_id_salt("task-account")
+                    .width(254.0)
+                    .selected_text(name)
+                    .show_ui(ui, |ui| {
+                        for (i, a) in f.accounts.iter().enumerate() {
+                            ui.selectable_value(&mut f.account, i, &a.1);
+                        }
+                    })
+                    .response
+                    .accessible_name(tl!("Account"));
             });
         });
     }
     egui::ScrollArea::vertical().id_salt("task-notes").max_height(NOTES_MAX_H).show(ui, |ui| {
         area(ui, &mut f.notes, tl!("Notes"), 4);
     });
-    if !f.repeat.is_empty() {
+    if f.repeat != Repeat::Never {
         ui.add_space(4.0);
         ui.label(RichText::new(tl!("Marked complete, it comes back on its next due date.")).color(t.faint).small());
     }

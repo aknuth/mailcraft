@@ -242,28 +242,16 @@ impl Out<'_> {
 /// `raw` with `id` for its Message-ID (the header's first, continuation lines and all); none
 /// when it has no Message-ID.
 fn with_id(mut raw: Vec<u8>, id: &str) -> Option<Vec<u8>> {
-    let end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = raw.get(..end).unwrap_or_default();
-    let mut found: Option<(usize, usize)> = None;
-    let mut at = 0;
-    while at < head.len() {
-        let next = head.get(at..).and_then(|h| h.windows(2).position(|w| w == b"\r\n")).map_or(head.len(), |n| at.saturating_add(n));
-        match found.as_mut() {
-            Some(f) if head.get(at).is_some_and(|c| *c == b' ' || *c == b'\t') => f.1 = next,
-            Some(_) => break,
-            None if head.get(at..at.saturating_add(11)).is_some_and(|l| l.eq_ignore_ascii_case(b"message-id:")) => found = Some((at, next)),
-            None => {}
-        }
-        at = next.saturating_add(2);
-    }
-    let (from, to) = found?;
-    raw.splice(from..to, format!("Message-ID: <{id}>").into_bytes());
+    let head = raw.get(..mailcraft_mime::header_end(&raw)?.start)?;
+    let field = mailcraft_mime::field_span(head, "Message-ID")?;
+    raw.splice(field, format!("Message-ID: <{id}>").into_bytes());
     Some(raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_files::scratch::scratch;
 
     /// A conversation index: its header (GUID `g`) and `blocks` replies.
     fn index(g: u8, blocks: &[u8]) -> Vec<u8> {
@@ -425,8 +413,7 @@ mod tests {
         let none = b"From: a@studio.example\r\n\r\nMessage-ID: body\r\n".to_vec();
         assert_eq!(with_id(none, "x@mailcraft.invalid"), None);
 
-        let dir = std::env::temp_dir().join(format!("mailcraft-pst-sent-ids-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("pst-sent-ids");
         let store = Store::open_packed(dir.join("app"), dir.join("Files")).unwrap();
         let mut progress = |_| {};
         let mut out = Out::new(&store, "a1", &ImportOptions::default(), &mut progress);
@@ -452,6 +439,5 @@ mod tests {
         );
         assert_eq!(st.messages[1].size as usize, second.len());
         drop(out);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

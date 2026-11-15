@@ -25,26 +25,15 @@ const PREFIXES: [&str; 12] = ["re", "fw", "fwd", "aw", "sv", "vs", "wg", "rif", 
 pub fn base_subject(subject: &str) -> String {
     let mut s = subject.trim();
     loop {
-        let before = s;
+        // Each pass leaves a shorter end of the subject, or the same one when it took nothing.
+        let before = s.len();
         if s.starts_with('[')
             && let Some(end) = s.find(']')
         {
             s = s.get(end + 1..).unwrap_or_default().trim_start();
         }
-        // ASCII lowering keeps byte offsets equal to `s`'s.
-        let lower = s.to_ascii_lowercase();
-        for p in PREFIXES {
-            if let Some(rest) = lower.strip_prefix(p) {
-                // `Re:`, `RE[2]:`, `Re :`.
-                let rest_t = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '[' || c == ']').trim_start();
-                if rest_t.starts_with(':') || rest_t.starts_with('：') {
-                    let consumed = lower.len() - rest_t.len() + rest_t.chars().next().map_or(0, char::len_utf8);
-                    s = s.get(consumed..).unwrap_or_default().trim_start();
-                    break;
-                }
-            }
-        }
-        if s == before {
+        s = base_subject_step(s);
+        if s.len() == before {
             break;
         }
     }
@@ -77,15 +66,12 @@ fn tags_and_rest(subject: &str) -> (Vec<&str>, &str, bool) {
 
 /// `s` without one leading `Re:`, `Fwd:`, `AW:`… (`RE[2]:`, `Re :`), or as it is.
 fn base_subject_step(s: &str) -> &str {
-    // ASCII lowering keeps byte offsets equal to `s`'s.
-    let lower = s.to_ascii_lowercase();
     for p in PREFIXES {
-        if let Some(rest) = lower.strip_prefix(p) {
-            let rest_t = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '[' || c == ']').trim_start();
-            if rest_t.starts_with(':') || rest_t.starts_with('：') {
-                let consumed = lower.len() - rest_t.len() + rest_t.chars().next().map_or(0, char::len_utf8);
-                return s.get(consumed..).unwrap_or_default().trim_start();
-            }
+        // In any case (`RE:`): the subject's first bytes compared as they are, nothing copied.
+        let Some(rest) = s.get(..p.len()).filter(|head| head.eq_ignore_ascii_case(p)).and_then(|_| s.get(p.len()..)) else { continue };
+        let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '[' || c == ']').trim_start();
+        if let Some(after) = rest.strip_prefix([':', '：']) {
+            return after.trim_start();
         }
     }
     s
@@ -109,27 +95,20 @@ pub fn is_reply_subject(subject: &str) -> bool {
     tags_and_rest(subject).2
 }
 
-/// Normalise a Message-ID for comparison: no angle brackets or surrounding space.
-/// A Message-ID without its brackets. Whitespace and control characters, which an id can't
-/// hold (RFC 5322 §3.6.4), are dropped: a hostile one's bare CR would otherwise be copied into
-/// a reply's In-Reply-To and References.
+/// A Message-ID without its brackets, as it's compared. Whitespace and control characters, which
+/// an id can't hold (RFC 5322 §3.6.4), are dropped: a hostile one's bare CR would otherwise be
+/// copied into a reply's In-Reply-To and References.
 pub fn norm_id(id: &str) -> String {
     let id: String = id.chars().filter(|c| !c.is_control() && !c.is_whitespace()).take(998).collect();
     id.trim_start_matches('<').trim_end_matches('>').to_string()
 }
 
-/// The `Message-ID` a message was written with, from its header (never its body), without its
-/// brackets: what says which draft a save was of. Empty when it has none.
-pub fn written_message_id(raw: &[u8]) -> String {
-    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(raw.len()).min(64 * 1024);
-    let head = String::from_utf8_lossy(raw.get(..end).unwrap_or_default()).replace("\r\n ", " ").replace("\r\n\t", " ");
-    head.split("\r\n")
-        .find_map(|line| line.split_once(':').filter(|(name, _)| name.trim().eq_ignore_ascii_case("message-id")).map(|(_, v)| norm_id(v)))
-        .unwrap_or_default()
-}
-
 /// The most 5-byte blocks a conversation index is read with (a reply adds one).
 pub const MAX_INDEX_BLOCKS: usize = 50;
+
+/// The most message ids of a message's References (with its In-Reply-To) threading reads: the
+/// last ones, nearest the message (a hostile header can name any number).
+pub const MAX_REFERENCES: usize = 256;
 
 /// A conversation index as threading keeps it: hashes of the whole index, of the index of the
 /// message it answers (the whole less its last block) and of the conversation's (its 22-byte
@@ -158,7 +137,7 @@ pub fn index_keys(index: &[u8]) -> IndexKeys {
 
 /// FNV-1a: kept in the lists, so it must never change.
 fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    crate::hash::fnv1a(bytes)
 }
 
 #[derive(Default)]
@@ -344,8 +323,8 @@ fn threads_of(msgs: &[&Summary]) -> Vec<Thread> {
             refs.push(irt);
         }
         // Cap absurd chains (hostile headers).
-        if refs.len() > 256 {
-            refs.drain(..refs.len() - 256);
+        if refs.len() > MAX_REFERENCES {
+            refs.drain(..refs.len() - MAX_REFERENCES);
         }
         let mut prev: Option<usize> = None;
         for r in &refs {
@@ -389,10 +368,12 @@ fn threads_of(msgs: &[&Summary]) -> Vec<Thread> {
         let s = msgs.get(oldest).map(|m| m.subject.as_str()).unwrap_or_default();
         (base_subject(s).to_lowercase(), is_reply_subject(s))
     };
-    // Original posts first, so replies join them rather than the other way round.
-    groups.sort_by_key(|g| first_subject(g).1);
-    for g in groups {
-        let (subj, reply) = first_subject(&g);
+    // Original posts first, so replies join them rather than the other way round. Each group's
+    // subject read once: read for every comparison of the sort, a folder of 50,000 messages
+    // made millions of strings.
+    let mut keyed: Vec<((String, bool), Vec<usize>)> = groups.into_iter().map(|g| (first_subject(&g), g)).collect();
+    keyed.sort_by_key(|((_, reply), _)| *reply);
+    for ((subj, reply), g) in keyed {
         if !subj.is_empty()
             && reply
             && let Some(&at) = by_subject.get(&subj)
@@ -423,16 +404,6 @@ fn threads_of(msgs: &[&Summary]) -> Vec<Thread> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A draft's Message-ID from its header: any case, folded, without brackets; never one its
-    /// body quotes, nor a header whose name only starts the same.
-    #[test]
-    fn a_messages_written_id_is_read_from_its_header() {
-        assert_eq!(written_message_id(b"Subject: x\r\nMessage-ID: <a1@studio.example>\r\n\r\nbody"), "a1@studio.example");
-        assert_eq!(written_message_id(b"message-id:\r\n <b2@studio.example>\r\nTo: z\r\n\r\n"), "b2@studio.example");
-        assert_eq!(written_message_id(b"Message-IDs: <no@x>\r\nSubject: x\r\n\r\nMessage-ID: <quoted@x>\r\n"), "");
-        assert_eq!(written_message_id(b""), "");
-    }
 
     fn m(id: &str, refs: &[&str], irt: &str, subject: &str, date: i64) -> Summary {
         Summary {
@@ -623,5 +594,26 @@ mod tests {
         assert_eq!(without_prefixes("[a] [b] re[2]: x"), "[a] [b] x");
         assert_eq!(without_prefixes("[URGENT]"), "[URGENT]");
         assert_eq!(without_prefixes("  Re: "), "");
+    }
+
+    /// A folder of 50,000 messages in 30,000 threads, threaded: each group's subject was read
+    /// again for every comparison of the sort.
+    /// `cargo test --release -p mailcraft-model --lib measure_threads -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run in release"]
+    fn measure_threads() {
+        let mut msgs = Vec::new();
+        for i in 0..30_000_i64 {
+            msgs.push(m(&format!("<o{i}@x>"), &[], "", &format!("Plan number {i} for the quarter"), i * 10));
+        }
+        for i in 0..20_000_i64 {
+            msgs.push(m(&format!("<r{i}@x>"), &[], "", &format!("Re: AW: Plan number {i} for the quarter"), i * 10 + 5));
+        }
+        let n = threads(&msgs).len();
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            assert_eq!(threads(&msgs).len(), n);
+        }
+        println!("MEASURE threads of 50,000 messages ({n} threads): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
     }
 }

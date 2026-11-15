@@ -84,21 +84,19 @@ impl Lanes {
         }
         drop(q);
         shared.work.notify_all();
-        self.replace_stuck();
+        self.tend();
         Ok(())
     }
 
-    /// Whether work can be given to a thread (no thread failed to start). Looks after the
-    /// lanes too: one whose cancelled work has gone on too long gets a new thread.
+    /// Whether work can be given to a thread (no thread failed to start).
     pub(crate) fn available(&self) -> bool {
-        self.replace_stuck();
         !self.failed.load(Ordering::Relaxed)
     }
 
-    /// Each lane whose work running now was cancelled more than `stuck_after` ago (counted
-    /// from when the cancel was first seen here) gets a new thread for the work waiting; the
-    /// old one ends when that work does.
-    fn replace_stuck(&self) {
+    /// Looks after the lanes: each one whose work running now was cancelled more than
+    /// `stuck_after` ago (counted from when the cancel was first seen here) gets a new thread
+    /// for the work waiting; the old one ends when that work does.
+    pub(crate) fn tend(&self) {
         let lanes: Vec<(Lane, Arc<Shared>)> = lock(&self.lanes).iter().map(|(l, s)| (*l, s.clone())).collect();
         for (lane, shared) in lanes {
             let mut q = lock(&shared.queue);
@@ -244,44 +242,77 @@ mod tests {
 
     /// Cancelled work that goes on past the limit (a decoder caught in a loop) is left alone:
     /// the work waiting behind it runs on a new thread. Work that wasn't cancelled is waited for.
+    ///
+    /// The lane is looked in on only when `tend` or `submit` is called, so what the test
+    /// asserts doesn't depend on timing: the stuck work is known to be running (it says so)
+    /// before it's cancelled, and the sleeps only make sure at least so long has passed. (It
+    /// failed under load when the lane's thread hadn't taken the work yet at the cancel: the
+    /// cancel was first seen later, and the lane not replaced.)
     #[test]
     fn a_lane_stuck_on_cancelled_work_gets_a_new_thread() {
+        a_lane_gets_a_new_thread_with(spawn);
+    }
+
+    fn a_lane_gets_a_new_thread_with(spawn: fn(Lane, &Arc<Shared>, u64) -> std::io::Result<()>) {
         let mut lanes = Lanes::default();
+        lanes.spawn = spawn;
         lanes.stuck_after = Duration::from_millis(200);
         let (loop_cancelled, no) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (started_tx, started) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         let t = tx.clone();
         lanes
             .submit(
                 Lane::Pictures,
                 work(&loop_cancelled, move || {
-                    // Goes on until the test lets it end (it never looks at its flag).
-                    let _ = stop_rx.recv_timeout(Duration::from_secs(30));
+                    started_tx.send(()).unwrap();
+                    // Goes on until the test lets it end, or ends (it never looks at its flag).
+                    let _ = stop_rx.recv();
                     t.send("loop ended").unwrap();
                 }),
             )
             .ok()
             .unwrap();
         lanes.submit(Lane::Pictures, work(&no, move || tx.send("next").unwrap())).ok().unwrap();
+        started.recv_timeout(Duration::from_secs(60)).expect("the lane's thread took the work");
         // Long, but not cancelled: waited for.
         std::thread::sleep(Duration::from_millis(400));
-        assert!(lanes.available());
+        lanes.tend();
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "not cancelled: the lane waits");
         // Cancelled late in a long run: given the limit from its cancel, not its start.
         loop_cancelled.store(true, Ordering::Relaxed);
-        assert!(lanes.available());
+        lanes.tend();
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "just cancelled: the lane still waits");
         // Once it has gone on past the limit after its cancel, the lane carries on without it.
         std::thread::sleep(Duration::from_millis(200));
+        // Asked whether it takes work, it's only asked: the lane is looked after when tended.
         assert!(lanes.available());
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), "next");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "not tended yet: the lane still waits");
+        lanes.tend();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(60)).unwrap(), "next");
         // The new thread takes later work while the old one is still caught.
         let (tx2, rx2) = mpsc::channel();
         lanes.submit(Lane::Pictures, work(&no, move || tx2.send(std::thread::current().name().map(str::to_string)).unwrap())).ok().unwrap();
-        assert_eq!(rx2.recv_timeout(Duration::from_secs(10)).unwrap().as_deref(), Some("mail-pictures"));
+        assert_eq!(rx2.recv_timeout(Duration::from_secs(60)).unwrap().as_deref(), Some("mail-pictures"));
         stop_tx.send(()).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), "loop ended");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(60)).unwrap(), "loop ended");
+    }
+
+    /// The same with lane threads that start a second late, as on a busy computer: later than
+    /// the cancel would come without the wait for the work, which made the failure under load
+    /// happen every time.
+    #[test]
+    fn a_lane_gets_a_new_thread_when_its_threads_start_late() {
+        fn late(_: Lane, shared: &Arc<Shared>, id: u64) -> std::io::Result<()> {
+            let shared = shared.clone();
+            std::thread::Builder::new().name("mail-pictures".into()).spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                work_lane(&shared, id);
+            })?;
+            Ok(())
+        }
+        a_lane_gets_a_new_thread_with(late);
     }
 
     /// A thread that can't be started gives the work back, and no more work is offered.

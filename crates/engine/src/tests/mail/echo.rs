@@ -60,13 +60,11 @@ fn a_read_marks_echo_keeps_the_folder_and_the_list() {
     let (mut s, id) = server_inbox(10_941);
     let keys: Vec<MessageKey> = s.row_keys().into_iter().take(50).collect();
     let (built, threadings) = (s.nav_structure(), s.nav.threadings());
-    let started = std::time::Instant::now();
     for k in &keys {
         s.open_message(k);
         assert_eq!(made_on_disk(&mut s).len(), 1);
         inbox_changed(&mut s, &id);
     }
-    eprintln!("50 opened, marked read and said back in {:?}", started.elapsed());
     assert!(keys.iter().all(|k| s.summary(k).is_some_and(|m| m.flags.seen)), "read");
     assert_eq!(s.nav_structure(), built, "no rows built");
     assert_eq!(s.nav.threadings(), threadings, "no conversations worked out");
@@ -84,7 +82,7 @@ fn a_read_marks_echo_keeps_the_folder_and_the_list() {
 /// body downloaded on the way cost before it was said as its summary filled, `Filled`), and the
 /// summary filled taken in.
 #[test]
-#[ignore]
+#[ignore = "a measurement: run in release"]
 fn down_steps_on_a_big_server_folder() {
     use std::time::{Duration, Instant};
     let (mut s, id) = server_inbox(10_941);

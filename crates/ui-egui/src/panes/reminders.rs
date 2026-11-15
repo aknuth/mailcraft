@@ -11,10 +11,29 @@ use crate::{Action, Dialog, widgets};
 
 /// How often the due list is worked out again.
 const EVERY_SECS: i64 = 15;
-/// The snoozes offered, in minutes (Outlook's list); negative: minutes before the start.
-const SNOOZES: [i64; 10] = [5, 10, 15, 30, 60, 120, 240, 480, 1440, 0];
-/// "Before start" choices go in as this minus the minutes (so 0 before start is `BEFORE`).
-const BEFORE: i64 = -1;
+/// A snooze: minutes from now, or until the event starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Snooze {
+    Minutes(u32),
+    AtStart,
+}
+
+/// The snoozes offered (Outlook's list).
+const SNOOZES: [Snooze; 10] = [
+    Snooze::Minutes(5),
+    Snooze::Minutes(10),
+    Snooze::Minutes(15),
+    Snooze::Minutes(30),
+    Snooze::Minutes(60),
+    Snooze::Minutes(120),
+    Snooze::Minutes(240),
+    Snooze::Minutes(480),
+    Snooze::Minutes(1440),
+    Snooze::AtStart,
+];
+
+/// The snooze offered until another is picked.
+const FIRST_SNOOZE: Snooze = Snooze::Minutes(5);
 
 /// What the window keeps between frames.
 #[derive(Clone, Debug, Default)]
@@ -24,49 +43,26 @@ pub struct State {
     pub checked: i64,
     /// The one picked in the list.
     pub selected: Option<String>,
-    /// The snooze picked (minutes; [`BEFORE`] for "0 minutes before start").
-    pub snooze: i64,
+    /// The snooze picked; none yet: [`FIRST_SNOOZE`].
+    pub snooze: Option<Snooze>,
     /// Closed with these due: shown again only when another comes.
     pub closed: std::collections::BTreeSet<String>,
     /// Told on the desktop already.
     pub notified: std::collections::BTreeSet<String>,
-    /// What the list was worked out from ([`signature`]): when it changes (a reminder answered,
-    /// an event changed), it's worked out again at once.
-    pub signature: u64,
-}
-
-/// A digest of what decides the due list: the answers given, the events and the tasks.
-fn signature(s: &Session) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
-    mix(s.prefs.reminders.len() as u64);
-    for (k, v) in &s.prefs.reminders {
-        mix(k.len() as u64);
-        mix(*v as u64);
-    }
-    for p in s.pim.values() {
-        mix(p.events.len() as u64);
-        for e in &p.events {
-            mix(e.event.start as u64 ^ (e.event.extra.len() as u64).rotate_left(32) ^ (e.event.status.len() as u64).rotate_left(48));
-        }
-        // Tasks' reminders, and whether they're done.
-        mix(p.tasks.len() as u64);
-        for t in &p.tasks {
-            mix(t.task.reminder.unwrap_or(0) as u64 ^ u64::from(t.task.is_done()).rotate_left(63) ^ (t.task.due.unwrap_or(0) as u64).rotate_left(17));
-        }
-    }
-    h
+    /// The calendars' revision the list was worked out at ([`Session::pim_revision`], which every
+    /// change to an event or a task, and every reminder dismissed or snoozed, moves on): when it
+    /// moves, the list is worked out again on that frame; `None` until it first is.
+    pub revision: Option<u64>,
 }
 
 /// Work out what's due when it's time; the reminders newly come, to tell on the desktop.
 pub fn refresh(st: &mut State, s: &Session, force: bool) -> Vec<DueReminder> {
     let now = s.clock.now;
-    let sig = signature(s);
-    if !force && sig == st.signature && now - st.checked < EVERY_SECS && now >= st.checked {
+    if !force && st.revision == Some(s.pim_revision) && now - st.checked < EVERY_SECS && now >= st.checked {
         return Vec::new();
     }
     st.checked = now;
-    st.signature = sig;
+    st.revision = Some(s.pim_revision);
     st.due = s.due_reminders(now);
     let keys: std::collections::BTreeSet<String> = st.due.iter().map(|r| r.key.clone()).collect();
     st.closed.retain(|k| keys.contains(k));
@@ -86,14 +82,8 @@ pub fn showing(st: &State) -> bool {
 
 /// When an occurrence is, for the list: `Today 09:00`, `Tomorrow`, `Mon 2026-10-26 14:00`.
 fn when(r: &DueReminder, s: &Session) -> String {
-    let day = s.clock.local(r.start).div_euclid(86_400);
-    let today = dates::today(&s.clock);
-    let date = match day - today {
-        0 => tl!("Today").to_string(),
-        1 => tl!("Tomorrow").to_string(),
-        -1 => tl!("Yesterday").to_string(),
-        _ => crate::i18n::date(&dates::day_text(day, &s.clock)),
-    };
+    let day = s.clock.local_day(r.start);
+    let date = crate::tasks::near_day(day, dates::today(&s.clock)).map_or_else(|| crate::i18n::date(&dates::day_text(day, &s.clock)), str::to_string);
     if r.all_day { date } else { format!("{date} {}", crate::calendar::hm(r.start, s)) }
 }
 
@@ -111,8 +101,11 @@ fn due_in(r: &DueReminder, now: i64) -> String {
     }
 }
 
-fn snooze_label(m: i64) -> String {
-    if m == BEFORE { tl!("0 minutes before start").to_string() } else { crate::pim_dialogs::reminder_label(Some(m)) }
+fn snooze_label(snooze: Snooze) -> String {
+    match snooze {
+        Snooze::AtStart => tl!("0 minutes before start").to_string(),
+        Snooze::Minutes(m) => crate::pim_dialogs::reminder_label(Some(i64::from(m))),
+    }
 }
 
 /// The window, when something is due.
@@ -120,9 +113,7 @@ pub fn show(ctx: &egui::Context, st: &mut State, s: &Session, t: &Tokens, acts: 
     if !showing(st) {
         return;
     }
-    if st.snooze == 0 {
-        st.snooze = 5;
-    }
+    let snooze = *st.snooze.get_or_insert(FIRST_SNOOZE);
     let now = s.clock.now;
     let mut open = true;
     let title = if st.due.len() == 1 { tl!("1 Reminder").to_string() } else { tf!("{n} Reminders", n = st.due.len()) };
@@ -164,19 +155,25 @@ pub fn show(ctx: &egui::Context, st: &mut State, s: &Session, t: &Tokens, acts: 
                 });
             });
             ui.add_space(4.0);
-            ui.label(RichText::new(tl!("Click Snooze to be reminded again in:")).color(t.dim).small());
+            let again = ui.label(RichText::new(tl!("Click Snooze to be reminded again in:")).color(t.dim).small());
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("reminder-snooze").width(200.0).selected_text(snooze_label(st.snooze)).show_ui(ui, |ui| {
-                    for m in SNOOZES {
-                        let m = if m == 0 { BEFORE } else { m };
-                        ui.selectable_value(&mut st.snooze, m, snooze_label(m));
-                    }
-                });
+                egui::ComboBox::from_id_salt("reminder-snooze")
+                    .width(200.0)
+                    .selected_text(snooze_label(snooze))
+                    .show_ui(ui, |ui| {
+                        for m in SNOOZES {
+                            ui.selectable_value(&mut st.snooze, Some(m), snooze_label(m));
+                        }
+                    })
+                    .response
+                    .labelled_by(again.id);
                 if let Some(r) = &picked
                     && ui.button(tl!("Snooze")).clicked()
                 {
-                    let p =
-                        if st.snooze == BEFORE { json!({ "key": r.key, "beforeStart": 0 }) } else { json!({ "key": r.key, "minutes": st.snooze }) };
+                    let p = match snooze {
+                        Snooze::AtStart => json!({ "key": r.key, "beforeStart": 0 }),
+                        Snooze::Minutes(m) => json!({ "key": r.key, "minutes": m }),
+                    };
                     acts.push(Action::Run("reminders.snooze", p));
                 }
             });

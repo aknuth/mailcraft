@@ -1,16 +1,20 @@
 //! Files written here and read back: new ones, added to, changed, in both formats.
 
+#[path = "support/sample.rs"]
+mod sample;
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use std::rc::Rc;
 
 use mailcraft_pst::write::{self, *};
 use mailcraft_pst::*;
+use sample::message;
+use scratch::scratch;
 
+/// A file `name` in a scratch folder of its own.
 fn temp(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-tests-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    let _ = std::fs::remove_file(&path);
-    path
+    scratch(&format!("pst-tests-{name}")).join(name)
 }
 
 fn open(path: &std::path::Path) -> Rc<PstStore> {
@@ -26,18 +30,7 @@ fn text(v: Option<&PropertyValue>) -> String {
 }
 
 fn msg<'a>(subject: &'a str, recipients: &'a [NewRecipient<'a>], properties: &'a [NewProperty<'a>]) -> NewMessage<'a> {
-    NewMessage {
-        subject,
-        sender_name: "Ann",
-        sender_email: "ann@example.org",
-        recipients,
-        body: "The body.",
-        html_body: None,
-        message_id: "<one@example.org>",
-        delivery_time: 133_000_000_000_000_000,
-        message_class: "IPM.Note",
-        properties,
-    }
+    NewMessage { recipients, properties, ..message(subject) }
 }
 
 /// The child of `folder` named `name`.
@@ -228,6 +221,24 @@ fn folders_get_their_class_and_special_folders_are_recorded() {
     let store = open(&path);
     let t = child(&store, store.ipm_subtree().unwrap(), "Tasks").unwrap();
     assert_eq!(text(store.open_folder(t).unwrap().properties().get(0x3613)), "IPF.Task");
+}
+
+/// Looking up a special folder only reads: a file that can't be written to still says.
+#[test]
+fn a_special_folder_is_read_from_a_file_that_cant_be_written_to() {
+    let path = temp("special-read-only.pst");
+    write::create_empty(&path, Format::Unicode).unwrap();
+    write::set_special_folder(&path, SpecialFolder::SentItems, &["Archive", "Sent"]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms.clone()).unwrap();
+    let found = write::special_folder(&path, SpecialFolder::SentItems);
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+    assert_eq!(found.unwrap(), Some(vec!["Archive".to_string(), "Sent".to_string()]));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]

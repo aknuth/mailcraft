@@ -9,7 +9,7 @@ use crate::session::{SearchStats, SearchWork};
 /// A mailbox of `folders` folders of `per` messages each (the first `big` more), in memory: every
 /// message's text holds common words, every seventh "zanzibar" and every eleventh the phrase
 /// "quarterly budget review". Indexed when `index`.
-fn generated(folders: usize, per: u32, big: u32, index: bool) -> Session {
+pub(super) fn generated(folders: usize, per: u32, big: u32, index: bool) -> Session {
     let store = Store::memory();
     store.save_accounts(&[mailcraft_model::AccountConfig { id: "a1".into(), email: "me@studio.example".into(), ..Default::default() }]).unwrap();
     let list: Vec<mailcraft_model::Folder> = (0..folders)
@@ -205,7 +205,6 @@ fn a_search_folder_on_an_empty_index_reads_no_message() {
     assert_eq!(s.store.as_ref().unwrap().reads(), reads, "no message read");
     assert!(s.search_progress().is_some_and(|p| p.missing > 0));
     assert_eq!(s.search_stats().sources, 0);
-    done(s);
 }
 
 /// Waiting with no index (each message read) finds what the index finds, query after query.
@@ -241,7 +240,18 @@ fn waiting_without_an_index_finds_what_the_index_finds() {
         assert_eq!(keys(&s), want, "{q}");
     }
     assert_eq!(s.search_stats().sources, sources, "with the index, no message is read");
-    done(s);
+}
+
+/// A message whose text shows its picture (no file), come into `account`'s Inbox with a summary
+/// that says it has files (as an old `.pst` import's did); its key.
+fn logo_inside(s: &mut Session, account: &str) -> mailcraft_model::MessageKey {
+    const RAW: &[u8] = b"From: a@x.example\r\nSubject: Logo inside\r\nContent-Type: multipart/related; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/html\r\n\r\n<p>Our logo <img src=\"cid:logo@x\"></p>\r\n\
+--b\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=logo.png\r\n\
+Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--b--\r\n";
+    let key = next_key(s, account, "INBOX");
+    let summary = mailcraft_model::Summary { key, subject: "Logo inside".into(), has_attachments: true, ..Default::default() };
+    file_in(s, summary, Some(RAW))
 }
 
 /// `has:attachment` counts files, not pictures the text shows: as the index read the message,
@@ -250,16 +260,7 @@ fn waiting_without_an_index_finds_what_the_index_finds() {
 fn a_picture_shown_in_the_text_is_no_attachment() {
     let mut s = sample_session("search-inline");
     let a = sample::SAMPLE_ACCOUNT.to_string();
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder(&a, "INBOX").unwrap();
-    let uid = st.messages.iter().map(|m| m.key.uid).max().unwrap_or(0) + 1;
-    let key = mailcraft_model::MessageKey { account: a.clone(), folder: "INBOX".into(), validity: st.validity, uid };
-    let raw = "From: a@x.example\r\nSubject: Logo inside\r\nContent-Type: multipart/related; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>Our logo <img src=\"cid:logo@x\"></p>\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=logo.png\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--b--\r\n";
-    store.write_body(&key, raw.as_bytes()).unwrap();
-    st.messages
-        .insert(0, mailcraft_model::Summary { key: key.clone(), subject: "Logo inside".into(), has_attachments: true, ..Default::default() }.into());
-    store.save_folder(&a, "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: a.clone(), folder: "INBOX".into() });
+    let key = logo_inside(&mut s, &a);
     let found = |s: &mut Session| {
         s.run("search.run", &json!({"query": "has:attachment", "scope": "all"})).unwrap();
         s.list.iter().any(|m| m.key == key)
@@ -269,7 +270,6 @@ fn a_picture_shown_in_the_text_is_no_attachment() {
     assert!(!found(&mut s), "the index read it: no file");
     s.run("search.run", &json!({"query": "-has:attachment logo", "scope": "all"})).unwrap();
     assert!(s.list.iter().any(|m| m.key == key));
-    done(s);
 }
 
 /// A summary that said a picture the text shows was a file (an old `.pst` import's) is put
@@ -280,32 +280,16 @@ fn a_picture_shown_in_the_text_is_no_attachment() {
 fn the_has_files_filter_agrees_with_has_attachment() {
     let mut s = sample_session("search-files-known");
     let a = sample::SAMPLE_ACCOUNT.to_string();
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder(&a, "INBOX").unwrap();
-    let uid = st.messages.iter().map(|m| m.key.uid).max().unwrap_or(0) + 1;
-    let key = mailcraft_model::MessageKey { account: a.clone(), folder: "INBOX".into(), validity: st.validity, uid };
-    let raw = "From: a@x.example\r\nSubject: Logo inside\r\nContent-Type: multipart/related; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>Our logo <img src=\"cid:logo@x\"></p>\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=logo.png\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--b--\r\n";
-    store.write_body(&key, raw.as_bytes()).unwrap();
-    st.messages
-        .insert(0, mailcraft_model::Summary { key: key.clone(), subject: "Logo inside".into(), has_attachments: true, ..Default::default() }.into());
-    store.save_folder(&a, "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: a.clone(), folder: "INBOX".into() });
+    let key = logo_inside(&mut s, &a);
+    let uid = key.uid;
     s.run("list.filter", &json!({"value": "attachments"})).unwrap();
     assert!(s.list.iter().any(|m| m.key == key), "as its summary says");
     // A pass, as the indexer runs it: what it found put right in the list kept, then told.
-    let mut p = mailcraft_store::search::Pass::start(&store, &a, &[]).unwrap();
-    let adds = p.adds().clone();
-    for (i, m) in adds.iter().enumerate() {
-        let doc = store.read_body(&m.key).map(|raw| mailcraft_mime::index_doc(&raw));
-        p.add(&store, i, doc.as_ref()).unwrap();
-    }
-    let found = p.take_files();
-    let inbox = found.get("INBOX").cloned().unwrap_or_default();
-    assert_eq!(inbox.without, [uid], "{found:?}");
-    assert_eq!(store.set_has_files(&a, "INBOX", &inbox).unwrap(), 1);
-    p.finish(&store, true).unwrap();
-    let generation = p.generation();
-    drop(p);
+    let pass = sample::big::index(s.store.as_ref().unwrap(), &a).unwrap();
+    let inbox = pass.files.get("INBOX").cloned().unwrap_or_default();
+    assert_eq!(inbox.without, [uid], "{:?}", pass.files);
+    assert_eq!(pass.corrected, 1);
+    let generation = pass.generation;
     s.apply(Event::AttachmentsKnown { account: a.clone(), folder: "INBOX".into(), with: inbox.with, without: inbox.without });
     assert!(!s.list.iter().any(|m| m.key == key), "the filter reads it as the index did");
     assert!(!s.folder_state(&a, "INBOX").find(uid).unwrap().has_attachments);
@@ -320,7 +304,6 @@ fn the_has_files_filter_agrees_with_has_attachment() {
     let revision = s.revision;
     s.apply(Event::AttachmentsKnown { account: a.clone(), folder: "INBOX".into(), with: vec![uid], without: Vec::new() });
     assert!(s.summary(&key).unwrap().has_attachments && s.revision != revision);
-    done(s);
 }
 
 /// A word past the first 50,000 characters of a message is found, from the index and from the
@@ -331,19 +314,14 @@ fn the_has_files_filter_agrees_with_has_attachment() {
 fn long_texts_are_searched_whole() {
     let mut s = sample_session("search-long");
     let a = sample::SAMPLE_ACCOUNT.to_string();
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder(&a, "INBOX").unwrap();
-    let uid = st.messages.iter().map(|m| m.key.uid).max().unwrap_or(0) + 1;
-    let key = mailcraft_model::MessageKey { account: a.clone(), folder: "INBOX".into(), validity: st.validity, uid };
     // "needle haystack" across the first slice's end (256 KiB of text).
     let mut text = "lorem ".repeat(262_140 / 6);
     text.push_str("needle haystack ");
     text.push_str(&"ipsum ".repeat(20_000));
     text.push_str("zanzibar");
-    store.write_body(&key, format!("From: a@x.example\r\nSubject: Long\r\n\r\n{text}\r\n").as_bytes()).unwrap();
-    st.messages.insert(0, mailcraft_model::Summary { key: key.clone(), subject: "Long".into(), ..Default::default() }.into());
-    store.save_folder(&a, "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: a.clone(), folder: "INBOX".into() });
+    let raw = format!("From: a@x.example\r\nSubject: Long\r\n\r\n{text}\r\n");
+    let summary = mailcraft_model::Summary { key: next_key(&s, &a, "INBOX"), subject: "Long".into(), ..Default::default() };
+    let key = file_in(&mut s, summary, Some(raw.as_bytes()));
     let hits = |s: &mut Session, q: &str| {
         s.run("search.run", &json!({"query": q, "scope": "all"})).unwrap();
         s.list.iter().any(|m| m.key == key)
@@ -359,7 +337,6 @@ fn long_texts_are_searched_whole() {
     assert!(hits(&mut s, "\"needle haystack\""));
     assert!(s.search_stats().texts - texts > 2, "checked a slice a unit");
     assert!(!hits(&mut s, "\"haystack needle\""));
-    done(s);
 }
 
 /// What the index settles isn't checked again, nor told as waiting for it: a message of
@@ -373,21 +350,13 @@ fn long_texts_are_searched_whole() {
 fn what_the_index_settles_is_not_checked_again() {
     let mut s = sample_session("search-settled");
     let a = sample::SAMPLE_ACCOUNT.to_string();
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder(&a, "INBOX").unwrap();
-    let uid = st.messages.iter().map(|m| m.key.uid).max().unwrap_or(0) + 1;
-    let key = |uid: u32| mailcraft_model::MessageKey { account: a.clone(), folder: "INBOX".into(), validity: st.validity, uid };
-    let (pictures, long, dotted) = (key(uid), key(uid + 1), key(uid + 2));
-    let raw = "From: a@x.example\r\nSubject: Pictures\r\nContent-Type: multipart/related; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p><img src=\"cid:logo@x\"></p>\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=logo.png\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--b--\r\n";
-    store.write_body(&pictures, raw.as_bytes()).unwrap();
-    let text = format!("alpha beta {}zanzibar", "lorem ".repeat(200_000));
-    store.write_body(&long, format!("From: a@x.example\r\nSubject: Long\r\n\r\n{text}\r\n").as_bytes()).unwrap();
-    store.write_body(&dotted, b"From: a@x.example\r\nSubject: Dotted\r\n\r\nSee xx.quokka here.\r\n").unwrap();
-    for (k, subject) in [(&pictures, "Pictures"), (&long, "Long"), (&dotted, "Dotted")] {
-        st.messages.insert(0, mailcraft_model::Summary { key: k.clone(), subject: subject.into(), ..Default::default() }.into());
-    }
-    store.save_folder(&a, "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: a.clone(), folder: "INBOX".into() });
+    let pictures = "From: a@x.example\r\nSubject: Pictures\r\nContent-Type: multipart/related; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n<p><img src=\"cid:logo@x\"></p>\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: inline; filename=logo.png\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--b--\r\n";
+    let long = format!("From: a@x.example\r\nSubject: Long\r\n\r\nalpha beta {}zanzibar\r\n", "lorem ".repeat(200_000));
+    let dotted = "From: a@x.example\r\nSubject: Dotted\r\n\r\nSee xx.quokka here.\r\n";
+    let [pictures, long, dotted] = [("Pictures", pictures), ("Long", &long), ("Dotted", dotted)].map(|(subject, raw)| {
+        let summary = mailcraft_model::Summary { key: next_key(&s, &a, "INBOX"), subject: subject.into(), ..Default::default() };
+        file_in(&mut s, summary, Some(raw.as_bytes()))
+    });
     index_now(&s, &a);
     let search = |s: &mut Session, q: &str| {
         s.run("search.run", &json!({"query": q, "scope": "all"})).unwrap();
@@ -411,7 +380,6 @@ fn what_the_index_settles_is_not_checked_again() {
     s.search_folder_changed(&a, "INBOX");
     settle(&mut s, 1);
     assert_eq!(progress(&s), Some((0, 1)), "after its folder is scanned again");
-    done(s);
 }
 
 /// With an index, a word that must be missing, an address and a word in the files' names read
@@ -426,7 +394,6 @@ fn negated_words_read_no_message_with_an_index() {
     }
     assert_eq!(s.store.as_ref().unwrap().reads(), reads);
     assert_eq!(s.search_stats().sources, 0);
-    done(s);
 }
 
 /// A message marked read at any point of a search, the list being put together at its end
@@ -677,7 +644,8 @@ fn a_step_tells_its_work_and_never_waits_for_marks() {
     assert!(store.marks_waiting());
     // No folder's list in memory: a search reads them.
     s.cache.clear();
-    let began = std::time::Instant::now();
+    // Paused by this thread: a wait for them could only be given up, and is logged.
+    let waits = waits_logged();
     s.start_search("zanzibar", SearchScope::All, false);
     let mut kinds = HashSet::new();
     for _ in 0..50 {
@@ -685,7 +653,7 @@ fn a_step_tells_its_work_and_never_waits_for_marks() {
             kinds.insert(w);
         });
     }
-    assert!(began.elapsed() < std::time::Duration::from_secs(5), "waited {:?}", began.elapsed());
+    assert_eq!(waits_logged(), waits, "waited for the marks");
     assert!(!s.search_progress().unwrap().done, "the Inbox not read yet");
     let read: HashSet<&str> = s.cache.keys().map(|(_, f)| f.as_str()).collect();
     assert!(read.len() >= 3 && !read.contains("INBOX"), "the others read: {read:?}");

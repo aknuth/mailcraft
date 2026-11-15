@@ -43,7 +43,21 @@ pub(crate) fn sync_folder_of(path: &Path) {
 /// or lock violation, or access denied: it's tried again for up to about a second before that
 /// counts as a failure (craft-atomic's `retry_rename`).
 pub(crate) fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
-    craft_atomic::retry_rename(RenameRetry::platform(), || fs::rename(from, to))
+    craft_atomic::retry_rename(RenameRetry::platform(), || {
+        let renamed = fs::rename(from, to);
+        #[cfg(test)]
+        if renamed.is_err() {
+            RENAME_REFUSED.with_borrow_mut(|heard| heard.as_mut().map(|h| h()));
+        }
+        renamed
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: told of each rename on this thread that was refused, before it's tried again (a
+    /// test holding the file lets go of it once its rename has been seen refused).
+    pub(crate) static RENAME_REFUSED: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Makes the cache's folder if it isn't there. On Unix a folder that others can get into is
@@ -69,12 +83,12 @@ fn close_to_others(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::scratch;
 
     /// Written whole or not at all, readable by its owner only on Unix.
     #[test]
     fn written_whole_and_private() {
-        let root = std::env::temp_dir().join(format!("mailcraft-replace-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = scratch("replace");
         let target = root.join("nested").join("state.json");
         for contents in [&b"first"[..], b"second, longer", b"third"] {
             write_atomic(&target, contents).unwrap();
@@ -91,7 +105,6 @@ mod tests {
             private_dir(&root).unwrap();
             assert_eq!(bits(&root), 0o700, "a folder others could enter is closed");
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A link at the target's name is kept, and the file it names written (as the other Craft
@@ -99,8 +112,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_is_kept_and_its_file_written() {
-        let root = std::env::temp_dir().join(format!("mailcraft-replace-link-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = scratch("replace-link");
         fs::create_dir_all(&root).unwrap();
         let real = root.join("real.json");
         fs::write(&real, b"old").unwrap();
@@ -109,7 +121,6 @@ mod tests {
         write_atomic(&link, b"new").unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(fs::read(&real).unwrap(), b"new");
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// On Windows itself: a file held open by another program (no delete sharing, as OneDrive or
@@ -118,7 +129,7 @@ mod tests {
     #[test]
     fn a_file_held_for_a_moment_is_still_written() {
         use std::os::windows::fs::OpenOptionsExt;
-        let d = std::env::temp_dir().join(format!("mailcraft-held-{}", std::process::id()));
+        let d = scratch("held");
         fs::create_dir_all(&d).unwrap();
         let target = d.join("accounts.json");
         fs::write(&target, b"old").unwrap();
@@ -134,6 +145,5 @@ mod tests {
         write_atomic(&target, b"new").unwrap();
         letting_go.join().unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
-        let _ = fs::remove_dir_all(&d);
     }
 }

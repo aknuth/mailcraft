@@ -2,12 +2,13 @@
 
 use super::*;
 
+use crate::session::pim::MAX_SECONDS;
+
 pub(super) fn commands() -> Vec<CommandSpec> {
     vec![
-        // Accounts
         // Calendar and People
         CommandSpec::new("view.module", "Mail, Calendar, People, Tasks or Notes", "Navigation", |s, v| {
-            s.module = match p::req_str(v, "name")? {
+            let module = match p::req_str(v, "name")? {
                 "mail" => crate::Module::Mail,
                 "calendar" => crate::Module::Calendar,
                 "people" => crate::Module::People,
@@ -15,31 +16,15 @@ pub(super) fn commands() -> Vec<CommandSpec> {
                 "tasks" => crate::Module::Tasks,
                 other => return Err(CmdError::Params(format!("unknown module `{other}`"))),
             };
-            Ok(json!({"module": s.module}))
+            set_module(s, module)
         })
         .params(r#"{"name": "mail"|"calendar"|"people"|"tasks"|"notes"}"#),
         // Outlook's keys for its modules: Ctrl+1 Mail, Ctrl+2 Calendar, Ctrl+3 People, Ctrl+5 Notes
         // (Ctrl+4, Tasks: `cmd/tasks.rs`).
-        CommandSpec::new("view.mail", "Mail", "Navigation", |s, _| {
-            s.module = crate::Module::Mail;
-            Ok(json!({"module": s.module}))
-        })
-        .key("Mod+1"),
-        CommandSpec::new("view.calendar", "Calendar", "Navigation", |s, _| {
-            s.module = crate::Module::Calendar;
-            Ok(json!({"module": s.module}))
-        })
-        .key("Mod+2"),
-        CommandSpec::new("view.people", "People", "Navigation", |s, _| {
-            s.module = crate::Module::People;
-            Ok(json!({"module": s.module}))
-        })
-        .key("Mod+3"),
-        CommandSpec::new("view.notes", "Notes", "Navigation", |s, _| {
-            s.module = crate::Module::Notes;
-            Ok(json!({"module": s.module}))
-        })
-        .key("Mod+5"),
+        CommandSpec::new("view.mail", "Mail", "Navigation", |s, _| set_module(s, crate::Module::Mail)).key("Mod+1"),
+        CommandSpec::new("view.calendar", "Calendar", "Navigation", |s, _| set_module(s, crate::Module::Calendar)).key("Mod+2"),
+        CommandSpec::new("view.people", "People", "Navigation", |s, _| set_module(s, crate::Module::People)).key("Mod+3"),
+        CommandSpec::new("view.notes", "Notes", "Navigation", |s, _| set_module(s, crate::Module::Notes)).key("Mod+5"),
         CommandSpec::new("calendar.view", "Day, week or month", "Calendar › View", |s, v| {
             s.cal_mode = match p::req_str(v, "mode")? {
                 "day" => crate::CalMode::Day,
@@ -56,7 +41,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("calendar.events", "Events", "Calendar", |s, v| {
             let (d0, d1) = s.cal_days();
             let from = p::str(v, "from").and_then(|x| parse_local(x, &s.clock)).map_or(s.local_midnight(d0), |(t, all_day)| if all_day { s.clock.utc(t) } else { t });
-            let to = p::str(v, "to").and_then(|x| parse_local(x, &s.clock)).map_or(s.local_midnight(d1), |(t, all_day)| if all_day { s.clock.utc(t + 86_400) } else { t });
+            let to = p::str(v, "to").and_then(|x| parse_local(x, &s.clock)).map_or(s.local_midnight(d1), |(t, all_day)| if all_day { s.clock.utc(t.saturating_add(86_400)) } else { t });
             Ok(json!(s.agenda(from, to).iter().map(|i| json!({
                 "uid": i.uid, "summary": i.summary, "location": i.location, "start": i.start, "end": i.end, "allDay": i.all_day,
                 "occurrence": i.occurrence, "recurring": i.recurring, "account": i.account, "calendar": i.calendar,
@@ -84,10 +69,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("event.create", "New event", "Calendar › New event", |s, v| {
             let mut e = event_from(s, v, mailcraft_model::ical::CalEvent::default())?;
             super::meetings::for_all(s, v, &mut e);
-            let account = match p::str(v, "account") {
-                Some(a) => a.to_string(),
-                None => s.current_account().map(|a| a.config.id.clone()).ok_or_else(|| CmdError::Disabled("add an account first".into()))?,
-            };
+            let account = account_param(s, v)?;
             // With guests, the user organizes it.
             if !e.attendees.is_empty() && e.organizer.is_none() {
                 let me = s.account(&account).map(|a| (a.config.name.clone(), a.config.email.clone())).unwrap_or_default();
@@ -172,11 +154,11 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             {
                 // One occurrence off: the guests are told of that one.
                 if let Some(at) = occurrence.filter(|_| e.rrule.is_some()) {
-                    let len = e.end - e.start;
+                    let len = e.end.saturating_sub(e.start);
                     e.recurrence_id = Some(at);
                     e.rrule = None;
                     e.start = at;
-                    e.end = at + len;
+                    e.end = at.saturating_add(len);
                 }
                 e.sequence = e.sequence.saturating_add(1);
                 // The whole meeting waits for its item to be deleted; one occurrence, for the
@@ -335,24 +317,30 @@ pub(super) fn event_from(s: &Session, v: &Value, mut e: mailcraft_model::ical::C
             Some(x) => {
                 parse_local(x, &s.clock).map(Some).ok_or_else(|| CmdError::Params(format!("`{x}` is not a date (YYYY-MM-DD or YYYY-MM-DDTHH:MM)")))
             }
-            None => Ok(v.get(k).and_then(Value::as_i64).map(|n| (n, false))),
+            // Unix seconds, within the years a date written out can name (sums with one past
+            // them overflowed: a panic in a debug build, a time long past in a release one).
+            None => match v.get(k).and_then(Value::as_i64) {
+                Some(n) if !(-MAX_SECONDS..MAX_SECONDS).contains(&n) => Err(CmdError::Params(format!("`{k}`: {n} is no time a calendar has"))),
+                n => Ok(n.map(|n| (n, false))),
+            },
         }
     };
-    let length = e.end - e.start;
+    let length = e.end.saturating_sub(e.start);
     if let Some((t, all_day)) = when("start")? {
         e.start = t;
         e.all_day = p::bool(v, "allDay").unwrap_or(all_day);
-        e.end = t + length.max(if e.all_day { 86_400 } else { 3600 });
+        e.end = t.saturating_add(length.max(if e.all_day { 86_400 } else { 3600 }));
     } else if let Some(a) = p::bool(v, "allDay") {
         e.all_day = a;
     }
     if let Some((t, all_day)) = when("end")? {
         // An all-day end date is the last day shown: the event ends the day after.
-        e.end = if all_day && e.all_day { t + 86_400 } else { t };
+        e.end = if all_day && e.all_day { t.saturating_add(86_400) } else { t };
     }
     if e.all_day {
-        e.start -= e.start.rem_euclid(86_400);
-        e.end = (e.end - e.end.rem_euclid(86_400)).max(e.start + 86_400);
+        // Times kept in the calendar's file are whatever it holds: none overflows here.
+        e.start = e.start.saturating_sub(e.start.rem_euclid(86_400));
+        e.end = e.end.saturating_sub(e.end.rem_euclid(86_400)).max(e.start.saturating_add(86_400));
     } else if e.tzid.is_empty()
         && let Some(zone) = s.clock.zone.and_then(|z| z.name())
     {
@@ -381,14 +369,8 @@ pub(super) fn event_from(s: &Session, v: &Value, mut e: mailcraft_model::ical::C
             })
             .collect();
     }
-    let list: Option<Vec<String>> = match v.get("categories") {
-        Some(Value::String(x)) => Some(x.split([',', ';']).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()),
-        Some(Value::Array(a)) => Some(a.iter().filter_map(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()),
-        _ => None,
-    };
-    if let Some(mut list) = list {
-        list.dedup();
-        e.categories = list.into_iter().take(20).map(|c| c.chars().take(100).collect()).collect();
+    if let Some(list) = categories_param(v) {
+        e.categories = list;
     }
     // Its reminder: minutes before it starts, or none.
     match v.get("reminder") {
@@ -412,12 +394,10 @@ pub(super) fn event_from(s: &Session, v: &Value, mut e: mailcraft_model::ical::C
             .ok_or_else(|| CmdError::Params(format!("`{x}` is not free, workingElsewhere, tentative, busy or oof")))?;
         mailcraft_model::ical::set_show_as(&mut e, show);
     }
-    match p::str(v, "repeat").map(str::trim) {
+    match repeat_param(v)? {
         // No repeat: none of a file's added dates either.
-        Some("" | "none" | "never") => (e.rrule, e.rdates) = (None, Vec::new()),
-        Some(r @ ("daily" | "weekly" | "monthly" | "yearly")) => e.rrule = Some(format!("FREQ={}", r.to_ascii_uppercase())),
-        Some(r) if r.to_ascii_uppercase().starts_with("FREQ=") && r.len() < 500 => e.rrule = Some(r.to_string()),
-        Some(r) => return Err(CmdError::Params(format!("`{r}` is not a repeat"))),
+        Some(None) => (e.rrule, e.rdates) = (None, Vec::new()),
+        Some(rule) => e.rrule = rule,
         None => {}
     }
     super::meetings::apply(s, v, &mut e)?;
@@ -433,10 +413,14 @@ pub(super) fn card_from(v: &Value, mut c: mailcraft_model::vcard::Card) -> Resul
             _ => None,
         }
     };
-    if let Some(n) = p::str(v, "name") {
+    // The name as shown, sent back unchanged (the contact form always sends it), keeps its parts.
+    if let Some(n) = p::str(v, "name")
+        && n.trim() != c.display()
+    {
         c.name = n.trim().chars().take(300).collect();
         c.given.clear();
         c.family.clear();
+        c.name_rest.clear();
     }
     use mailcraft_model::vcard::{PostalAddress, Typed};
     // A list of values, each a string or {"value", "kind"} (a phone's kind: work, home, cell,
@@ -466,7 +450,20 @@ pub(super) fn card_from(v: &Value, mut c: mailcraft_model::vcard::Card) -> Resul
         }
     };
     if let Some(e) = typed("emails") {
-        c.emails = e.into_iter().take(20).collect();
+        // Given as text (the contact form's), an address keeps the kind it had.
+        let bare = matches!(v.get("emails"), Some(Value::String(_)))
+            || v.get("emails").and_then(Value::as_array).is_some_and(|a| a.iter().all(Value::is_string));
+        let had = std::mem::take(&mut c.emails);
+        c.emails = e
+            .into_iter()
+            .take(20)
+            .map(|mut t| {
+                if bare && let Some(old) = had.iter().find(|o| o.value == t.value) {
+                    t.kind.clone_from(&old.kind);
+                }
+                t
+            })
+            .collect();
     }
     if let Some(ph) = typed("phones") {
         c.phones = ph.into_iter().take(20).collect();
@@ -518,10 +515,7 @@ fn save_note_file(s: &mut Session, v: &Value) -> CmdResult {
     let index = p::u64(v, "index").and_then(|i| usize::try_from(i).ok()).ok_or_else(|| CmdError::Params("`index` is required".into()))?;
     let path = p::req_str(v, "path")?;
     if p::bool(v, "open").unwrap_or(false) {
-        let name = std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy().into_owned();
-        if mailcraft_mime::runs_code(&name) {
-            return Err(CmdError::Disabled(format!("{name} could run a program, so it isn't opened from here; save it and check it first")));
-        }
+        super::compose::refuse_runnable(path)?;
     }
     let (_, data) = s.note_file(uid, index)?;
     std::fs::write(path, &data).map_err(|e| CmdError::Failed(format!("{path}: {e}")))?;

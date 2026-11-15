@@ -6,6 +6,7 @@ use mailcraft_store::Store;
 use mailcraft_store::search::{self, Field, Reader, Writer};
 
 use super::super::ImportOptions;
+use super::super::out::held;
 use super::pipeline::{data_file, run};
 
 /// Messages a folder of [`data_file`] holds…
@@ -61,13 +62,12 @@ fn an_imported_file_is_searchable_without_reading_it_again() {
         assert_eq!(p.total, 0, "every folder passed over");
         assert_eq!(store.reads(), reads);
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// However many lanes read the file, the index is the same: the same messages behind each word.
 #[test]
 fn the_index_is_the_same_whatever_the_lanes() {
-    let (dir, pst) = data_file("indexed-lanes", PER_FOLDER, false);
+    let (_, pst) = data_file("indexed-lanes", PER_FOLDER, false);
     let (one, four) = (Store::memory(), Store::memory());
     run(&pst, &one, "i2", &lanes(1));
     run(&pst, &four, "i2", &lanes(4));
@@ -81,14 +81,13 @@ fn the_index_is_the_same_whatever_the_lanes() {
         assert!(!keys(&one, word).is_empty(), "{word}");
         assert_eq!(keys(&one, word), keys(&four, word), "{word}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An index that can't be written costs the import nothing: every message comes in, and the
 /// next pass finds them all to add.
 #[test]
 fn an_index_that_cant_be_written_leaves_the_import_whole() {
-    let (dir, pst) = data_file("index-fails", PER_FOLDER, false);
+    let (_, pst) = data_file("index-fails", PER_FOLDER, false);
     let store = Store::failing();
     store.fail(None, Some("meta.bin"));
     let done = run(&pst, &store, "i3", &lanes(4));
@@ -99,15 +98,15 @@ fn an_index_that_cant_be_written_leaves_the_import_whole() {
     let listed: usize = done.folders.iter().map(|f| store.load_folder("i3", &f.path).unwrap().messages.len()).sum();
     assert_eq!(listed, MESSAGES);
     assert_eq!(plan(&store, "i3").add.len(), MESSAGES, "every message for the next pass");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An index another writer holds (a pass not yet stopped) is waited for a moment: let go within
-/// it, the import takes it; held on, the import goes on without it and the next pass adds every
-/// message. Asked not to index, it doesn't.
+/// it (once the import has found it held, however long a busy computer takes to get there), the
+/// import takes it; held on, the import goes on without it and the next pass adds every message.
+/// Asked not to index, it doesn't.
 #[test]
 fn an_index_held_elsewhere_is_waited_for_then_left() {
-    let (dir, pst) = data_file("index-held", PER_FOLDER, false);
+    let (_, pst) = data_file("index-held", PER_FOLDER, false);
     let store = Store::memory();
     let held = Writer::open(&store, "i4").unwrap();
     let done = run(&pst, &store, "i4", &lanes(2));
@@ -117,13 +116,8 @@ fn an_index_held_elsewhere_is_waited_for_then_left() {
     assert_eq!(plan(&store, "i4").add.len(), MESSAGES);
 
     let store = Store::memory();
-    let held = Writer::open(&store, "i5").unwrap();
-    let letting_go = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        drop(held);
-    });
+    held::until_found("i5", Writer::open(&store, "i5").unwrap());
     let done = run(&pst, &store, "i5", &lanes(2));
-    letting_go.join().unwrap();
     assert_eq!((done.messages, done.stats.indexed), (MESSAGES, MESSAGES as u64));
     assert!(plan(&store, "i5").is_empty());
 
@@ -131,5 +125,4 @@ fn an_index_held_elsewhere_is_waited_for_then_left() {
     let done = run(&pst, &store, "i6", &ImportOptions { lanes: 2, no_index: true, ..ImportOptions::default() });
     assert_eq!((done.messages, done.stats.indexed), (MESSAGES, 0));
     assert!(Reader::open(&store, "i6").unwrap().is_none());
-    let _ = std::fs::remove_dir_all(&dir);
 }

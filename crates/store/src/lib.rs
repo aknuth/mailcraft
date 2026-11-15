@@ -24,8 +24,6 @@ pub mod location;
 mod packed;
 pub mod search;
 #[cfg(not(target_arch = "wasm32"))]
-pub use packed::EXTENSION as DATA_FILE_EXTENSION;
-#[cfg(not(target_arch = "wasm32"))]
 pub use packed::growth as data_file_growth;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
@@ -58,6 +56,39 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+impl StoreError {
+    /// Whether the mail is open in another copy of MailCraft (a data file it has open, or its
+    /// folder layout), which has to be closed first. Told by the error's kind, not its words: the
+    /// CLI matched "another copy of MailCraft", which rewording here would have undone unseen.
+    pub fn is_open_elsewhere(&self) -> bool {
+        matches!(self, StoreError::Io { source, .. } if source.get_ref().is_some_and(|e| e.is::<OpenElsewhere>()))
+    }
+}
+
+/// The error inside an [`io::Error`] saying the mail is open in another copy of MailCraft.
+#[derive(Debug)]
+struct OpenElsewhere(String);
+
+impl std::fmt::Display for OpenElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OpenElsewhere {}
+
+/// `what` (words saying it's open in another copy of MailCraft) as the error
+/// [`StoreError::is_open_elsewhere`] knows (only a copy on disk can be another's).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn open_elsewhere(what: String) -> io::Error {
+    io::Error::other(OpenElsewhere(what))
+}
+
+/// A lock that outlives a panic elsewhere (what it guards is whole between steps).
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
     move |source| StoreError::Io { path: path.display().to_string(), source }
@@ -203,9 +234,8 @@ impl ListWriter {
     }
 
     fn write_page(&mut self, store: &Store) -> Result<()> {
-        let path = store.folder_dir(&self.account, &self.folder).join(format!("state-{}.json", self.pages.len()));
-        let p = path.display().to_string();
-        let bytes = serde_json::to_vec(&self.page).map_err(|source| StoreError::Json { path: p, source })?;
+        let path = folders::page_path(&store.folder_dir(&self.account, &self.folder), self.pages.len());
+        let bytes = to_json(&path, &self.page)?;
         store.files.write(&path, &bytes)?;
         self.pages.push(page_hash(&bytes));
         self.page.clear();
@@ -239,9 +269,23 @@ impl ListWriter {
         if !self.page.is_empty() {
             self.write_page(store)?;
         }
+        // The head under the lock every head written takes, after the marks handed over before,
+        // as save_folder writes it.
+        store.flush_marks_of(&self.account, Some(&self.folder));
+        let _held = store.hold_changes();
         let dir = store.folder_dir(&self.account, &self.folder);
-        let path = dir.join("state.json");
-        let old: StateFile = store.read_json(&path).unwrap_or_default();
+        // Its pages are written already, over the old list's: the head is written whatever the old
+        // one reads as, or the old head would name a mix of both lists' pages. Missing or damaged
+        // reads as none; one that can't be read names no pages, so the ones this list no longer
+        // has are found by looking for their files.
+        let old: StateFile = match store.read_json(&dir.join(folders::HEAD)) {
+            Ok(old) => old,
+            Err(e) => {
+                log::warn!("{}/{}: the list's old head not read: {e}", self.account, self.folder);
+                let after = (self.pages.len()..TAIL_PAGES_MAX).take_while(|i| store.files.is_file(&folders::page_path(&dir, *i))).count();
+                StateFile { pages: vec![0; self.pages.len().saturating_add(after)], ..StateFile::default() }
+            }
+        };
         let file = StateFile {
             validity: head.validity,
             uid_next: head.uid_next,
@@ -251,30 +295,18 @@ impl ListWriter {
             count: self.total,
             pages: self.pages,
         };
-        let p = path.display().to_string();
-        let bytes = serde_json::to_vec(&file).map_err(|source| StoreError::Json { path: p, source })?;
         // A new list: no marks from an old one put on it.
-        let marks = dir.join(folders::MARKS);
-        let mut writes = vec![(path, bytes)];
-        if store.has_marks(&marks) {
-            writes.push((marks, b"[]".to_vec()));
-        }
+        let mut writes = Vec::new();
+        let stale = store.head_writes(&dir, &file, &old, &mut writes)?;
         store.write_files(writes)?;
-        for i in file.pages.len()..old.pages.len() {
-            let _ = store.files.remove_file(&dir.join(format!("state-{i}.json")));
-        }
+        store.remove_stale(stale);
         Ok(counts)
     }
 }
 
 /// A page's hash (FNV-1a over its JSON), to tell which pages changed.
 fn page_hash(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
+    mailcraft_model::hash::fnv1a(bytes)
 }
 
 impl FolderState {
@@ -335,21 +367,36 @@ pub struct OutboxItem {
     /// Held back until then (Unix seconds; 0 = send at once): Outlook's Delay Delivery.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub not_before: i64,
+    /// The server refused it for good (not a connection that failed): it isn't tried again, and
+    /// waits for the user to change or delete it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub refused: bool,
 }
+
+/// How [`OutboxItem::error`] began for one refused for good, kept before
+/// [`OutboxItem::refused`] was.
+pub(crate) const OUTBOX_REFUSED: &str = "refused: ";
 
 fn is_zero(n: &i64) -> bool {
     *n == 0
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// An account's folder list with its counts, in the account's folder.
+pub(crate) const FOLDERS: &str = "folders.json";
+
+/// `value` as the JSON a cache file keeps, or an error naming the file it was for.
+pub(crate) fn to_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|source| StoreError::Json { path: path.display().to_string(), source })
+}
+
 /// FNV-1a: a stable, dependency-free hash for folder directory names (folder names can hold
 /// characters no file system accepts).
 pub fn fnv64(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
+    mailcraft_model::hash::fnv1a(s.as_bytes())
 }
 
 /// Keep only characters that are safe in a path segment.
@@ -422,8 +469,14 @@ impl Store {
     fn on_folders(root: PathBuf, alone: bool) -> Result<Store> {
         private_dir(&root)?;
         let folders = leases::folder_layout(&root, alone)?;
-        Ok(Store {
-            files: Routed::new(&root, Files::Disk),
+        Ok(Store::with(root, Files::Disk, folders))
+    }
+
+    /// A cache at `root` whose files are `files`, holding the folder layout's lease `folders`
+    /// (when it has one): what every way of opening one shares.
+    fn with(root: PathBuf, files: Files, folders: Option<Arc<leases::Lease>>) -> Store {
+        Store {
+            files: Routed::new(&root, files),
             root,
             changes: Arc::default(),
             reads: Arc::default(),
@@ -431,7 +484,7 @@ impl Store {
             removals: Arc::default(),
             marking: Arc::default(),
             _folders: folders,
-        })
+        }
     }
 
     /// A cache whose accounts are each one data file in `files` (as Outlook keeps a `.pst` per
@@ -442,16 +495,7 @@ impl Store {
         let root = root.into();
         private_dir(&root)?;
         let packs = packed::Packs::open(&root, files.as_ref())?;
-        Ok(Store {
-            files: Routed::new(&root, Files::Packed(Arc::new(packs))),
-            root,
-            changes: Arc::default(),
-            reads: Arc::default(),
-            search_writers: Arc::default(),
-            removals: Arc::default(),
-            marking: Arc::default(),
-            _folders: None,
-        })
+        Ok(Store::with(root, Files::Packed(Arc::new(packs)), None))
     }
 
     /// [`Store::open_packed`]'s cache with nothing opened yet: no data file, and no folder from
@@ -462,55 +506,32 @@ impl Store {
         let root = root.into();
         private_dir(&root)?;
         let packs = packed::Packs::new(&root, files.as_ref())?;
-        Ok(Store {
-            files: Routed::new(&root, Files::Packed(Arc::new(packs))),
-            root,
-            changes: Arc::default(),
-            reads: Arc::default(),
-            search_writers: Arc::default(),
-            removals: Arc::default(),
-            marking: Arc::default(),
-            _folders: None,
-        })
+        Ok(Store::with(root, Files::Packed(Arc::new(packs)), None))
     }
 
     /// A cache kept in memory only (clones share it).
     pub fn memory() -> Store {
-        let root = PathBuf::from("memory");
-        Store {
-            files: Routed::new(&root, Files::Memory(Arc::default(), Arc::default())),
-            root,
-            changes: Arc::default(),
-            reads: Arc::default(),
-            search_writers: Arc::default(),
-            removals: Arc::default(),
-            marking: Arc::default(),
-            _folders: None,
-        }
+        Store::with(PathBuf::from("memory"), Files::Memory(Arc::default(), Arc::default()), None)
     }
 
     /// A memory cache whose files can be made to fail ([`Store::fail`]), for tests of what a
     /// store error loses.
     #[doc(hidden)]
     pub fn failing() -> Store {
-        let root = PathBuf::from("memory");
-        let faults = files::Faults { files: Files::Memory(Arc::default(), Arc::default()), reads: Mutex::default(), writes: Mutex::default() };
-        Store {
-            files: Routed::new(&root, Files::Failing(Arc::new(faults))),
-            root,
-            changes: Arc::default(),
-            reads: Arc::default(),
-            search_writers: Arc::default(),
-            removals: Arc::default(),
-            marking: Arc::default(),
-            _folders: None,
-        }
+        let faults = files::Faults {
+            files: Files::Memory(Arc::default(), Arc::default()),
+            reads: Mutex::default(),
+            writes: Mutex::default(),
+            watch: Mutex::default(),
+        };
+        Store::with(PathBuf::from("memory"), Files::Failing(Arc::new(faults)), None)
     }
 
     /// From now on, a [`Store::failing`] cache fails to read the files whose path ends with
     /// `reads` (`state.json`, `.eml`), and to write, rename or remove those ending with `writes`;
     /// `None` lets them work again; a leading `!` makes them damaged rather than failing, and a
-    /// leading `#` fails them as a full drive would. Other caches ignore it.
+    /// leading `#` fails them as a full drive would; `|` separates several endings
+    /// (`7.json|7.eml`). Other caches ignore it.
     #[doc(hidden)]
     pub fn fail(&self, reads: Option<&str>, writes: Option<&str>) {
         if let Files::Failing(f) = &self.files.main {
@@ -535,17 +556,7 @@ impl Store {
     /// a cache on disk.
     pub fn snapshot(&self, keep: impl Fn(&str) -> bool) -> Vec<(String, Vec<u8>)> {
         let Files::Memory(m, _) = &self.files.main else { return Vec::new() };
-        Files::with(m, |m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let rel = k.strip_prefix(&self.root).ok()?;
-                    let rel: Vec<&str> = rel.iter().map(|s| s.to_str()).collect::<Option<_>>()?;
-                    Some((rel.join("/"), v))
-                })
-                .filter(|(p, _)| keep(p))
-                .map(|(p, v)| (p, v.clone()))
-                .collect()
-        })
+        Files::with(m, |m| m.iter().filter_map(|(k, v)| Some((self.relative(k)?, v))).filter(|(p, _)| keep(p)).map(|(p, v)| (p, v.clone())).collect())
     }
 
     /// Whether the cache lives in memory.
@@ -565,24 +576,29 @@ impl Store {
     /// started): relative path and the bytes now, `None` for a file removed. Lets the browser
     /// keep the cache between visits.
     pub fn take_changes(&self) -> Vec<(String, Option<Vec<u8>>)> {
-        let Files::Memory(m, changed) = &self.files.main else { return Vec::new() };
-        let paths = {
-            let mut g = changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            match g.as_mut() {
-                Some(set) => std::mem::take(set),
-                None => return Vec::new(),
-            }
-        };
-        Files::with(m, |m| {
-            paths
-                .into_iter()
-                .filter_map(|k| {
-                    let rel = k.strip_prefix(&self.root).ok()?;
-                    let rel: Vec<&str> = rel.iter().map(|s| s.to_str()).collect::<Option<_>>()?;
-                    Some((rel.join("/"), m.get(&k).cloned()))
-                })
-                .collect()
-        })
+        let Files::Memory(m, _) = &self.files.main else { return Vec::new() };
+        let paths = self.take_marked();
+        Files::with(m, |m| paths.into_iter().filter_map(|k| Some((self.relative(&k)?, m.get(&k).cloned()))).collect())
+    }
+
+    /// The relative paths of [`Store::take_changes`], without the files' bytes: for one that only
+    /// asks whether something it keeps changed.
+    pub fn take_changed_paths(&self) -> Vec<String> {
+        self.take_marked().into_iter().filter_map(|k| self.relative(&k)).collect()
+    }
+
+    /// The paths noted as changed since the last call, taken.
+    fn take_marked(&self) -> std::collections::BTreeSet<PathBuf> {
+        let Files::Memory(_, changed) = &self.files.main else { return Default::default() };
+        let mut g = changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// A memory cache's file as a path relative to its root (`a1/folders.json`).
+    fn relative(&self, k: &Path) -> Option<String> {
+        let rel = k.strip_prefix(&self.root).ok()?;
+        let rel: Vec<&str> = rel.iter().map(|s| s.to_str()).collect::<Option<_>>()?;
+        Some(rel.join("/"))
     }
 
     pub fn root(&self) -> &Path {
@@ -616,8 +632,7 @@ impl Store {
     }
 
     fn write_json<T: Serialize + ?Sized>(&self, path: &Path, value: &T) -> Result<()> {
-        let bytes = serde_json::to_vec(value).map_err(|source| StoreError::Json { path: path.display().to_string(), source })?;
-        self.files.write(path, &bytes)
+        self.files.write(path, &to_json(path, value)?)
     }
 
     /// A small document at the top of the data folder (`rules.json`, `snoozes.json`); empty when
@@ -669,7 +684,12 @@ impl Store {
     /// [`Store::load_folders`] without waiting for the marks: with the lock held, which their
     /// thread takes.
     pub(crate) fn read_folders(&self, account: &str) -> Result<Vec<Folder>> {
-        self.read_json(&self.account_dir(account).join("folders.json"))
+        self.read_json(&self.folders_path(account))
+    }
+
+    /// Where `account`'s folder list is kept.
+    fn folders_path(&self, account: &str) -> PathBuf {
+        self.account_dir(account).join(FOLDERS)
     }
 
     /// Keep an account's folder list as it is now. It's written under the same lock as
@@ -684,7 +704,7 @@ impl Store {
 
     /// [`Store::save_folders`] with the lock held already.
     fn write_folders(&self, account: &str, folders: &[Folder]) -> Result<()> {
-        self.write_json(&self.account_dir(account).join("folders.json"), folders)
+        self.write_json(&self.folders_path(account), folders)
     }
 }
 
@@ -761,7 +781,7 @@ pub use accounts::Recompressed;
 use atomic::private_dir;
 pub use atomic::write_atomic;
 pub use beside::{Beside, Found, stamp as file_stamp};
-pub use bodies::{CommitTimes, LongWrite, Prepared, Timed};
+pub use bodies::{CommitTimes, Filing, LongWrite, Prepared, Timed, Waiting};
 pub use compacting::Shrunk;
 use files::{Files, Routed};
 pub use folders::FolderLoad;

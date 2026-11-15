@@ -13,8 +13,8 @@
 //! `MAILCRAFT_MICROSOFT_CLIENT_ID`, at run time or baked in at build time. Without one, a
 //! provider isn't offered.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::io::{ErrorKind, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::rand::SecureRandom;
@@ -117,7 +117,7 @@ pub fn available() -> Vec<String> {
 
 /// Base64url without padding (RFC 4648 §5), as PKCE wants.
 pub fn b64url(data: &[u8]) -> String {
-    crate::imap::base64(data).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
+    mailcraft_model::base64::encode(data).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
 }
 
 fn random(n: usize) -> Result<Vec<u8>> {
@@ -200,6 +200,12 @@ fn token_request(p: &Provider, mut fields: Vec<(&str, String)>, extra_scope: &st
         serde_json::from_slice(&r.body).map_err(|_| NetError::Protocol(format!("the sign-in service answered HTTP {} without JSON", r.status)))?;
     if !r.ok() || v.get("error").is_some() {
         let what = v.get("error_description").or_else(|| v.get("error")).and_then(Value::as_str).unwrap_or("refused");
+        // The service failing, busy or throttling refused nothing: the connection is dropped and
+        // tried again later (taken for a refusal, it asked to sign in again).
+        let code = v.get("error").and_then(Value::as_str).unwrap_or_default();
+        if r.status >= 500 || r.status == 429 || matches!(code, "server_error" | "temporarily_unavailable") {
+            return Err(NetError::Protocol(format!("{} couldn't answer now (HTTP {}): {what}", p.name, r.status)));
+        }
         // A revoked or expired grant means signing in again.
         return Err(NetError::Auth(format!("{}: {what}", p.name)));
     }
@@ -265,6 +271,72 @@ pub(crate) fn unpct(s: &str) -> String {
 /// Run the browser sign-in: `open` shows the provider's page (the system browser), the
 /// redirect comes back to a listener on 127.0.0.1, and the code becomes tokens.
 pub fn authorize(p: &Provider, login_hint: &str, open: &mut dyn FnMut(&str) -> std::result::Result<(), String>, timeout: Duration) -> Result<Tokens> {
+    authorize_with(p, login_hint, open, timeout, REQUEST_LINE_WAIT)
+}
+
+/// How long one connection to the redirect listener has to send its request line. A browser
+/// sends it at once; one that sends nothing (a speculative connection) is let go after this,
+/// so the redirect waiting behind it isn't held up for long.
+const REQUEST_LINE_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest request line read from the redirect listener.
+const REQUEST_LINE_MAX: usize = 8192;
+
+/// The most read of one request to the redirect listener: its line and its headers.
+const REQUEST_MAX: usize = 64 * 1024;
+
+/// The first line of a request on `sock`, or `None` when the connection doesn't send a whole
+/// one (at most [`REQUEST_LINE_MAX`] bytes) within `wait`, or fails.
+///
+/// The request's headers are read to their end too (within `wait`, at most [`REQUEST_MAX`]
+/// bytes in all): a connection closed with part of the request unread can be reset, and the
+/// browser then shows an error instead of the page written to it.
+fn request_line(sock: &TcpStream, wait: Duration) -> Option<String> {
+    sock.set_nonblocking(false).ok()?;
+    let until = Instant::now().checked_add(wait)?;
+    let mut got: Vec<u8> = Vec::new();
+    // Where the line ends in `got`, once it has.
+    let mut line_end: Option<usize> = None;
+    let mut buf = [0u8; 1024];
+    loop {
+        let chunk = until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .and_then(|left| sock.set_read_timeout(Some(left)).ok())
+            .and_then(|()| (&*sock).read(&mut buf).ok())
+            .and_then(|n| buf.get(..n))
+            .filter(|c| !c.is_empty());
+        // Out of time, closed or failed: the line counts if it came whole.
+        let Some(chunk) = chunk else {
+            break;
+        };
+        // An empty line ends the headers; it may have begun in the read before.
+        let from = got.len().saturating_sub(2);
+        got.extend_from_slice(chunk);
+        if line_end.is_none() {
+            line_end = got.iter().position(|&b| b == b'\n');
+            if line_end.unwrap_or(got.len()) > REQUEST_LINE_MAX {
+                return None;
+            }
+        }
+        let tail = got.get(from..).unwrap_or_default();
+        let ended = tail.windows(2).any(|w| w == b"\n\n") || tail.windows(3).any(|w| w == b"\n\r\n");
+        if line_end.is_some() && (ended || got.len() >= REQUEST_MAX) {
+            break;
+        }
+    }
+    let line = got.get(..line_end?)?;
+    Some(String::from_utf8_lossy(line).into_owned())
+}
+
+/// [`authorize`], with how long each connection to the listener may take to send its request line.
+fn authorize_with(
+    p: &Provider,
+    login_hint: &str,
+    open: &mut dyn FnMut(&str) -> std::result::Result<(), String>,
+    timeout: Duration,
+    line_wait: Duration,
+) -> Result<Tokens> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let redirect = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());
     let state = b64url(&random(16)?);
@@ -292,16 +364,19 @@ pub fn authorize(p: &Provider, login_hint: &str, open: &mut dyn FnMut(&str) -> s
         }
         let (sock, _) = match listener.accept() {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
+            // A connection that went away before it was taken.
+            Err(e) if matches!(e.kind(), ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted) => continue,
             Err(e) => return Err(e.into()),
         };
-        sock.set_nonblocking(false)?;
-        sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-        let mut line = String::new();
-        BufReader::new(sock.try_clone()?).take(8192).read_line(&mut line)?;
+        // One connection that sends nothing, half a line or fails is that connection's
+        // trouble: the redirect may be waiting behind it.
+        let Some(line) = request_line(&sock, line_wait) else {
+            continue;
+        };
         let target = line.split_whitespace().nth(1).unwrap_or("");
         let params = query_params(target);
         let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
@@ -336,7 +411,7 @@ pub fn authorize(p: &Provider, login_hint: &str, open: &mut dyn FnMut(&str) -> s
 
 /// The SASL XOAUTH2 initial response (base64 of `user=…^Aauth=Bearer …^A^A`).
 pub fn xoauth2(user: &str, token: &str) -> String {
-    crate::imap::base64(format!("user={user}\x01auth=Bearer {token}\x01\x01").as_bytes())
+    mailcraft_model::base64::encode(format!("user={user}\x01auth=Bearer {token}\x01\x01").as_bytes())
 }
 
 use std::io::Read as _;
@@ -368,7 +443,7 @@ pub(crate) mod tests {
             b64url(ring::digest::digest(&ring::digest::SHA256, b"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk").as_ref()),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
-        assert_eq!(xoauth2("a@b.c", "tok"), crate::imap::base64(b"user=a@b.c\x01auth=Bearer tok\x01\x01"));
+        assert_eq!(xoauth2("a@b.c", "tok"), mailcraft_model::base64::encode(b"user=a@b.c\x01auth=Bearer tok\x01\x01"));
         assert_eq!(query_params("/?code=4%2F0A&state=s+1"), vec![("code".to_string(), "4/0A".to_string()), ("state".into(), "s 1".into())]);
         assert_eq!(provider_for_host("IMAP.gmail.com"), Some("google"));
         assert_eq!(provider_for_host("outlook.office365.com"), Some("microsoft"));
@@ -441,5 +516,116 @@ pub(crate) mod tests {
             Ok(())
         };
         assert!(matches!(authorize(&p, "", &mut deny, Duration::from_secs(10)), Err(NetError::Auth(m)) if m.contains("access_denied")));
+    }
+
+    /// A connection that sends nothing (a browser's speculative one) or half a line and goes
+    /// away is passed over: the redirect waiting behind it still signs in, and only its code counts.
+    #[test]
+    fn stray_connections_dont_fail_the_sign_in() {
+        let json = r#"{"access_token":"good-token","refresh_token":"r1","expires_in":3600}"#;
+        let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}", json.len());
+        let (base, seen) = crate::http::tests::serve(vec![reply.into_bytes()]);
+        let p = local(&format!("{base}/token"));
+        let mut held = Vec::new();
+        let mut browser = |url: &str| -> std::result::Result<(), String> {
+            let params = query_params(url);
+            let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let (redirect, state) = (get("redirect_uri"), get("state"));
+            let addr = redirect.trim_start_matches("http://").trim_end_matches('/').to_string();
+            // Silent, and kept open until the sign-in is over.
+            held.push(std::net::TcpStream::connect(&addr).map_err(|e| e.to_string())?);
+            // Half a request line (with a code of its own), then gone.
+            let mut half = std::net::TcpStream::connect(&addr).map_err(|e| e.to_string())?;
+            half.write_all(b"GET /?code=stray-code&sta").map_err(|e| e.to_string())?;
+            drop(half);
+            std::thread::spawn(move || {
+                let _ = crate::http::get(&format!("{redirect}?code=the-code&state={state}"), 10_000);
+            });
+            Ok(())
+        };
+        let started = Instant::now();
+        let t = authorize_with(&p, "", &mut browser, Duration::from_secs(10), Duration::from_millis(300)).unwrap();
+        assert_eq!(t.access, "good-token");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let seen = seen.join().unwrap();
+        assert!(seen[0].contains("code=the-code") && !seen[0].contains("stray-code"), "{}", seen[0]);
+        drop(held);
+    }
+
+    /// A browser's request is read to the end of its headers before it is answered (they come
+    /// in more than one read): answered and closed with part of it unread, the connection can
+    /// be reset and the page lost. Headers that never end don't hold the answer back for good.
+    #[test]
+    fn a_request_is_read_to_the_end_of_its_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = |wait: Duration| {
+            let listener = listener.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let (sock, _) = listener.accept().unwrap();
+                let line = request_line(&sock, wait);
+                (&sock).write_all(b"answered").unwrap();
+                line
+            })
+        };
+        let server = serve(Duration::from_secs(30));
+        let mut browser = TcpStream::connect(addr).unwrap();
+        browser.write_all(b"GET /?code=c&state=s HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
+        // Nothing is answered while headers are still to come.
+        browser.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut early = [0u8; 8];
+        let e = browser.read(&mut early).unwrap_err();
+        assert!(matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{e}");
+        // The rest, several reads long, its empty line split in two.
+        browser.write_all(format!("Cookie: {}\r\n\r", "c".repeat(5000)).as_bytes()).unwrap();
+        browser.write_all(b"\n").unwrap();
+        browser.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut answer = String::new();
+        browser.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "answered");
+        assert_eq!(server.join().unwrap().as_deref(), Some("GET /?code=c&state=s HTTP/1.1\r"));
+        // Headers with no end: the line still counts, at the cap or when the time is up.
+        for (wait, headers) in [(Duration::from_secs(30), "h".repeat(REQUEST_MAX)), (Duration::from_millis(200), "Host: x\r\n".to_string())] {
+            let server = serve(wait);
+            let mut browser = TcpStream::connect(addr).unwrap();
+            browser.write_all(format!("GET / HTTP/1.1\n{headers}").as_bytes()).unwrap();
+            assert_eq!(server.join().unwrap().as_deref(), Some("GET / HTTP/1.1"));
+        }
+        // And a line that is too long, or never whole, is still no request.
+        for sent in ["G".repeat(REQUEST_LINE_MAX + 2) + "\n\n", "GET /?code=c".to_string()] {
+            let server = serve(Duration::from_millis(200));
+            let mut browser = TcpStream::connect(addr).unwrap();
+            let _ = browser.write_all(sent.as_bytes());
+            assert_eq!(server.join().unwrap(), None);
+        }
+    }
+
+    /// Test hang, and what it brought to light: the sign-in service failing (HTTP 5xx or 429, or
+    /// RFC 6749's `server_error` and `temporarily_unavailable`) was taken for a refusal, which
+    /// asks to sign in again. It refused nothing: the connection is dropped and tried again
+    /// later. Its refusals (`invalid_grant`, `invalid_client`) still ask to sign in.
+    #[test]
+    fn a_failing_sign_in_service_refuses_nothing() {
+        let answers = [
+            ("503 Service Unavailable", r#"{"error":"temporarily_unavailable"}"#, false),
+            ("500 Internal Server Error", r#"{"error":"server_error","error_description":"oops"}"#, false),
+            ("502 Bad Gateway", "<html>down</html>", false),
+            ("429 Too Many Requests", r#"{"error":"throttled"}"#, false),
+            ("400 Bad Request", r#"{"error":"temporarily_unavailable"}"#, false),
+            ("200 OK", r#"{"error":"server_error"}"#, false),
+            ("400 Bad Request", r#"{"error":"invalid_grant","error_description":"revoked"}"#, true),
+            ("401 Unauthorized", r#"{"error":"invalid_client"}"#, true),
+        ];
+        let reply = |status: &str, body: &str| {
+            format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+        };
+        let (base, seen) = crate::http::tests::serve(answers.iter().map(|(status, body, _)| reply(status, body)).collect());
+        let p = local(&format!("{base}/token"));
+        for (status, body, refused) in answers {
+            let e = refresh(&p, "r1").unwrap_err();
+            assert_eq!(matches!(e, NetError::Auth(_)), refused, "{status} {body}: {e}");
+            assert!(refused || e.is_fatal(), "dropped and tried again: {status} {body}: {e}");
+        }
+        assert_eq!(seen.join().unwrap().len(), answers.len());
     }
 }

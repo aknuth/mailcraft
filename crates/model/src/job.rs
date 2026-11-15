@@ -15,13 +15,16 @@ mod import;
 mod keys;
 mod op;
 pub mod progress;
+mod status;
 mod vacation;
+pub mod work;
 pub use compact::*;
 pub use eta::Eta;
 pub use import::*;
 pub use keys::{HeldKey, Revocation};
 pub use op::Op;
 pub use progress::Work;
+pub use status::{FailureKind, SyncStatus};
 pub use vacation::{Vacation, is_day};
 
 /// A password in transit. Its `Debug` form is redacted so it never reaches a log.
@@ -369,36 +372,6 @@ impl Job {
     }
 }
 
-/// How an account's connection is doing.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "camelCase")]
-pub enum SyncStatus {
-    #[default]
-    Offline,
-    Connecting,
-    Syncing {
-        folder: String,
-    },
-    /// Connected and up to date as of `at` (Unix seconds).
-    Online {
-        at: i64,
-    },
-    /// The server refused the login: the user must enter the password again.
-    NeedsPassword {
-        error: String,
-    },
-    /// The last attempt failed; the worker retries with back-off.
-    Error {
-        error: String,
-    },
-}
-
-impl SyncStatus {
-    pub fn is_online(&self) -> bool {
-        matches!(self, SyncStatus::Online { .. } | SyncStatus::Syncing { .. })
-    }
-}
-
 /// What the network layer reports back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "camelCase")]
@@ -436,6 +409,12 @@ pub enum Event {
         account: String,
         id: u64,
     },
+    /// A message went out, but no copy of it could be kept in Sent Items: why (said as a
+    /// notice). An event of its own, so what waits for the copy knows it won't come.
+    SentCopyNotKept {
+        account: String,
+        error: String,
+    },
     /// A [`Job::SaveDraft`] done: the draft (its `Message-ID`, as written) is in Drafts on the
     /// server, or kept on this computer for it (`error: None`), or neither could keep it.
     DraftSaved {
@@ -449,11 +428,14 @@ pub enum Event {
         error: String,
     },
     /// The message couldn't be sent yet (offline, or the server asked to try later): it waits in
-    /// the Outbox and goes out when the account is back online.
+    /// the Outbox and goes out when the account is back online. `kind`: what kind of failure held
+    /// it (a certificate to be asked about).
     Queued {
         account: String,
         id: u64,
         error: String,
+        #[serde(default, skip_serializing_if = "FailureKind::is_other")]
+        kind: FailureKind,
     },
     /// A mailbox change could not be applied on the server (it was rolled back locally).
     OpFailed {
@@ -640,6 +622,9 @@ pub enum Event {
         /// them, written in place of their earlier copies.
         #[serde(default)]
         replaced: usize,
+        /// Folders whose list couldn't be read: their mail isn't in the file.
+        #[serde(default)]
+        folders_skipped: usize,
         done: bool,
         error: Option<String>,
     },

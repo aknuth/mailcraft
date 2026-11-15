@@ -24,11 +24,7 @@ fn task_json(account: &str, t: &Task) -> Value {
 pub(super) fn commands() -> Vec<CommandSpec> {
     vec![
         // Outlook's key for Tasks.
-        CommandSpec::new("view.tasks", "Tasks", "Navigation", |s, _| {
-            s.module = crate::Module::Tasks;
-            Ok(json!({"module": s.module}))
-        })
-        .key("Mod+4"),
+        CommandSpec::new("view.tasks", "Tasks", "Navigation", |s, _| set_module(s, crate::Module::Tasks)).key("Mod+4"),
         CommandSpec::new("task.list", "Tasks", "Tasks", |s, v| {
             let list: Vec<Value> = s.tasks(p::str(v, "query").unwrap_or("")).iter().map(|r| task_json(r.account, r.task)).collect();
             Ok(json!({"tasks": list}))
@@ -63,11 +59,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             Ok(json!({"by": s.prefs.tasks_order.code()}))
         })
         .params(r#"{"by": "due"|"priority"|"title"|"modified"}"#),
-        CommandSpec::new("task.hideDone", "Hide completed tasks", "Tasks › View", |s, v| {
-            s.prefs.tasks_hide_done = p::bool(v, "on").unwrap_or(!s.prefs.tasks_hide_done);
-            Ok(json!({"on": s.prefs.tasks_hide_done}))
-        })
-        .params(r#"{"on"?: bool (default: the other way)}"#),
+        toggle!("task.hideDone", "Hide completed tasks", "Tasks › View", tasks_hide_done, r#"{"on"?: bool (default: the other way)}"#),
     ]
 }
 
@@ -120,14 +112,8 @@ pub(super) fn task_from(s: &Session, v: &Value, mut t: Task) -> Result<Task, Cmd
         }
         t.status = status;
     }
-    let list: Option<Vec<String>> = match v.get("categories") {
-        Some(Value::String(x)) => Some(x.split([',', ';']).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()),
-        Some(Value::Array(a)) => Some(a.iter().filter_map(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).collect()),
-        _ => None,
-    };
-    if let Some(mut list) = list {
-        list.dedup();
-        t.categories = list.into_iter().take(20).map(|c| c.chars().take(100).collect()).collect();
+    if let Some(list) = categories_param(v) {
+        t.categories = list;
     }
     match v.get("reminder") {
         None => {}
@@ -141,12 +127,8 @@ pub(super) fn task_from(s: &Session, v: &Value, mut t: Task) -> Result<Task, Cmd
         },
         Some(_) => return Err(CmdError::Params("`reminder` is a date and time (YYYY-MM-DDTHH:MM) or none".into())),
     }
-    match p::str(v, "repeat").map(str::trim) {
-        Some("" | "none" | "never") => t.rrule = None,
-        Some(r @ ("daily" | "weekly" | "monthly" | "yearly")) => t.rrule = Some(format!("FREQ={}", r.to_ascii_uppercase())),
-        Some(r) if r.to_ascii_uppercase().starts_with("FREQ=") && r.len() < 500 && !r.contains(['\r', '\n']) => t.rrule = Some(r.to_string()),
-        Some(r) => return Err(CmdError::Params(format!("`{r}` is not a repeat"))),
-        None => {}
+    if let Some(rule) = repeat_param(v)? {
+        t.rrule = rule;
     }
     Ok(t)
 }

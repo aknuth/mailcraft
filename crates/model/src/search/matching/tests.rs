@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::search::fold::{AsciiWords, pieces};
+use crate::search::fold::{AsciiWords, join, pieces};
 use proptest::strategy::ValueTree;
 
 /// How [`SummaryText::with_parts`] made a summary's text before: a string for each part, word
@@ -158,7 +158,7 @@ fn no_ascii_letter_folds() {
 /// Hand-run, in release (`cargo test -p mailcraft-model --release --lib how_long_a_summary -- --ignored
 /// --nocapture`): how long a summary's text takes to make, now and as before.
 #[test]
-#[ignore]
+#[ignore = "a measurement"]
 fn how_long_a_summary_text_takes() {
     let mut runner = proptest::test_runner::TestRunner::deterministic();
     let ms: Vec<Summary> = (0..20_000).map(|_| summary().new_tree(&mut runner).unwrap().current()).collect();

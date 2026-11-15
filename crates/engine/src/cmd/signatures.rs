@@ -28,11 +28,6 @@ const SIGNATURE_HTML_MAX: usize = 200_000 + mailcraft_mime::SIGNATURE_PICTURES *
 /// Longest signature text taken.
 const SIGNATURE_TEXT_MAX: usize = 10_000;
 
-fn config_of(s: &Session, v: &Value) -> Result<AccountConfig, CmdError> {
-    let id = p::req_str(v, "account")?;
-    s.account(id).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{id}`")))
-}
-
 /// A signature from the editor: its text, its look as HTML (kept as the editor would send it,
 /// with its pictures written in, issue #11, its text the signature's), or HTML code sent as
 /// written, the editor showing its text.
@@ -55,7 +50,7 @@ fn signature_param(v: &Value, name: String) -> Result<Signature, CmdError> {
 }
 
 pub(super) fn set_signature(s: &mut Session, v: &Value) -> CmdResult {
-    let mut config = config_of(s, v)?;
+    let mut config = s.config_of(p::req_str(v, "account")?)?;
     let was = p::str(v, "was");
     let name = p::str(v, "name")
         .or(was)
@@ -77,7 +72,7 @@ pub(super) fn set_signature(s: &mut Session, v: &Value) -> CmdResult {
 }
 
 pub(super) fn remove_signature(s: &mut Session, v: &Value) -> CmdResult {
-    let mut config = config_of(s, v)?;
+    let mut config = s.config_of(p::req_str(v, "account")?)?;
     let name = p::req_str(v, "name")?;
     if !config.remove_signature(name) {
         return Err(CmdError::Params(format!("no signature called {name}")));
@@ -87,7 +82,7 @@ pub(super) fn remove_signature(s: &mut Session, v: &Value) -> CmdResult {
 }
 
 pub(super) fn signature_defaults(s: &mut Session, v: &Value) -> CmdResult {
-    let mut config = config_of(s, v)?;
+    let mut config = s.config_of(p::req_str(v, "account")?)?;
     for (key, slot) in [("new", &mut config.signature_new), ("reply", &mut config.signature_reply)] {
         match v.get(key) {
             None => {}
@@ -106,7 +101,7 @@ pub(super) fn signature_defaults(s: &mut Session, v: &Value) -> CmdResult {
 }
 
 pub(super) fn list_signatures(s: &mut Session, v: &Value) -> CmdResult {
-    let config = config_of(s, v)?;
+    let config = s.config_of(p::req_str(v, "account")?)?;
     let list: Vec<Value> = config
         .signatures
         .iter()
@@ -119,11 +114,8 @@ pub(super) fn list_signatures(s: &mut Session, v: &Value) -> CmdResult {
 /// its list): in place of the one there, else at character `at` (else where a signature goes) on a line of its
 /// own after the usual `-- ` line.
 pub(super) fn insert_signature(s: &mut Session, v: &Value) -> CmdResult {
-    let (account, current, reply, from) = s
-        .compose
-        .as_ref()
-        .map(|c| (c.account.clone(), c.signature_name.clone(), c.mode.is_some(), c.from.clone()))
-        .ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    let c = s.composing()?;
+    let (account, current, reply, from) = (c.account.clone(), c.signature_name.clone(), c.mode.is_some(), c.from.clone());
     let sig = match p::str(v, "name") {
         Some(name) => Some(s.signature_of(&account, name).ok_or_else(|| CmdError::Params(format!("no signature called {name}")))?),
         None => s

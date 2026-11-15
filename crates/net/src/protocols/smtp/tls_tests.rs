@@ -62,7 +62,8 @@ fn converse(s: &mut (impl Read + Write), log: &mut String) {
 }
 
 /// An SMTP server on 127.0.0.1 presenting `identity`, over implicit TLS or STARTTLS, for one
-/// connection. What the client said, once it's gone.
+/// connection. What the client said, once it's gone, or once it hasn't come, or said nothing,
+/// for [`crate::http::tests::TEST_SERVER_WAIT`].
 fn serve(identity: Identity, starttls: bool) -> (u16, JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -76,7 +77,7 @@ fn serve(identity: Identity, starttls: bool) -> (u16, JoinHandle<String>) {
         .unwrap();
     let handle = std::thread::spawn(move || {
         let mut log = String::new();
-        let Ok((mut tcp, _)) = listener.accept() else { return log };
+        let Some(mut tcp) = crate::http::tests::accept_within(&listener, crate::http::tests::TEST_SERVER_WAIT) else { return log };
         if starttls {
             if tcp.write_all(b"220 test ESMTP\r\n").is_err() {
                 return log;
@@ -106,7 +107,7 @@ fn serve(identity: Identity, starttls: bool) -> (u16, JoinHandle<String>) {
 }
 
 /// Sends one message to such a server, the system trusting `store` less `distrusted`, as
-/// [`send_with`] does with the system's own. Its result, and what the server heard.
+/// [`send`] does with the system's own. Its result, and what the server heard.
 fn send_to(
     identity: Identity,
     security: Security,
@@ -140,6 +141,14 @@ fn refusal_text(result: Result<()>) -> String {
     match result {
         Ok(()) => String::from("sent"),
         Err(e) => e.to_string(),
+    }
+}
+
+/// The server and the certificate a refusal names as one of its own on this computer.
+fn untrusted(result: &Result<()>) -> Option<(String, String)> {
+    match result {
+        Err(crate::NetError::Untrusted { host, fingerprint }) => Some((host.clone(), fingerprint.clone())),
+        _ => None,
     }
 }
 
@@ -178,8 +187,8 @@ fn a_ca_the_system_does_not_trust_is_refused() {
     for (store, distrusted) in [(vec![], vec![]), (vec![internal_ca()], vec![internal_ca()])] {
         for security in [Security::Tls, Security::StartTls] {
             let (result, heard) = send_to(server_identity(), security, store.clone(), &distrusted);
+            let (host, fingerprint) = untrusted(&result).unwrap_or_default();
             let why = refusal_text(result);
-            let (host, fingerprint) = mailcraft_model::untrusted_local_certificate(&why).unwrap_or_default();
             assert_eq!(host, "127.0.0.1", "{why}");
             assert_eq!(fingerprint, crate::stream::trust::fingerprint(&server_identity().0[0]), "{why}");
             assert!(!heard.contains("AUTH"), "{heard}");
@@ -203,8 +212,9 @@ fn a_local_server_s_certificate_the_user_trusts_is_accepted() {
         // Another certificate than the one trusted: asked about again.
         let other = crate::stream::trust::fingerprint(&via_issuing_identity().0[0]);
         let (result, heard) = send_trusting_to(server_identity(), security, vec![], &[], std::slice::from_ref(&other));
+        let refused = untrusted(&result).map(|(_, f)| f);
         let why = refusal_text(result);
-        assert_eq!(mailcraft_model::untrusted_local_certificate(&why).map(|(_, f)| f), Some(shown.clone()), "{why}");
+        assert_eq!(refused, Some(shown.clone()), "{why}");
         assert!(!heard.contains("AUTH"), "{heard}");
         // One the system distrusts stays refused.
         let distrusted = server_identity().0[0].clone();

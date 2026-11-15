@@ -1,7 +1,7 @@
 //! Engine tests: a long local move in a data file seals the file as it goes, so a crash part-way
-//! reopens it at once; a short one doesn't.
+//! reopens it at once; a short one doesn't. A long copy is written in batches too.
 
-use mailcraft_model::{Flags, MessageKey, Summary};
+use mailcraft_model::{Flags, Summary};
 
 use super::*;
 
@@ -9,27 +9,7 @@ use super::*;
 /// each with its source.
 fn projects(root: &std::path::Path, n: u32) -> (Store, Session) {
     let store = Store::open_packed(root, root.join("files")).unwrap();
-    sample::seed_if_empty(&store, NOW).unwrap();
-    let mut st = store.load_folder("sample", "Projects").unwrap();
-    st.validity = 7;
-    st.messages = (1..=n)
-        .map(|uid| Summary {
-            key: MessageKey { account: "sample".into(), folder: "Projects".into(), validity: 7, uid },
-            subject: format!("Report {uid}"),
-            date: NOW - i64::from(uid) * 60,
-            flags: Flags { seen: true, ..Default::default() },
-            ..Default::default()
-        })
-        .map(Into::into)
-        .collect();
-    let bodies: Vec<(MessageKey, Vec<u8>)> =
-        st.messages.iter().map(|m| (m.key.clone(), format!("Subject: Report {}\r\n\r\nThe figures.\r\n", m.key.uid).into_bytes())).collect();
-    for chunk in bodies.chunks(500) {
-        store.write_bodies(chunk).unwrap();
-    }
-    store.save_folder("sample", "Projects", &st).unwrap();
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    s.run("folder.open", &json!({"account": "sample", "folder": "Projects"})).unwrap();
+    let s = big_projects_with(&store, n, Flags { seen: true, ..Default::default() }, true);
     (store, s)
 }
 
@@ -39,8 +19,7 @@ fn projects(root: &std::path::Path, n: u32) -> (Store, Session) {
 /// file as it opened again (105 s for a 37 GB one). Every message is moved with its source.
 #[test]
 fn a_long_move_leaves_its_data_file_sealed() {
-    let root = std::env::temp_dir().join(format!("mailcraft-engine-long-move-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch("long-move");
     let (store, mut s) = projects(&root, 1200);
     // Marks made before the move are written before it (unsealed: the file is sealed as the long
     // write begins); none come in during it.
@@ -69,5 +48,30 @@ fn a_long_move_leaves_its_data_file_sealed() {
     assert!(store.commit_times().plain.count > before.plain.count, "a short move sealed");
     drop(s);
     drop(store);
-    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A copy of 1,200 messages within a data file is written in batches: a handful of commits that
+/// wait for the disk, every one sealed, where each message was one (unsealed) of its own. Each
+/// copy has its source, read once.
+#[test]
+fn a_long_copy_is_written_in_batches() {
+    let root = scratch("long-copy");
+    let (store, mut s) = projects(&root, 1200);
+    assert!(store.flush_marks());
+    let paused = store.pause_marks();
+    s.run("list.selectAll", &json!({})).unwrap();
+    let before = store.commit_times();
+    assert_eq!(s.run("mail.copy", &json!({"folder": "INBOX"})).unwrap()["copied"], 1200);
+    let after = store.commit_times();
+    assert_eq!(after.plain.count, before.plain.count, "a commit that waited for the disk wasn't sealed");
+    let waited = after.sealed.count.saturating_sub(before.sealed.count);
+    assert!((1..10).contains(&waited), "{waited} commits waited for the disk");
+    let inbox = store.load_folder("sample", "INBOX").unwrap();
+    let copies: Vec<&Summary> = inbox.messages.iter().filter(|m| m.subject.starts_with("Report ")).map(|m| &**m).collect();
+    assert_eq!(copies.len(), 1200);
+    assert!(copies.iter().all(|m| store.read_body(&m.key).is_some_and(|b| b.starts_with(format!("Subject: {}", m.subject).as_bytes()))));
+    assert_eq!(store.load_folder("sample", "Projects").unwrap().messages.len(), 1200, "still where they were");
+    drop(paused);
+    drop(s);
+    drop(store);
 }

@@ -16,98 +16,22 @@ use mailcraft_pst::{
 };
 
 use super::super::props::text_of;
+use super::pipeline::everything;
+use crate::data_files::pst_bytes::{blocks, crc, put32, put64, seal, u16_at, u32_at, u64_at};
+use crate::data_files::scratch::scratch;
+use crate::data_files::test_data::plain_message;
 
 /// The writer's node for an attachment's bytes (`NID_TYPE_INTERNAL`, index 0x200 + n) and for
 /// the attachment itself (`NID_TYPE_ATTACHMENT`, index 0x100 + n).
 const DATA_NODE: u64 = (0x200 << 5) | 0x01;
 const ATTACHMENT_NODE: u64 = (0x100 << 5) | 0x05;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn message(subject: &str) -> NewMessage<'_> {
-    with_id(subject, "<outer@example.com>")
-}
-
-/// A message whose id (which the writer also makes its search key) is `message_id`.
-fn with_id<'a>(subject: &'a str, message_id: &'a str) -> NewMessage<'a> {
-    NewMessage {
-        subject,
-        sender_name: "Riley Moreno",
-        sender_email: "riley@example.com",
-        recipients: &[],
-        body: "See attached.",
-        html_body: None,
-        message_id,
-        delivery_time: 133_485_408_000_000_000,
-        message_class: "IPM.Note",
-        properties: &[],
-    }
+    plain_message(subject, "<outer@example.com>")
 }
 
 fn file<'a>(filename: &'a str, data: &'a [u8]) -> NewAttachment<'a> {
     NewAttachment { filename, mime_type: "application/octet-stream", content_id: None, data, ..Default::default() }
-}
-
-fn u16_at(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
-}
-
-fn u32_at(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
-}
-
-fn u64_at(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
-}
-
-fn put32(b: &mut [u8], at: usize, v: u32) {
-    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-fn put64(b: &mut [u8], at: usize, v: u64) {
-    b[at..at + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-/// MS-PST's CRC: CRC-32's table, started at 0 and not inverted at the end.
-fn crc(data: &[u8]) -> u32 {
-    let mut c = 0u32;
-    for &b in data {
-        c ^= u32::from(b);
-        for _ in 0..8 {
-            c = if c & 1 == 1 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
-        }
-    }
-    c
-}
-
-/// A Unicode file's blocks by id: where each starts and how many bytes it holds, found from the
-/// 16-byte trailers that end them on 64-byte boundaries (a trailer whose CRC matches the bytes
-/// before it).
-fn blocks(f: &[u8]) -> HashMap<u64, (usize, usize)> {
-    let mut out = HashMap::new();
-    for end in (64..=f.len()).step_by(64) {
-        let size = usize::from(u16_at(f, end - 16));
-        if size == 0 || size > 8176 {
-            continue;
-        }
-        let Some(start) = end.checked_sub((size + 16).div_ceil(64) * 64) else { continue };
-        if crc(&f[start..start + size]) == u32_at(f, end - 12) {
-            out.insert(u64_at(f, end - 8), (start, size));
-        }
-    }
-    out
-}
-
-/// Write a changed block's CRC into its trailer.
-fn seal(f: &mut [u8], (start, size): (usize, usize)) {
-    let end = start + (size + 16).div_ceil(64) * 64;
-    let c = crc(&f[start..start + size]);
-    put32(f, end - 12, c);
 }
 
 /// The entry for `nid` in a subnode block (an SLBLOCK: btype 2, level 0, then 24-byte entries
@@ -142,6 +66,29 @@ fn heap_item(f: &[u8], (start, _): (usize, usize), hid: u32) -> usize {
     start + usize::from(u16_at(f, page_map + 4 + (index - 1) * 2))
 }
 
+/// The attachment whose property context's block is `attachment` made one holding a message,
+/// the one in its subnode `node`: its method 1 becomes 5, and its 0x3701 a `PtypObject` on an
+/// 8-byte heap item (node, size), written over the MIME type's text. Its block sealed.
+fn holds_a_message(f: &mut [u8], attachment: (usize, usize), node: u32) {
+    let method = record(f, attachment, 0x3705, 0x0003);
+    put32(f, method + 4, 5);
+    let mime = u32_at(f, record(f, attachment, 0x370E, 0x001F) + 4);
+    let item = heap_item(f, attachment, mime);
+    put32(f, item, node);
+    put32(f, item + 4, 0);
+    let value = record(f, attachment, 0x3701, 0x0102);
+    f[value + 2..value + 4].copy_from_slice(&0x000D_u16.to_le_bytes());
+    put32(f, value + 4, mime);
+    seal(f, attachment);
+}
+
+/// Where each entry of the node B-tree's leaf pages (ptype 0x81, cLevel 0) starts: 32 bytes of
+/// node, data block, subnode block and parent. The writer may leave older copies of a page
+/// behind: their entries are here too.
+fn leaf_entries(f: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    (0..f.len() - 32).step_by(32).filter(|&o| f.get(o / 512 * 512 + 496) == Some(&0x81) && f[o / 512 * 512 + 491] == 0)
+}
+
 /// A data file with one message, "Outer", whose first attachment holds a message and whose
 /// second is a zero-byte file. The writer only writes files, so the first one is turned into an
 /// attached message after: its method becomes 5, its 0x3701 a `PtypObject` naming its node, and
@@ -163,28 +110,14 @@ fn attached_in(dir: &Path, subject: &str) -> PathBuf {
     let outer_sub_nodes_id = all.iter().find(|(_, b)| **b == outer_sub_nodes).map(|(id, _)| *id).unwrap();
     let attachment = all[&u64_at(&f, at + 8)];
     // The outer message's PC: the node B-tree entry whose subnode block is that one.
-    let outer = (0..f.len() - 32)
-        .step_by(32)
-        .find(|&o| u64_at(&f, o + 16) == outer_sub_nodes_id && (u64_at(&f, o) & 0x1F) == 0x04)
-        .map(|o| u64_at(&f, o + 8))
-        .unwrap();
+    let outer =
+        leaf_entries(&f).find(|&o| u64_at(&f, o + 16) == outer_sub_nodes_id && (u64_at(&f, o) & 0x1F) == 0x04).map(|o| u64_at(&f, o + 8)).unwrap();
     // The attachment's own subnode block: its bytes' node now names the outer message's blocks.
     let (own, at) = sub_node_entry(&f, &all, DATA_NODE);
     put64(&mut f, at + 8, outer);
     put64(&mut f, at + 16, outer_sub_nodes_id);
     seal(&mut f, own);
-    // Method 1 → 5; 0x3701 → PtypObject on an 8-byte heap item (node, size), written over the
-    // MIME type's text.
-    let method = record(&f, attachment, 0x3705, 0x0003);
-    put32(&mut f, method + 4, 5);
-    let mime = u32_at(&f, record(&f, attachment, 0x370E, 0x001F) + 4);
-    let item = heap_item(&f, attachment, mime);
-    put32(&mut f, item, DATA_NODE as u32);
-    put32(&mut f, item + 4, 0);
-    let object = record(&f, attachment, 0x3701, 0x0102);
-    f[object + 2..object + 4].copy_from_slice(&0x000D_u16.to_le_bytes());
-    put32(&mut f, object + 4, mime);
-    seal(&mut f, attachment);
+    holds_a_message(&mut f, attachment, DATA_NODE as u32);
     std::fs::write(&path, f).unwrap();
     path
 }
@@ -242,7 +175,7 @@ fn read_in_time<T: Send + 'static>(path: &Path, read: impl FnOnce(PstFile) -> T 
 /// turn. A zero-byte file reads as one with no bytes.
 #[test]
 fn an_attached_message_and_an_empty_file_read() {
-    let dir = scratch("attached");
+    let dir = scratch("pst-attached");
     let path = with_an_attached_message(&dir);
     let (outer, inner) = read_in_time(&path, |pst| {
         let store = PstStore::read(Rc::new(pst)).unwrap();
@@ -254,7 +187,6 @@ fn an_attached_message_and_an_empty_file_read() {
     assert_eq!(outer, ["message Outer", "file 0"]);
     // The copy has the same attachments: its own are read with the file's own types.
     assert_eq!(inner, ("Outer".to_string(), vec!["message Outer".to_string(), "file 0".to_string()]));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// What the import makes of a message attached to itself: it finishes in time, the zero-byte
@@ -262,13 +194,12 @@ fn an_attached_message_and_an_empty_file_read() {
 /// search key is that message's), is counted and left out rather than read again and again.
 #[test]
 fn the_import_of_a_message_attached_to_itself_ends() {
-    let dir = scratch("attached-import");
+    let dir = scratch("pst-attached-import");
     let path = with_an_attached_message(&dir);
     let (done, sources) = import_in_time(&path, &dir);
     assert_eq!((done.messages, done.skipped), (1, 0), "{done:?}");
     assert_eq!(done.skips.into_iter().collect::<Vec<_>>(), [(SkipReason::AttachedMessageUnreadable, 1)]);
     assert_eq!(sources.iter().map(|s| tree(s)).collect::<Vec<_>>(), ["Outer[empty.txt]"]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A message of a data file whose subject is `subject`: its property context's block and its
@@ -276,9 +207,8 @@ fn the_import_of_a_message_attached_to_itself_ends() {
 /// UTF-16 in the block.
 fn message_blocks(f: &[u8], all: &HashMap<u64, (usize, usize)>, subject: &str) -> (u64, u64) {
     let wide: Vec<u8> = subject.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    (0..f.len() - 32)
-        .step_by(32)
-        .filter(|&o| (u64_at(f, o) & 0x1F) == 0x04 && f.get(o / 512 * 512 + 496) == Some(&0x81) && f[o / 512 * 512 + 491] == 0)
+    leaf_entries(f)
+        .filter(|&o| (u64_at(f, o) & 0x1F) == 0x04)
         .map(|o| (u64_at(f, o + 8), u64_at(f, o + 16)))
         .find(|(pc, _)| all.get(pc).is_some_and(|&(start, size)| f[start..start + size].windows(wide.len()).any(|w| w == wide)))
         .unwrap()
@@ -309,16 +239,7 @@ fn attach(f: &mut [u8], holder: u64, target: (u64, u64)) {
     put64(f, at + 8, target.0);
     put64(f, at + 16, target.1);
     seal(f, own);
-    let method = record(f, attachment, 0x3705, 0x0003);
-    put32(f, method + 4, 5);
-    let mime = u32_at(f, record(f, attachment, 0x370E, 0x001F) + 4);
-    let item = heap_item(f, attachment, mime);
-    put32(f, item, object as u32);
-    put32(f, item + 4, 0);
-    let value = record(f, attachment, 0x3701, 0x0102);
-    f[value + 2..value + 4].copy_from_slice(&0x000D_u16.to_le_bytes());
-    put32(f, value + 4, mime);
-    seal(f, attachment);
+    holds_a_message(f, attachment, object as u32);
 }
 
 /// A data file of three messages, each with an id of its own: "Outer" holds "Middle", which
@@ -327,11 +248,11 @@ fn attach(f: &mut [u8], holder: u64, target: (u64, u64)) {
 fn with_nested_messages(dir: &Path) -> PathBuf {
     let path = dir.join("nested.pst");
     let outer = [file("a.bin", b"one"), file("empty.txt", b"")];
-    write::create_with(&path, &["Inbox"], &with_id("Outer", "<outer@example.com>"), &outer).unwrap();
+    write::create_with(&path, &["Inbox"], &plain_message("Outer", "<outer@example.com>"), &outer).unwrap();
     let middle = [file("b.bin", b"two"), file("middle.txt", b"in the middle")];
-    write::append_message(&path, &["Inbox"], &with_id("Middle", "<middle@example.com>"), &middle).unwrap();
+    write::append_message(&path, &["Inbox"], &plain_message("Middle", "<middle@example.com>"), &middle).unwrap();
     let deep = [file("deep.txt", b"at the bottom")];
-    write::append_message(&path, &["Inbox"], &with_id("Deep", "<deep@example.com>"), &deep).unwrap();
+    write::append_message(&path, &["Inbox"], &plain_message("Deep", "<deep@example.com>"), &deep).unwrap();
     let mut f = std::fs::read(&path).unwrap();
     let all = blocks(&f);
     let outer = message_blocks(&f, &all, "Outer");
@@ -344,25 +265,55 @@ fn with_nested_messages(dir: &Path) -> PathBuf {
 }
 
 /// Import the file into a cache of its own on a thread with a time limit: what the import did,
-/// and each message's source.
+/// and each message's source. The limit is there to fail an import that never ends (a message
+/// read again and again), so it's long: these imports take a fifth of a second alone, but 12 to
+/// 16 s with 6 runs of the net tests at once, and failed the old 20 s in most such runs.
 fn import_in_time(path: &Path, dir: &Path) -> (super::super::Imported, Vec<Vec<u8>>) {
-    use mailcraft_model::MessageKey;
     use mailcraft_store::Store;
     let (path, cache) = (path.to_path_buf(), dir.join("cache"));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let store = Store::open(cache).unwrap();
         let done = super::import(&path, &store, "a1", &mut |_| {}).unwrap();
-        let mut sources = Vec::new();
-        for f in &done.folders {
-            for m in store.load_folder("a1", &f.path).map(|s| s.messages).unwrap_or_default() {
-                let key = MessageKey { account: "a1".into(), folder: f.path.clone(), validity: 1, uid: m.key.uid };
-                sources.push(store.read_body(&key).unwrap());
-            }
-        }
-        let _ = tx.send((done, sources));
+        let _ = tx.send((done, everything(&store, "a1").2));
     });
-    rx.recv_timeout(Duration::from_secs(20)).expect("the file was imported in time")
+    rx.recv_timeout(Duration::from_secs(120)).expect("the file was imported in time")
+}
+
+/// MEASURE: a small data file's import, as the app makes one (a cache on disk, its own lanes),
+/// twenty times: the slowest and the median, and where the median one's time went. Run in
+/// release, alone and beside other work:
+/// `cargo test --release -p mailcraft-net --lib measure_a_small_import -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn measure_a_small_import() {
+    let dir = scratch("measure-small-import");
+    let path = with_nested_messages(&dir);
+    let mut runs: Vec<(Duration, super::super::ImportStats)> = (0..20)
+        .map(|n| {
+            let store = mailcraft_store::Store::open(dir.join(format!("cache{n}"))).unwrap();
+            let began = std::time::Instant::now();
+            let done = super::import(&path, &store, "a1", &mut |_| {}).unwrap();
+            (began.elapsed(), done.stats)
+        })
+        .collect();
+    runs.sort_by_key(|(took, _)| *took);
+    let (median, s) = &runs[runs.len() / 2];
+    eprintln!(
+        "MEASURE small import: median {median:?}, slowest {:?}; the median's ms: total {}, plan {}, read {}, build {}, write {}, commit {}, writer idle {}, budget wait {}, index {}; lanes {}",
+        runs[runs.len() - 1].0,
+        s.total_ms,
+        s.plan_ms,
+        s.read_ms,
+        s.build_ms,
+        s.write_ms,
+        s.commit_ms,
+        s.writer_idle_ms,
+        s.budget_wait_ms,
+        s.index_ms,
+        s.lanes
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A message's subject and its attachments' names, an attached message's as its own tree:
@@ -385,7 +336,7 @@ fn tree(raw: &[u8]) -> String {
 /// An attached message's own files were left out before.
 #[test]
 fn the_import_keeps_attached_messages_with_their_own_files() {
-    let dir = scratch("nested-import");
+    let dir = scratch("pst-nested-import");
     let path = with_nested_messages(&dir);
     let (done, sources) = import_in_time(&path, &dir);
     assert_eq!((done.messages, done.skipped), (3, 0), "{done:?}");
@@ -393,7 +344,6 @@ fn the_import_keeps_attached_messages_with_their_own_files() {
     let mut trees: Vec<String> = sources.iter().map(|s| tree(s)).collect();
     trees.sort();
     assert_eq!(trees, ["Deep[deep.txt]", "Middle[Deep[deep.txt], middle.txt]", "Outer[Middle[Deep[deep.txt], middle.txt], empty.txt]"]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A file of 20,000 bytes: three data blocks under an XBLOCK (btype 1, level 1, count, total).
@@ -426,7 +376,7 @@ fn first_attachment(pst: PstFile) -> Result<Vec<u8>, String> {
 /// A data tree is read up to the size it declares, and not at all past a limit the caller sets.
 #[test]
 fn a_data_tree_reads_no_more_than_it_declares_or_is_allowed() {
-    let dir = scratch("big");
+    let dir = scratch("pst-big");
     let (path, data) = with_a_big_file(&dir);
     assert_eq!(read_in_time(&path, first_attachment), Ok(data.clone()));
     // A limit under the value's size: an error before it is read.
@@ -442,14 +392,13 @@ fn a_data_tree_reads_no_more_than_it_declares_or_is_allowed() {
     seal(&mut f, x);
     std::fs::write(&path, &f).unwrap();
     assert_eq!(read_in_time(&path, first_attachment), Ok(data[..100].to_vec()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An XBLOCK whose entry names the XBLOCK itself is an error, not a stack overflow (which ends
 /// the whole program, with no unwinding to catch).
 #[test]
 fn a_data_tree_that_points_at_itself_is_an_error() {
-    let dir = scratch("cycle");
+    let dir = scratch("pst-cycle");
     let (path, _) = with_a_big_file(&dir);
     let mut f = std::fs::read(&path).unwrap();
     let x = xblock(&f);
@@ -459,7 +408,6 @@ fn a_data_tree_that_points_at_itself_is_an_error() {
     std::fs::write(&path, &f).unwrap();
     let read = read_in_time(&path, first_attachment);
     assert!(read.as_ref().is_err_and(|e| e.contains("a list where a block should be")), "{read:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An XBLOCK whose entries all name the same data block reads no more than it declares, and
@@ -467,7 +415,7 @@ fn a_data_tree_that_points_at_itself_is_an_error() {
 /// XXBLOCK) can't make the reader hold gigabytes for one value.
 #[test]
 fn a_data_tree_that_names_one_block_over_and_over_reads_no_more_than_it_declares() {
-    let dir = scratch("repeat");
+    let dir = scratch("pst-repeat");
     let (path, data) = with_a_big_file(&dir);
     let mut f = std::fs::read(&path).unwrap();
     let x = xblock(&f);
@@ -489,7 +437,6 @@ fn a_data_tree_that_names_one_block_over_and_over_reads_no_more_than_it_declares
     seal(&mut f, x);
     std::fs::write(&path, &f).unwrap();
     assert_eq!(read_in_time(&path, first_attachment), Ok(data[..8176].to_vec()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The big file, with the binary property `prop` of node `nid` (a store, a folder, the
@@ -503,10 +450,7 @@ fn with_a_big_value(dir: &Path, nid: u64, prop: u16) -> PathBuf {
     let own_id = all.iter().find(|(_, b)| **b == own).map(|(id, _)| *id).unwrap();
     // The node's entry in a leaf page of the node B-tree (ptype 0x81, cLevel 0): nid, data,
     // subnodes. The writer may leave older copies of a page behind: each gets the change.
-    let entries: Vec<usize> = (0..f.len() - 32)
-        .step_by(32)
-        .filter(|&o| u64_at(&f, o) == nid && f.get(o / 512 * 512 + 496) == Some(&0x81) && f[o / 512 * 512 + 491] == 0)
-        .collect();
+    let entries: Vec<usize> = leaf_entries(&f).filter(|&o| u64_at(&f, o) == nid).collect();
     let pc = all[&u64_at(&f, entries[0] + 8)];
     for entry in entries {
         put64(&mut f, entry + 16, own_id);
@@ -533,7 +477,7 @@ fn binary_len(value: Option<&mailcraft_pst::PropertyValue>) -> Option<usize> {
 /// their data tree declared (up to 4 GiB).
 #[test]
 fn a_store_or_name_map_value_is_held_to_the_file_limit() {
-    let dir = scratch("store-limit");
+    let dir = scratch("pst-store-limit");
     // The store's record key (0x0FF9).
     let path = with_a_big_value(&dir, 0x21, 0x0FF9);
     let store = |limit: Option<u64>| {
@@ -562,14 +506,13 @@ fn a_store_or_name_map_value_is_held_to_the_file_limit() {
     assert_eq!(read_in_time(&path, map(None)), Ok(Some(20_000)));
     let limited = read_in_time(&path, map(Some(10_000)));
     assert!(limited.as_ref().is_err_and(|e| e.contains("over the limit")), "{limited:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A node B-tree page whose entry names the page itself is an error, not a stack overflow:
 /// every read goes through that tree.
 #[test]
 fn a_btree_page_that_points_at_itself_is_an_error() {
-    let dir = scratch("page-cycle");
+    let dir = scratch("pst-page-cycle");
     let (path, _) = with_a_big_file(&dir);
     let mut f = std::fs::read(&path).unwrap();
     // The header's root (offset 180): the node B-tree's BREF (bid, ib) at 216.
@@ -585,14 +528,13 @@ fn a_btree_page_that_points_at_itself_is_an_error() {
     std::fs::write(&path, &f).unwrap();
     let read = read_in_time(&path, |pst| PstStore::read(Rc::new(pst)).map(|_| ()).map_err(|e| e.to_string()));
     assert!(read.as_ref().is_err_and(|e| e.contains("level by level")), "{read:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An attachment whose own subnode tree can't be read finds its object in the message's
 /// subnode tree, the one place it was looked for before.
 #[test]
 fn an_attached_message_in_the_message_tree_reads_when_its_own_tree_is_damaged() {
-    let dir = scratch("own-damaged");
+    let dir = scratch("pst-own-damaged");
     let path = with_an_attached_message(&dir);
     let mut f = std::fs::read(&path).unwrap();
     let all = blocks(&f);
@@ -614,17 +556,15 @@ fn an_attached_message_in_the_message_tree_reads_when_its_own_tree_is_damaged() 
         attachments(&m).into_iter().next()
     });
     assert_eq!(read.as_deref(), Some("message Outer"));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An attachment the reader fails on, and one that only links to a file elsewhere, are counted
 /// by reason; the message comes in without them, and isn't counted as skipped.
 #[test]
 fn an_unreadable_attachment_and_a_link_are_counted() {
-    use mailcraft_model::MessageKey;
     use mailcraft_model::job::SkipReason;
     use mailcraft_store::Store;
-    let dir = scratch("unread-and-link");
+    let dir = scratch("pst-unread-and-link");
     let path = dir.join("left-out.pst");
     let files = [file("letter.bin", b"twelve bytes"), file("share.txt", b"a path")];
     write::create_with(&path, &["Inbox"], &message("Outer"), &files).unwrap();
@@ -649,16 +589,10 @@ fn an_unreadable_attachment_and_a_link_are_counted() {
     let done = super::import(&path, &store, "a1", &mut |_| {}).unwrap();
     assert_eq!((done.messages, done.skipped), (1, 0), "{done:?}");
     assert_eq!(done.skips.into_iter().collect::<Vec<_>>(), [(SkipReason::AttachmentUnreadable, 1), (SkipReason::AttachmentLink, 1)]);
-    let (folder, st) = done
-        .folders
-        .iter()
-        .find_map(|f| store.load_folder("a1", &f.path).ok().filter(|s| !s.messages.is_empty()).map(|s| (f.path.clone(), s)))
-        .unwrap();
+    let st = done.folders.iter().find_map(|f| store.load_folder("a1", &f.path).ok().filter(|s| !s.messages.is_empty())).unwrap();
     assert!(!st.messages[0].has_attachments);
-    let key = MessageKey { account: "a1".into(), folder, validity: 1, uid: st.messages[0].key.uid };
-    let p = mailcraft_mime::parse(&store.read_body(&key).unwrap()).unwrap();
+    let p = mailcraft_mime::parse(&store.read_body(&st.messages[0].key).unwrap()).unwrap();
     assert!(p.attachments.is_empty(), "{:?}", p.attachments.iter().map(|a| &a.name).collect::<Vec<_>>());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Mark the attachment `nid` hidden (PidTagAttachmentHidden): the record of its file's type
@@ -689,30 +623,22 @@ fn class_from_subject(f: &mut [u8], subject: &str) {
 /// doesn't, and its other files still do.
 #[test]
 fn hidden_files_are_left_out_by_the_items_class() {
-    use mailcraft_model::MessageKey;
     use mailcraft_store::Store;
     let names = |path: &Path, cache: &Path| {
         let store = Store::open(cache).unwrap();
         let done = super::import(path, &store, "a1", &mut |_| {}).unwrap();
         assert_eq!((done.messages, done.skipped), (2, 0), "{done:?}");
-        let mut names = Vec::new();
-        for f in &done.folders {
-            for m in store.load_folder("a1", &f.path).map(|s| s.messages).unwrap_or_default() {
-                let key = MessageKey { account: "a1".into(), folder: f.path.clone(), validity: 1, uid: m.key.uid };
-                let p = mailcraft_mime::parse(&store.read_body(&key).unwrap()).unwrap();
-                names.extend(p.attachments.iter().map(|a| a.name.clone()));
-            }
-        }
-        names
+        let sources = everything(&store, "a1").2;
+        sources.iter().flat_map(|raw| mailcraft_mime::parse(raw).unwrap().attachments).map(|a| a.name).collect::<Vec<_>>()
     };
-    let dir = scratch("hidden-by-class");
+    let dir = scratch("pst-hidden-by-class");
     for (subject, kept) in [("IPM.Note", true), ("IPM.Schedule.Meeting.Request", false)] {
         let at = dir.join(subject);
         std::fs::create_dir_all(&at).unwrap();
         let path = at.join("hidden.pst");
         let files = [file("letter.bin", b"twelve bytes"), file("empty.txt", b"")];
-        write::create_with(&path, &["Inbox"], &with_id(subject, "<outer@example.com>"), &files).unwrap();
-        write::append_message(&path, &["Inbox"], &with_id("Other", "<other@example.com>"), &[]).unwrap();
+        write::create_with(&path, &["Inbox"], &plain_message(subject, "<outer@example.com>"), &files).unwrap();
+        write::append_message(&path, &["Inbox"], &plain_message("Other", "<other@example.com>"), &[]).unwrap();
         let mut f = std::fs::read(&path).unwrap();
         let all = blocks(&f);
         // The first file becomes the other message, which isn't one holding the message.
@@ -725,5 +651,4 @@ fn hidden_files_are_left_out_by_the_items_class() {
         assert_eq!(names.iter().any(|n| n.ends_with(".eml")), kept, "{subject}: {names:?}");
         assert!(names.iter().any(|n| n == "empty.txt"), "{subject}: {names:?}");
     }
-    let _ = std::fs::remove_dir_all(dir);
 }

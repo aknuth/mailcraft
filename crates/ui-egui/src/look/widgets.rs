@@ -6,7 +6,6 @@ use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 use crate::{Action, Dialog};
 
-/// A ribbon button: icon over nothing, label to the right.
 /// The ribbon's buttons as it's drawn: those from `icons_from` on are icons alone, their labels
 /// tooltips (it didn't fit the window); how wide each label is, and how far right (and left, for
 /// a right-to-left ribbon) they reached.
@@ -85,9 +84,24 @@ fn ribbon_button(ui: &Ui, label_width: f32) -> bool {
     })
 }
 
-/// Whether the ribbon being drawn is the classic one.
+/// Whether the ribbon being drawn is the classic one (read in place: a copy would take every
+/// label width noted so far with it, for every button).
 fn classic(ui: &Ui) -> bool {
-    ui.ctx().data_mut(|d| d.get_temp::<RibbonFit>(ribbon_fit_id()).is_some_and(|f| f.active && f.classic))
+    ui.ctx().data_mut(|d| {
+        let f = d.get_temp_mut_or_default::<RibbonFit>(ribbon_fit_id());
+        f.active && f.classic
+    })
+}
+
+/// A button filled in the app colour: faint when it can't be used, lighter under the pointer.
+fn accent_fill(t: &Tokens, enabled: bool, hovered: bool) -> Color32 {
+    if !enabled {
+        t.faint
+    } else if hovered {
+        t.accent.gamma_multiply(0.88)
+    } else {
+        t.accent
+    }
 }
 
 /// The classic ribbon's buttons: this tall, the group names under them.
@@ -104,14 +118,7 @@ fn big_button(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool, o
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     reached(ui, rect);
     if fill {
-        let c = if !enabled {
-            t.faint
-        } else if resp.hovered() {
-            t.accent.gamma_multiply(0.88)
-        } else {
-            t.accent
-        };
-        ui.painter().rect_filled(rect, 6.0, c);
+        ui.painter().rect_filled(rect, 6.0, accent_fill(t, enabled, resp.hovered()));
     } else if on {
         ui.painter().rect(rect, 6.0, t.accent_soft, Stroke::new(1.0, t.accent.gamma_multiply(0.5)), egui::StrokeKind::Inside);
     } else {
@@ -141,7 +148,6 @@ fn reached(ui: &Ui, rect: egui::Rect) {
     });
 }
 
-/// An icon alone, its label as the tooltip (a ribbon too wide for the window).
 /// A button's background as the pointer comes and goes: the hover fades in and out (quickly),
 /// a press shows at once.
 fn hover_fill(ui: &Ui, resp: &Response, rect: egui::Rect, t: &Tokens, enabled: bool) {
@@ -164,6 +170,7 @@ pub(crate) fn named(ui: &Ui, resp: &Response, label: &str, enabled: bool, on: Op
     });
 }
 
+/// An icon alone, its label as the tooltip (a ribbon too wide for the window).
 fn icon_button(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool, on: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 30.0), if enabled { Sense::click() } else { Sense::hover() });
     reached(ui, rect);
@@ -177,15 +184,63 @@ fn icon_button(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool, 
     resp.on_hover_text(label)
 }
 
-pub fn tool_button(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool) -> Response {
-    let mut resp = tool_button_drawn(ui, icon, label, t, enabled);
+/// A ribbon button's label: its English words, which the button translates and finds its key
+/// tip by, or words already in the language shown (a label with a value in it, made with
+/// `tf!`, has no English key of its own), with the English words its key tip goes by.
+#[derive(Clone, Copy, Debug)]
+pub enum Label<'a> {
+    Key(&'a str),
+    Shown { key: &'a str, text: &'a str },
+}
+
+impl<'a> Label<'a> {
+    /// `text`, already translated (a `tf!` with a value), its key tip found by `key`.
+    pub fn shown(key: &'a str, text: &'a str) -> Self {
+        Label::Shown { key, text }
+    }
+
+    /// What's drawn.
+    fn text(self) -> &'a str {
+        match self {
+            Label::Key(key) => tl!(key),
+            Label::Shown { text, .. } => text,
+        }
+    }
+
+    /// The English words its key tip goes by.
+    fn key(self) -> &'a str {
+        match self {
+            Label::Key(key) | Label::Shown { key, .. } => key,
+        }
+    }
+}
+
+impl<'a> From<&'a str> for Label<'a> {
+    fn from(key: &'a str) -> Self {
+        Label::Key(key)
+    }
+}
+
+/// A label made at run time (`tf!`, a value in it) is shown as it is: translating it again
+/// looked the translation up as English.
+impl<'a> From<&'a String> for Label<'a> {
+    fn from(text: &'a String) -> Self {
+        Label::Shown { key: text, text }
+    }
+}
+
+/// A ribbon button: its icon, its label to the right (on the classic ribbon, a big icon over
+/// its label).
+pub fn tool_button<'a>(ui: &mut Ui, icon: Icon, label: impl Into<Label<'a>>, t: &Tokens, enabled: bool) -> Response {
+    let label = label.into();
+    let mut resp = tool_button_drawn(ui, icon, label.text(), t, enabled);
     // Its key tip, by its label in English (Alt, then its tab's letters and its own).
-    crate::keytips::apply(ui, label, &mut resp, enabled, t);
+    crate::keytips::apply(ui, label.key(), &mut resp, enabled, t);
     resp
 }
 
+/// A ribbon button labelled `label` (in the language shown).
 fn tool_button_drawn(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool) -> Response {
-    let label = tl!(label);
     if classic(ui) {
         // Its label's width noted all the same, so the simplified ribbon fits at once when it's back.
         let width = ui.painter().layout_no_wrap(label.to_string(), theme::regular(13.0), t.text).size().x;
@@ -216,15 +271,16 @@ fn tool_button_drawn(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: 
 }
 
 /// A ribbon button that stays lit while it's on (a search term in the box, say).
-pub fn tool_toggle(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, on: bool) -> Response {
-    let mut resp = tool_toggle_drawn(ui, icon, label, t, on);
+pub fn tool_toggle<'a>(ui: &mut Ui, icon: Icon, label: impl Into<Label<'a>>, t: &Tokens, on: bool) -> Response {
+    let label = label.into();
+    let mut resp = tool_toggle_drawn(ui, icon, label.text(), t, on);
     // Its key tip, by its label in English (Alt, then its tab's letters and its own).
-    crate::keytips::apply(ui, label, &mut resp, true, t);
+    crate::keytips::apply(ui, label.key(), &mut resp, true, t);
     resp
 }
 
+/// A ribbon toggle labelled `label` (in the language shown).
 fn tool_toggle_drawn(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, on: bool) -> Response {
-    let label = tl!(label);
     if classic(ui) {
         // Its label's width noted all the same, so the simplified ribbon fits at once when it's back.
         let width = ui.painter().layout_no_wrap(label.to_string(), theme::regular(13.0), t.text).size().x;
@@ -276,15 +332,16 @@ pub fn more_pill(ui: &mut Ui, tip: &str, t: &Tokens) -> Response {
 }
 
 /// The filled "New mail" button.
-pub fn accent_button(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool) -> Response {
-    let mut resp = accent_button_drawn(ui, icon, label, t, enabled);
+pub fn accent_button<'a>(ui: &mut Ui, icon: Icon, label: impl Into<Label<'a>>, t: &Tokens, enabled: bool) -> Response {
+    let label = label.into();
+    let mut resp = accent_button_drawn(ui, icon, label.text(), t, enabled);
     // Its key tip, by its label in English (Alt, then its tab's letters and its own).
-    crate::keytips::apply(ui, label, &mut resp, enabled, t);
+    crate::keytips::apply(ui, label.key(), &mut resp, enabled, t);
     resp
 }
 
+/// The filled button labelled `label` (in the language shown).
 fn accent_button_drawn(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled: bool) -> Response {
-    let label = tl!(label);
     if classic(ui) {
         let resp = big_button(ui, icon, label, t, enabled, false, true);
         named(ui, &resp, label, enabled, None);
@@ -295,14 +352,7 @@ fn accent_button_drawn(ui: &mut Ui, icon: Icon, label: &str, t: &Tokens, enabled
     let size = vec2(galley.size().x + 40.0, 30.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     named(ui, &resp, label, enabled, None);
-    let fill = if !enabled {
-        t.faint
-    } else if resp.hovered() {
-        t.accent.gamma_multiply(0.88)
-    } else {
-        t.accent
-    };
-    ui.painter().rect_filled(rect, 6.0, fill);
+    ui.painter().rect_filled(rect, 6.0, accent_fill(t, enabled, resp.hovered()));
     let m = crate::bidi::Mirror::new(rect);
     let ir = m.rect(egui::Rect::from_min_size(rect.min + vec2(10.0, 7.0), vec2(16.0, 16.0)));
     icons::paint(ui.painter(), ir, icon, t.on_accent);
@@ -318,24 +368,17 @@ pub fn primary_button(ui: &mut Ui, label: &str, t: &Tokens, enabled: bool) -> Re
     let size = vec2((galley.size().x + 28.0).max(76.0), 30.0);
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     named(ui, &resp, label, enabled, None);
-    let fill = if !enabled {
-        t.faint
-    } else if resp.hovered() {
-        t.accent.gamma_multiply(0.88)
-    } else {
-        t.accent
-    };
-    ui.painter().rect_filled(rect, 6.0, fill);
+    ui.painter().rect_filled(rect, 6.0, accent_fill(t, enabled, resp.hovered()));
     ui.painter().galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, t.on_accent);
     resp
 }
 
-/// An icon button on the coloured title bar.
 /// The top bar's hover: a lighter wash on the coloured bar, the pane's hover on a plain one.
 pub fn bar_wash(t: &Tokens) -> Color32 {
     if t.on_bar == Color32::WHITE { Color32::from_white_alpha(40) } else { t.hover }
 }
 
+/// An icon button on the coloured title bar.
 pub fn bar_icon_button(ui: &mut Ui, icon: Icon, tip: &str, t: &Tokens) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
     named(ui, &resp, tl!(tip), true, None);
@@ -504,7 +547,7 @@ pub fn group_sep(ui: &mut Ui, t: &Tokens) {
 /// the line before the next one, unless it's the `last`.
 pub fn group(ui: &mut Ui, t: &Tokens, name: &str, last: bool) {
     if classic(ui) {
-        let from = ui.ctx().data_mut(|d| d.get_temp::<RibbonFit>(ribbon_fit_id()).map_or(0.0, |f| f.group_from));
+        let from = ui.ctx().data_mut(|d| d.get_temp_mut_or_default::<RibbonFit>(ribbon_fit_id()).group_from);
         let to = cursor_x(ui);
         let y = ui.max_rect().top() + CLASSIC_BUTTON_H + CLASSIC_CAPTION_H / 2.0 + 4.0;
         let mid = if from > 0.0 && from != to { (from + to) / 2.0 } else { to };
@@ -548,10 +591,24 @@ fn cursor_x(ui: &Ui) -> f32 {
 pub fn start_group(ui: &Ui) {
     let x = cursor_x(ui);
     ui.ctx().data_mut(|d| {
-        if let Some(mut f) = d.get_temp::<RibbonFit>(ribbon_fit_id()).filter(|f| f.active) {
+        let f = d.get_temp_mut_or_default::<RibbonFit>(ribbon_fit_id());
+        if f.active {
             f.group_from = x;
-            d.insert_temp(ribbon_fit_id(), f);
         }
+    });
+}
+
+/// What a pane shows with nothing in it: a big faint icon over a line saying why (`text`, as
+/// shown).
+pub fn empty_state(ui: &mut Ui, t: &Tokens, icon: Icon, text: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.35);
+            let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+            icons::paint(ui.painter(), r, icon, t.border);
+            ui.add_space(8.0);
+            ui.label(RichText::new(text).color(t.faint));
+        });
     });
 }
 

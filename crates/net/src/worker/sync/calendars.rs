@@ -76,10 +76,7 @@ impl Worker {
         let pim: mailcraft_model::pim::Pim = self.store.load_account_doc(&self.acc.id, mailcraft_model::pim::PIM_DOC).unwrap_or_default();
         let (user, password) = match &given.username {
             Some(u) => (u.clone(), self.creds.as_ref().and_then(|c| c.get_secret(&self.acc, DAV_SECRET)).unwrap_or_default()),
-            None => (
-                if self.acc.username.is_empty() { self.acc.email.clone() } else { self.acc.username.clone() },
-                self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner).secret.clone(),
-            ),
+            None => (self.acc.login_name().to_string(), Auth::held(&self.auth).secret.clone()),
         };
         let dav = crate::dav::Dav::new(&user, &password).with_digest(self.dav_digest.take());
         let host = self.acc.pop.as_ref().map_or(self.acc.imap.host.as_str(), |p| p.host.as_str());
@@ -140,7 +137,7 @@ impl Worker {
         let now_at = Instant::now();
         match done {
             Ok(()) => {
-                self.backoff = Duration::from_secs(5);
+                self.backoff = FIRST_BACKOFF;
                 self.status(SyncStatus::Online { at: now() });
                 let every = self.check_every().unwrap_or(MINUTE.saturating_mul(CALENDAR_MINUTES));
                 now_at.checked_add(every)
@@ -153,7 +150,7 @@ impl Worker {
             Err(e) => {
                 let wait = self.backoff;
                 self.backoff = self.backoff.saturating_mul(2).min(MOST_BACKOFF);
-                self.status(SyncStatus::Error { error: e.to_string() });
+                self.status(e.status());
                 now_at.checked_add(wait)
             }
         }

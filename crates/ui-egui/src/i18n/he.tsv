@@ -72,6 +72,7 @@
 	Edit rule	עריכת כלל
 	Email address	כתובת דואר אלקטרוני
 	Enter the password for {email}.	הזן את הסיסמה של {email}.
+	Enter the password for {email}, which signs in as {user}.	הזינו את הסיסמה של {email}, שנכנס בשם {user}.
 	Favorites	מועדפים
 	Feb	פבר׳
 	File	קובץ
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	סמן הודעות כנקראו כשהן נפתחות
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	אין עדיין שולחים.
-	Not available: the sample mailbox has no server.	לא זמין: לתיבת הדואר לדוגמה אין שרת.
+	Not available: this mailbox has no server.	לא זמין: לתיבת דואר זו אין שרת.
 	Not available: {error}	לא זמין: {error}
 	On	פועל
 	On from {from}	פועל מ-{from}
@@ -842,7 +843,8 @@ month	May	מאי
 	Formatted	מעוצב
 	HTML code	קוד HTML
 	From a file…	מקובץ…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	הדביקו את ה-HTML של חתימה שנוצרה במקום אחר, או פתחו חתימה ששמורה כדף אינטרנט (‎.htm של Outlook). היא נשלחת כפי שנכתבה; בזמן הכתיבה ההודעה מציגה את הטקסט שלה.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	הדביקו את ה-HTML של חתימה שנוצרה במקום אחר, או פתחו חתימה ששמורה כדף אינטרנט (‎.htm של Outlook). היא נשלחת כפי שנכתבה, וכך היא מוצגת גם בזמן הכתיבה.
+	Your signature as it will be sent. To change it, pick Signature above the message.	החתימה שלכם כפי שתישלח. כדי לשנות אותה, בחרו 'חתימה' מעל ההודעה.
 	{name} can't be read as a signature	אי אפשר לקרוא את {name} כחתימה
 	All contacts	כל אנשי הקשר
 	Always open with this address book	לפתוח תמיד עם פנקס כתובות זה
@@ -934,6 +936,9 @@ month	May	מאי
 	Name on mail from it	השם על דואר שנשלח ממנה
 	Replies go to	תשובות נשלחות אל
 	(the account's own)	(זו של החשבון)
+	Write new mail from this address	כתיבת הודעות חדשות מכתובת זו
+	A new message starts from this address, not from {email}. Pick another in From as ever.	הודעה חדשה מתחילה מכתובת זו, ולא מ-{email}. אפשר לבחור אחרת ב'מאת', כתמיד.
+	{address} (new mail)	{address} (הודעות חדשות)
 	Add…	הוספה…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	התיקיות שלה יופיעו תחת החשבון הזה. נדרשת לך גישה אליה בשרת Exchange; תיבות שיש לך אליהן גישה מלאה נפתחות מעצמן.
 	Mailboxes you have full access to open by themselves.	תיבות שיש לך אליהן גישה מלאה נפתחות מעצמן.
@@ -1102,6 +1107,7 @@ month	May	מאי
 	Check before sending	בדיקה לפני שליחה
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} נראית כמו כתובת ב־{like}, אבל היא לא. האם זו הכתובת הנכונה?
 	{n} people who may not know each other will all see each other's addresses.	{n} אנשים שאולי אינם מכירים זה את זה יראו כולם את הכתובות של כולם.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	נמצא בנמענים משהו שכדאי לבדוק, אך אי אפשר להציג אותו. עברו עליהם לפני השליחה.
 	Put everyone in Bcc	להעביר את כולם ל־Bcc
 	Each of them gets the message without seeing who else did; you're in To	כל אחד מקבל את ההודעה בלי לראות מי עוד קיבל; אתם בשדה אל
 	Open links without their tracking	לפתוח קישורים בלי המעקב שלהם
@@ -1441,6 +1447,7 @@ month	May	מאי
 	Calendar and contacts couldn't be read: changes to them won't be saved	לא ניתן היה לקרוא את לוח השנה ואנשי הקשר: שינויים בהם לא יישמרו
 	Your rules couldn't be read: changes to them won't be saved	לא ניתן היה לקרוא את הכללים שלך: שינויים בהם לא יישמרו
 	Snoozed mail couldn't be read: changes to it won't be saved	לא ניתן היה לקרוא את הדואר שנדחה: שינויים בו לא יישמרו
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	לא ניתן היה לקרוא לאילו הודעות עונות התשובות הממתינות בדואר היוצא: ייתכן שהדואר הזה לא יסומן כנענה
 	Checking your data file	בודק את קובץ הנתונים
 	Opening your mail…	פותח את הדואר…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} לא נסגר כראוי בפעם הקודמת. MailCraft בודק אותו; בקובץ גדול זה עשוי להימשך דקה או שתיים.
@@ -1458,6 +1465,8 @@ month	May	מאי
 	Some results may be missing: still indexing	ייתכן שחסרות תוצאות: האינדוקס עדיין מתבצע
 	Some long messages were searched only in part	חלק מההודעות הארוכות נבדקו רק בחלקן
 	Couldn't read the date “{value}”	לא ניתן לקרוא את התאריך „{value}”
+	Couldn't read “{value}”	לא ניתן לקרוא את „{value}”
+	Part of a long search was left out	חלק מחיפוש ארוך הושמט
 	Received after	התקבל אחרי
 	Received before	התקבל לפני
 	About {h} h {m} min left	נותרו כ־{h} שע׳ {m} דק׳
@@ -1704,3 +1713,7 @@ month	May	מאי
 	Nothing to do	אין מה לעשות
 	Nothing in the next 7 days	אין דבר ב-7 הימים הקרובים
 	Show the calendar, what's coming up and your tasks beside the mail	הצג את לוח השנה, את מה שמתקרב ואת המשימות שלך לצד הדואר
+	Read / Unread (Ctrl+Q / Ctrl+U)	נקרא / לא נקרא (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	לא ניתן היה להוריד את {name}: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	משהו השתבש בחלון, ומה שעשה הופסק. MailCraft ממשיך לפעול; היומן מציין היכן זה קרה.
+	Font size	גודל גופן

@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 
+use mailcraft_model::work::scanned;
+
 /// CSS read at most, in bytes.
 const MAX_CSS: usize = 256 * 1024;
 /// Rules kept at most.
@@ -43,12 +45,13 @@ pub(crate) struct Decl {
     pub important: bool,
 }
 
-/// An element as selectors see it.
+/// An element as selectors see it: kept, one for each element around the one being styled,
+/// while the tree is walked ([`Sheet::matching`]).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct El<'a> {
-    pub tag: &'a str,
-    pub id: Option<&'a str>,
-    pub classes: Vec<&'a str>,
+pub(crate) struct El {
+    pub tag: String,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
 }
 
 /// The rules of a message's style sheets, indexed by what their last part needs.
@@ -88,7 +91,9 @@ pub(crate) fn declarations(block: &str) -> Vec<Decl> {
             }
             let v = v.trim();
             let lower = v.to_ascii_lowercase();
-            let (value, important) = match lower.find("!important") {
+            // `!important`, a space after the `!` or not (`! important`, as CSS reads it too).
+            let bang = lower.rfind('!').filter(|i| lower.get(i + 1..).is_some_and(|r| r.trim() == "important"));
+            let (value, important) = match bang {
                 Some(i) => (v.get(..i).unwrap_or(v).trim(), true),
                 None => (v, false),
             };
@@ -99,6 +104,25 @@ pub(crate) fn declarations(block: &str) -> Vec<Decl> {
             Some(Decl { prop, value: value.to_string(), important })
         })
         .collect()
+}
+
+/// The value `decls` (a style's, [`declarations`]) give `prop` (lower case), as CSS picks it: the
+/// last declaration of it marked `!important`, else the last. The one rule for every pass that
+/// looks a property up (some took the first, some the last).
+pub(crate) fn pick<'d>(decls: &'d [Decl], prop: &str) -> Option<&'d str> {
+    let of = || decls.iter().rev().filter(|d| d.prop == prop);
+    of().find(|d| d.important).or_else(|| of().next()).map(|d| d.value.as_str())
+}
+
+/// The value a style (an element's `style`) gives `prop` (lower case), as CSS picks it ([`pick`]).
+pub(crate) fn style_value(style: &str, prop: &str) -> Option<String> {
+    pick(&declarations(style), prop).map(str::to_string)
+}
+
+/// A colour as CSS and HTML write it (`#rrggbb`).
+pub(crate) fn hex(c: [u8; 3]) -> String {
+    let [r, g, b] = c;
+    format!("#{r:02x}{g:02x}{b:02x}")
 }
 
 /// One selector (`table.report td`), or `None` when it uses what isn't supported.
@@ -144,9 +168,9 @@ fn selector(text: &str) -> Option<Vec<Compound>> {
 }
 
 impl Compound {
-    fn matches(&self, e: &El<'_>) -> bool {
+    fn matches(&self, e: &El) -> bool {
         self.tag.as_deref().is_none_or(|t| e.tag.eq_ignore_ascii_case(t))
-            && self.id.as_deref().is_none_or(|id| e.id.is_some_and(|x| x.eq_ignore_ascii_case(id)))
+            && self.id.as_deref().is_none_or(|id| e.id.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(id)))
             && self.classes.iter().all(|c| e.classes.iter().any(|x| x.eq_ignore_ascii_case(c)))
     }
 }
@@ -200,7 +224,12 @@ fn wide_screen(head: &str) -> bool {
 impl Sheet {
     /// The rules in a message's style sheets (their text, one after another).
     pub(crate) fn parse(css: &str) -> Sheet {
-        let css = css.get(..css.len().min(MAX_CSS)).unwrap_or("");
+        // Cut at a character's edge at or before the cap (cut inside one, all of it was lost).
+        let mut end = css.len().min(MAX_CSS);
+        while !css.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        let css = css.get(..end).unwrap_or("");
         let css = without_comments(css).replace("<!--", " ").replace("-->", " ");
         let mut sheet = Sheet::default();
         sheet.read(&css, 0);
@@ -210,10 +239,9 @@ impl Sheet {
     /// The rules in `css`, and (`nested`: how many at-rules it's in) those of the `@media` blocks
     /// in it that are for a wide screen.
     fn read(&mut self, css: &str, nested: usize) {
-        let sheet = self;
         let mut rest = css;
-        while sheet.rules.len() < MAX_RULES {
-            let Some(open) = rest.find('{') else { break };
+        while self.rules.len() < MAX_RULES {
+            let Some(open) = scanned(rest, rest.find('{')) else { break };
             let before = rest.get(..open).unwrap_or("");
             let head = before.trim();
             // `@import …;` before a block: drop it, and read on from after it (where it ends
@@ -226,24 +254,25 @@ impl Sheet {
             // The block, to its matching `}` (at-rules nest).
             let mut depth = 0usize;
             let mut close = None;
-            for (i, ch) in rest.get(open..).unwrap_or("").char_indices() {
+            let block = rest.get(open..).unwrap_or("");
+            for (i, ch) in block.char_indices() {
                 match ch {
                     '{' => depth += 1,
                     '}' => {
                         depth = depth.saturating_sub(1);
                         if depth == 0 {
-                            close = Some(open + i);
+                            close = Some(i);
                             break;
                         }
                     }
                     _ => {}
                 }
             }
-            let Some(close) = close else { break };
+            let Some(close) = scanned(block, close).map(|i| open + i) else { break };
             let body = rest.get(open + 1..close).unwrap_or("");
             rest = rest.get(close + 1..).unwrap_or("");
             if head.starts_with('@') && nested < 2 && wide_screen(head) {
-                sheet.read(body, nested + 1);
+                self.read(body, nested + 1);
                 continue;
             }
             if head.starts_with('@') || body.contains('{') {
@@ -262,16 +291,16 @@ impl Sheet {
                         c.saturating_add(u16::from(p.tag.is_some())),
                     )
                 });
-                let i = sheet.rules.len();
+                let i = self.rules.len();
                 let Some(last) = parts.last() else { continue };
                 match (&last.id, last.classes.first(), &last.tag) {
-                    (Some(id), _, _) => sheet.by_id.entry(id.clone()).or_default().push(i),
-                    (None, Some(c), _) => sheet.by_class.entry(c.clone()).or_default().push(i),
-                    (None, None, Some(t)) => sheet.by_tag.entry(t.clone()).or_default().push(i),
-                    (None, None, None) => sheet.any.push(i),
+                    (Some(id), _, _) => self.by_id.entry(id.clone()).or_default().push(i),
+                    (None, Some(c), _) => self.by_class.entry(c.clone()).or_default().push(i),
+                    (None, None, Some(t)) => self.by_tag.entry(t.clone()).or_default().push(i),
+                    (None, None, None) => self.any.push(i),
                 }
-                sheet.rules.push(Rule { parts, specificity, order: i, decls: decls.clone() });
-                if sheet.rules.len() >= MAX_RULES {
+                self.rules.push(Rule { parts, specificity, order: i, decls: decls.clone() });
+                if self.rules.len() >= MAX_RULES {
                     break;
                 }
             }
@@ -284,11 +313,11 @@ impl Sheet {
 
     /// The declarations that apply to the last element of `chain` (its ancestors before it),
     /// weakest first, so a later one wins.
-    pub(crate) fn matching(&self, chain: &[El<'_>]) -> Vec<&Decl> {
+    pub(crate) fn matching(&self, chain: &[El]) -> Vec<&Decl> {
         let Some(me) = chain.last() else { return Vec::new() };
         let mut found: Vec<usize> = self.any.clone();
         found.extend(self.by_tag.get(&me.tag.to_ascii_lowercase()).into_iter().flatten());
-        if let Some(id) = me.id {
+        if let Some(id) = &me.id {
             found.extend(self.by_id.get(&id.to_ascii_lowercase()).into_iter().flatten());
         }
         for c in &me.classes {
@@ -304,7 +333,7 @@ impl Sheet {
 
 impl Rule {
     /// Its last part matches the element, and each part before it an ancestor further out.
-    fn applies(&self, chain: &[El<'_>]) -> bool {
+    fn applies(&self, chain: &[El]) -> bool {
         let (Some(last), Some(me)) = (self.parts.last(), chain.last()) else { return false };
         if !last.matches(me) {
             return false;
@@ -324,11 +353,11 @@ impl Rule {
 mod tests {
     use super::*;
 
-    fn el<'a>(tag: &'a str, classes: &[&'a str]) -> El<'a> {
-        El { tag, id: None, classes: classes.to_vec() }
+    fn el(tag: &str, classes: &[&str]) -> El {
+        El { tag: tag.into(), id: None, classes: classes.iter().map(|c| c.to_string()).collect() }
     }
 
-    fn props(sheet: &Sheet, chain: &[El<'_>]) -> Vec<String> {
+    fn props(sheet: &Sheet, chain: &[El]) -> Vec<String> {
         sheet.matching(chain).into_iter().map(|d| format!("{}:{}", d.prop, d.value)).collect()
     }
 
@@ -383,7 +412,7 @@ mod tests {
         assert_eq!(props(&sheet, &[el("table", &[]), el("td", &["title"])]), ["color:#111", "background-color:#888", "color:#fff", "font-size:20px"]);
         assert_eq!(props(&sheet, &[el("table", &["report"]), el("tr", &[]), el("td", &["odd"])]), ["color:#111", "background-color:#f0f0f0"]);
         assert_eq!(props(&sheet, &[el("table", &[]), el("td", &["odd"])]), ["color:#111"], "not inside a .report table");
-        assert_eq!(props(&sheet, &[El { tag: "div", id: Some("TOP"), classes: vec![] }]), ["color:red"]);
+        assert_eq!(props(&sheet, &[El { tag: "div".into(), id: Some("TOP".into()), classes: vec![] }]), ["color:red"]);
         assert_eq!(props(&sheet, &[el("div", &["dark"]), el("div", &[]), el("p", &[])]), ["color:white"]);
         assert!(props(&sheet, &[el("a", &[])]).is_empty(), "pseudo-classes and @media are left out");
         // Specificity before order: the class rule beats the later tag rule.
@@ -399,6 +428,18 @@ mod tests {
         ] {
             assert_eq!(props(&Sheet::parse(sheet), &[el("p", &["x"])]), ["color:red"], "{sheet}");
         }
+    }
+
+    /// A sheet longer than what's read, the cut falling inside a character: what's read of it
+    /// still counts. It was dropped whole, every rule lost.
+    #[test]
+    fn a_long_sheet_cut_inside_a_character_still_counts() {
+        let mut css = ".x{color:red}".to_string();
+        css.push_str(&" ".repeat(MAX_CSS - 1 - css.len()));
+        css.push('\u{e9}');
+        css.push_str(".y{color:blue}");
+        assert!(!css.is_char_boundary(MAX_CSS));
+        assert_eq!(props(&Sheet::parse(&css), &[el("p", &["x"])]), ["color:red"]);
     }
 
     #[test]

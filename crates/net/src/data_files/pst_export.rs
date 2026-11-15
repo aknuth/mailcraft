@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use mailcraft_mime as mime;
 use mailcraft_model::organize::FollowUpDays;
-use mailcraft_model::{Folder, FolderRole, MessageKey, utf7};
+use mailcraft_model::{Folder, FolderRole, utf7};
 use mailcraft_pst::{
     Format, NodeId,
     write::{self, BatchMessage, NewAttachment, NewMessage, NewProperty, NewRecipient, PropertyKey, RecipientType},
@@ -72,6 +72,8 @@ pub struct Exported {
     pub messages: usize,
     /// Messages whose body isn't on this computer, or that couldn't be read.
     pub skipped: usize,
+    /// Folders whose list couldn't be read: their mail isn't in the file.
+    pub folders_skipped: usize,
     /// Messages a data file already there had (by `Message-ID`), not written again.
     pub already: usize,
     /// The account's events written into it as appointments (a series is one)…
@@ -102,22 +104,26 @@ fn ids_in(path: &Path) -> Result<HashSet<String>, String> {
     let read = || -> io::Result<HashSet<String>> {
         let any = store_of(path)?;
         let mut ids = HashSet::new();
-        let top = any.open_folder(any.ipm_subtree()?)?;
-        let mut stack = vec![(top, 0usize)];
+        // Each folder once, as the import reads them: a damaged or crafted file's folder listed
+        // under itself twice was gone down 2^64 ways.
+        let mut guard = super::pst::Guard::to_depth(MAX_DEPTH + 1);
+        let top = any.ipm_subtree()?;
+        let _ = guard.admit(top, 0);
+        let mut stack = vec![(any.open_folder(top)?, 0usize)];
         while let Some((folder, depth)) = stack.pop() {
             if let Some(contents) = folder.contents_table() {
-                for row in contents.rows_matrix() {
+                for row in contents.rows_matrix().take(super::pst::MAX_ROWS) {
                     let Ok(props) = any.message_properties(row.id(), &[0x1035]) else { continue };
                     if let Some(id) = props.get(0x1035).and_then(crate::pst::text_of) {
                         ids.insert(mailcraft_model::thread::norm_id(&id));
                     }
                 }
             }
-            if depth < MAX_DEPTH
-                && let Some(table) = folder.hierarchy_table()
-            {
+            if let Some(table) = folder.hierarchy_table() {
                 for row in table.rows_matrix() {
-                    if let Ok(sub) = any.open_folder(row.id()) {
+                    if guard.admit(row.id(), depth + 1).is_ok()
+                        && let Ok(sub) = any.open_folder(row.id())
+                    {
                         stack.push((sub, depth + 1));
                     }
                 }
@@ -127,7 +133,7 @@ fn ids_in(path: &Path) -> Result<HashSet<String>, String> {
     };
     match read() {
         Ok(ids) => Ok(ids),
-        Err(e) if matches!(e.raw_os_error(), Some(32 | 33)) => {
+        Err(e) if crate::pst::locked_by_another(&e) => {
             Err("Outlook (or another program) has this data file open: close Outlook, including from the notification area, and try again".into())
         }
         Err(_) => Err("this data file can't be read, so mail can't be added to it: choose another name to make a new one".into()),
@@ -173,16 +179,23 @@ pub fn export(
     let placed = if format == Format::Ansi { place::apart(&placed, &targets) } else { placed };
     let mut write_all = || -> Result<(), String> {
         for (f, folder) in folders.iter().zip(&placed).filter(|(f, _)| f.selectable) {
-            let Ok(st) = store.load_folder(account, &f.path) else { continue };
+            let st = match store.load_folder(account, &f.path) {
+                Ok(st) => st,
+                Err(e) => {
+                    log::warn!("export: a folder's list couldn't be read, its mail is left out: {e}");
+                    done.folders_skipped += 1;
+                    continue;
+                }
+            };
             let folder = folder.clone();
             taken.push(folder.clone());
             let folder: Vec<&str> = folder.iter().map(String::as_str).collect();
             let mut batch = Vec::new();
             let mut bytes = 0usize;
-            for s in &st.messages {
-                let key = MessageKey { account: account.to_string(), folder: f.path.clone(), validity: s.key.validity, uid: s.key.uid };
+            let mut messages = st.messages.iter().peekable();
+            while let Some(s) = messages.next() {
                 let state = item::state(s, f.role, follow_up);
-                match store.read_body(&key).and_then(|raw| item::owned(&raw, s.received, state, &owner, Some(&spill))) {
+                match store.read_body(&s.key).and_then(|raw| item::owned(&raw, s.received, state, &owner, Some(&spill))) {
                     Some(m) if !m.message_id.is_empty() && had.contains(&mailcraft_model::thread::norm_id(&m.message_id)) => done.already += 1,
                     Some(m) => {
                         bytes = bytes.saturating_add(m.held());
@@ -190,7 +203,9 @@ pub fn export(
                     }
                     None => done.skipped += 1,
                 }
-                if batch.len() >= BATCH || bytes >= BATCH_BYTES || spill.bytes() >= SPILL_BYTES {
+                // Written once full, and what's left at the folder's end.
+                let full = batch.len() >= BATCH || bytes >= BATCH_BYTES || spill.bytes() >= SPILL_BYTES;
+                if full || (messages.peek().is_none() && !batch.is_empty()) {
                     let n = batch.len();
                     write(&temp, &folder, &std::mem::take(&mut batch), &mut created)?;
                     spill.clear();
@@ -198,12 +213,6 @@ pub fn export(
                     done.messages += n;
                     progress(done.messages);
                 }
-            }
-            if !batch.is_empty() {
-                write(&temp, &folder, &batch, &mut created)?;
-                spill.clear();
-                done.messages += batch.len();
-                progress(done.messages);
             }
         }
         record_special(&temp, &folders, &targets, created);

@@ -1,10 +1,23 @@
 use super::*;
+use crate::tests::util::{message, page, shown, tables};
 
 fn text(b: &Block) -> String {
     match b {
         Block::Text(r) => r.iter().map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>()).collect::<Vec<_>>().join("\n"),
         Block::Table(_) => String::new(),
     }
+}
+
+/// The spans of `blocks` whose text is `words`.
+fn spans(blocks: &[Block], words: &str) -> Vec<crate::Span> {
+    let mut all = blocks.to_vec();
+    let mut out = Vec::new();
+    each_span(&mut all, &mut |s| {
+        if s.text.trim() == words {
+            out.push(s.clone());
+        }
+    });
+    out
 }
 
 #[test]
@@ -96,26 +109,15 @@ fn pictures_behind_boxes_are_kept() {
 #[test]
 fn text_takes_its_cells_colour() {
     // White on a dark band, set on the cell (or the table), as CSS inherits it.
-    let colour_of = |b: &[Block], word: &str| {
-        format!("{b:?}").contains(word).then(|| {
-            fn spans(b: &[Block], out: &mut Vec<(String, Option<[u8; 3]>)>) {
-                for x in b {
-                    match x {
-                        Block::Text(r) => out.extend(r.iter().flatten().map(|s| (s.text.clone(), s.color))),
-                        Block::Table(t) => t.rows.iter().flatten().for_each(|c| spans(&c.blocks, out)),
-                    }
-                }
-            }
-            let mut v = Vec::new();
-            spans(b, &mut v);
-            v.into_iter().find(|(t, _)| t.contains(word)).and_then(|(_, c)| c)
-        })
+    let colour_of = |b: &[Block], word: &str| match spans(b, word).as_slice() {
+        [s, ..] => s.color,
+        [] => panic!("no {word} in {b:?}"),
     };
     let cell = html_layout(r##"<table><tr><td style="color:#ffffff" bgcolor="#123456">Band</td><td>Other</td></tr></table>"##);
-    assert_eq!(colour_of(&cell, "Band").flatten(), Some([255, 255, 255]), "{cell:?}");
-    assert_eq!(colour_of(&cell, "Other").flatten(), None, "a neighbour keeps its own");
+    assert_eq!(colour_of(&cell, "Band"), Some([255, 255, 255]), "{cell:?}");
+    assert_eq!(colour_of(&cell, "Other"), None, "a neighbour keeps its own");
     let table = html_layout(r##"<table style="color:#00ff00"><tr><td>A</td><td>B</td></tr></table>"##);
-    assert_eq!(colour_of(&table, "A").flatten(), Some([0, 255, 0]));
+    assert_eq!(colour_of(&table, "A"), Some([0, 255, 0]));
     // A colour can't smuggle markup in.
     let evil = html_layout(r##"<table><tr><td style="color:red&quot;><script>x</script>">A</td><td>B</td></tr></table>"##);
     assert!(!format!("{evil:?}").contains("script"), "{evil:?}");
@@ -164,6 +166,12 @@ fn hostile_markup_is_survived() {
     let _ = html_layout("<table><tr><td><script>if (a < b) { document.write('<td>') }</script>z</td><td>y</td></tr></table>");
     let many = "<table><tr>".to_string() + &"<td>c</td>".repeat(5000) + "</tr></table>";
     assert!(html_layout(&many).is_empty(), "too many cells: flows as text");
+}
+
+/// A colour as CSS writes one: `#abc` is `#aabbcc`, an `rgb()` part over 255 is 255, and a hex
+/// colour of two digits is none.
+#[test]
+fn colours_read_as_css_writes_them() {
     assert_eq!(color("#abc"), Some([0xaa, 0xbb, 0xcc]));
     assert_eq!(color("rgb(1, 2, 300)"), Some([1, 2, 255]));
     assert_eq!(color("#12"), None);
@@ -235,6 +243,17 @@ fn a_centred_column_in_points_or_ems_keeps_its_width() {
     assert_eq!((length_px("-3px"), length_px("1e9px"), length_px("NaNpx"), length_px("10vw")), (None, Some(100_000.0), None, None));
 }
 
+proptest::proptest! {
+    /// A cell's least height read with [`length_px`] alone is what it was read as a bare number
+    /// first and `length_px` after: a bare number is one `length_px` reads, as the cell keeps it.
+    #[test]
+    fn a_height_read_once(v in "[-+]?([0-9]{0,6}(\\.[0-9]{0,3})?|inf|NaN|infinity)(e[0-9])?(px|pt|em|in|%|vw)?") {
+        let kept = |px: f32| (px.is_finite() && px >= 1.0).then(|| (px.round() as u16).min(MAX_CELL_HEIGHT));
+        let before = v.parse::<f32>().ok().or_else(|| length_px(&v)).and_then(kept);
+        proptest::prop_assert_eq!(length_px(&v).and_then(kept), before);
+    }
+}
+
 /// Issue #41, as Outlook shows it: a title centred in the column (`text-align: center`) stays
 /// centred, and its size, set on a span inside `<b>` as Outlook writes it, makes it a title.
 #[test]
@@ -254,6 +273,10 @@ fn a_centred_title_in_a_column_stays_centred_and_big() {
     assert!(matches!(&cell[1], Block::Text(t) if t.iter().flatten().any(|s| s.text.contains("Hello") && s.heading == 0)), "{cell:?}");
     // Text that flows keeps flowing: no layout for paragraphs that line up nothing.
     assert!(html_layout(r#"<p style="text-align:left">Just text</p><p>More</p>"#).is_empty());
+    // A heading isn't made one again; a tag that only looks like one (`<h7>`, no HTML heading)
+    // sized as a title is, as any other element is.
+    assert_eq!(inline_css(r#"<td><h2 style="font-size:30px">Hi</h2></td>"#).matches("<h2").count(), 1);
+    assert!(inline_css(r#"<td><h7 style="font-size:30px">Hi</h7></td>"#).contains("<h1><h7"));
 }
 
 /// Issue #74: a logo and a title centred over a message that otherwise flows (`<center>`,
@@ -372,11 +395,6 @@ fn a_pages_background_is_no_highlight() {
 /// the text; too deep to read, the message is read as it came.
 #[test]
 fn blocks_nested_deep_stay_apart() {
-    let message = |html: &str| {
-        let raw = format!("From: a@shop.example\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n{html}");
-        crate::parse(raw.as_bytes()).unwrap_or_default()
-    };
-    let shown = |p: &crate::Parsed| p.rich.iter().map(|l| l.iter().map(|s| s.text.as_str()).collect::<String>()).collect::<Vec<_>>().join("|");
     let body = "<p>First paragraph.</p><p>Second paragraph.</p><h2>Heading</h2><p>Last words</p>";
     for n in [24, 28, 32, 80] {
         let nest = format!("{}{body}{}", r#"<table role="presentation"><tbody><tr><td>"#.repeat(n), "</td></tr></tbody></table>".repeat(n));

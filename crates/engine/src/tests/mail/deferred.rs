@@ -15,17 +15,11 @@ fn smime_testdata(name: &str) -> Vec<u8> {
     std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../smime/testdata").join(name)).unwrap()
 }
 
-/// Put `raw` in the sample Inbox (no body kept when `None`); its key.
+/// Put `raw` in the sample Inbox (its source kept only when `keep`) and show the Inbox; its key.
 fn put(s: &mut Session, uid: u32, raw: &[u8], keep: bool) -> MessageKey {
-    let store = s.store.clone().unwrap();
-    let mut inbox = store.load_folder("sample", "INBOX").unwrap();
-    let key = MessageKey { account: "sample".into(), folder: "INBOX".into(), validity: inbox.validity, uid };
-    inbox.messages.insert(0, mailcraft_mime::summary_from_full(raw, key.clone(), mailcraft_model::Flags::default(), 0, NOW - 3600).into());
-    store.save_folder("sample", "INBOX", &inbox).unwrap();
-    if keep {
-        store.write_body(&key, raw).unwrap();
-    }
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    let key = MessageKey { uid, ..next_key(s, "sample", "INBOX") };
+    let summary = mailcraft_mime::summary_from_full(raw, key, mailcraft_model::Flags::default(), 0, NOW - 3600);
+    let key = file_in(s, summary, keep.then_some(raw));
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     key
 }
@@ -83,8 +77,6 @@ fn deferred_open_then_finish_equals_sync_open() {
     later.finish_body(work.run());
     assert_eq!(later.reading.as_ref().unwrap().parsed.as_ref().unwrap().date, NOW - 3600);
     assert_eq!(later.bodies_parsed_here() - before, 2, "only the signed and the encrypted message were parsed here");
-    done(now);
-    done(later);
 }
 
 /// A body got ready for a message the pane moved on from is let go: the pane waits for the
@@ -115,7 +107,6 @@ fn stale_prepared_body_is_ignored() {
     assert!(!s.body_waiting(&a) && s.bodies_parsed_here() == parsed);
     s.finish_body(w.run());
     assert!(s.reading.is_none() && s.take_jobs().is_empty());
-    done(s);
 }
 
 /// A command run while the body is still being got ready acts on it as shown: it's got ready
@@ -143,7 +134,6 @@ fn a_command_finishes_the_body_first() {
     let shown = s.reading.clone();
     s.finish_body(handed.run());
     assert_eq!(s.reading, shown);
-    done(s);
 }
 
 /// Searching doesn't wait for the open message either: the search box, left for a result,
@@ -174,7 +164,6 @@ fn searching_leaves_the_body_waiting() {
     s.run("list.open", &json!({"key": k.to_id()})).unwrap();
     s.run("search.run", &json!({"query": "storyboard", "remember": true})).unwrap();
     assert_eq!(s.bodies_parsed_here(), parsed);
-    done(s);
 }
 
 /// A message the parser trips on (a panic) shows that it couldn't be read; the session goes on.
@@ -196,7 +185,6 @@ fn a_panicking_parse_shows_an_error() {
     s.finish_body(w.run());
     assert!(s.reading.as_ref().unwrap().parsed.is_some(), "the next one shows");
     assert_eq!(crate::PANICS_CAUGHT.load(std::sync::atomic::Ordering::Relaxed), caught, "no command panicked");
-    done(s);
 }
 
 /// A body not kept is downloaded once the work finds it missing, and parsed on the other
@@ -231,7 +219,6 @@ fn a_body_downloaded_is_parsed_on_the_other_thread() {
     assert!(!s.body_waiting(&other));
     let pane = s.reading.as_ref().unwrap().parsed.clone().unwrap();
     assert!(std::sync::Arc::ptr_eq(&pane, s.windows[0].parsed.as_ref().unwrap()));
-    done(s);
 }
 
 /// A body that arrives while the cache is still being read for it wins: the cache read's
@@ -252,7 +239,7 @@ fn a_body_arriving_during_the_cache_read_wins() {
     assert!(s.body_waiting(&k), "still waits for the arrived body");
     s.finish_body(arrived.run());
     assert_eq!(s.reading.as_ref().unwrap().parsed.as_ref().unwrap().subject, "Undated");
-    done(s);
+    drop(s);
 
     // The cache holds the text-first copy; the full message arrives while it's read.
     let (mut s, keys) = with_kinds("deferred-race-text-first");
@@ -267,7 +254,6 @@ fn a_body_arriving_during_the_cache_read_wins() {
     s.finish_body(arrived.run());
     let r = s.reading.as_ref().unwrap();
     assert!(!r.text_first && r.parsed.as_ref().unwrap().subject == "Colour notes", "the full body is shown");
-    done(s);
 }
 
 /// Commands that only change the list or the view (typing in the search box, the Focused tab,
@@ -279,14 +265,53 @@ fn list_and_view_commands_leave_the_body_waiting() {
     let k = s.list[0].key.clone();
     s.run("list.open", &json!({"key": k.to_id()})).unwrap();
     let parsed = s.bodies_parsed_here();
+    let registry = s.registry();
+    let leaves = |id: &str| registry.get(id).is_some_and(|c| c.leaves_body);
     for id in ["list.filter", "list.focusTab", "search.run", "search.clear", "view.reverseSort", "view.arrange", "view.folderPane", "dataFile.idle"] {
-        assert!(crate::cmd::leaves_body_waiting(id), "{id}");
+        assert!(leaves(id), "{id}");
     }
-    let _ = s.run("view.reverseSort", &json!({}));
-    let _ = s.run("search.run", &json!({"query": "zzzz"}));
-    let _ = s.run("search.clear", &json!({}));
-    let _ = s.run("dataFile.idle", &json!({"seconds": 30}));
+    s.run("view.reverseSort", &json!({})).unwrap();
+    s.run("search.run", &json!({"query": "zzzz"})).unwrap();
+    s.run("search.clear", &json!({})).unwrap();
+    s.run("dataFile.idle", &json!({"seconds": 30})).unwrap();
     assert_eq!(s.bodies_parsed_here(), parsed, "nothing read on the session's thread");
-    assert!(!crate::cmd::leaves_body_waiting("mail.reply") && !crate::cmd::leaves_body_waiting("view.html"));
-    done(s);
+    assert!(!leaves("mail.reply") && !leaves("view.html"));
+}
+
+/// Which commands leave the body waiting is said where each is declared (`.leaves_body()`); these
+/// are the ones a list of ids kept apart named (any `list.extend…` and `dataFile.…` among them).
+#[test]
+fn the_commands_that_leave_the_body_waiting_are_these() {
+    let s = sample_session("deferred-which");
+    let mut leaving: Vec<&str> = s.registry().all().iter().filter(|c| c.leaves_body).map(|c| c.id).collect();
+    leaving.sort_unstable();
+    let mut listed = vec![
+        "list.open",
+        "list.select",
+        "list.selectRange",
+        "list.selectAll",
+        "list.next",
+        "list.prev",
+        "list.first",
+        "list.last",
+        "list.pageDown",
+        "list.pageUp",
+        "folder.open",
+        "folder.unified",
+        "list.filter",
+        "list.focusTab",
+        "list.messages",
+        "search.run",
+        "search.clear",
+        "search.remember",
+        "search.forgetRecent",
+        "searchFolder.open",
+        "view.arrange",
+        "view.reverseSort",
+        "view.folderPane",
+        "compose.update",
+    ];
+    listed.extend(s.registry().all().iter().map(|c| c.id).filter(|id| id.starts_with("list.extend") || id.starts_with("dataFile.")));
+    listed.sort_unstable();
+    assert_eq!(leaving, listed);
 }

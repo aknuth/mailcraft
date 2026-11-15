@@ -1,6 +1,7 @@
 //! An account removed while its worker is at work: nothing of it is written again.
 
 use super::*;
+use crate::fakes::proxy::{Cut, Hang, Proxy};
 
 /// Found in review: an account removed while its worker was syncing a folder had the folder's
 /// cache written back as the sync ended, and its files came back with the Inbox in them (an
@@ -8,76 +9,43 @@ use super::*;
 #[test]
 fn a_folder_synced_as_its_account_is_removed_writes_nothing() {
     let st = crate::fake::State::new();
+    let (hold, holding) = crate::fake::Hold::on("SELECT \"INBOX\"");
     {
         let mut s = st.lock().unwrap();
         for n in 0..3 {
             s.add("INBOX", &format!("m{n}"), &[]);
         }
-        s.stall_on = Some(("SELECT \"INBOX\"".into(), Duration::from_millis(1000)));
+        s.hold_on = Some(hold);
     }
     let port = crate::fake::serve_tcp(&st);
-    let store = crate::fake::tests_store("removed-mid-sync");
+    let store = crate::fake::store("removed-mid-sync");
     let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
-    let acc = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: mailcraft_model::ServerConfig { host: "127.0.0.1".into(), port, security: mailcraft_model::Security::None },
-        ..Default::default()
-    };
+    let acc = imap_account("a1", port);
     let w = Worker::new(acc, Auth::shared("pw"), store.clone(), pool.sink.clone(), SyncOptions::default());
     let (tx, rx) = mpsc::channel();
     tx.send(Job::SyncFolder { account: "a1".into(), folder: "INBOX".into() }).unwrap();
     let t = std::thread::spawn(move || w.run(rx));
     // Removed while the Inbox is being read, as `Job::Remove` does (its channel dropped).
-    let end = Instant::now() + Duration::from_secs(10);
-    while !st.lock().unwrap().log.iter().any(|c| c.starts_with("LOGIN")) {
-        assert!(Instant::now() < end, "never signed in");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(400));
+    holding.came();
     store.remove_account("a1").unwrap();
     drop(tx);
+    holding.go(crate::fake::LetGo::Answer);
     let _ = t.join();
     assert!(st.lock().unwrap().log.iter().any(|c| c.starts_with("SELECT \"INBOX\"")), "the Inbox was read");
     assert_eq!(store.load_folder("a1", "INBOX").map(|f| f.messages.len()).unwrap_or(0), 0, "the Inbox cached again");
     assert!(store.load_folders("a1").unwrap_or_default().is_empty(), "the folder list written again");
     let said_failed = pool.poll().into_iter().any(|e| matches!(e, Event::Status { status: SyncStatus::Error { .. }, .. }));
     assert!(!said_failed, "a failure said of an account removed");
-    let _ = std::fs::remove_dir_all(store.root());
-}
-
-/// A proxy to the server at `port` that holds each answer `hold` before passing it on (a slow
-/// server: each HTTP request its own connection).
-fn slow_proxy(port: u16, hold: Duration) -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let at = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for client in listener.incoming().flatten() {
-            let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", port)) else { continue };
-            let (Ok(mut from_client), Ok(mut to_server)) = (client.try_clone(), server.try_clone()) else { continue };
-            let (mut from_server, mut to_client) = (server, client);
-            std::thread::spawn(move || {
-                let _ = std::io::copy(&mut from_client, &mut to_server);
-            });
-            std::thread::spawn(move || {
-                let mut answer = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut from_server, &mut answer);
-                std::thread::sleep(hold);
-                let _ = std::io::Write::write_all(&mut to_client, &answer);
-                let _ = to_client.shutdown(std::net::Shutdown::Both);
-            });
-        }
-    });
-    at
 }
 
 /// `base`, a server's address on this computer (`http://127.0.0.1:port/path`), through a
-/// [`slow_proxy`] holding each answer 400 ms.
-fn slowed(base: &str) -> String {
+/// proxy holding the first request with `marker` in it (the Inbox's listing) until `hold` lets
+/// it go.
+fn held(base: &str, marker: &'static [u8], hold: &Arc<Hang>) -> String {
     let rest = base.strip_prefix("http://127.0.0.1:").unwrap();
     let (port, path) = rest.split_once('/').map_or((rest, String::new()), |(p, path)| (p, format!("/{path}")));
-    format!("http://127.0.0.1:{}{path}", slow_proxy(port.parse().unwrap(), Duration::from_millis(400)))
+    let proxy = Proxy { client: Some((marker, Cut::Hold(hold.clone()))), ..Proxy::default() }.to(port.parse().unwrap());
+    format!("http://127.0.0.1:{}{path}", proxy.port)
 }
 
 /// Found in review: the same for a JMAP account (and from the code, Microsoft Graph, Exchange
@@ -93,8 +61,10 @@ fn a_jmap_folder_synced_as_its_account_is_removed_writes_nothing() {
         d.deliver(&inbox, raw.as_bytes(), &[], &format!("2026-05-0{n}T09:00:00Z"));
     }
     let server = serve(d);
-    let acc = AccountConfig { id: "j1".into(), email: USER.into(), username: USER.into(), jmap: Some(slowed(&server.base)), ..Default::default() };
-    removed_mid_sync("removed-mid-jmap-sync", acc, PASSWORD);
+    let hold = Arc::new(Hang::default());
+    let jmap = Some(held(&server.base, b"Email/query", &hold));
+    let acc = AccountConfig { id: "j1".into(), email: USER.into(), username: USER.into(), jmap, ..Default::default() };
+    removed_mid_sync("removed-mid-jmap-sync", acc, PASSWORD, &hold);
 }
 
 /// The same for a Microsoft Graph account.
@@ -108,31 +78,83 @@ fn a_graph_folder_synced_as_its_account_is_removed_writes_nothing() {
         d.deliver(&inbox, raw.as_bytes(), false, &format!("2026-05-0{n}T09:00:00Z"));
     }
     let server = serve(d);
-    let acc = AccountConfig { id: "j1".into(), email: "me@contoso.example".into(), graph: Some(slowed(&server.base)), ..Default::default() };
-    removed_mid_sync("removed-mid-graph-sync", acc, TOKEN);
+    let hold = Arc::new(Hang::default());
+    let graph = Some(held(&server.base, b"/messages", &hold));
+    let acc = AccountConfig { id: "j1".into(), email: "me@contoso.example".into(), graph, ..Default::default() };
+    removed_mid_sync("removed-mid-graph-sync", acc, TOKEN, &hold);
 }
 
-/// An account (`j1`) removed while its worker syncs the Inbox: nothing of it is on disk after.
-fn removed_mid_sync(name: &str, acc: AccountConfig, secret: &str) {
-    let store = crate::fake::tests_store(name);
+/// An account (`j1`) removed while its worker syncs the Inbox, its listing held by `hold`: nothing
+/// of it is on disk after.
+fn removed_mid_sync(name: &str, acc: AccountConfig, secret: &str, hold: &Hang) {
+    let store = crate::fake::store(name);
     let pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
     let w = Worker::new(acc, Auth::shared(secret), store.clone(), pool.sink.clone(), SyncOptions::default());
     let (tx, rx) = mpsc::channel();
     let t = std::thread::spawn(move || w.run(rx));
-    let end = Instant::now() + Duration::from_secs(20);
-    loop {
-        assert!(Instant::now() < end, "the Inbox never synced");
-        let e = pool.wait(Duration::from_millis(50));
-        if matches!(e, Some(Event::Status { status: SyncStatus::Syncing { folder }, .. }) if folder == "INBOX") {
-            break;
-        }
-    }
+    until(&pool, "the Inbox's sync", |e| matches!(e, Event::Status { status: SyncStatus::Syncing { folder }, .. } if folder == "INBOX"));
     // Removed while the Inbox is being read, as `Job::Remove` does (its channel dropped).
-    std::thread::sleep(Duration::from_millis(200));
+    eventually("the Inbox's listing held", || hold.hung.load(std::sync::atomic::Ordering::Relaxed));
     store.remove_account("j1").unwrap();
     drop(tx);
+    hold.closed.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = t.join();
     assert_eq!(store.load_folder("j1", "INBOX").map(|f| f.messages.len()).unwrap_or(0), 0, "the Inbox cached again");
     assert!(!store.root().join("j1").exists(), "the account's files came back");
-    let _ = std::fs::remove_dir_all(store.root());
+}
+
+/// Found in the audit: the folder list was written once a look said the account was still
+/// there, so a removal coming between the look and the write brought its `folders.json` back
+/// (and the account's folder with it). Written while it's kept, it isn't.
+#[test]
+fn a_folder_list_published_as_its_account_is_removed_writes_nothing() {
+    let store = crate::fake::store("removed-folder-list");
+    let folder = |path: &str| Folder { account: "a1".into(), path: path.into(), selectable: true, ..Default::default() };
+    store.save_folders("a1", &[folder("INBOX")]).unwrap();
+    let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
+    let mut w = Worker::new(imap_account("a1", 1), Auth::shared("pw"), store.clone(), pool.sink.clone(), SyncOptions::default());
+    w.folders = vec![folder("Archive")];
+    // Removed after the worker decided to write its list, before it's written.
+    let removing = store.clone();
+    crate::worker::sync::BEFORE_FOLDERS_SAVED.with(|b| *b.borrow_mut() = Some(Box::new(move || drop(removing.remove_account("a1")))));
+    w.publish_folders();
+    assert!(store.load_folders("a1").unwrap_or_default().is_empty(), "the folder list written again");
+    assert!(!store.root().join("a1").exists(), "the account's files came back");
+    assert!(!pool.poll().into_iter().any(|e| matches!(e, Event::Folders { .. })), "its folders said");
+}
+
+/// Found in the audit: a change made here to a POP account (a folder made: its worker makes it, as
+/// there's no server copy) and Show more, handled by a worker whose account was removed since it
+/// started, wrote the change, the change queued and the folder's window: the account's files came
+/// back. Nothing is written.
+#[test]
+fn changes_handled_after_their_account_was_removed_write_nothing() {
+    let store = crate::fake::store("removed-changes");
+    store.save_folders("p1", &[Folder { account: "p1".into(), path: "INBOX".into(), selectable: true, ..Default::default() }]).unwrap();
+    let pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
+    let mut w = Worker::new(pop_account(1), Auth::shared("pw"), store.clone(), pool.sink.clone(), SyncOptions::default());
+    store.remove_account("p1").unwrap();
+    w.handle(Job::Apply { account: "p1".into(), op: Op::CreateFolder { path: "Plans".into() } });
+    assert!(!store.root().join("p1").exists(), "a change made brought the account's files back");
+    w.handle(Job::MoreMail { account: "p1".into(), folder: "INBOX".into(), more: 25 });
+    assert!(!store.root().join("p1").exists(), "Show more brought the account's files back");
+}
+
+/// Found in the audit: the Exchange server autodiscovery found was kept (`ews.json`) whatever
+/// happened meanwhile, so an account removed while autodiscovery went on had its folder back.
+#[test]
+fn a_server_autodiscovered_as_its_account_is_removed_isnt_kept() {
+    use crate::fakes::fake_ews::{Data, PASSWORD, account, serve};
+    let server = serve(Data::default());
+    let store = crate::fake::store("removed-autodiscovered");
+    let pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
+    let mut w =
+        Worker::new(account("a1", crate::ews::AUTODISCOVER), Auth::shared(PASSWORD), store.clone(), pool.sink.clone(), SyncOptions::default());
+    // Found, then removed before it's kept.
+    let removing = store.clone();
+    let then: Box<dyn FnOnce()> = Box::new(move || drop(removing.remove_account("a1")));
+    crate::worker::connect::AUTODISCOVER_IN_TEST.with(|a| *a.borrow_mut() = (Some(server.url.clone()), Some(then)));
+    let _ = w.connect();
+    assert_eq!(store.load_account_doc::<String>("a1", "ews.json").unwrap_or_default(), "", "the server found kept");
+    assert!(!store.root().join("a1").exists(), "the account's files came back");
 }

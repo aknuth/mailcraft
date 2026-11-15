@@ -7,34 +7,29 @@ use std::path::Path;
 
 use super::btree::{finish_page, page_bytes};
 use super::edit::Editor;
-use super::folders::NID_ROOT_FOLDER;
+use super::folders::{CONTENT_COUNT, CONTENT_UNREAD, NID_ROOT_FOLDER, NID_SEARCH_QUEUE};
 use super::heap::build_props;
-use super::space::{self, AMAP_BYTES, FIRST_AMAP};
-use super::table::{Cell, NewRow, Schema, build_table};
+use super::message::{attachment_columns, recipient_template_columns};
+use super::space::{self, AMAP_BYTES, AMAP_VALID, DLIST_AT, FIRST_AMAP};
+use super::table::{Cell, NewRow, ROW_ID, ROW_VERSION, Schema, build_table};
 use super::text::Text;
+use super::{FIRST_SUBNODE, entry_id};
 use crate::crypt::Crypt;
 use crate::ltp::{Bytes, PropertyType as P, PropertyValue};
 use crate::messaging::{BUCKET_COUNT, NID_MESSAGE_STORE, NID_NAME_TO_ID_MAP, STREAM_ENTRY, STREAM_GUID, STREAM_STRING};
 use crate::ndb::Bref;
 use crate::ndb::btree::{block_entry_size, node_entry_size};
-use crate::ndb::{Format, Header, PAGE, PT_BBT, PT_NBT, Root, SubNodes};
+use crate::ndb::{CLIENT, Format, Header, MAGIC, MAP_BYTES, PAGE, PT_AMAP, PT_BBT, PT_DLIST, PT_NBT, PT_PMAP, Root, SubNodes};
 
 const NID_IPM_SUBTREE: u32 = 0x8022;
 const NID_SEARCH_ROOT: u32 = 0x8042;
 const NID_DELETED_ITEMS: u32 = 0x8062;
 const NID_SPAM_FOLDER: u32 = 0x2223;
-const NID_SEARCH_QUEUE: u32 = 0x1E1;
 const NID_SEARCH_ACTIVITY: u32 = 0x201;
 
 /// The store says these of its special folders are valid (`PidTagValidFolderMask`): the
 /// IPM subtree, Deleted Items and the search root's.
 const VALID_FOLDER_MASK: i32 = 0xC9;
-
-const AMAP_VALID: u8 = 2;
-const PT_AMAP: u8 = 0x84;
-const PT_PMAP: u8 = 0x83;
-const PT_DLIST: u8 = 0x86;
-const DLIST_AT: u64 = 0x4200;
 
 /// Columns of a hierarchy table (MS-PST 2.4.4.4.1).
 fn hierarchy_columns(st: u16) -> Vec<(u16, u16)> {
@@ -157,37 +152,16 @@ fn tracking_tables(st: u16) -> [(u32, Vec<(u16, u16)>); 3] {
     ]
 }
 
-fn recipient_columns(st: u16) -> Vec<(u16, u16)> {
-    vec![
-        (0x0C15, P::INT32),
-        (0x0E0F, P::BOOLEAN),
-        (0x0FF9, P::BINARY),
-        (0x0FFE, P::INT32),
-        (0x0FFF, P::BINARY),
-        (0x3001, st),
-        (0x3002, st),
-        (0x3003, st),
-        (0x300B, P::BINARY),
-        (0x3900, P::INT32),
-        (0x39FF, st),
-        (0x3A40, P::BOOLEAN),
-    ]
-}
-
-fn attachment_columns(st: u16) -> Vec<(u16, u16)> {
-    vec![(0x0E20, P::INT32), (0x3704, st), (0x3705, P::INT32), (0x370B, P::INT32)]
-}
-
 /// A header for an empty file: both B-trees one empty page, the first run's map written.
 fn new_header(format: Format) -> Vec<u8> {
-    let mut b = vec![0u8; if format.wide() { 564 } else { 512 }];
+    let mut b = vec![0u8; format.header_size()];
     let put = |b: &mut Vec<u8>, at: usize, v: &[u8]| {
         if let Some(s) = b.get_mut(at..at + v.len()) {
             s.copy_from_slice(v);
         }
     };
-    put(&mut b, 0, b"!BDN");
-    put(&mut b, 8, b"SM");
+    put(&mut b, 0, MAGIC);
+    put(&mut b, 8, CLIENT);
     put(&mut b, 10, &(if format.wide() { 23u16 } else { 15u16 }).to_le_bytes());
     put(&mut b, 12, &19u16.to_le_bytes());
     b[14] = 1;
@@ -269,13 +243,13 @@ fn write_bare(path: &Path, format: Format) -> io::Result<()> {
     let mut dlist = vec![0u8; PAGE];
     finish_page(&mut dlist, format, PT_DLIST, DLIST_AT, header.next_page, true)?;
     put_page(DLIST_AT, &dlist)?;
-    let bits_at = if format.wide() { 0 } else { 4 };
+    let bits_at = format.map_bits_at();
     let mut amap = vec![0u8; PAGE];
-    amap.get_mut(bits_at..bits_at + 496).ok_or_else(crate::util::short)?.copy_from_slice(&bits);
+    amap.get_mut(bits_at..bits_at + MAP_BYTES).ok_or_else(crate::util::short)?.copy_from_slice(&bits);
     finish_page(&mut amap, format, PT_AMAP, base, base, false)?;
     put_page(base, &amap)?;
     let mut pmap = vec![0u8; PAGE];
-    pmap.get_mut(bits_at..bits_at + 496).ok_or_else(crate::util::short)?.fill(0xFF);
+    pmap.get_mut(bits_at..bits_at + MAP_BYTES).ok_or_else(crate::util::short)?.fill(0xFF);
     finish_page(&mut pmap, format, PT_PMAP, base + PAGE as u64, base + PAGE as u64, false)?;
     put_page(base + PAGE as u64, &pmap)?;
     put_page(nbt_at, &page_bytes(format, PT_NBT, nbt_at, 2, node_entry_size(format), 0, &[])?)?;
@@ -286,16 +260,18 @@ fn write_bare(path: &Path, format: Format) -> io::Result<()> {
 
 impl Editor {
     fn empty_table(&mut self, nid: u32, schema: &Schema, rows: &[NewRow], parent: u32) -> io::Result<()> {
-        let built = build_table(self.format(), schema, rows, 0)?;
+        let built = build_table(self.format(), schema, rows.to_vec(), 0)?;
         let (data, sub) = self.write_built(built, SubNodes::new())?;
         self.set_node(nid, data, sub, parent);
         Ok(())
     }
 
     fn props_node(&mut self, nid: u32, props: Vec<(u16, PropertyValue)>, parent: u32) -> io::Result<()> {
-        let built = build_props(self.format(), props, 0x80)?;
-        let data = self.write_leaves(&built.blocks)?;
-        self.set_node(nid, data, 0, parent);
+        let built = build_props(self.format(), props, FIRST_SUBNODE)?;
+        let mut subs = SubNodes::new();
+        let data = self.write_props_into(built, &mut subs)?;
+        let sub = self.write_subnodes(&subs)?;
+        self.set_node(nid, data, sub, parent);
         Ok(())
     }
 
@@ -307,10 +283,10 @@ impl Editor {
             .iter()
             .map(|c| match c.prop_id() {
                 #[allow(clippy::cast_possible_wrap)]
-                0x67F2 => Some(Cell::Fixed((nid as i32).to_le_bytes().to_vec())),
-                0x67F3 => Some(Cell::Fixed(1i32.to_le_bytes().to_vec())),
+                ROW_ID => Some(Cell::Fixed((nid as i32).to_le_bytes().to_vec())),
+                ROW_VERSION => Some(Cell::Fixed(1i32.to_le_bytes().to_vec())),
                 0x3001 => text.cell(st, name).map(Cell::Bytes),
-                0x3602 | 0x3603 => Some(Cell::Fixed(0i32.to_le_bytes().to_vec())),
+                CONTENT_COUNT | CONTENT_UNREAD => Some(Cell::Fixed(0i32.to_le_bytes().to_vec())),
                 0x360A => Some(Cell::Fixed(vec![u8::from(subs)])),
                 0x3613 => text.cell(st, class).map(Cell::Bytes),
                 _ => None,
@@ -324,12 +300,7 @@ impl Editor {
         let text = Text::plain(self.format());
         let st = text.string_type();
         let key = random_key();
-        let entry = |nid: u32| {
-            let mut e = vec![0u8; 4];
-            e.extend_from_slice(&key);
-            e.extend(nid.to_le_bytes());
-            PropertyValue::Binary(Bytes(e))
-        };
+        let entry = |nid: u32| PropertyValue::Binary(Bytes(entry_id(&key, nid)));
         self.props_node(
             NID_MESSAGE_STORE,
             vec![
@@ -357,7 +328,7 @@ impl Editor {
             self.empty_table(nid, schema, &[], 0)?;
         }
         self.empty_table(0x610, &Schema::new(&search_columns(st))?, &[], 0)?;
-        self.empty_table(0x692, &Schema::new(&recipient_columns(st))?, &[], 0)?;
+        self.empty_table(0x692, &Schema::new(&recipient_template_columns(st))?, &[], 0)?;
         self.empty_table(0x671, &Schema::new(&attachment_columns(st))?, &[], 0)?;
         let receive = Schema::new(&receive_columns(st))?;
         let default_row = NewRow {
@@ -369,8 +340,8 @@ impl Editor {
                     0x001A => Some(Cell::Bytes(Vec::new())),
                     #[allow(clippy::cast_possible_wrap)]
                     0x6605 => Some(Cell::Fixed((NID_ROOT_FOLDER as i32).to_le_bytes().to_vec())),
-                    0x67F2 => Some(Cell::Fixed(1i32.to_le_bytes().to_vec())),
-                    0x67F3 => Some(Cell::Fixed(2i32.to_le_bytes().to_vec())),
+                    ROW_ID => Some(Cell::Fixed(1i32.to_le_bytes().to_vec())),
+                    ROW_VERSION => Some(Cell::Fixed(2i32.to_le_bytes().to_vec())),
                     _ => None,
                 })
                 .collect(),

@@ -29,6 +29,7 @@ pub mod stream;
 pub mod sync;
 pub mod updates;
 pub mod worker;
+mod xml;
 
 // Each module by its own name, wherever its file sits (`mailcraft_net::ews`, `crate::imap`).
 use data_files::pst_pim;
@@ -36,7 +37,7 @@ pub use data_files::{msg, pst, pst_export, space};
 use exchange::ews_pim;
 pub use exchange::{ews, graph, graph_pim, kerberos, ntlm};
 #[cfg(test)]
-use fakes::{fake, fake_graph};
+use fakes::{fake, fake_graph, waiting};
 pub use protocols::{dav, imap, jmap, pop, sieve, smtp, web_calendar};
 
 use std::io;
@@ -47,6 +48,11 @@ pub enum NetError {
     Io(#[from] io::Error),
     #[error("secure connection: {0}")]
     Tls(String),
+    /// A mail server on this computer showed a certificate of its own, which no authority vouches
+    /// for and the user hasn't trusted: the server, and the certificate's SHA-256 in hex, for the
+    /// user to be asked about it (issue #77). Otherwise a TLS failure.
+    #[error("secure connection: {}", mailcraft_model::local_certificate_refusal(.host, .fingerprint))]
+    Untrusted { host: String, fingerprint: String },
     /// The server's response could not be understood.
     #[error("unexpected server response: {0}")]
     Protocol(String),
@@ -76,6 +82,11 @@ pub enum NetError {
     /// Can't go on, for a reason said in full (what to do included): not a server's words.
     #[error("{0}")]
     Refused(String),
+    /// Microsoft signed the account in, but its server won't open the mailbox over IMAP: why,
+    /// and what helps, in full (starting with [`mailcraft_model::MICROSOFT_IMAP_CLOSED`]).
+    /// Otherwise a refusal.
+    #[error("{0}")]
+    MailboxClosed(String),
     /// The whole message went to the server, which never said whether it took it: it may have
     /// been sent. Never sent again without the user saying so (that's how mail arrives twice).
     #[error(
@@ -87,7 +98,7 @@ pub enum NetError {
 impl NetError {
     /// Whether the connection is unusable after this error (reconnect needed).
     pub fn is_fatal(&self) -> bool {
-        matches!(self, NetError::Io(_) | NetError::Tls(_) | NetError::Closed(_) | NetError::Protocol(_))
+        matches!(self, NetError::Io(_) | NetError::Tls(_) | NetError::Untrusted { .. } | NetError::Closed(_) | NetError::Protocol(_))
     }
 
     /// Whether sending may work later (keep the message in the Outbox rather than give up): a
@@ -95,9 +106,42 @@ impl NetError {
     pub fn is_retryable(&self) -> bool {
         self.is_fatal() || matches!(self, NetError::Later(_) | NetError::Auth(_))
     }
+
+    /// The kind of failure it is, for what helps to be offered without reading its words.
+    pub fn failure(&self) -> mailcraft_model::FailureKind {
+        use mailcraft_model::FailureKind;
+        match self {
+            NetError::Untrusted { host, fingerprint } => FailureKind::LocalCertificate { host: host.clone(), fingerprint: fingerprint.clone() },
+            NetError::MailboxClosed(_) => FailureKind::MicrosoftImapClosed,
+            _ => FailureKind::Other,
+        }
+    }
+
+    /// An account's status after this error: its words and its kind.
+    pub fn status(&self) -> mailcraft_model::SyncStatus {
+        mailcraft_model::SyncStatus::Error { error: self.to_string(), kind: self.failure() }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NetError>;
+
+/// Bytes in lowercase hex, two digits each (a digest, a random mark).
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Every byte gives what each place that wrote its own hex gave.
+#[test]
+fn hex_is_each_bytes_two_lowercase_digits() {
+    let all: Vec<u8> = (0..=255).collect();
+    assert_eq!(hex(&all), all.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    assert_eq!(hex(&[]), "");
+}
 
 /// The smart cards' PKCS #11 modules installed here, the likeliest first (S/MIME with a card).
 pub fn card_modules() -> Vec<String> {

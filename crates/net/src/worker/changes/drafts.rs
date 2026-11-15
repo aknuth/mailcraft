@@ -1,30 +1,24 @@
 //! An account's worker: drafts saved to the server, and kept on this computer when they can't be
-//! (#53). The kept drafts' file, the order drafts were handed out in, and the drafts the pool
-//! keeps as it stops a worker. The kept drafts filed at each connection: `drafts/kept.rs`;
-//! MailCraft's own copies of a draft on an IMAP server: `drafts/copies.rs`.
+//! (#53). Keeping a draft, the order drafts were handed out in, and the drafts the pool keeps as
+//! it stops a worker. How the kept drafts are kept: `drafts/stored.rs`; filed at each
+//! connection: `drafts/kept.rs`; MailCraft's own copies of a draft on an IMAP server:
+//! `drafts/copies.rs`.
 
 use super::*;
 
+use mailcraft_mime::written_message_id;
 use mailcraft_model::MessageKey;
-use mailcraft_model::thread::written_message_id;
 
 mod copies;
 mod kept;
+mod stored;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use kept::KeptDrafts;
-
-/// Drafts kept on this computer until the account connects again: those that couldn't be saved
-/// to the server (offline, or it failed), and those the pool or a worker kept as the worker
-/// stopped before saving them.
-pub(crate) const PENDING_DRAFTS: &str = "drafts-pending.json";
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct PendingDraft {
-    pub(crate) folder: String,
-    #[serde(default)]
-    pub(crate) replaces: Option<MessageKey>,
-    pub(crate) raw: Vec<u8>,
-}
+use stored::{Digest, Kept};
+#[cfg(test)]
+pub(crate) use stored::{KEPT_DRAFTS, PENDING_DRAFTS, PendingDraft, kept_raws, sweep as sweep_kept};
 
 /// The order, in this run, in which drafts were handed out to be saved and kept as the newest
 /// version of their draft (`Job::KeepDraft`, as MailCraft closes): a save handed out before its
@@ -48,17 +42,38 @@ struct Newest {
     at: u64,
 }
 
+/// Which draft a version is of, as the drafts' bookkeeping knows it: its Message-ID, and the copy
+/// on the server it replaces.
+#[derive(Clone, Copy)]
+pub(crate) struct DraftId<'a> {
+    pub(crate) message_id: &'a str,
+    pub(crate) replaces: Option<&'a MessageKey>,
+}
+
+impl DraftId<'_> {
+    /// Whether `other` is a version of the same draft: it replaces the same copy, or has the same
+    /// Message-ID (an empty one matches none).
+    pub(crate) fn same(&self, other: &DraftId<'_>) -> bool {
+        (self.replaces.is_some() && self.replaces == other.replaces) || (!self.message_id.is_empty() && self.message_id == other.message_id)
+    }
+}
+
+impl Newest {
+    fn draft(&self) -> DraftId<'_> {
+        DraftId { message_id: &self.message_id, replaces: self.replaces.as_ref() }
+    }
+}
+
 /// Drafts handed out and kept as the newest remembered, at most (the oldest forgotten: a save
 /// not remembered is kept as it always was).
 const MAX_ORDER: usize = 1024;
 
 pub(crate) type Order = Arc<std::sync::Mutex<DraftOrder>>;
 
+/// A draft's source's hash, the same from run to run (a draft kept on this computer is known by it
+/// too, [`Digest::hash`]).
 fn hash_of(raw: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    raw.hash(&mut h);
-    h.finish()
+    Digest::of(raw).hash()
 }
 
 impl DraftOrder {
@@ -77,31 +92,31 @@ impl DraftOrder {
         o.handed.push_back((hash_of(raw), at));
     }
 
-    /// When `raw` was last handed out to be saved, if this run remembers it.
-    fn handed_at(&self, raw: &[u8]) -> Option<u64> {
-        let hash = hash_of(raw);
+    /// When a draft (its source's `hash`) was last handed out to be saved, if this run remembers it.
+    fn handed_at(&self, hash: u64) -> Option<u64> {
         self.handed.iter().rev().find(|(h, _)| *h == hash).map(|(_, at)| *at)
     }
 
-    /// Whether a version of a draft (`same`) was kept as the newest after `at`.
-    fn kept_newest_after(&self, account: &str, at: u64, same: impl Fn(&str, Option<&MessageKey>) -> bool) -> bool {
-        self.newest.iter().any(|n| n.account == account && n.at > at && same(&n.message_id, n.replaces.as_ref()))
+    /// Whether a version of `draft` was kept as the newest after `at`.
+    fn kept_newest_after(&self, account: &str, at: u64, draft: &DraftId<'_>) -> bool {
+        self.newest.iter().any(|n| n.account == account && n.at > at && draft.same(&n.draft()))
     }
 
-    /// Whether `raw`, a version of a draft (`same`), was handed out to be saved before a version
-    /// of it was kept as the newest.
-    fn older(&self, account: &str, raw: &[u8], same: impl Fn(&str, Option<&MessageKey>) -> bool) -> bool {
-        self.handed_at(raw).is_some_and(|handed| self.kept_newest_after(account, handed, same))
+    /// Whether a version of `draft` (its source's `hash`) was handed out to be saved before a
+    /// version of it was kept as the newest.
+    fn older(&self, account: &str, hash: u64, draft: &DraftId<'_>) -> bool {
+        self.handed_at(hash).is_some_and(|handed| self.kept_newest_after(account, handed, draft))
     }
 
-    /// Whether `kept`, another version of the draft `filed` (`same`) kept on this computer, is
+    /// Whether `kept`, another version of the draft `filed` (`draft`) kept on this computer, is
     /// older than `filed`, filed just now: handed out to be saved before it (to a worker, or kept
     /// at once with the account offline), or not in this run (kept in an earlier one), and with
     /// no version of the draft kept as the newest since `filed` was handed out. Never when this
     /// run doesn't remember `filed` handed out (a draft read from the kept drafts' file itself).
-    fn superseded(&self, account: &str, filed: &[u8], kept: &[u8], same: impl Fn(&str, Option<&MessageKey>) -> bool) -> bool {
+    /// Both by their sources' hashes.
+    fn superseded(&self, account: &str, filed: u64, kept: u64, draft: &DraftId<'_>) -> bool {
         let Some(at) = self.handed_at(filed) else { return false };
-        !self.handed_at(kept).is_some_and(|k| k > at) && !self.kept_newest_after(account, at, same)
+        !self.handed_at(kept).is_some_and(|k| k > at) && !self.kept_newest_after(account, at, draft)
     }
 
     fn kept_newest(&mut self, account: &str, message_id: String, replaces: Option<MessageKey>) {
@@ -138,18 +153,25 @@ pub(crate) fn keep_draft(
     // by this one, as is the same one kept twice (MailCraft closing while its save was on the
     // way: kept by both).
     let id = written_message_id(&raw);
-    let same =
-        |message_id: &str, copy: Option<&MessageKey>| (replaces.is_some() && copy == replaces.as_ref()) || (!id.is_empty() && message_id == id);
+    let draft = DraftId { message_id: &id, replaces: replaces.as_ref() };
     // Unless this is a save handed out before the draft was kept as the newest version of itself:
     // older, and that one stays.
-    if !newest && order.lock().is_ok_and(|o| o.older(account, &raw, same)) {
+    let source = Digest::of(&raw);
+    if !newest && order.lock().is_ok_and(|o| o.older(account, source.hash(), &draft)) {
         log::info!("{account}: a save older than the draft kept as MailCraft closed is left");
         return Ok(());
     }
-    let mut list: Vec<PendingDraft> = store.load_account_doc(account, PENDING_DRAFTS)?;
-    list.retain(|d| !same(&written_message_id(&d.raw), d.replaces.as_ref()));
-    list.push(PendingDraft { folder: folder.to_string(), replaces: replaces.clone(), raw });
-    store.save_account_doc(account, PENDING_DRAFTS, &list).map_err(NetError::from)?;
+    // Its source written first, then the list; the sources of those it replaces go after that.
+    let list = stored::load(store, account)?;
+    let kept = stored::add(store, account, &list, folder, replaces.clone(), &raw, source)?;
+    let (gone, mut list): (Vec<Kept>, Vec<Kept>) = list.into_iter().partition(|k| draft.same(&k.draft()));
+    let new = kept.id;
+    list.push(kept);
+    if let Err(e) = stored::save(store, account, &list) {
+        stored::forget_sources(store, account, &[new]);
+        return Err(e);
+    }
+    stored::remove_sources(store, account, &gone);
     if newest && let Ok(mut o) = order.lock() {
         o.kept_newest(account, id, replaces);
     }
@@ -270,19 +292,66 @@ enum Saving {
     Elsewhere,
 }
 
+/// What's done once a save handed to a worker went as it went ([`Worker::save_draft`]): one way
+/// each, whatever the order they're looked at in ([`Outcome::of`]).
+enum Outcome {
+    /// The pool kept it as it stopped this worker, and said so: left to it. With why this
+    /// worker's own filing failed, when it did.
+    LeftToPool(Option<NetError>),
+    /// Its account removed meanwhile: nothing of it written again, nor said. With why it wasn't
+    /// filed, when it wasn't.
+    Removed(Option<NetError>),
+    /// Filed: where, and whether that folder was made for it; being filed until it's kept on this
+    /// computer no more.
+    Filed((String, bool), Filed),
+    /// Another worker is filing a version of it: kept on this computer meanwhile.
+    KeepMeanwhile,
+    /// Not filed, and this worker's to say: kept on this computer, filed when the account
+    /// connects.
+    Failed(NetError),
+}
+
+impl Outcome {
+    /// How a save went (`r`), given whether it's this worker's to say done (`ours`: the pool
+    /// didn't say it first) and whether its account was removed meanwhile (asked only of a save
+    /// filed, or failed and ours).
+    fn of(r: Result<Saving>, ours: bool, removed: impl FnOnce() -> bool) -> Outcome {
+        match (r, ours) {
+            (Ok(Saving::LeftToPool), _) | (Ok(Saving::Elsewhere), false) => Outcome::LeftToPool(None),
+            (Ok(Saving::Elsewhere), true) => Outcome::KeepMeanwhile,
+            (Err(e), false) => Outcome::LeftToPool(Some(e)),
+            (Ok(Saving::Filed(filed, being_filed)), _) => {
+                if removed() {
+                    Outcome::Removed(None)
+                } else {
+                    Outcome::Filed(filed, being_filed)
+                }
+            }
+            (Err(e), true) => {
+                if removed() {
+                    Outcome::Removed(Some(e))
+                } else {
+                    Outcome::Failed(e)
+                }
+            }
+        }
+    }
+}
+
 impl Worker {
     /// Save a draft handed to this worker on the server ([`Job::SaveDraft`]), and say how that
     /// went (#53): saved; or kept on this computer, to be saved when the account connects; or,
     /// kept nowhere, why, for the session to give the message back.
     pub(super) fn save_draft(&mut self, raw: Vec<u8>, folder: String, replaces: Option<MessageKey>) {
-        let (message_id, hash) = (written_message_id(&raw), hash_of(&raw));
+        let (message_id, source) = (written_message_id(&raw), Digest::of(&raw));
+        let hash = source.hash();
         // Not connected, and not to connect again yet (a connection failed a moment ago, or the
         // sign-in was refused): kept on this computer for the next connection, as offline. Its
         // own connection would ignore the wait (found in review: with a kept draft that dropped
         // each connection, every save connected again at once, 605 sign-ins in 6 s).
         if self.conn.is_none() && (self.auth_failed || Instant::now() < self.next_attempt) {
             if !self.says_done(hash) {
-                log::info!("{}: a draft the pool kept as it stopped this connection is left to it", self.acc.id);
+                self.left_to_pool();
                 return;
             }
             let Some(kept) = self.keep_here(&folder, replaces, raw) else {
@@ -322,27 +391,23 @@ impl Worker {
         // This worker's to say done from here, unless the pool said it first, as it stopped this
         // worker; taken before the draft is kept, or kept no more, so the pool never keeps it after.
         let ours = self.says_done(hash);
-        match r {
-            Ok(Saving::LeftToPool) => log::info!("{}: a draft the pool kept as it stopped this connection is left to it", self.acc.id),
-            Ok(Saving::Elsewhere) if !ours => {
-                log::info!("{}: a draft the pool kept as it stopped this connection is left to it", self.acc.id);
-            }
-            Ok(Saving::Elsewhere) => self.keep_meanwhile(&folder, replaces, raw, message_id, hash),
+        match Outcome::of(r, ours, || self.removed()) {
+            Outcome::LeftToPool(None) => self.left_to_pool(),
             // Failed once the pool had kept it: kept already, and said so.
-            Err(e) if !ours => log::info!("{}: a draft the pool kept wasn't saved here: {e}", self.acc.id),
-            // Its account removed meanwhile: nothing of it written again, nor said.
-            Ok(Saving::Filed(..)) if self.removed() => log::info!("{}: a draft of an account removed was saved", self.acc.id),
+            Outcome::LeftToPool(Some(e)) => log::info!("{}: a draft the pool kept wasn't saved here: {e}", self.acc.id),
+            Outcome::Removed(None) => log::info!("{}: a draft of an account removed was saved", self.acc.id),
+            // Nothing to keep it for.
+            Outcome::Removed(Some(e)) => log::info!("{}: a draft of an account removed isn't kept: {e}", self.acc.id),
+            Outcome::KeepMeanwhile => self.keep_meanwhile(&folder, replaces, raw, message_id, hash),
             // Filed: said done, unless the pool kept it and said so as it stopped this worker; kept
             // on this computer no more either way (the next worker set it aside, and leaves it).
-            Ok(Saving::Filed(filed, being_filed)) => {
+            Outcome::Filed(filed, being_filed) => {
                 if ours {
                     self.sink.emit(Event::DraftSaved { account: self.id(), message_id: message_id.clone(), error: None });
                 }
-                self.draft_filed(&raw, replaces.as_ref(), &message_id, filed, being_filed);
+                self.draft_filed(&source, replaces.as_ref(), &message_id, filed, being_filed);
             }
-            // Its account removed meanwhile: nothing to keep it for.
-            Err(e) if self.removed() => log::info!("{}: a draft of an account removed isn't kept: {e}", self.acc.id),
-            Err(e) => {
+            Outcome::Failed(e) => {
                 // Not lost: kept on this computer and saved when the account connects.
                 // Neither kept: the session gives the message back to be written, saying
                 // both reasons (#53). One notice either way: the connection's own trouble
@@ -377,6 +442,11 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// A save the pool said done as it stopped this worker, keeping it on this computer: its own.
+    fn left_to_pool(&self) {
+        log::info!("{}: a draft the pool kept as it stopped this connection is left to it", self.acc.id);
     }
 
     /// A save of a draft another worker is filing a version of (the account's connection started
@@ -422,25 +492,8 @@ impl Worker {
                 .ok_or_else(|| NetError::Closed("the account was removed".into()))??;
             return Ok((folder.to_string(), false));
         }
-        if let Some(Conn::Jmap(c)) = self.conn.as_mut() {
-            jmap::append(c, &self.jstate, folder, raw, &["$draft", "$seen"])?;
-            if let Some(old) = replaces {
-                jmap::apply_remote(c, &self.jstate, &Op::Expunge { keys: vec![old] })?;
-            }
-            return Ok((folder.to_string(), false));
-        }
-        if let Some(Conn::Graph(c)) = self.conn.as_mut() {
-            crate::graph::append(c, &self.jstate, folder, raw)?;
-            if let Some(old) = replaces {
-                crate::graph::apply_remote(c, &self.jstate, &Op::Expunge { keys: vec![old] })?;
-            }
-            return Ok((folder.to_string(), false));
-        }
-        if let Some(Conn::Ews(c)) = self.conn.as_mut() {
-            crate::ews::append(c, &self.jstate, folder, raw)?;
-            if let Some(old) = replaces {
-                crate::ews::apply_remote(c, &self.jstate, &Op::Expunge { keys: vec![old] })?;
-            }
+        if let Some(r) = self.conn.as_mut().and_then(|c| c.file_api_draft(&self.jstate, folder, raw, replaces.as_ref())) {
+            r?;
             return Ok((folder.to_string(), false));
         }
         // A server without Drafts gets one, as it gets Sent Items: once its folders are known
@@ -478,11 +531,11 @@ impl Worker {
         Ok((filed, made))
     }
 
-    /// A draft filed on the server (`filed`: where, and whether that folder was made for it): kept
-    /// on this computer no more, nor an older version of it, and then filed (`being_filed` ended,
-    /// for another worker that set it aside); the folder read again.
-    fn draft_filed(&mut self, raw: &[u8], replaces: Option<&MessageKey>, message_id: &str, (folder, made): (String, bool), being_filed: Filed) {
-        self.kept_no_more(raw, replaces, message_id);
+    /// A draft filed on the server (`source`: what it is; `filed`: where, and whether that folder
+    /// was made for it): kept on this computer no more, nor an older version of it, and then filed
+    /// (`being_filed` ended, for another worker that set it aside); the folder read again.
+    fn draft_filed(&mut self, source: &Digest, replaces: Option<&MessageKey>, message_id: &str, (folder, made): (String, bool), being_filed: Filed) {
+        self.kept_no_more(source, replaces, message_id);
         drop(being_filed);
         // Stopped meanwhile: the folders are the next connection's to read.
         if self.stopped() {
@@ -497,23 +550,22 @@ impl Worker {
     /// A draft filed: kept on this computer no more, nor another version of it kept there that's
     /// older ([`DraftOrder::superseded`]), which would replace it on the server at the next
     /// connection. A newer one stays, to replace it.
-    fn kept_no_more(&mut self, raw: &[u8], replaces: Option<&MessageKey>, message_id: &str) {
+    fn kept_no_more(&mut self, source: &Digest, replaces: Option<&MessageKey>, message_id: &str) {
         let account = self.id();
-        let same = |id: &str, copy: Option<&MessageKey>| (replaces.is_some() && copy == replaces) || (!message_id.is_empty() && id == message_id);
+        let draft = DraftId { message_id, replaces };
         let (store, order, queued) = (&self.store, &self.order, &mut self.kept.queued);
         // The account, then the file, then the order, as a draft is kept ([`Self::keep_here`]).
         let written = store.while_kept(&account, self.removals, || -> Result<()> {
             let _one_at_a_time = pending_file();
             let order = order.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let gone = |d: &PendingDraft| {
-                d.raw == raw || (same(&written_message_id(&d.raw), d.replaces.as_ref()) && order.superseded(&account, raw, &d.raw, same))
-            };
-            queued.retain(|d| !gone(d));
-            let mut list: Vec<PendingDraft> = store.load_account_doc(&account, PENDING_DRAFTS)?;
-            let before = list.len();
-            list.retain(|d| !gone(d));
-            if list.len() != before {
-                store.save_account_doc(&account, PENDING_DRAFTS, &list)?;
+            let goes =
+                |d: &Kept| d.source == *source || (draft.same(&d.draft()) && order.superseded(&account, source.hash(), d.source.hash(), &draft));
+            queued.retain(|d| !goes(d));
+            // The list written first, then the sources of those gone from it.
+            let (gone, left): (Vec<Kept>, Vec<Kept>) = stored::load(store, &account)?.into_iter().partition(|d| goes(d));
+            if !gone.is_empty() {
+                stored::save(store, &account, &left)?;
+                stored::remove_sources(store, &account, &gone);
             }
             Ok(())
         });

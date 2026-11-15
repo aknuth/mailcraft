@@ -1,12 +1,13 @@
 //! Encryption: `EnvelopedData` (RFC 5652 §6) and `AuthEnvelopedData` (RFC 5083, AES-GCM by
 //! RFC 5084), each recipient's copy of the content key encrypted to their RSA key
-//! (`KeyTransRecipientInfo`).
+//! (`KeyTransRecipientInfo`) or wrapped with one agreed with their EC key by ECDH
+//! (`KeyAgreeRecipientInfo`, RFC 5753, in `kari.rs`).
 //!
 //! Sent: AES-256-CBC by default, since Thunderbird before 154 and older Outlook read nothing
 //! else; AES-256-GCM, which can't be changed undetected (EFAIL), when every recipient said they
 //! read it. Read: AES-CBC and AES-GCM of every key size, and 3DES for old mail; the content key
-//! by RSA PKCS #1 v1.5 or OAEP. Any failure on the way is [`Error::Decrypt`], one error, so
-//! nothing about the key leaks through what went wrong.
+//! by RSA PKCS #1 v1.5 or OAEP, or by ECDH on P-256 or P-384. Any failure on the way is
+//! [`Error::Decrypt`], one error, so nothing about the key leaks through what went wrong.
 
 use cms::cert::IssuerAndSerialNumber;
 use cms::content_info::{CmsVersion, ContentInfo};
@@ -19,7 +20,7 @@ use spki::AlgorithmIdentifierOwned;
 use x509_cert::Certificate;
 use x509_cert::attr::Attribute;
 
-use crate::{Error, Identity, cert, der_of, oids, sign};
+use crate::{Error, Identity, cert, der_of, oids};
 
 /// How the content is encrypted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +68,18 @@ pub fn encrypt(content: &[u8], recipients: &[Vec<u8>], cipher: Cipher, rng: &mut
     let mut key = [0u8; 32];
     rng.fill_bytes(&mut key);
     let mut infos = SetOfVec::new();
+    let mut seen: Vec<&[u8]> = Vec::new();
     for r in recipients {
+        // A certificate named twice (the sender's own, to themselves) gets one copy of the key.
+        if seen.contains(&r.as_slice()) {
+            continue;
+        }
+        seen.push(r);
         let c = cert::parse(r)?;
         let spki = &c.tbs_certificate.subject_public_key_info;
         // An EC key: the content key wrapped with one agreed by ECDH (RFC 5753).
         if spki.algorithm.oid == oids::EC_PUBLIC_KEY {
-            let _ = infos.insert(RecipientInfo::Kari(crate::kari::recipient(&c, &key, rng)?));
+            written(infos.insert(RecipientInfo::Kari(crate::kari::recipient(&c, &key, rng)?)))?;
             continue;
         }
         if spki.algorithm.oid != oids::RSA_ENCRYPTION {
@@ -89,8 +96,7 @@ pub fn encrypt(content: &[u8], recipients: &[Vec<u8>], cipher: Cipher, rng: &mut
             key_enc_alg: AlgorithmIdentifierOwned { oid: oids::RSA_ENCRYPTION, parameters: Some(Any::null()) },
             enc_key: written(OctetString::new(wrapped))?,
         };
-        // Two recipients with the same certificate are one.
-        let _ = infos.insert(RecipientInfo::Ktri(ktri));
+        written(infos.insert(RecipientInfo::Ktri(ktri)))?;
     }
     // Version 0 when every recipient is RSA by issuer and serial, else 2 (RFC 5652 §6.1).
     let version = if infos.iter().all(|r| matches!(r, RecipientInfo::Ktri(_))) { CmsVersion::V0 } else { CmsVersion::V2 };
@@ -154,21 +160,46 @@ pub fn decrypt_with(cms: &[u8], cert: &[u8], id: &mut dyn crate::PrivateKey) -> 
     let der_bytes = der_of(cms)?;
     let ci = ContentInfo::from_der(&der_bytes).map_err(|_| Error::Malformed("not encrypted mail"))?;
     let me = cert::parse(cert)?;
-    if ci.content_type == oids::ENVELOPED_DATA {
-        let ed: EnvelopedData = ci.content.decode_as().map_err(|_| Error::Malformed("the encrypted mail can't be read"))?;
-        let key = content_key(&ed.recip_infos, &me, id)?;
-        return open(&ed.encrypted_content, &key, None).map(|c| (c, false));
-    }
-    if ci.content_type == oids::AUTH_ENVELOPED_DATA {
-        let aed: AuthEnvelopedData = ci.content.decode_as().map_err(|_| Error::Malformed("the encrypted mail can't be read"))?;
-        // Authenticated attributes would be covered by the tag as well; mail never has them.
-        if aed.auth_attrs.is_some() {
-            return Err(Error::Unsupported("authenticated attributes".into()));
+    match Envelope::of(&ci)? {
+        Envelope::Plain(ed) => {
+            let key = content_key(&ed.recip_infos, &me, id)?;
+            open(&ed.encrypted_content, &key, None).map(|c| (c, false))
         }
-        let key = content_key(&aed.recip_infos, &me, id)?;
-        return open(&aed.auth_encrypted_content, &key, Some(aed.mac.as_bytes())).map(|c| (c, true));
+        Envelope::Authenticated(aed) => {
+            // Authenticated attributes would be covered by the tag as well; mail never has them.
+            if aed.auth_attrs.is_some() {
+                return Err(Error::Unsupported("authenticated attributes".into()));
+            }
+            let key = content_key(&aed.recip_infos, &me, id)?;
+            open(&aed.auth_encrypted_content, &key, Some(aed.mac.as_bytes())).map(|c| (c, true))
+        }
     }
-    Err(Error::Malformed("not encrypted mail"))
+}
+
+/// What encrypted mail's `ContentInfo` holds.
+enum Envelope {
+    Plain(EnvelopedData),
+    Authenticated(AuthEnvelopedData),
+}
+
+impl Envelope {
+    fn of(ci: &ContentInfo) -> Result<Envelope, Error> {
+        let unreadable = |_| Error::Malformed("the encrypted mail can't be read");
+        if ci.content_type == oids::ENVELOPED_DATA {
+            return ci.content.decode_as().map(Envelope::Plain).map_err(unreadable);
+        }
+        if ci.content_type == oids::AUTH_ENVELOPED_DATA {
+            return ci.content.decode_as().map(Envelope::Authenticated).map_err(unreadable);
+        }
+        Err(Error::Malformed("not encrypted mail"))
+    }
+
+    fn recip_infos(&self) -> &RecipientInfos {
+        match self {
+            Envelope::Plain(ed) => &ed.recip_infos,
+            Envelope::Authenticated(aed) => &aed.recip_infos,
+        }
+    }
 }
 
 /// Whether `cms` (encrypted mail) is addressed to the certificate `cert` (DER): one of its
@@ -177,29 +208,20 @@ pub fn decrypt_with(cms: &[u8], cert: &[u8], id: &mut dyn crate::PrivateKey) -> 
 pub fn addressed_to(cms: &[u8], cert: &[u8]) -> bool {
     let (Ok(der_bytes), Ok(me)) = (der_of(cms), cert::parse(cert)) else { return false };
     let Ok(ci) = ContentInfo::from_der(&der_bytes) else { return false };
-    let infos = if ci.content_type == oids::ENVELOPED_DATA {
-        ci.content.decode_as::<EnvelopedData>().map(|e| e.recip_infos)
-    } else if ci.content_type == oids::AUTH_ENVELOPED_DATA {
-        ci.content.decode_as::<AuthEnvelopedData>().map(|e| e.recip_infos)
-    } else {
-        return false;
-    };
-    let Ok(infos) = infos else { return false };
-    let names = |issuer: &x509_cert::name::Name, serial: &x509_cert::serial_number::SerialNumber| {
-        *issuer == me.tbs_certificate.issuer && *serial == me.tbs_certificate.serial_number
-    };
-    let key_id = |k: &[u8]| sign::key_id(&me).is_some_and(|id| id == k);
-    infos.0.iter().any(|r| match r {
-        RecipientInfo::Ktri(k) => match &k.rid {
-            RecipientIdentifier::IssuerAndSerialNumber(i) => names(&i.issuer, &i.serial_number),
-            RecipientIdentifier::SubjectKeyIdentifier(s) => key_id(s.0.as_bytes()),
-        },
-        RecipientInfo::Kari(k) => k.recipient_enc_keys.iter().any(|e| match &e.rid {
-            cms::enveloped_data::KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(i) => names(&i.issuer, &i.serial_number),
-            cms::enveloped_data::KeyAgreeRecipientIdentifier::RKeyId(k) => key_id(k.subject_key_identifier.0.as_bytes()),
-        }),
+    let Ok(envelope) = Envelope::of(&ci) else { return false };
+    envelope.recip_infos().0.iter().any(|r| match r {
+        RecipientInfo::Ktri(k) => names(&k.rid, &me),
+        RecipientInfo::Kari(k) => k.recipient_enc_keys.iter().any(|e| crate::kari::names(&e.rid, &me)),
         _ => false,
     })
+}
+
+/// Whether `rid` names `me` (by issuer and serial number, or by subject key identifier).
+fn names(rid: &RecipientIdentifier, me: &Certificate) -> bool {
+    match rid {
+        RecipientIdentifier::IssuerAndSerialNumber(i) => cert::is_named(me, &i.issuer, &i.serial_number),
+        RecipientIdentifier::SubjectKeyIdentifier(s) => cert::has_key_id(me, s.0.as_bytes()),
+    }
 }
 
 /// The content key from the recipient info that names `me`.
@@ -222,12 +244,7 @@ fn content_key(infos: &RecipientInfos, me: &Certificate, id: &mut dyn crate::Pri
             RecipientInfo::Ktri(k) => Some(k),
             _ => None,
         })
-        .filter(|k| match &k.rid {
-            RecipientIdentifier::IssuerAndSerialNumber(i) => {
-                i.issuer == me.tbs_certificate.issuer && i.serial_number == me.tbs_certificate.serial_number
-            }
-            RecipientIdentifier::SubjectKeyIdentifier(s) => sign::key_id(me).is_some_and(|k| k == s.0.as_bytes()),
-        })
+        .filter(|k| names(&k.rid, me))
         .collect();
     if mine.is_empty() {
         return Err(Error::Decrypt);
@@ -238,7 +255,7 @@ fn content_key(infos: &RecipientInfos, me: &Certificate, id: &mut dyn crate::Pri
             id.rsa_decrypt(wrapped, None)
         } else if k.key_enc_alg.oid == oids::RSAES_OAEP {
             // A hash that isn't known isn't guessed at.
-            let Some(hash) = oaep_hash(&k.key_enc_alg) else { continue };
+            let Some(hash) = cert::params_hash(&k.key_enc_alg) else { continue };
             id.rsa_decrypt(wrapped, Some(hash))
         } else {
             continue;
@@ -248,20 +265,6 @@ fn content_key(infos: &RecipientInfos, me: &Certificate, id: &mut dyn crate::Pri
         }
     }
     Err(Error::Decrypt)
-}
-
-/// The digest RSAES-OAEP parameters name (`[0] hashFunc`, SHA-1 when absent; RFC 8017 A.2.1).
-fn oaep_hash(alg: &AlgorithmIdentifierOwned) -> Option<cert::Hash> {
-    use der::Reader as _;
-    let Some(p) = alg.parameters.as_ref() else { return Some(cert::Hash::Sha1) };
-    let content = p.value();
-    if content.first() != Some(&0xA0) {
-        return Some(cert::Hash::Sha1);
-    }
-    let mut r = der::SliceReader::new(content).ok()?;
-    let explicit: Any = r.decode().ok()?;
-    let a = AlgorithmIdentifierOwned::from_der(explicit.value()).ok()?;
-    cert::Hash::from_oid(&a.oid)
 }
 
 /// The content of `eci` decrypted with `key`; `tag` is the GCM tag when it's authenticated.
@@ -295,6 +298,9 @@ fn open(eci: &EncryptedContentInfo, key: &[u8], tag: Option<&[u8]>) -> Result<Ve
         let nonce = aes_gcm::Nonce::from_slice(nonce);
         let out = match len {
             16 => aes_gcm::Aes128Gcm::new_from_slice(key).map_err(|_| Error::Decrypt)?.decrypt(nonce, whole.as_slice()),
+            24 => aes_gcm::AesGcm::<aes::Aes192, aes_gcm::aead::consts::U12>::new_from_slice(key)
+                .map_err(|_| Error::Decrypt)?
+                .decrypt(nonce, whole.as_slice()),
             _ => aes_gcm::Aes256Gcm::new_from_slice(key).map_err(|_| Error::Decrypt)?.decrypt(nonce, whole.as_slice()),
         };
         out.map_err(|_| Error::Decrypt)
@@ -304,6 +310,7 @@ fn open(eci: &EncryptedContentInfo, key: &[u8], tag: Option<&[u8]>) -> Result<Ve
         oids::AES192_CBC if tag.is_none() => cbc(24),
         oids::AES256_CBC if tag.is_none() => cbc(32),
         oids::AES128_GCM if tag.is_some() => gcm(16),
+        oids::AES192_GCM if tag.is_some() => gcm(24),
         oids::AES256_GCM if tag.is_some() => gcm(32),
         oids::DES_EDE3_CBC if tag.is_none() => {
             let iv = iv()?;

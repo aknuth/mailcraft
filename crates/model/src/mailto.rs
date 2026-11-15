@@ -90,6 +90,13 @@ pub fn parse(link: &str) -> Option<Mailto> {
 /// An escape that isn't `%` plus two hex digits is copied through untouched, invalid UTF-8 turns
 /// into U+FFFD, and `+` means a plus sign, not a space (RFC 6068 §5).
 pub fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned()
+}
+
+/// [`percent_decode`]'s bytes, for text that may be in another charset (a file's name Outlook
+/// wrote in Windows' Western characters). The one decoder of `%XX` there is: an address's, a
+/// picture's, a link's.
+pub fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let src = s.as_bytes();
     // The value of the hex digit at `at`, if that byte is one.
     let nibble = |at: usize| -> Option<u8> {
@@ -114,7 +121,25 @@ pub fn percent_decode(s: &str) -> String {
             at += 1;
         }
     }
-    String::from_utf8_lossy(&bytes).into_owned()
+    bytes
+}
+
+/// Every byte of `s` but RFC 3986's unreserved characters (letters, digits, `-._~`) as `%XX`:
+/// for a query's value, a path's segment, a form's field or a mailto's subject. The one encoder
+/// of `%XX` there is.
+pub fn percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0')));
+            out.push(char::from(HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0')));
+        }
+    }
+    out
 }
 
 /// Append each comma-separated address in `value` (flattened, blanks dropped) to `field`.

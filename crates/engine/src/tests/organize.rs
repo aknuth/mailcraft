@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod focused;
+mod junk;
+mod many;
+
 #[test]
 fn every_command_survives_junk_params() {
     let mut s = sample_session("junk");
@@ -31,7 +35,6 @@ fn every_command_survives_junk_params() {
         }
     }
     assert!(matches!(s.run("no.such", &json!({})), Err(CmdError::Unknown(_))));
-    done(s);
 }
 
 #[test]
@@ -67,7 +70,6 @@ fn the_unread_filter_keeps_the_message_being_read() {
     s.run("list.open", &k).unwrap();
     s.run("list.filter", &json!({"value": "unread"})).unwrap();
     assert!(!has(&s, &first) && s.reading.is_none());
-    done(s);
 }
 
 #[test]
@@ -114,7 +116,6 @@ fn flags_filters_and_conversations() {
     s.run("list.next", &json!({})).unwrap();
     s.run("list.prev", &json!({})).unwrap();
     assert!(s.focus.is_some());
-    done(s);
 }
 
 #[test]
@@ -160,7 +161,6 @@ fn categories_pins_and_focused_inbox() {
     assert!(s.list.is_empty());
     s.run("list.focusTab", &json!({"value": "focused"})).unwrap();
     assert_eq!(s.list.len(), 7);
-    done(s);
 }
 
 #[test]
@@ -194,7 +194,6 @@ fn snoozed_mail_comes_back_unread() {
     let back = s.folder_state("sample", "INBOX").messages.iter().find(|m| m.subject == "Character turnarounds").cloned().unwrap();
     assert!(!back.flags.seen, "it comes back unread");
     assert!(s.run("mail.snooze", &json!({"preset": "someday"})).is_err());
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -208,16 +207,13 @@ fn rules_file_new_mail_as_it_arrives() {
     assert!(s.run("rules.add", &json!({"rule": {"name": "x", "conditions": [], "actions": [{"do": "categorize", "value": "Nope"}]}})).is_err());
     // A message from Zoe arrives in the Inbox.
     let store = s.store.clone().unwrap();
-    let mut st = store.load_folder("sample", "INBOX").unwrap();
-    let mut m = mailcraft_model::Summary::clone(&st.messages[0]);
+    let mut m = mailcraft_model::Summary::clone(&store.load_folder("sample", "INBOX").unwrap().messages[0]);
     m.key.uid = 500;
     m.subject = "Fresh from Zoe".into();
     m.from = mailcraft_model::EmailAddress::new("Zoe Park", "zoe@studio.example");
     m.flags.seen = false;
     m.date = NOW;
-    st.messages.insert(0, m.into());
-    store.save_folder("sample", "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    file_in(&mut s, m, None);
     assert!(!s.list.iter().any(|m| m.subject == "Fresh from Zoe"), "filed away by the rule");
     // Filed in a folder, it's still new mail: announced, as Outlook does.
     assert!(s.take_new_mail().iter().any(|m| m.subject == "Fresh from Zoe"), "filed mail is announced");
@@ -232,7 +228,6 @@ fn rules_file_new_mail_as_it_arrives() {
     assert!(!s.list.iter().any(|m| m.from.email == "zoe@studio.example"));
     s.run("rules.delete", &json!({"index": 0})).unwrap();
     assert!(s.rules.is_empty());
-    done(s);
 }
 
 /// Undo (Ctrl+Z) puts back the last move, delete, flag or category: moved mail is found again
@@ -290,9 +285,7 @@ fn ignored_conversations_stay_in_deleted_items() {
     assert_eq!(s.run("mail.ignore", &json!({})).unwrap()["moved"], 2, "Zoe's message and Sam's reply");
     assert!(!s.list.iter().any(|m| m.subject.contains("Storyboard review")));
     // A reply in it arrives.
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder("sample", "INBOX").unwrap();
-    let mut m = mailcraft_model::Summary::clone(&st.messages[0]);
+    let mut m = mailcraft_model::Summary::clone(&s.store.as_ref().unwrap().load_folder("sample", "INBOX").unwrap().messages[0]);
     let sam = s.folder_state("sample", &trash).messages.iter().find(|m| m.subject.starts_with("Re:")).cloned().unwrap();
     m.key.uid = 600;
     m.subject = "Re: Storyboard review on Thursday".into();
@@ -301,9 +294,7 @@ fn ignored_conversations_stay_in_deleted_items() {
     m.references = vec![sam.message_id.clone()];
     m.flags.seen = false;
     m.date = NOW;
-    st.messages.insert(0, m.into());
-    store.save_folder("sample", "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    file_in(&mut s, m, None);
     assert!(!s.list.iter().any(|m| m.subject.contains("Storyboard review")), "went to Deleted Items");
     assert!(s.take_new_mail().is_empty(), "not announced");
     assert!(s.folder_state("sample", &trash).messages.iter().any(|m| m.message_id == "late-reply@studio.example"));
@@ -322,8 +313,12 @@ fn a_rule_runs_now_on_the_inbox() {
     let mut s = sample_session("rule-now");
     s.run("rules.add", &json!({"rule": {"name": "Zoe to Archive", "conditions": [{"if": "from", "value": "zoe@"}], "actions": [{"do": "moveToRole", "value": "archive"}]}})).unwrap();
     s.run("folder.open", &json!({"account": "sample", "folder": "Archive"})).unwrap();
+    // Turned off, it runs all the same when asked for by itself, and stays off.
+    s.rules[0].enabled = false;
+    assert!(s.run("rules.run", &json!({"index": 5, "inbox": true})).is_err());
     let r = s.run("rules.run", &json!({"index": 0, "inbox": true})).unwrap();
     assert_eq!(r["matched"], 1);
+    assert!(s.rules.len() == 1 && !s.rules[0].enabled, "the rules kept as they were");
     assert!(s.notices.last().is_some_and(|n| n.text.contains("1 message matched")));
     assert!(!s.folder_state("sample", "INBOX").messages.iter().any(|m| m.from.email == "zoe@studio.example"), "moved out of the Inbox");
     assert!(s.list.iter().any(|m| m.from.email == "zoe@studio.example"), "and into Archive, on screen");
@@ -335,17 +330,18 @@ fn mail_a_rule_deletes_is_not_announced() {
     let mut s = sample_session("rule-quiet");
     s.run("rules.add", &json!({"rule": {"name": "Zoe away", "conditions": [{"if": "from", "value": "zoe@"}], "actions": [{"do": "delete"}]}}))
         .unwrap();
-    let store = s.store.clone().unwrap();
-    let mut st = store.load_folder("sample", "INBOX").unwrap();
-    let mut m = mailcraft_model::Summary::clone(&st.messages[0]);
+    let mut m = mailcraft_model::Summary::clone(&s.store.as_ref().unwrap().load_folder("sample", "INBOX").unwrap().messages[0]);
     m.key.uid = 700;
     m.subject = "Deleted on arrival".into();
     m.from = mailcraft_model::EmailAddress::new("Zoe Park", "zoe@studio.example");
     m.flags.seen = false;
     m.date = NOW;
-    st.messages.insert(0, m.into());
-    store.save_folder("sample", "INBOX", &st).unwrap();
-    s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
+    file_in(&mut s, m, None);
+    // It came, and the rule deleted it: out of the Inbox, in Deleted Items.
+    let trash = s.account("sample").and_then(|a| a.folder(FolderRole::Trash)).map(|f| f.path.clone()).unwrap();
+    let has = |s: &mut Session, folder: &str| s.folder_state("sample", folder).messages.iter().any(|m| m.subject == "Deleted on arrival");
+    assert!(!has(&mut s, "INBOX"), "deleted by the rule");
+    assert!(has(&mut s, &trash), "in Deleted Items");
     assert!(!s.take_new_mail().iter().any(|m| m.subject == "Deleted on arrival"));
 }
 
@@ -391,8 +387,6 @@ fn rules_export_and_import() {
     }
     assert_eq!(other.rules.len(), 2, "a bad file changes nothing");
     assert!(other.run("rules.import", &json!({"path": "/no/such/file"})).is_err());
-    done(other);
-    done(s);
 }
 
 /// Junk Email lists, as Outlook's: a blocked sender's mail goes to Junk as it arrives, a safe
@@ -403,11 +397,8 @@ fn blocked_and_safe_senders_sort_mail_as_it_arrives() {
     let junk = s.account("sample").and_then(|a| a.folder(FolderRole::Junk)).map(|f| f.path.clone()).unwrap();
     let store = s.store.clone().unwrap();
     let arrive = |s: &mut Session, folder: &str, uid: u32, from: &str, subject: &str| {
-        let mut st = store.load_folder("sample", folder).unwrap();
         let mut m = mailcraft_model::Summary::clone(&store.load_folder("sample", "INBOX").unwrap().messages[0]);
-        m.key.folder = folder.into();
-        m.key.uid = uid;
-        m.key.validity = st.validity;
+        m.key = mailcraft_model::MessageKey { uid, ..next_key(s, "sample", folder) };
         m.from = mailcraft_model::EmailAddress::new("", from);
         m.subject = subject.into();
         m.message_id = format!("{uid}@junk.example");
@@ -415,9 +406,7 @@ fn blocked_and_safe_senders_sort_mail_as_it_arrives() {
         m.references.clear();
         m.flags.seen = false;
         m.date = NOW;
-        st.messages.insert(0, m.into());
-        store.save_folder("sample", folder, &st).unwrap();
-        s.apply(Event::FolderChanged { account: "sample".into(), folder: folder.into() });
+        file_in(s, m, None);
     };
     let inbox_has = |s: &mut Session, subject: &str| s.folder_state("sample", "INBOX").messages.iter().any(|m| m.subject == subject);
     let junk_has = |s: &mut Session, subject: &str| s.folder_state("sample", &junk).messages.iter().any(|m| m.subject == subject);
@@ -516,7 +505,7 @@ fn clean_up_moves_only_what_a_reply_quotes() {
     }
     store.save_folder("sample", "INBOX", &st).unwrap();
     s.apply(Event::FolderChanged { account: "sample".into(), folder: "INBOX".into() });
-    let in_trash = |s: &mut Session, uid_subject: &str| s.folder_state("sample", &trash).messages.iter().any(|m| m.message_id == uid_subject);
+    let in_trash = |s: &mut Session, message_id: &str| s.folder_state("sample", &trash).messages.iter().any(|m| m.message_id == message_id);
     // The selection's conversation only.
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
     let k = s.list.iter().find(|m| m.message_id == "c803@studio.example").map(|m| json!({"key": m.key.to_id()})).unwrap();
@@ -641,6 +630,9 @@ fn quick_steps_mark_then_move_the_selection() {
     assert!(s.folder_state("sample", &archive).messages.iter().any(|m| m.subject == "Open call: winter group show"));
     // No such step; none selected.
     assert!(s.run("quickStep.9", &json!({})).is_err());
+    // A place past the end, the last one a number can name among them: refused, saying so.
+    let past = s.run("quickStep.run", &json!({"index": u64::MAX}));
+    assert!(matches!(&past, Err(CmdError::Disabled(m)) if m.starts_with("there's no Quick Step")), "{past:?}");
     s.selection.clear();
     assert!(s.run("quickStep.1", &json!({})).is_err());
     // Checked as made and edited.
@@ -701,11 +693,12 @@ fn an_account_is_set_to_look_for_mail_every_so_often() {
 /// was announced as new.
 #[test]
 fn mail_moved_into_the_inbox_is_not_new_mail() {
-    let store = temp("moved-in");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "riley@studio.example", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let folder = |path: &str, role| mailcraft_model::Folder { account: id.clone(), path: path.into(), role, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![folder("INBOX", FolderRole::Inbox), folder("Archive", FolderRole::Archive)] });
+    let (mut s, id) = server_account(
+        "moved-in",
+        json!({"email": "riley@studio.example", "password": "pw"}),
+        &[("INBOX", FolderRole::Inbox), ("Archive", FolderRole::Archive)],
+    );
+    let store = s.store.clone().unwrap();
     let mail = |folder: &str, uid: u32, subject: &str, mid: &str| -> mailcraft_model::SharedSummary {
         mailcraft_model::Summary {
             key: mailcraft_model::MessageKey { account: id.clone(), folder: folder.into(), validity: 1, uid },
@@ -776,5 +769,4 @@ fn rules_and_snoozes_follow_a_renamed_folder() {
     assert_eq!(s.rules[0].actions, [mailcraft_model::organize::RuleAction::MoveTo("Customers".into())]);
     s.tick();
     assert!(s.folder_state("sample", "INBOX").messages.iter().any(|m| m.subject == "Character turnarounds"), "back from the renamed folder");
-    let _ = std::fs::remove_dir_all(root);
 }

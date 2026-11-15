@@ -72,6 +72,7 @@
 	Edit rule	編輯規則
 	Email address	電子郵件地址
 	Enter the password for {email}.	請輸入 {email} 的密碼。
+	Enter the password for {email}, which signs in as {user}.	請輸入 {email} 的密碼，它以 {user} 登入。
 	Favorites	我的最愛
 	Feb	2月
 	File	檔案
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	開啟郵件時標示為已讀
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	還沒有寄件者。
-	Not available: the sample mailbox has no server.	無法使用: 範例信箱沒有伺服器。
+	Not available: this mailbox has no server.	無法使用: 此信箱沒有伺服器。
 	Not available: {error}	無法使用: {error}
 	On	已開啟
 	On from {from}	從 {from} 起開啟
@@ -840,7 +841,8 @@
 	Formatted	有格式
 	HTML code	HTML 程式碼
 	From a file…	從檔案…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	貼上在別處製作的簽名 HTML，或開啟另存為網頁的簽名（Outlook 的 .htm）。它會依原樣傳送；撰寫時，郵件中顯示它的文字。
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	貼上在別處製作的簽名 HTML，或開啟另存為網頁的簽名（Outlook 的 .htm）。它會依原樣傳送，撰寫時也依原樣顯示。
+	Your signature as it will be sent. To change it, pick Signature above the message.	簽名將依此樣式傳送。若要變更，請選擇郵件上方的「簽名」。
 	{name} can't be read as a signature	無法將 {name} 讀取為簽名
 	All contacts	所有連絡人
 	Always open with this address book	一律以此通訊錄開啟
@@ -932,6 +934,9 @@
 	Name on mail from it	用此位址寄信時顯示的名稱
 	Replies go to	回覆寄到
 	(the account's own)	（帳戶自己的簽名）
+	Write new mail from this address	用此地址寫新郵件
+	A new message starts from this address, not from {email}. Pick another in From as ever.	新郵件從此地址開始，而不是 {email}。仍可在「寄件者」中另選一個。
+	{address} (new mail)	{address}（新郵件）
 	Add…	新增…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	其資料夾會顯示在此帳戶下。你需要在 Exchange 伺服器上擁有存取權；擁有完整存取權的信箱會自動開啟。
 	Mailboxes you have full access to open by themselves.	擁有完整存取權的信箱會自動開啟。
@@ -1106,6 +1111,7 @@ month	May	5月
 	Check before sending	傳送前檢查
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} 看起來像 {like} 的地址，但其實不是。地址正確嗎？
 	{n} people who may not know each other will all see each other's addresses.	{n} 位可能互不相識的人都會看到彼此的地址。
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	在收件者中發現了需要查看的地方，但無法顯示。傳送前請檢查收件者。
 	Put everyone in Bcc	把所有人放進密件副本
 	Each of them gets the message without seeing who else did; you're in To	每個人收到郵件時都看不到其他收件人；你在收件者欄
 	Open links without their tracking	開啟連結時移除追蹤
@@ -1445,6 +1451,7 @@ month	May	5月
 	Calendar and contacts couldn't be read: changes to them won't be saved	無法讀取行事曆和連絡人：對它們的變更不會儲存
 	Your rules couldn't be read: changes to them won't be saved	無法讀取你的規則：對它們的變更不會儲存
 	Snoozed mail couldn't be read: changes to it won't be saved	無法讀取已延後提醒的郵件：對它們的變更不會儲存
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	無法讀取寄件匣中待寄回覆所回覆的郵件：這些郵件可能不會標示為已回覆
 	Checking your data file	正在檢查資料檔案
 	Opening your mail…	正在開啟郵件…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} 上次未正常關閉。MailCraft 正在檢查它；大型檔案可能需要一兩分鐘。
@@ -1462,6 +1469,8 @@ month	May	5月
 	Some results may be missing: still indexing	可能缺少部分結果：仍在建立索引
 	Some long messages were searched only in part	部分長郵件只搜尋了一部分
 	Couldn't read the date “{value}”	無法讀取日期「{value}」
+	Couldn't read “{value}”	無法讀取「{value}」
+	Part of a long search was left out	長搜尋的一部分被略去了
 	Received after	接收日期晚於
 	Received before	接收日期早於
 	About {h} h {m} min left	大約還剩 {h} 小時 {m} 分鐘
@@ -1708,3 +1717,7 @@ month	May	5月
 	Nothing to do	沒有待辦事項
 	Nothing in the next 7 days	未來 7 天沒有安排
 	Show the calendar, what's coming up and your tasks beside the mail	在郵件旁顯示行事曆、即將到來的約會和工作
+	Read / Unread (Ctrl+Q / Ctrl+U)	已讀 / 未讀 (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	無法下載 {name}: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	視窗發生問題，正在進行的操作已停止。MailCraft 可以繼續使用；記錄中寫明了出錯的位置。
+	Font size	字型大小

@@ -76,14 +76,18 @@ pub(super) fn msi_step(file: &Path) -> String {
 }
 
 /// The PowerShell step unzipping the portable zip over `dir` (its one top folder's contents).
+/// The zip goes only once it's copied in, as the MSI goes only once installed: one that can't
+/// be unpacked or copied stays, to be tried again rather than downloaded again.
 pub(super) fn portable_step(zip: &Path, dir: &Path) -> String {
     let tmp = dir.join(".mailcraft-update");
     format!(
-        "$t = {t}; Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue; \
-         Expand-Archive -LiteralPath {z} -DestinationPath $t -Force; \
+        "$t = {t}; $ok = $false; Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue; \
+         try {{ Expand-Archive -LiteralPath {z} -DestinationPath $t -Force -ErrorAction Stop; \
          $top = Get-ChildItem -LiteralPath $t -Directory | Select-Object -First 1; \
-         if ($top) {{ Copy-Item -Path (Join-Path $top.FullName '*') -Destination {d} -Recurse -Force }}; \
-         Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath {z} -ErrorAction SilentlyContinue",
+         if ($top) {{ Copy-Item -Path (Join-Path $top.FullName '*') -Destination {d} -Recurse -Force -ErrorAction Stop; $ok = $true }} }} \
+         catch {{ Write-Output $_ }}; \
+         Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue; \
+         if ($ok) {{ Remove-Item -LiteralPath {z} -ErrorAction SilentlyContinue }}",
         t = ps_quote(&tmp.display().to_string()),
         z = ps_quote(&zip.display().to_string()),
         d = ps_quote(&dir.display().to_string()),
@@ -94,15 +98,16 @@ pub(super) fn portable_step(zip: &Path, dir: &Path) -> String {
 /// takes its place (a failed or partial one, or one left by an earlier try, never does), and if
 /// the new one can't be moved in, the old one goes back. A disk image the system is still busy
 /// with (checking it, indexing it) is attached again for about a minute before the update gives
-/// up (craft-libs' updater found that one refusal threw the download away).
+/// up (craft-libs' updater found that one refusal threw the download away). The disk image goes
+/// only once the new app is in place: one that never attached stays, to be tried again.
 pub(super) fn mac_step(dmg: &Path, bundle: &Path) -> String {
     let (b, d) = (sh_quote(bundle), sh_quote(dmg));
     format!(
-        "rm -rf {b}.new; att() {{ for w in 1 2 4 8 16 32 0; do hdiutil attach -nobrowse -readonly -mountpoint \"$1\" {d} >/dev/null && return 0; \
+        "rm -rf {b}.new; put=0; att() {{ for w in 1 2 4 8 16 32 0; do hdiutil attach -nobrowse -readonly -mountpoint \"$1\" {d} >/dev/null && return 0; \
          [ $w -eq 0 ] && return 1; sleep $w; done; }}; m=$(mktemp -d) && att \"$m\" && \
          {{ ditto \"$m/MailCraft.app\" {b}.new; ok=$?; hdiutil detach \"$m\" >/dev/null 2>&1; \
-         [ $ok -eq 0 ] && rm -rf {b}.old && mv {b} {b}.old && {{ mv {b}.new {b} || mv {b}.old {b}; }}; }}; \
-         rm -rf {b}.new {b}.old; rm -f {d}"
+         [ $ok -eq 0 ] && rm -rf {b}.old && mv {b} {b}.old && {{ mv {b}.new {b} && put=1 || mv {b}.old {b}; }}; }}; \
+         rm -rf {b}.new {b}.old; [ $put -eq 1 ] && rm -f {d}"
     )
 }
 
@@ -195,19 +200,47 @@ fn spawn(mut cmd: std::process::Command) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| format!("couldn't start the installer ({e})"))
 }
 
-/// Put the new AppImage in place of `path`: copied beside it, made runnable, renamed over it.
-fn replace_appimage(new: &Path, path: &Path) -> Result<(), String> {
+/// Put the new AppImage in place of `path`: copied into a file made new beside it, made runnable,
+/// renamed over it. The copy is a file no one had made yet, under a name of this run's (never
+/// through a file or link already at a name that could be guessed, which would have written the
+/// update wherever that link led), written and made runnable through its own handle. (Not
+/// craft-atomic's write, which opens the file it replaces first: a running AppImage can't be.)
+pub(super) fn replace_appimage(new: &Path, path: &Path) -> Result<(), String> {
     let dir = path.parent().ok_or("the AppImage isn't in a folder")?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let staged = dir.join(format!(".{name}.new"));
-    std::fs::copy(new, &staged).map_err(|e| format!("couldn't write beside {} ({e})", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&staged, path).map_err(|e| {
+    let (staged, mut file) = new_file_beside(dir, &name).map_err(|e| format!("couldn't write beside {} ({e})", path.display()))?;
+    let written = std::fs::File::open(new)
+        .and_then(|mut from| std::io::copy(&mut from, &mut file))
+        .and_then(|_| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            }
+            file.sync_all()
+        })
+        .map_err(|e| format!("couldn't write beside {} ({e})", path.display()));
+    drop(file);
+    let put = written.and_then(|()| std::fs::rename(&staged, path).map_err(|e| format!("couldn't replace {} ({e})", path.display())));
+    if put.is_err() {
         let _ = std::fs::remove_file(&staged);
-        format!("couldn't replace {} ({e})", path.display())
-    })
+    }
+    put
+}
+
+/// A file made new in `dir` for `name`'s replacement, and its path: hidden, named for this
+/// process and a count, and made only where nothing is (a name taken is passed over).
+fn new_file_beside(dir: &Path, name: &str) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let stem: String = name.chars().take(64).collect();
+    for _ in 0..16 {
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staged = dir.join(format!(".{stem}.{}-{n}.new", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&staged) {
+            Ok(file) => return Ok((staged, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free name for the new copy"))
 }

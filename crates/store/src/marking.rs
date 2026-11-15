@@ -41,6 +41,11 @@ const GIVE_WAY: Duration = Duration::from_secs(1);
 /// logged with who waited: on the window's thread it held a frame (a hold of Down on a 38 GB
 /// data file once had frames of 0.5 and 1.8 s while marks were committed).
 pub(crate) const SLOW_WAIT: Duration = Duration::from_millis(50);
+/// After the thread for marks couldn't be started (the system had no more threads), marks are
+/// written as they're made, and it's tried again only once this has passed since: not before
+/// every mark (each paid for a failed start, and logged it).
+#[cfg(not(target_arch = "wasm32"))]
+const START_AGAIN: Duration = Duration::from_secs(60);
 
 /// One folder's messages marked: their number and what their flags are now, in the list of
 /// `validity` (a list made anew since isn't marked).
@@ -67,9 +72,31 @@ pub(crate) struct Marking {
     /// The thread's queue (none in the browser, which writes them at once): only the stores
     /// handing it marks hold it, so it closes, and the thread ends, once they have all gone.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    tx: Mutex<Option<Sender<Task>>>,
+    tx: Mutex<Thread>,
     /// What the thread shares with them.
     state: Arc<MarkState>,
+}
+
+/// The thread for marks, as the stores handing it marks know it.
+#[derive(Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum Thread {
+    /// Started with the first marks handed over.
+    #[default]
+    NotStarted,
+    /// Its queue.
+    Running(Sender<Task>),
+    /// It couldn't be started, last tried then: marks are written as they're made, and it's
+    /// tried again once [`START_AGAIN`] has passed.
+    Unavailable(std::time::Instant),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the thread for marks can't be started on this thread (as when the system has no
+    /// more threads), and how many times it was tried.
+    pub(crate) static NO_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static STARTS_TRIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -77,6 +104,7 @@ struct MarkState {
     queue: Mutex<Queue>,
     written: Condvar,
     /// Held by a test to keep the thread from writing ([`Store::pause_marks`]).
+    #[cfg(any(test, feature = "test-drive"))]
     pause: Mutex<()>,
 }
 
@@ -248,6 +276,7 @@ impl Store {
     }
 
     /// Whether marks handed over aren't on disk yet (tests).
+    #[cfg(any(test, feature = "test-drive"))]
     #[doc(hidden)]
     pub fn marks_waiting(&self) -> bool {
         let q = self.marking.queue();
@@ -263,6 +292,7 @@ impl Store {
 
     /// Keep the thread from writing marks while the guard is held (tests: what the window's thread
     /// writes itself).
+    #[cfg(any(test, feature = "test-drive"))]
     #[doc(hidden)]
     pub fn pause_marks(&self) -> std::sync::MutexGuard<'_, ()> {
         self.marking.state.pause.lock().unwrap_or_else(PoisonError::into_inner)
@@ -270,6 +300,7 @@ impl Store {
 
     /// Hold the lock every change of a list is made under, as the thread for marks does through a
     /// commit (tests: what the window's thread would wait for).
+    #[cfg(any(test, feature = "test-drive"))]
     #[doc(hidden)]
     pub fn hold_lists(&self) -> MutexGuard<'_, ()> {
         self.hold_changes()
@@ -284,10 +315,24 @@ impl Store {
     #[cfg(not(target_arch = "wasm32"))]
     fn send_marks(&self, task: Task) -> std::result::Result<(), Task> {
         let mut tx = self.marking.tx.lock().unwrap_or_else(PoisonError::into_inner);
-        if tx.is_none() {
-            *tx = self.start_marking();
+        let start = match &*tx {
+            Thread::NotStarted => true,
+            Thread::Running(_) => false,
+            Thread::Unavailable(tried) => tried.elapsed() >= START_AGAIN,
+        };
+        if start {
+            *tx = match self.start_marking() {
+                Ok(sender) => Thread::Running(sender),
+                Err(e) => {
+                    // Told once: tried again later, quietly.
+                    if matches!(*tx, Thread::NotStarted) {
+                        log::warn!("read marks will be saved as they're made: {e}");
+                    }
+                    Thread::Unavailable(std::time::Instant::now())
+                }
+            };
         }
-        let Some(sender) = tx.as_ref() else { return Err(task) };
+        let Thread::Running(sender) = &*tx else { return Err(task) };
         // Counted before it's sent, so a flush right after waits for it.
         {
             let mut q = self.marking.queue();
@@ -297,7 +342,8 @@ impl Store {
         match sender.send(task) {
             Ok(()) => Ok(()),
             Err(mpsc::SendError(task)) => {
-                *tx = None;
+                // The thread ended: started again with the next.
+                *tx = Thread::NotStarted;
                 let mut q = self.marking.queue();
                 q.sent = q.sent.saturating_sub(1);
                 q.pending.pop_back();
@@ -310,12 +356,20 @@ impl Store {
     /// queue's sending end, so it ends once every store handing it marks has gone, and never
     /// waits on itself.
     #[cfg(not(target_arch = "wasm32"))]
-    fn start_marking(&self) -> Option<Sender<Task>> {
+    fn start_marking(&self) -> std::io::Result<Sender<Task>> {
+        #[cfg(test)]
+        {
+            STARTS_TRIED.set(STARTS_TRIED.get().saturating_add(1));
+            if NO_THREAD.get() {
+                return Err(std::io::Error::other("no thread (a test)"));
+            }
+        }
         let (tx, rx) = mpsc::channel::<Task>();
         let store = Store { marking: Arc::default(), ..self.clone() };
         let marking = self.marking.state.clone();
         let spawned = std::thread::Builder::new().name("mail-marks".into()).spawn(move || {
             for task in rx {
+                #[cfg(any(test, feature = "test-drive"))]
                 drop(marking.pause.lock().unwrap_or_else(PoisonError::into_inner));
                 let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.write_marks(&task))).unwrap_or_else(|_| {
                     log::error!("{}: read marks failed unexpectedly", task.account);
@@ -328,13 +382,21 @@ impl Store {
                 marking.written.notify_all();
             }
         });
-        match spawned {
-            Ok(_) => Some(tx),
-            Err(e) => {
-                log::warn!("read marks will be saved as they're made: {e}");
-                None
-            }
+        spawned.map(|_| tx)
+    }
+
+    /// Tests: the thread for marks last failed to start `ago`.
+    #[cfg(test)]
+    pub(crate) fn marks_thread_failed(&self, ago: Duration) {
+        if let Some(at) = std::time::Instant::now().checked_sub(ago) {
+            *self.marking.tx.lock().unwrap_or_else(PoisonError::into_inner) = Thread::Unavailable(at);
         }
+    }
+
+    /// Tests: whether the thread for marks is running.
+    #[cfg(test)]
+    pub(crate) fn marks_thread_running(&self) -> bool {
+        matches!(*self.marking.tx.lock().unwrap_or_else(PoisonError::into_inner), Thread::Running(_))
     }
 
     /// Write `task` (nothing for an account removed since): what the window should hear of.
@@ -373,8 +435,8 @@ impl Store {
         let mut list = self.read_folders(account)?;
         let (found, recounted) = folders::set_counts(&mut list, counts);
         if recounted {
-            let path = self.account_dir(account).join("folders.json");
-            let bytes = serde_json::to_vec(&list).map_err(|source| StoreError::Json { path: path.display().to_string(), source })?;
+            let path = self.folders_path(account);
+            let bytes = to_json(&path, &list)?;
             writes.push((path, bytes));
         }
         if !writes.is_empty() {
@@ -387,7 +449,7 @@ impl Store {
     /// What keeping one folder's marks writes (with the lock held), and the pages it no longer has.
     fn flag_writes(&self, account: &str, marks: &FolderMarks) -> Result<(Vec<(PathBuf, Vec<u8>)>, Vec<PathBuf>)> {
         let dir = self.folder_dir(account, &marks.folder);
-        let head: StateFile = self.read_json(&dir.join("state.json"))?;
+        let mut head: StateFile = self.read_json(&dir.join(folders::HEAD))?;
         if head.validity != marks.validity {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -399,7 +461,7 @@ impl Store {
             all.extend(now.iter().map(|(uid, f)| (*uid, *f)));
             if all.len() <= folders::MARKS_MAX {
                 let list: Vec<(u32, &Flags)> = all.into_iter().collect();
-                let bytes = serde_json::to_vec(&list).map_err(|source| StoreError::Json { path: mark_path.display().to_string(), source })?;
+                let bytes = to_json(&mark_path, &list)?;
                 return Ok((vec![(mark_path, bytes)], Vec::new()));
             }
             // Too many: into their pages, as the list has them with these.
@@ -407,14 +469,17 @@ impl Store {
                 now.entry(*uid).or_insert(f);
             }
         }
-        let mut st = self.list_from_disk(account, &marks.folder)?;
+        // The list from the head and marks read above (under the lock, so as they still are): only
+        // its pages read now. The marks kept are in `now`, put on it below.
+        let mut st = self.list_from_head(account, &marks.folder, dir, &mut head, Vec::new())?;
         for m in &mut st.messages {
             if let Some(f) = now.get(&m.key.uid) {
                 SharedSummary::make_mut(m).flags.clone_from(f);
             }
         }
         let changed: std::collections::HashSet<u32> = now.keys().copied().collect();
-        self.list_writes(account, &marks.folder, &st, Some(&changed))
+        let kept = (!head.pages.is_empty()).then_some(kept.as_slice());
+        self.list_writes_over(account, &marks.folder, &st, Some(&changed), &head, kept)
     }
 }
 

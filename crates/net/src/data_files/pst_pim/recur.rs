@@ -4,21 +4,16 @@
 //! an ExtendedException (2.2.1.44.3: the subject and location again, in UTF-16), and is kept in
 //! full as an attached exception item of the appointment, which `changed_events` reads it with.
 
+use std::collections::BTreeSet;
+
 use super::*;
 
 /// Changed occurrences a pattern says it has, read at most.
 const MAX_CHANGED: usize = 5_000;
-/// ExceptionInfo's OverrideFlags (2.2.1.44.2): what a changed occurrence changed.
-const ARO_SUBJECT: u16 = 0x0001;
-const ARO_MEETINGTYPE: u16 = 0x0002;
-const ARO_REMINDERDELTA: u16 = 0x0004;
-const ARO_REMINDER: u16 = 0x0008;
-const ARO_LOCATION: u16 = 0x0010;
-const ARO_BUSYSTATUS: u16 = 0x0020;
-const ARO_ATTACHMENT: u16 = 0x0040;
-const ARO_SUBTYPE: u16 = 0x0080;
-const ARO_APPTCOLOR: u16 = 0x0100;
-const ARO_EXCEPTIONAL_BODY: u16 = 0x0200;
+use crate::data_files::outlook::{
+    ARO_APPTCOLOR, ARO_ATTACHMENT, ARO_BUSYSTATUS, ARO_EXCEPTIONAL_BODY, ARO_LOCATION, ARO_MEETINGTYPE, ARO_REMINDER, ARO_REMINDERDELTA, ARO_SUBJECT,
+    ARO_SUBTYPE, DAYS,
+};
 /// The writer version from which each ExtendedException starts with its change highlight.
 const WITH_HIGHLIGHT: u32 = 0x3009;
 /// How far an exception item's own time of the occurrence it replaces may be from the pattern's
@@ -50,8 +45,6 @@ impl<'a> Bytes<'a> {
         self.take(n).map(|_| ())
     }
 }
-
-const DAYS: [&str; 7] = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 
 /// The `nth` (-1: the last) of the days in `mask` in a month. Of one weekday: that weekday's
 /// nth. Of several (Outlook's "weekday", "weekend day" and "day"): the nth day that is one of
@@ -143,25 +136,35 @@ pub(crate) fn pattern(blob: &[u8], start: i64, tzid: &str) -> Option<Pattern> {
         Some((offset, changes(&mut b, writer)))
     })()
     .unwrap_or((0, Vec::new()));
-    let nth = |n: u32| if n >= 5 { -1 } else { i32::try_from(n).unwrap_or(1) };
+    // Which of the days a month's occurrence is: Outlook writes 1 to 4, or 5 for the last. A
+    // damaged one is no rule: RFC 5545 has no 0th.
+    let nth = |n: u32| match n {
+        1..=4 => i32::try_from(n).ok(),
+        5 => Some(-1),
+        _ => None,
+    };
+    // The days of the week, a bit each from Sunday (bits 0 to 6): none, or a bit past them, is a
+    // damaged pattern (`BYDAY=` with no day isn't a rule).
+    let days = |mask: u32| (1..=0x7F).contains(&mask).then_some(mask);
     let mut rule = match (frequency, pattern) {
         (0x200A, 0x0000) => format!("FREQ=DAILY;INTERVAL={}", (period / 1440).max(1)),
         (0x200A, 0x0001) => "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR".to_string(),
-        (0x200B, 0x0001) => format!("FREQ=WEEKLY;INTERVAL={};BYDAY={}", period.max(1), byday(a, None)),
+        (0x200B, 0x0001) => format!("FREQ=WEEKLY;INTERVAL={};BYDAY={}", period.max(1), byday(days(a)?, None)),
         // A day past the 28th is the month's last where it has no such day, as Outlook has it
         // (the 31st every month: said as that day alone, five months of the year had none).
         (0x200C, 0x0002) if (29..=31).contains(&a) => {
             let days: Vec<String> = (28..=a).map(|d| d.to_string()).collect();
             format!("FREQ=MONTHLY;INTERVAL={};BYMONTHDAY={};BYSETPOS=-1", period.max(1), days.join(","))
         }
-        (0x200C, 0x0002) => format!("FREQ=MONTHLY;INTERVAL={};BYMONTHDAY={a}", period.max(1)),
+        // A day of the month is 1 to 31: another (0, or a damaged number) is no rule.
+        (0x200C, 0x0002) if (1..=28).contains(&a) => format!("FREQ=MONTHLY;INTERVAL={};BYMONTHDAY={a}", period.max(1)),
         (0x200C, 0x0004) => format!("FREQ=MONTHLY;INTERVAL={};BYMONTHDAY=-1", period.max(1)),
-        (0x200C, 0x0003) => format!("FREQ=MONTHLY;INTERVAL={};{}", period.max(1), nth_of(a, nth(c))),
+        (0x200C, 0x0003) => format!("FREQ=MONTHLY;INTERVAL={};{}", period.max(1), nth_of(days(a)?, nth(c)?)),
         (0x200D, 0x0002 | 0x0004) => format!("FREQ=YEARLY;INTERVAL={}", (period / 12).max(1)),
         (0x200D, 0x0003) => {
             // Its month: the first day's, where the series is (its UTC start may be in the next).
             let (_, month, _) = civil_from_days((first_day - EPOCH_MINUTES).div_euclid(1440));
-            format!("FREQ=YEARLY;INTERVAL={};BYMONTH={month};{}", (period / 12).max(1), nth_of(a, nth(c)))
+            format!("FREQ=YEARLY;INTERVAL={};BYMONTH={month};{}", (period / 12).max(1), nth_of(days(a)?, nth(c)?))
         }
         _ => return None,
     };
@@ -260,7 +263,7 @@ fn info(b: &mut Bytes<'_>) -> Option<(Changed, u16)> {
     let text = |b: &mut Bytes<'_>| -> Option<String> {
         b.u16()?;
         let n = usize::from(b.u16()?);
-        Some(crate::pst::text_from_bytes(b.take(n)?, 1252, false).trim_end_matches('\0').to_string())
+        Some(crate::pst::without_nuls(crate::pst::decode(b.take(n)?, 1252, false)))
     };
     if flags & ARO_SUBJECT != 0 {
         c.subject = Some(text(b)?);
@@ -306,7 +309,7 @@ fn extended(b: &mut Bytes<'_>, c: &mut Changed, flags: u16, writer: u32) -> Opti
         let mut wide = || -> Option<String> {
             let n = usize::from(b.u16()?).checked_mul(2)?;
             let units: Vec<u16> = b.take(n)?.as_chunks::<2>().0.iter().map(|u| u16::from_le_bytes(*u)).collect();
-            Some(String::from_utf16_lossy(&units).trim_end_matches('\0').to_string())
+            Some(crate::pst::without_nuls(String::from_utf16_lossy(&units)))
         };
         if flags & ARO_SUBJECT != 0 {
             c.subject = Some(wide()?);
@@ -350,32 +353,16 @@ pub(crate) fn changed_events(
     let Some(p) = pattern(&x.recurrence, start, tzid) else { return Vec::new() };
     let mut taken = vec![false; own.len()];
     let mut out = Vec::new();
-    // What each occurrence starts from: the series without its pattern (which may be big, and
-    // was read already), copied once per occurrence.
-    let base = Extra { recurrence: Vec::new(), members: Vec::new(), ..x.clone() };
-    let day = |t: i64| t.saturating_add(43_200).div_euclid(86_400) * 86_400;
+    let base = Base { x: Extra { recurrence: Vec::new(), members: Vec::new(), ..x.clone() }, from, people, uid };
     for c in p.changed {
-        // Its item: the one whose occurrence (or, when it doesn't say, start) is nearest.
-        let near = |o: &Own<'_>| {
-            let (at, mine) = match o.x.replaces {
-                Some(r) => (r, c.original),
-                None => (o.x.start?, c.start),
-            };
-            let off = at.saturating_sub(mine).saturating_abs();
-            (off <= MATCH_WITHIN).then_some(off)
-        };
-        let found = own.iter().enumerate().filter(|(i, _)| !taken.get(*i).copied().unwrap_or(true)).filter_map(|(i, o)| Some((near(o)?, i))).min();
-        let found = found.map(|(_, i)| i);
-        if let Some(t) = found.and_then(|i| taken.get_mut(i)) {
-            *t = true;
-        }
+        let found = item_of(&c, own, &mut taken);
         let item = found.and_then(|i| own.get(i));
-        let mut one = base.clone();
         // Its own item has its times exactly (in UTC); the pattern's are at the series' offset.
-        (one.start, one.end) = match item.and_then(|o| Some((o.x.start?, o.x.end.unwrap_or(o.x.start?)))) {
-            Some((s, e)) => (Some(s), Some(e.max(s))),
-            None => (Some(c.start), Some(c.end)),
+        let (start, end) = match item.and_then(|o| Some((o.x.start?, o.x.end.unwrap_or(o.x.start?)))) {
+            Some((s, e)) => (s, e.max(s)),
+            None => (c.start, c.end),
         };
+        let mut one = base.at(start, end);
         if let Some(location) = &c.location {
             one.location = location.clone();
         }
@@ -392,23 +379,19 @@ pub(crate) fn changed_events(
             Some(o) if c.own_body => o.body,
             _ => body,
         };
-        let guests = item.map(|o| o.people).filter(|p| !p.is_empty()).unwrap_or(people);
-        // Its own guests' answers, when it has guests of its own.
-        if let Some(o) = item.filter(|o| !o.people.is_empty()) {
-            one.answers = o.x.answers.clone();
+        let original = if x.all_day { day_of(c.original) } else { c.original };
+        if let Some(e) = base.event(one, item, summary, text, original) {
+            out.push((e, found));
         }
-        let Some(mut e) = event_of(&one, summary, text, from, guests, uid.to_string()) else { continue };
-        e.recurrence_id = Some(if x.all_day { day(c.original) } else { c.original });
-        out.push((e, found));
     }
     // The items left: each with its own times, place, text and guests, the rest the series'.
-    let mut replaced: std::collections::BTreeSet<i64> = out.iter().filter_map(|(e, _)| e.recurrence_id).collect();
+    let mut replaced: BTreeSet<i64> = out.iter().filter_map(|(e, _)| e.recurrence_id).collect();
     // The series' own occurrences (at its offset, as the calendar shows them), up to the last
     // a left item could replace: an item's time of its occurrence may be an hour off them (a
     // change of summer time between), and only a RECURRENCE-ID equal to one replaces it.
     let left = own.iter().enumerate().filter(|(i, _)| !taken.get(*i).copied().unwrap_or(true));
     let last = left.filter_map(|(_, o)| o.x.replaces.or(o.x.start)).max();
-    let series: std::collections::BTreeSet<i64> = match (last, event_of(x, subject, "", from, &[], uid.to_string())) {
+    let series: BTreeSet<i64> = match (last, event_of(x, subject, "", from, &[], uid.to_string())) {
         (Some(last), Some(master)) => ical::starts(&master, last.saturating_add(MATCH_WITHIN).saturating_add(86_400)).into_iter().collect(),
         _ => Default::default(),
     };
@@ -417,34 +400,90 @@ pub(crate) fn changed_events(
             continue;
         }
         let Some(s) = o.x.start else { continue };
-        let original = o.x.replaces.unwrap_or(s);
-        let original = if x.all_day { day(original) } else { original };
-        // The series' occurrence nearest (within MATCH_WITHIN) is the one it replaces; with none
-        // that near (its pattern cut short), its own time is.
-        let original = series
-            .range(original.saturating_sub(MATCH_WITHIN)..=original.saturating_add(MATCH_WITHIN))
-            .min_by_key(|t| t.saturating_sub(original).saturating_abs())
-            .copied()
-            .unwrap_or(original);
+        let original = replaced_by(o, s, x.all_day, &series);
         // One near an occurrence already replaced is another copy of it (its time may be an
         // hour off the pattern's, as a match may be).
         if replaced.range(original.saturating_sub(MATCH_WITHIN)..=original.saturating_add(MATCH_WITHIN)).next().is_some() {
             continue;
         }
         replaced.insert(original);
-        let mut one = base.clone();
-        (one.start, one.end) = (Some(s), Some(o.x.end.unwrap_or(s).max(s)));
+        let mut one = base.at(s, o.x.end.unwrap_or(s).max(s));
         if !o.x.location.is_empty() {
             one.location = o.x.location.clone();
         }
         let text = if o.body.trim().is_empty() { body } else { o.body };
-        let guests = Some(o.people).filter(|p| !p.is_empty()).unwrap_or(people);
-        if !o.people.is_empty() {
-            one.answers = o.x.answers.clone();
+        if let Some(e) = base.event(one, Some(o), subject, text, original) {
+            out.push((e, Some(i)));
         }
-        let Some(mut e) = event_of(&one, subject, text, from, guests, uid.to_string()) else { continue };
-        e.recurrence_id = Some(original);
-        out.push((e, Some(i)));
     }
     out
+}
+
+/// What each changed occurrence of a series starts from: the series without its pattern (which
+/// may be big, and was read already), copied once per occurrence, and its organizer, guests and
+/// uid.
+struct Base<'a> {
+    x: Extra,
+    from: &'a EmailAddress,
+    people: &'a [EmailAddress],
+    uid: &'a str,
+}
+
+impl Base<'_> {
+    /// The series from `start` to `end`, to be changed into one of its occurrences.
+    fn at(&self, start: i64, end: i64) -> Extra {
+        Extra { start: Some(start), end: Some(end), ..self.x.clone() }
+    }
+
+    /// `one` (from [`Base::at`]) as the event of the occurrence it replaces, the series' at
+    /// `original`, titled `summary`, with the text `text`: with `item`'s guests and their answers
+    /// when it has guests of its own, else the series'.
+    fn event(&self, mut one: Extra, item: Option<&Own<'_>>, summary: &str, text: &str, original: i64) -> Option<CalEvent> {
+        let guests = match item.filter(|o| !o.people.is_empty()) {
+            Some(o) => {
+                one.answers = o.x.answers.clone();
+                o.people
+            }
+            None => self.people,
+        };
+        let mut e = event_of(&one, summary, text, self.from, guests, self.uid.to_string())?;
+        e.recurrence_id = Some(original);
+        Some(e)
+    }
+}
+
+/// An all-day occurrence's time (a local midnight) as its day: the nearest UTC midnight.
+fn day_of(t: i64) -> i64 {
+    t.saturating_add(43_200).div_euclid(86_400) * 86_400
+}
+
+/// Which of `own` not `taken` yet is the item of the changed occurrence `c` (taken now): the one
+/// whose occurrence (or, when it doesn't say, start) is nearest `c`'s, within [`MATCH_WITHIN`].
+fn item_of(c: &Changed, own: &[Own<'_>], taken: &mut [bool]) -> Option<usize> {
+    let near = |o: &Own<'_>| {
+        let (at, mine) = match o.x.replaces {
+            Some(r) => (r, c.original),
+            None => (o.x.start?, c.start),
+        };
+        let off = at.saturating_sub(mine).saturating_abs();
+        (off <= MATCH_WITHIN).then_some(off)
+    };
+    let (_, i) = own.iter().enumerate().filter(|(i, _)| !taken.get(*i).copied().unwrap_or(true)).filter_map(|(i, o)| Some((near(o)?, i))).min()?;
+    if let Some(t) = taken.get_mut(i) {
+        *t = true;
+    }
+    Some(i)
+}
+
+/// The occurrence of a series (`series`: its starts) that its item `o`, starting at `s`, replaces
+/// when no ExceptionInfo says: the one nearest (within [`MATCH_WITHIN`]) the occurrence the item
+/// says it replaces (or its start); with none that near (its pattern cut short), that time.
+fn replaced_by(o: &Own<'_>, s: i64, all_day: bool, series: &BTreeSet<i64>) -> i64 {
+    let original = o.x.replaces.unwrap_or(s);
+    let original = if all_day { day_of(original) } else { original };
+    series
+        .range(original.saturating_sub(MATCH_WITHIN)..=original.saturating_add(MATCH_WITHIN))
+        .min_by_key(|t| t.saturating_sub(original).saturating_abs())
+        .copied()
+        .unwrap_or(original)
 }

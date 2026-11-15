@@ -49,8 +49,6 @@ pub enum Status {
 /// Where a certificate says to ask: its CRLs' and OCSP responders' web addresses.
 pub fn points(cert_der: &[u8]) -> (Vec<String>, Vec<String>) {
     let Ok(c) = cert::parse(cert_der) else { return (Vec::new(), Vec::new()) };
-    let ext =
-        |oid: Oid| c.tbs_certificate.extensions.as_ref().and_then(|e| e.iter().find(|x| x.extn_id == oid)).map(|x| x.extn_value.as_bytes().to_vec());
     let web = |n: &GeneralName| match n {
         GeneralName::UniformResourceIdentifier(u) => {
             Some(u.as_str().trim().to_string()).filter(|u| u.starts_with("http://") || u.starts_with("https://"))
@@ -58,7 +56,7 @@ pub fn points(cert_der: &[u8]) -> (Vec<String>, Vec<String>) {
         _ => None,
     };
     let mut crls = Vec::new();
-    if let Some(CrlDistributionPoints(points)) = ext(CRL_POINTS).and_then(|b| CrlDistributionPoints::from_der(&b).ok()) {
+    if let Some(CrlDistributionPoints(points)) = cert::extension(&c, CRL_POINTS) {
         for p in points {
             if let Some(DistributionPointName::FullName(names)) = &p.distribution_point {
                 crls.extend(names.iter().filter_map(web));
@@ -66,14 +64,10 @@ pub fn points(cert_der: &[u8]) -> (Vec<String>, Vec<String>) {
         }
     }
     let mut ocsp = Vec::new();
-    if let Some(AuthorityInfoAccessSyntax(access)) = ext(AUTHORITY_INFO).and_then(|b| AuthorityInfoAccessSyntax::from_der(&b).ok()) {
+    if let Some(AuthorityInfoAccessSyntax(access)) = cert::extension(&c, AUTHORITY_INFO) {
         ocsp.extend(access.iter().filter(|a| a.access_method == OCSP_METHOD).filter_map(|a| web(&a.access_location)));
     }
     (crls, ocsp)
-}
-
-fn secs(t: &x509_cert::time::Time) -> i64 {
-    i64::try_from(t.to_unix_duration().as_secs()).unwrap_or(i64::MAX)
 }
 
 /// What the CRL `crl` (DER) says about `cert`, issued by `issuer` (both DER), at `now`.
@@ -96,10 +90,10 @@ pub fn crl_status(crl: &[u8], cert_der: &[u8], issuer_der: &[u8], now: i64) -> S
     if !holds {
         return Status::Unknown("the list's signature doesn't hold".into());
     }
-    if secs(&tbs.this_update) > now + SKEW {
+    if cert::secs(tbs.this_update.to_unix_duration()) > now + SKEW {
         return Status::Unknown("the list is from the future".into());
     }
-    let until = tbs.next_update.as_ref().map(secs);
+    let until = tbs.next_update.map(|t| cert::secs(t.to_unix_duration()));
     if until.is_some_and(|u| u < now) {
         return Status::Unknown("the list is out of date".into());
     }
@@ -112,7 +106,7 @@ pub fn crl_status(crl: &[u8], cert_der: &[u8], issuer_der: &[u8], now: i64) -> S
         return Status::Unknown("the list's entry for the certificate can't be read".into());
     }
     match revoked {
-        Some(r) => Status::Revoked { at: secs(&r.revocation_date) },
+        Some(r) => Status::Revoked { at: cert::secs(r.revocation_date.to_unix_duration()) },
         None => Status::Good { until },
     }
 }
@@ -199,13 +193,7 @@ pub fn ocsp_status(answer: &[u8], cert_der: &[u8], issuer_der: &[u8], now: i64) 
     let by = |spki: &spki::SubjectPublicKeyInfoOwned| cert::signature_holds(spki, &basic.signature_algorithm, None, signed, sig);
     let delegated = basic.certs.iter().flatten().any(|r| {
         let Ok(r_der) = r.to_der() else { return false };
-        let for_ocsp = r
-            .tbs_certificate
-            .extensions
-            .as_ref()
-            .and_then(|e| e.iter().find(|x| x.extn_id == oids::EXT_KEY_USAGE))
-            .and_then(|x| ExtendedKeyUsage::from_der(x.extn_value.as_bytes()).ok())
-            .is_some_and(|ExtendedKeyUsage(u)| u.contains(&OCSP_SIGNING));
+        let for_ocsp = cert::extension(r, oids::EXT_KEY_USAGE).is_some_and(|ExtendedKeyUsage(u)| u.contains(&OCSP_SIGNING));
         // A delegated responder: for OCSP signing, issued by the same authority, and in date.
         for_ocsp && cert::in_date(r, now).is_ok() && cert::issued_by(&r_der, issuer_der) && by(&r.tbs_certificate.subject_public_key_info)
     });
@@ -215,18 +203,17 @@ pub fn ocsp_status(answer: &[u8], cert_der: &[u8], issuer_der: &[u8], now: i64) 
     let Some(single) = basic.tbs_response_data.responses.iter().find(|r| same_cert(&r.cert_id, &c, &issuer)) else {
         return Status::Unknown("the OCSP answer is about another certificate".into());
     };
-    let this = i64::try_from(single.this_update.0.to_unix_duration().as_secs()).unwrap_or(i64::MAX);
+    let this = cert::secs(single.this_update.0.to_unix_duration());
     if this > now + SKEW {
         return Status::Unknown("the OCSP answer is from the future".into());
     }
-    let until =
-        single.next_update.map(|n| i64::try_from(n.0.to_unix_duration().as_secs()).unwrap_or(i64::MAX)).unwrap_or(this.saturating_add(OCSP_FRESH));
+    let until = single.next_update.map(|n| cert::secs(n.0.to_unix_duration())).unwrap_or(this.saturating_add(OCSP_FRESH));
     if until < now {
         return Status::Unknown("the OCSP answer is out of date".into());
     }
     match &single.cert_status {
         CertStatus::Good(_) => Status::Good { until: Some(until) },
-        CertStatus::Revoked(info) => Status::Revoked { at: i64::try_from(info.revocation_time.0.to_unix_duration().as_secs()).unwrap_or(0) },
+        CertStatus::Revoked(info) => Status::Revoked { at: cert::secs(info.revocation_time.0.to_unix_duration()) },
         CertStatus::Unknown(_) => Status::Unknown("the OCSP responder doesn't know the certificate".into()),
     }
 }

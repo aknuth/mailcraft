@@ -30,6 +30,8 @@ use super::merge::Shown;
 use super::work::SearchWork;
 use super::*;
 
+#[cfg(test)]
+mod tests;
 mod verify;
 
 /// Summaries checked in one unit.
@@ -99,7 +101,7 @@ enum Loaded {
     Ready,
     /// A page was read (a unit).
     Read,
-    /// Not read yet: read marks of it are still being written (a unit).
+    /// Not read yet: read marks of it are still being written (a unit; a run that doesn't wait).
     Waits,
     /// It can't be read.
     Failed,
@@ -397,7 +399,7 @@ impl Session {
     /// `wait`: settled in full before it's shown, what isn't indexed read from its source.
     pub fn start_search(&mut self, q: &str, scope: SearchScope, wait: bool) {
         let query = self.query_of(q);
-        let mut folders = self.scope_folders(scope);
+        let mut folders = self.search_run_folders(scope);
         // The folders on view first: what's on screen is found first.
         let shown = self.view_folders();
         folders.sort_by_key(|k| !shown.contains(k));
@@ -504,7 +506,9 @@ impl Session {
     }
 
     /// Have a folder's list in the cache, a page a call (`load` holds the reading between calls).
-    fn load_unit(&mut self, k: &(String, String), load: &mut Option<FolderLoad>) -> Loaded {
+    /// `wait`: the run waits (the CLI's), and waits for the folder's read marks as reading it
+    /// does; told they were waited for, it went round, a unit at a time, until they were written.
+    fn load_unit(&mut self, k: &(String, String), load: &mut Option<FolderLoad>, wait: bool) -> Loaded {
         let Some(store) = self.store.clone() else {
             return match self.load_cached(&k.0, &k.1) {
                 Ok(()) => Loaded::Ready,
@@ -515,7 +519,7 @@ impl Session {
             None if self.cache.contains_key(k) => return Loaded::Ready,
             // Read marks still being written: read once they are, not waited for here (the window's
             // thread).
-            None if store.marks_waiting_for(&k.0, Some(&k.1)) => return Loaded::Waits,
+            None if !wait && store.marks_waiting_for(&k.0, Some(&k.1)) => return Loaded::Waits,
             None => store.folder_load(&k.0, &k.1).map(|l| {
                 let done = l.done();
                 *load = Some(l);
@@ -550,7 +554,7 @@ impl Session {
             return 1;
         };
         let k = (a, f);
-        match self.load_unit(&k, &mut load) {
+        match self.load_unit(&k, &mut load, run.wait) {
             Loaded::Read | Loaded::Waits => {
                 run.awaiting = Some((scan, load, at));
                 return 1;
@@ -593,7 +597,7 @@ impl Session {
             },
         };
         let Some(k) = run.folders.get(cur.fi).cloned() else { return 0 };
-        match self.load_unit(&k, &mut cur.load) {
+        match self.load_unit(&k, &mut cur.load, run.wait) {
             Loaded::Read => {
                 run.work = SearchWork::ListPage;
                 run.cur = Some(cur);

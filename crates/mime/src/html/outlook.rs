@@ -17,6 +17,7 @@
 
 use std::borrow::Cow;
 
+use mailcraft_model::work;
 use reading::{Comments, RAW_TEXT, TABLE_END, closed, has_text, raw_text_end, shows_something};
 
 /// The version of Office desktop Outlook reports (2016, 2019, 2021 and Microsoft 365).
@@ -47,8 +48,13 @@ pub(crate) const OUTLOOK_MARK: &str = "<!--mso-->";
 /// ([`crate::layout::ready`]); one a sender writes is left out.
 pub(crate) const OUTLOOK_TABLE: &str = "data-mailcraft-outlook";
 
-/// `html` as desktop Outlook reads it: its conditional comments worked out and its VML made HTML.
-/// The same HTML when it has none.
+/// `html` as desktop Outlook reads it: its conditional comments worked out and its VML made HTML,
+/// what it hides from Outlook hidden in its style. The same HTML when it has none.
+///
+/// For the tests and the `html` fuzz target only, on purpose: a message is read through
+/// [`outlook_copy`] (its tables marked) and [`marked_hidden`] (what's hidden marked for the text
+/// converters), which share all of this but how the hidden parts are hidden.
+#[doc(hidden)]
 pub fn as_outlook_reads(html: &str) -> Cow<'_, str> {
     let copy = read_as_outlook(html, false).html;
     match hidden_from_outlook(&copy) {
@@ -125,8 +131,9 @@ fn conditions(html: &str, lower: &str, mark: bool) -> Read {
     // Where each comment's end is, found once: looking for it from each comment again would take
     // as long as the mail for each of thousands.
     let endifs: Vec<usize> = lower.match_indices(ENDIF).map(|(at, _)| at).collect();
+    work::steps(lower.len());
     let mut i = 0;
-    while let Some(off) = lower.get(i..).and_then(|rest| rest.find("<!")) {
+    while let Some(off) = lower.get(i..).and_then(|rest| work::scanned(rest, rest.find("<!"))) {
         let at = i + off;
         out.push_str(html.get(i..at).unwrap_or(""));
         match conditional(lower, at, &endifs) {
@@ -205,7 +212,8 @@ fn conditional(lower: &str, at: usize, endifs: &[usize]) -> Option<Conditional> 
     // (`<!--[if !supportLists]-->`, a list's number after it) are comments, as in a browser.
     let head = rest.get(open.len()..)?;
     let limit = (0..=head.len().min(MAX_CONDITION + 8)).rev().find(|n| head.is_char_boundary(*n)).unwrap_or(0);
-    let close = head.get(..limit)?.find(']')? + open.len();
+    let condition_head = head.get(..limit)?;
+    let close = work::scanned(condition_head, condition_head.find(']'))? + open.len();
     if rest.as_bytes().get(close + 1) != Some(&b'>') {
         return None;
     }
@@ -380,17 +388,23 @@ fn tag(rest: &str) -> Option<(String, usize, bool)> {
     }
     // The end of the tag, past quoted values (not looked for past MAX_TAG).
     let mut quote = None;
+    let (mut looked, mut end) = (0, None);
     for (n, c) in rest.char_indices().skip(1).take_while(|(n, _)| *n < MAX_TAG) {
+        looked = n;
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') => quote = Some(c),
-            (None, '>') => return Some((name, n + 1, closing)),
-            (None, '<') => return None,
+            (None, '>') => {
+                end = Some(n + 1);
+                break;
+            }
+            (None, '<') => break,
             _ => {}
         }
     }
-    None
+    work::steps(looked + 1);
+    end.map(|end| (name, end, closing))
 }
 
 /// A tag's attributes, read as a browser reads them: names lowercased, values quoted or not, a
@@ -455,57 +469,10 @@ fn attrs_at(tag: &str) -> Vec<(String, String, usize)> {
             // A stray character: past it.
             chars.next();
         } else if out.len() < 64 {
-            out.push((name, decoded(&value).into_owned(), value_at));
+            out.push((name, super::decode_refs(&value, super::Refs::Value).into_owned(), value_at));
         }
     }
     out
-}
-
-/// An attribute's value with its character references made characters, as a browser reads it
-/// (`&amp;` in every address that has more than one parameter): `&amp;`, `&lt;`, `&gt;`,
-/// `&quot;`, `&apos;` and numbered ones (`&#38;`, `&#x26;`). Others stay as written.
-fn decoded(v: &str) -> Cow<'_, str> {
-    if !v.contains('&') {
-        return Cow::Borrowed(v);
-    }
-    let mut out = String::with_capacity(v.len());
-    let mut rest = v;
-    while let Some(at) = rest.find('&') {
-        out.push_str(rest.get(..at).unwrap_or(""));
-        let after = rest.get(at + 1..).unwrap_or("");
-        // The reference's name, up to its `;` (a short one; a longer run is text).
-        let named = after.find(';').filter(|n| *n <= 10).and_then(|n| Some((after.get(..n)?, n + 1)));
-        let c = named.and_then(|(name, len)| {
-            let c = match name {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                _ => {
-                    let n = name.strip_prefix('#')?;
-                    let code = match n.strip_prefix(['x', 'X']) {
-                        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                        None => n.parse::<u32>().ok()?,
-                    };
-                    Some(char::from_u32(code).filter(|c| *c != '\0').unwrap_or('\u{fffd}'))
-                }
-            }?;
-            Some((c, len))
-        });
-        match c {
-            Some((c, len)) => {
-                out.push(c);
-                rest = after.get(len..).unwrap_or("");
-            }
-            None => {
-                out.push('&');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    Cow::Owned(out)
 }
 
 /// An attribute's value in a tag's text.
@@ -529,20 +496,21 @@ fn safe(v: &str, url: bool) -> Option<String> {
 /// Whether a VML picture is placed behind what's drawn after it (`position: absolute` and a
 /// `z-index` below nothing, or a size to see: a pixel there to see who opened the mail isn't).
 fn behind(tag: &str) -> bool {
-    let style: String = attr(tag, "style").unwrap_or_default().to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
-    let placed = style.split(';').any(|d| d == "position:absolute");
+    let style = attr(tag, "style").unwrap_or_default();
+    let value = |prop: &str| crate::css::style_value(&style, prop);
+    let placed = value("position").is_some_and(|p| p.eq_ignore_ascii_case("absolute"));
     let (w, h) = picture_size(tag);
-    placed && (style.contains("z-index:-") || w.is_some_and(|w| w > 3) || h.is_some_and(|h| h > 3))
+    placed && (value("z-index").is_some_and(|z| z.starts_with('-')) || w.is_some_and(|w| w > 3) || h.is_some_and(|h| h > 3))
 }
 
 /// A picture's size in pixels from its `width` and `height`, or its style's (`width:1px`).
 fn picture_size(tag: &str) -> (Option<u32>, Option<u32>) {
-    let style = attr(tag, "style").unwrap_or_default().to_ascii_lowercase();
+    let style = attr(tag, "style").unwrap_or_default();
+    // The one that counts, as in CSS ([`crate::css::pick`]): the first was taken, and
+    // `width:1px;width:600px` was a pixel here and 600 wide to the layout.
     let from_style = |prop: &str| {
-        style.split(';').find_map(|d| {
-            let (p, v) = d.split_once(':')?;
-            (p.trim() == prop).then(|| v.trim().trim_end_matches("px").trim().parse::<f32>().ok()).flatten()
-        })
+        let v = crate::css::style_value(&style, prop)?.to_ascii_lowercase();
+        v.trim_end_matches("px").trim().parse::<f32>().ok()
     };
     let px = |prop: &str| {
         let v = attr(tag, prop).and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).or_else(|| from_style(prop))?;
@@ -570,7 +538,7 @@ fn vml(html: &str, kept: &[std::ops::Range<usize>]) -> (String, bool) {
     let mut xml = 0;
     let mut shown = false;
     let mut i = 0;
-    while let Some(off) = lower.get(i..).and_then(|rest| rest.find('<')) {
+    while let Some(off) = lower.get(i..).and_then(|rest| work::scanned(rest, rest.find('<'))) {
         let at = i + off;
         out.push_str(html.get(i..at).unwrap_or(""));
         if lower.get(at..).is_some_and(|r| r.starts_with("<!--")) {
@@ -596,10 +564,10 @@ fn vml(html: &str, kept: &[std::ops::Range<usize>]) -> (String, bool) {
         // by a browser, though (found in review: text hidden in one went unseen).
         if name == "xml" && !closing && xml < MAX_XML {
             xml += 1;
-            if let Some(end) = lower.get(i..).and_then(|r| r.find("</xml")).map(|e| i + e) {
+            if let Some(end) = lower.get(i..).and_then(|r| work::scanned(r, r.find("</xml"))).map(|e| i + e) {
                 let outlooks = kept.get(kept.partition_point(|r| r.end <= at)).is_some_and(|r| r.start <= at);
                 shown = shown || (!outlooks && lower.get(i..end).is_some_and(has_text));
-                i = lower.get(end..).and_then(|r| r.find('>')).map_or(end, |g| end + g + 1);
+                i = lower.get(end..).and_then(|r| work::scanned(r, r.find('>'))).map_or(end, |g| end + g + 1);
             }
             continue;
         }
@@ -678,9 +646,9 @@ fn vml(html: &str, kept: &[std::ops::Range<usize>]) -> (String, bool) {
 /// of its shorter side (`10%`, `0.1`, or in 65536ths, `6554f`; VML's 0.2 when it says none), at
 /// most half of it. Only numbers MailCraft writes go into the style.
 fn rounded(tag: &str) -> String {
-    let style = attr(tag, "style").unwrap_or_default().to_ascii_lowercase();
+    let style = attr(tag, "style").unwrap_or_default();
     let side = |prop: &str| {
-        let v = style.split(';').find_map(|d| d.split_once(':').filter(|(p, _)| p.trim() == prop).map(|(_, v)| v.trim().to_string()))?;
+        let v = crate::css::style_value(&style, prop)?.to_ascii_lowercase();
         crate::layout::length_px(&v).filter(|px| *px >= 1.0).map(|px| px.min(4000.0).round())
     };
     let (w, h) = (side("width"), side("height"));
@@ -719,6 +687,7 @@ fn with_fills(out: String, mut fills: Vec<(usize, String)>) -> String {
         return out;
     }
     fills.sort_by_key(|(at, _)| *at);
+    work::steps(out.len());
     let mut done = String::with_capacity(out.len() + fills.iter().map(|(_, f)| f.len()).sum::<usize>());
     let mut last = 0;
     for (at, fill) in fills {
@@ -735,7 +704,7 @@ fn with_fills(out: String, mut fills: Vec<(usize, String)>) -> String {
 
 /// What `html` hides from Outlook (`mso-hide: all` in an element's style, a newsletter's own copy
 /// of what its VML draws for Outlook) hidden here as well, `display:none;` written into its
-/// style. The same HTML when nothing is.
+/// style. The same HTML when nothing is. Only [`as_outlook_reads`] hides so.
 pub(crate) fn hidden_from_outlook(html: &str) -> Cow<'_, str> {
     in_place::hidden_in_place(html, in_place::Hide::Style)
 }
@@ -745,24 +714,7 @@ pub(crate) fn hidden_from_outlook(html: &str) -> Cow<'_, str> {
 /// any case and spacing). The one test of it for the message as it's shown, its text, and the
 /// text it hides.
 pub(crate) fn mso_hidden(style: &str) -> bool {
-    let mut said: Option<bool> = None;
-    let mut important = false;
-    for (p, v) in style.split(';').filter_map(|d| d.split_once(':')) {
-        if !p.trim().eq_ignore_ascii_case("mso-hide") {
-            continue;
-        }
-        let v: String = v.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
-        let (v, this_important) = match v.strip_suffix("!important") {
-            Some(v) => (v.to_string(), true),
-            None => (v, false),
-        };
-        if important && !this_important {
-            continue;
-        }
-        important |= this_important;
-        said = Some(v == "all");
-    }
-    said.unwrap_or(false)
+    crate::css::style_value(style, "mso-hide").is_some_and(|v| v.split_whitespace().collect::<String>().eq_ignore_ascii_case("all"))
 }
 
 mod in_place;

@@ -7,7 +7,7 @@
 use mailcraft_model::pim::{StoredTask, TASK_NOTES_KEPT, Task, task_day};
 use mailcraft_model::search::{fold_all, folded_has_phrase};
 
-use super::reminders::REMINDER_KEPT_AFTER_END;
+use super::reminders::{REMINDER_KEPT_AFTER_END, ReminderKey};
 use super::*;
 
 /// Most tasks an account keeps, and most characters in a title and in the notes.
@@ -31,6 +31,8 @@ pub struct TaskRef {
 pub struct ListedTask<'a> {
     pub account: &'a str,
     pub task: &'a Task,
+    /// Its place among its account's tasks (`Pim::tasks`), to find it again without a search.
+    pub at: usize,
 }
 
 /// How tasks are listed (Outlook's Arrange by for tasks). Done ones go last whichever it is.
@@ -127,29 +129,42 @@ impl Session {
     /// Every task matching a search (in its title, notes and categories), in the order chosen;
     /// done ones last, and left out when the list hides them.
     pub fn tasks(&self, query: &str) -> Vec<ListedTask<'_>> {
-        let words: Vec<String> = fold_all(query).split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
-        let hide_done = self.prefs.tasks_hide_done;
-        let mut out: Vec<ListedTask<'_>> = self
-            .pim
-            .iter()
-            .flat_map(|(a, p)| {
-                p.tasks
-                    .iter()
-                    .filter(|t| !(hide_done && t.task.is_done()) && task_matches(&t.task, &words))
-                    .map(|t| ListedTask { account: a, task: &t.task })
-            })
-            .collect();
+        let mut out = self.tasks_matching(query);
         let title = |r: &ListedTask<'_>| r.task.title.trim().to_lowercase();
         // No due day sorts after every due day.
         let due = |r: &ListedTask<'_>| r.task.due.unwrap_or(i64::MAX);
         let rank = |r: &ListedTask<'_>| std::cmp::Reverse(r.task.priority);
+        // The uid borrowed (it was copied for every task, every frame).
         match self.prefs.tasks_order {
-            TasksOrder::Due => out.sort_by_cached_key(|r| (r.task.is_done(), due(r), rank(r), title(r), r.task.uid.clone())),
-            TasksOrder::Priority => out.sort_by_cached_key(|r| (r.task.is_done(), rank(r), due(r), title(r), r.task.uid.clone())),
-            TasksOrder::Title => out.sort_by_cached_key(|r| (r.task.is_done(), title(r), r.task.uid.clone())),
-            TasksOrder::Modified => out.sort_by_cached_key(|r| (r.task.is_done(), std::cmp::Reverse(r.task.modified), r.task.uid.clone())),
+            TasksOrder::Due => out.sort_by_cached_key(|r| (r.task.is_done(), due(r), rank(r), title(r), r.task.uid.as_str())),
+            TasksOrder::Priority => out.sort_by_cached_key(|r| (r.task.is_done(), rank(r), due(r), title(r), r.task.uid.as_str())),
+            TasksOrder::Title => out.sort_by_cached_key(|r| (r.task.is_done(), title(r), r.task.uid.as_str())),
+            TasksOrder::Modified => out.sort_by_key(|r| (r.task.is_done(), std::cmp::Reverse(r.task.modified), r.task.uid.as_str())),
         }
         out
+    }
+
+    /// How many tasks [`Session::tasks`] lists, and how many of them are overdue `today`: the
+    /// side pane's counts, each frame, without putting them in order.
+    pub fn task_counts(&self, query: &str, today: i64) -> (usize, usize) {
+        let list = self.tasks_matching(query);
+        (list.len(), list.iter().filter(|r| r.task.overdue(today)).count())
+    }
+
+    /// The tasks a search finds, done ones left out when the list hides them, in no order.
+    fn tasks_matching(&self, query: &str) -> Vec<ListedTask<'_>> {
+        let words: Vec<String> = fold_all(query).split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
+        let hide_done = self.prefs.tasks_hide_done;
+        self.pim
+            .iter()
+            .flat_map(|(a, p)| {
+                p.tasks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| !(hide_done && t.task.is_done()) && task_matches(&t.task, &words))
+                    .map(|(at, t)| ListedTask { account: a, task: &t.task, at })
+            })
+            .collect()
     }
 
     /// The task with a uid, and its account.
@@ -183,7 +198,7 @@ impl Session {
     /// Add a task as it is. `from_file`: it replaces the account's task with its uid and keeps
     /// its own changed time (else a taken uid gets a new one, and the task is changed now).
     fn add_task(&mut self, account: Option<&str>, mut t: Task, from_file: bool) -> CmdResult {
-        let account = self.pim_account(account)?;
+        let account = self.account_or_shown(account)?;
         let taken = self.find_task(&t.uid).map(|r| r.account);
         let replaces = from_file && !t.uid.trim().is_empty() && taken.as_deref() == Some(account.as_str());
         if t.uid.trim().is_empty() || (taken.is_some() && !replaces) {
@@ -278,7 +293,7 @@ impl Session {
             }
             for t in p.tasks.iter().map(|t| &t.task).filter(|t| !t.is_done()) {
                 let Some(at) = t.reminder else { continue };
-                let key = format!("{account}|{}|{at}", t.uid);
+                let key = ReminderKey { account, uid: &t.uid, at }.to_string();
                 let due = match self.prefs.reminders.get(&key) {
                     Some(0) => continue,
                     Some(until) => *until,

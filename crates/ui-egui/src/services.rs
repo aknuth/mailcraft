@@ -96,7 +96,24 @@ pub struct Work {
     pub first: bool,
 }
 
-/// Platform services the UI needs.
+/// What files are chosen for, where the picker answers later (the browser:
+/// [`Services::pick_later`]), handed back with them ([`Services::take_picked`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Picked {
+    /// Attached to the message being written.
+    Attach,
+    /// Put in the message being written, at its cursor.
+    Picture,
+    /// A backup to bring back (issue #83).
+    Backup,
+    /// Rules to bring in.
+    Rules,
+    /// Categories to bring in.
+    Categories,
+    /// An account's certificate with its key (`.p12` / `.pfx`), by the account's id.
+    Certificate(String),
+}
+
 /// What becomes of the window when it's closed and MailCraft is kept running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeptOnClose {
@@ -107,6 +124,7 @@ pub enum KeptOnClose {
     Minimized,
 }
 
+/// Platform services the UI needs.
 pub trait Services {
     /// Unix seconds and the local UTC offset in seconds.
     fn clock(&self) -> (i64, i32);
@@ -119,6 +137,12 @@ pub trait Services {
     fn keep_frame(&mut self) {}
     /// MailCraft's own title bar is about to maximize or restore the window, in this frame.
     fn before_zoom(&mut self) {}
+    /// Where the system's cursor is on the screen, in physical pixels, while a pen or a finger
+    /// drags the window by MailCraft's own title bar (Windows): the window follows it where it
+    /// follows the pen. `None`: not known.
+    fn pointer_on_screen(&mut self) -> Option<[i32; 2]> {
+        None
+    }
     /// The local time zone's IANA name (`Europe/Berlin`), when the system says.
     fn zone(&self) -> Option<String> {
         None
@@ -269,22 +293,24 @@ pub trait Services {
     fn background(&mut self, _lane: Lane, work: Work) -> Result<(), Work> {
         Err(work)
     }
-    /// Whether [`Services::background`] takes work. Asked each frame that work is out there,
-    /// which is when a lane caught on cancelled work is given a new thread.
+    /// Whether [`Services::background`] takes work (only asked: see [`Services::tend_background`]).
     fn has_background(&self) -> bool {
         false
     }
+    /// Look after the threads [`Services::background`] runs work on: called each frame that
+    /// work is out there, which is when a lane caught on cancelled work is given a new thread.
+    fn tend_background(&mut self) {}
     /// Whether this app can keep running with its window closed, and what becomes of the window
-    /// then: what the option says of itself (none: it isn't offered), and what a close does now
-    /// (none: it closes).
+    /// then, as the option says of itself (none: the option isn't offered).
     fn keeps_running(&self) -> Option<KeptOnClose> {
         None
     }
+    /// What a close does to the window now, with the option on (none: it closes).
     fn kept_on_close(&self) -> Option<KeptOnClose> {
         None
     }
     /// Whether files can be dragged out of the window to other apps (see
-    /// [`MailApp::take_drag_out`]).
+    /// [`MailApp::take_drag_out`](crate::MailApp::take_drag_out)).
     fn can_drag_out(&self) -> bool {
         false
     }
@@ -305,15 +331,14 @@ pub trait Services {
     fn restore(&mut self, _files: Vec<(String, Vec<u8>)>, _state: serde_json::Value) -> Result<(), String> {
         Err("a backup is brought in where MailCraft runs in the browser".into())
     }
-    /// Start choosing files without waiting (the browser): `purpose` is `attach`, `picture`,
-    /// `backup`, `rules`, `categories` or `certificate:<account>`, and the files arrive through
+    /// Start choosing files for `_purpose` without waiting (the browser): they arrive through
     /// [`Services::take_picked`]. `false` (the default) means [`Services::pick_files`] answers
     /// at once.
-    fn pick_later(&mut self, _purpose: &str) -> bool {
+    fn pick_later(&mut self, _purpose: &Picked) -> bool {
         false
     }
     /// Files chosen since the last call: (purpose, name, bytes).
-    fn take_picked(&mut self) -> Vec<(String, String, Vec<u8>)> {
+    fn take_picked(&mut self) -> Vec<(Picked, String, Vec<u8>)> {
         Vec::new()
     }
     /// Whether the desktop prefers dark, where the window system doesn't say (Linux and the BSDs

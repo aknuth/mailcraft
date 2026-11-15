@@ -1,5 +1,7 @@
 //! `http(s)://` addresses: parsed, resolved against a base, and percent-encoding.
 
+use std::fmt::Write as _;
+
 use crate::{Error, Result};
 
 /// A parsed `http(s)://host[:port]/path?query` URL.
@@ -18,6 +20,23 @@ pub fn default_port(https: bool) -> u16 {
 
 fn strip_prefix_ci<'a>(s: &'a str, p: &str) -> Option<&'a str> {
     s.get(..p.len()).filter(|h| h.eq_ignore_ascii_case(p)).and_then(|_| s.get(p.len()..))
+}
+
+/// A path with its spaces and control characters percent-encoded rather than sent raw (each
+/// byte of a character's UTF-8: U+0085 is `%C2%85`).
+fn encode_controls(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c == ' ' || c.is_control() {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                let _ = write!(out, "%{b:02X}");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Url {
@@ -61,12 +80,7 @@ impl Url {
         } else {
             tail.to_string()
         };
-        // Spaces and controls are percent-encoded rather than sent raw.
-        let path: String = path
-            .chars()
-            .flat_map(|c| if c == ' ' || c.is_control() { format!("%{:02X}", u32::from(c) & 0xff).chars().collect::<Vec<_>>() } else { vec![c] })
-            .collect();
-        Ok(Url { https, host: host.to_ascii_lowercase(), port, path })
+        Ok(Url { https, host: host.to_ascii_lowercase(), port, path: encode_controls(&path) })
     }
 
     /// A `Location` (or any reference) resolved against this URL.
@@ -99,36 +113,7 @@ impl Url {
 }
 
 /// Percent-encode everything but RFC 3986's unreserved characters.
-pub fn pct(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// Base64 (RFC 4648), padded.
-pub fn base64(data: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk.first().copied().unwrap_or(0), chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                let idx = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap_or(0);
-                out.push(char::from(A.get(idx).copied().unwrap_or(b'A')));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
+pub use mailcraft_model::mailto::percent_encode as pct;
 
 #[cfg(test)]
 mod tests {
@@ -146,8 +131,11 @@ mod tests {
         }
         assert_eq!(Url::parse("http://[::1]:8080").unwrap().origin(), "http://[::1]:8080");
         assert_eq!(pct("a b/é"), "a%20b%2F%C3%A9");
-        assert_eq!(base64(b"me:pw"), "bWU6cHc=");
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn a_paths_controls_go_as_their_utf8() {
+        let u = Url::parse("https://h.example/a b\u{1}\u{7f}\u{85}\u{9f}é?q=x\ty").unwrap();
+        assert_eq!(u.path, "/a%20b%01%7F%C2%85%C2%9Fé?q=x%09y");
     }
 }

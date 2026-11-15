@@ -10,7 +10,8 @@ use mailcraft_engine::model::pim::{TaskPriority, TaskStatus};
 use mailcraft_engine::{ListedTask, Session, TasksOrder};
 use serde_json::json;
 
-use crate::icons::{self, Icon};
+use crate::icons::Icon;
+use crate::shown;
 use crate::theme::{self, Tokens};
 use crate::{Action, Dialog, UiState, widgets};
 
@@ -35,60 +36,59 @@ pub fn nav(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>) {
             }
         }
         ui.add_space(8.0);
-        let list = s.tasks(&st.tasks_query);
-        let today = dates::today(&s.clock);
-        let late = list.iter().filter(|r| r.task.overdue(today)).count();
-        ui.label(RichText::new(tf!("{n} tasks", n = list.len())).color(t.faint).small());
+        let (n, late) = s.task_counts(&st.tasks_query, dates::today(&s.clock));
+        ui.label(RichText::new(tf!("{n} tasks", n = n)).color(t.faint).small());
         if late > 0 {
             ui.label(RichText::new(tf!("{n} overdue", n = late)).color(t.danger).small());
         }
     });
 }
 
-/// When a task is due, as the list shows it: today, tomorrow, yesterday, else its date.
-pub(crate) fn due_label(day: i64, s: &Session) -> String {
-    let d = day.div_euclid(86_400);
-    let today = dates::today(&s.clock);
-    match d - today {
-        0 => tl!("Today").to_string(),
-        1 => tl!("Tomorrow").to_string(),
-        -1 => tl!("Yesterday").to_string(),
-        _ => {
-            let (y, m, dd) = dates::civil_from_days(d);
-            let (now_y, _, _) = dates::civil_from_days(today);
-            let wd = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].get((d + 3).rem_euclid(7) as usize).copied().unwrap_or("");
-            let month =
-                ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].get(m as usize - 1).copied().unwrap_or("");
-            if y == now_y { crate::i18n::date(&format!("{wd} {month} {dd}")) } else { format!("{y:04}-{m:02}-{dd:02}") }
-        }
+/// A local day (days since the epoch) as the task list and the To-Do Bar name it: Today,
+/// Tomorrow, Yesterday, else its date as the Dates option writes it ([`dates::day_short`]).
+pub(crate) fn relative_day(day: i64, s: &Session) -> String {
+    near_day(day, dates::today(&s.clock)).map_or_else(|| crate::i18n::date(&dates::day_short(day, &s.clock)), str::to_string)
+}
+
+/// Today, Tomorrow or Yesterday, when the local day `day` is one of them from `today`.
+pub(crate) fn near_day(day: i64, today: i64) -> Option<&'static str> {
+    match day.saturating_sub(today) {
+        0 => Some(tl!("Today")),
+        1 => Some(tl!("Tomorrow")),
+        -1 => Some(tl!("Yesterday")),
+        _ => None,
     }
 }
 
 /// The main pane: the columns' headings, then the tasks.
 pub fn show(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>) {
     let t = st.tokens;
-    let list = s.tasks(&st.tasks_query);
+    let list = shown::tasks(s, &mut st.shown, &st.tasks_query);
     if list.is_empty() {
-        ui.centered_and_justified(|ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.35);
-                let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-                icons::paint(ui.painter(), r, Icon::Task, t.border);
-                ui.add_space(8.0);
-                let empty = st.tasks_query.trim().is_empty() && !s.prefs.tasks_hide_done;
-                ui.label(RichText::new(tl!(if empty { "No tasks yet: New task adds one." } else { "No task matches." })).color(t.faint));
-            });
-        });
+        let empty = st.tasks_query.trim().is_empty() && !s.prefs.tasks_hide_done;
+        widgets::empty_state(ui, &t, Icon::Task, tl!(if empty { "No tasks yet: New task adds one." } else { "No task matches." }));
         return;
     }
     egui::Frame::new().inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| {
         headings(s, &t, ui, acts);
     });
-    egui::ScrollArea::vertical().auto_shrink(false).id_salt("tasks").show(ui, |ui| {
+    egui::ScrollArea::vertical().auto_shrink(false).id_salt("tasks").show_viewport(ui, |ui, viewport| {
         egui::Frame::new().inner_margin(Margin::symmetric(14, 0)).show(ui, |ui| {
-            for r in &list {
-                row(s, &t, st, ui, r, acts);
-            }
+            // Only the rows in view are laid out, each where it would be with all of them.
+            let pitch = ROW + ui.spacing().item_spacing.y;
+            shown::rows(
+                ui,
+                viewport,
+                list.len(),
+                |k| k as f32 * pitch,
+                None,
+                |ui, k| match list.get(k).and_then(|at| shown::task(s, at)) {
+                    Some(r) => row(s, &t, st, ui, &r, acts),
+                    None => {
+                        ui.allocate_exact_size(vec2(ui.available_width(), ROW), Sense::hover());
+                    }
+                },
+            );
             ui.add_space(10.0);
         });
     });
@@ -180,12 +180,12 @@ fn row(s: &Session, t: &Tokens, st: &mut UiState, ui: &mut Ui, r: &ListedTask<'_
     let p = ui.painter().with_clip_rect(rect);
     // The title, struck through when done.
     let title = if task.title.trim().is_empty() { tl!("(no title)").to_string() } else { task.title.clone() };
-    let (shown, title_rtl) = crate::bidi::shown(&title);
+    let title_rtl = crate::bidi::reads_rtl(&title);
     let title_color = if done { t.faint } else { t.text };
     // Cut with "…" where it doesn't fit, as the list's subjects are (it stopped mid-letter at
     // the next column).
     let room = (x_due - x_title - 10.0).max(10.0);
-    let galley = widgets::one_line(ui, &shown, theme::bold(13.0), title_color, room);
+    let galley = widgets::one_line(ui, &title, theme::bold(13.0), title_color, room);
     let title_w = galley.size().x.min(room);
     let title_x = if title_rtl && !mr.on() { rect.min.x + x_title + room - title_w } else { rect.min.x + x_title };
     // Under it: that it repeats, its categories, its notes' first line.
@@ -211,7 +211,7 @@ fn row(s: &Session, t: &Tokens, st: &mut UiState, ui: &mut Ui, r: &ListedTask<'_
     let under = widgets::one_line(ui, &under.join(" · "), theme::regular(11.5), t.dim, room);
     let under_at = start.anchor_size(mr.pos(pos2(rect.min.x + x_title, rect.min.y + 31.0)), under.size());
     p.with_clip_rect(clip).galley(under_at.min, under, t.dim);
-    let due_text = task.due.map_or_else(|| tl!("None").to_string(), |d| due_label(d, s));
+    let due_text = task.due_day().map_or_else(|| tl!("None").to_string(), |d| relative_day(d, s));
     let due_color = if late {
         t.danger
     } else if task.due.is_none() {

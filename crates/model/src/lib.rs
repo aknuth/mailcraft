@@ -9,6 +9,7 @@
 pub mod addr;
 pub mod contacts;
 pub mod dates;
+pub mod encoding;
 pub mod ical;
 pub mod job;
 pub mod lookalike;
@@ -19,7 +20,6 @@ pub mod search;
 pub mod signature;
 pub mod summary;
 pub mod thread;
-pub mod utf7;
 pub mod vcard;
 
 use serde::{Deserialize, Serialize};
@@ -27,11 +27,18 @@ use serde::{Deserialize, Serialize};
 pub use addr::EmailAddress;
 pub use addr::identity::Identity;
 pub use dates::zone;
+pub use encoding::path;
+pub use encoding::{base64, utf7};
+pub use job::{Event, FailureKind, HeldKey, Job, Op, PgpSignature, PgpWork, Private, Revocation, Secret, SyncStatus};
+pub use path::file_name;
 pub use signature::Signature;
 pub use summary::{FOLLOW_UP_COMPLETE, Flag, Flags, MessageKey, PINNED, SharedSummary, Smime, Summary, is_keyword, keyword_for, sort_newest_first};
 // Clean Up is a part of conversations, kept under its old path.
-pub use job::{Event, HeldKey, Job, Op, PgpSignature, PgpWork, Private, Revocation, Secret, SyncStatus};
 pub use thread::cleanup;
+// The work passes over hostile text do, counted for the tests.
+pub use job::work;
+// FNV-1a, for keys and fingerprints (with the message keys it mostly makes).
+pub use summary::hash;
 
 /// How a connection to a server is secured.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,26 +184,76 @@ pub struct AccountConfig {
     pub trusted_certificates: Vec<String>,
 }
 
+impl AccountConfig {
+    /// The name the account signs in with: its user name, or its address when it has none.
+    pub fn login_name(&self) -> &str {
+        if self.username.is_empty() { &self.email } else { &self.username }
+    }
+
+    /// Whether `other` connects and signs in as this does: the same servers, sign-in names
+    /// (the address is one, when there's no user name), mailboxes and how often it looks. Every
+    /// field is named in [`Self::connection`], so one added to the account is decided on there
+    /// (a list of comparisons kept apart missed the address and who OAuth signed in as).
+    pub fn same_connection(&self, other: &AccountConfig) -> bool {
+        self.connection() == other.connection()
+    }
+
+    /// What the connection is made from.
+    fn connection(&self) -> impl PartialEq + '_ {
+        let AccountConfig {
+            // What shows the account, or goes into what it writes: not how it connects.
+            id: _,
+            name: _,
+            color: _,
+            signatures: _,
+            signature_new: _,
+            signature_reply: _,
+            signature: _,
+            signature_html: _,
+            signature_code: _,
+            identities: _,
+            email,
+            username,
+            imap,
+            smtp,
+            smtp_username,
+            oauth,
+            jmap,
+            graph,
+            ews,
+            pop,
+            pop_delete,
+            pop_keep_days,
+            pop_delete_with_trash,
+            oauth_user,
+            shared_mailboxes,
+            online_only,
+            check_every,
+            dav,
+            user_agent,
+            trusted_certificates,
+        } = self;
+        (
+            (email, username, imap, smtp, pop),
+            (jmap, graph, ews, smtp_username, oauth, oauth_user),
+            (pop_delete, pop_keep_days, pop_delete_with_trash, shared_mailboxes, online_only, check_every),
+            (dav, user_agent, trusted_certificates),
+        )
+    }
+}
+
 /// The most certificates an account trusts by hand.
 pub const MAX_TRUSTED_CERTIFICATES: usize = 8;
 
 /// Why a mail server on this computer was refused: it showed a certificate of its own, which no
-/// authority vouches for and the user hasn't trusted. The refusal holds these words, then the
-/// server and the certificate's fingerprint ([`untrusted_local_certificate`]), so the UI can ask.
+/// authority vouches for and the user hasn't trusted. The refusal says these words, then the
+/// server and the certificate's fingerprint; its kind ([`FailureKind::LocalCertificate`]) names
+/// them, so the UI can ask.
 pub const LOCAL_CERTIFICATE: &str = "the mail server on this computer uses a certificate of its own that isn't trusted yet";
 
 /// What a refusal for [`LOCAL_CERTIFICATE`] says: its words, the server and the fingerprint.
 pub fn local_certificate_refusal(host: &str, fingerprint: &str) -> String {
     format!("{LOCAL_CERTIFICATE} ({host} {fingerprint})")
-}
-
-/// The server and the certificate's fingerprint in a refusal for [`LOCAL_CERTIFICATE`], wherever
-/// in an error's text it is.
-pub fn untrusted_local_certificate(error: &str) -> Option<(String, String)> {
-    let rest = error.split_once(LOCAL_CERTIFICATE)?.1.trim_start().strip_prefix('(')?;
-    let (inside, _) = rest.split_once(')')?;
-    let (host, fingerprint) = inside.rsplit_once(' ')?;
-    (!host.trim().is_empty() && is_certificate_fingerprint(fingerprint)).then(|| (host.trim().to_string(), fingerprint.to_ascii_lowercase()))
 }
 
 /// Whether `s` is a SHA-256 fingerprint in hex.
@@ -236,6 +293,14 @@ pub const EWS_AUTODISCOVER: &str = "autodiscover";
 /// Microsoft Graph's address, for Exchange Online accounts.
 pub const GRAPH_URL: &str = "https://graph.microsoft.com/v1.0";
 
+/// Whether the outgoing server at `smtp_host` files a copy of what it sends in Sent itself, as
+/// Gmail's do: Google's own domains and their servers only, never a host that merely ends in
+/// the same letters (`smtp.notgmail.com`).
+pub fn files_sent_mail_itself(smtp_host: &str) -> bool {
+    let h = smtp_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    ["gmail.com", "googlemail.com"].iter().any(|d| lookalike::is_under(&h, d))
+}
+
 /// The OAuth provider that runs an IMAP server, when it's one MailCraft knows.
 pub fn oauth_provider_for(imap_host: &str) -> Option<&'static str> {
     let h = imap_host.trim().to_ascii_lowercase();
@@ -251,17 +316,19 @@ pub fn oauth_provider_for(imap_host: &str) -> Option<&'static str> {
 /// Microsoft's own addresses (Outlook.com, Hotmail, Live, MSN). Since September 2024 they
 /// take no passwords from other mail apps over IMAP, POP or SMTP: only Microsoft sign-in.
 pub fn microsoft_consumer(email: &str) -> bool {
-    let domain = email.trim().rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()).unwrap_or_default();
+    let domain = lookalike::domain_of(email);
     let name = domain.split('.').next().unwrap_or_default();
     matches!(name, "outlook" | "hotmail" | "live" | "msn" | "windowslive" | "passport") && domain.contains('.')
 }
 
-/// Why a Microsoft account signing in with a password can't connect (its status starts with this).
+/// Why a Microsoft account signing in with a password can't connect: its status starts with this
+/// and is of the kind [`FailureKind::MicrosoftNoPasswords`].
 pub const MICROSOFT_NO_PASSWORDS: &str = "Microsoft doesn't accept passwords from mail apps for this account: it needs Sign in with Microsoft";
 
 /// Why an account signed in with Microsoft can't open its mailbox over IMAP: Microsoft took the
 /// sign-in, then its server said "User is authenticated but not connected". The status starts
-/// with this, so the UI can offer what helps (signing in again, or Microsoft Graph).
+/// with this and is of the kind [`FailureKind::MicrosoftImapClosed`], so the UI can offer what
+/// helps (signing in again, or Microsoft Graph).
 pub const MICROSOFT_IMAP_CLOSED: &str = "Microsoft signed you in, but its mail server won't open this mailbox over IMAP";
 
 /// An account that signs in to Microsoft's servers with a password rather than Microsoft
@@ -278,7 +345,7 @@ impl AccountConfig {
     /// IMAPS 993, SMTPS 465). The account dialog shows them for the user to correct.
     pub fn guess(email: &str) -> AccountConfig {
         let email = email.trim();
-        let domain = email.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()).unwrap_or_default();
+        let domain = lookalike::domain_of(email);
         let (imap_host, smtp_host) = match domain.as_str() {
             "gmail.com" | "googlemail.com" => ("imap.gmail.com".to_string(), "smtp.gmail.com".to_string()),
             _ if microsoft_consumer(email) => ("outlook.office365.com".to_string(), "smtp.office365.com".to_string()),
@@ -587,7 +654,6 @@ pub fn sort_folders(folders: &mut [Folder]) {
             Some(d) => f.path.split(d).map(|p| utf7::decode(p).to_lowercase()).collect(),
             None => vec![utf7::decode(&f.path).to_lowercase()],
         };
-        let rank = |role: FolderRole| if role == FolderRole::Other { 6 } else { role.rank() };
         let top_role = |n: usize| {
             let top = f.delimiter.map(|d| f.path.split(d).take(n).collect::<Vec<_>>().join(&d.to_string())).unwrap_or_else(|| f.path.clone());
             roles.get(&top).copied().unwrap_or(FolderRole::Other)
@@ -597,11 +663,11 @@ pub fn sort_folders(folders: &mut [Folder]) {
         if f.mailbox.is_some() {
             let mailbox = if parts.is_empty() { String::new() } else { parts.remove(0) };
             let role = if f.mailbox_role == FolderRole::Other { top_role(2) } else { f.mailbox_role };
-            return (7, mailbox, if parts.is_empty() { 0 } else { 1 + rank(role) }, parts);
+            return (7, mailbox, if parts.is_empty() { 0 } else { 1 + role.rank() }, parts);
         }
         // A special folder keeps its own place; another goes where its top folder is.
         let role = if f.role == FolderRole::Other { top_role(1) } else { f.role };
-        (rank(role), String::new(), 0, parts)
+        (role.rank(), String::new(), 0, parts)
     });
 }
 
@@ -609,12 +675,35 @@ pub fn sort_folders(folders: &mut [Folder]) {
 mod tests {
     use super::*;
 
+    /// An account signs in with its user name, or its address when it has none.
+    #[test]
+    fn the_login_name_is_the_user_name_else_the_address() {
+        let mut a = AccountConfig { email: "zoe@studio.example".into(), ..Default::default() };
+        assert_eq!(a.login_name(), "zoe@studio.example");
+        a.username = "zoe".into();
+        assert_eq!(a.login_name(), "zoe");
+    }
+
+    /// Issue #19's cause: a server whose name only ends in "gmail.com" was taken for Gmail's,
+    /// and its account's sent mail kept nowhere.
+    #[test]
+    fn only_gmails_own_servers_file_sent_mail_themselves() {
+        for h in ["smtp.gmail.com", "SMTP.Gmail.COM", " smtp.googlemail.com ", "smtp.gmail.com.", "gmail.com"] {
+            assert!(files_sent_mail_itself(h), "{h}");
+        }
+        for h in ["smtp.notgmail.com", "mail.xgmail.com", "gmail.com.example", "smtp.googlemail.co", "", "."] {
+            assert!(!files_sent_mail_itself(h), "{h}");
+        }
+    }
+
     #[test]
     fn microsofts_own_addresses_need_its_sign_in() {
         for e in ["a@outlook.com", "a@hotmail.com", "a@hotmail.co.uk", "a@live.nl", "a@msn.com", "A@Outlook.FR"] {
             assert!(microsoft_consumer(e), "{e}");
         }
-        for e in ["a@outlook-studio.example", "a@studio.example", "a@hotmail", "hotmail.com", ""] {
+        // An address's domain is read as the lookalike check reads it: `outlook.` is `outlook`.
+        assert!(microsoft_consumer("a@Outlook.com."));
+        for e in ["a@outlook-studio.example", "a@studio.example", "a@hotmail", "a@hotmail.", "hotmail.com", ""] {
             assert!(!microsoft_consumer(e), "{e}");
         }
         let mut a = AccountConfig::guess("someone@hotmail.com");
@@ -666,6 +755,9 @@ mod tests {
         assert_eq!(a.username, "zoe@example.org");
         let g = AccountConfig::guess("x@gmail.com");
         assert_eq!(g.imap.host, "imap.gmail.com");
+        // A domain written with a dot at its end, or capitals beyond ASCII, is the same domain.
+        assert_eq!(AccountConfig::guess("x@Gmail.com.").imap.host, "imap.gmail.com");
+        assert_eq!(AccountConfig::guess("x@ÉCOLE.example").imap.host, "mail.école.example");
         assert_eq!(AccountConfig::guess("nonsense").imap.host, "");
     }
 

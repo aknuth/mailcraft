@@ -72,6 +72,7 @@
 	Edit rule	编辑规则
 	Email address	电子邮件地址
 	Enter the password for {email}.	请输入 {email} 的密码。
+	Enter the password for {email}, which signs in as {user}.	请输入 {email} 的密码，它以 {user} 登录。
 	Favorites	收藏夹
 	Feb	2月
 	File	文件
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	打开邮件时标记为已读
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	还没有发件人。
-	Not available: the sample mailbox has no server.	不可用: 示例邮箱没有服务器。
+	Not available: this mailbox has no server.	不可用: 此邮箱没有服务器。
 	Not available: {error}	不可用: {error}
 	On	已开启
 	On from {from}	从 {from} 起开启
@@ -843,7 +844,8 @@ month	May	5月
 	Formatted	带格式
 	HTML code	HTML 代码
 	From a file…	从文件…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	粘贴在别处制作的签名的 HTML，或打开另存为网页的签名（Outlook 的 .htm）。它按原样发送；撰写时，邮件中显示它的文字。
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	粘贴在别处制作的签名的 HTML，或打开另存为网页的签名（Outlook 的 .htm）。它按原样发送，撰写时也按原样显示。
+	Your signature as it will be sent. To change it, pick Signature above the message.	签名将按此样式发送。要更改它，请选择邮件上方的“签名”。
 	{name} can't be read as a signature	无法将 {name} 读取为签名
 	All contacts	所有联系人
 	Always open with this address book	始终用此通讯簿打开
@@ -935,6 +937,9 @@ month	May	5月
 	Name on mail from it	用此地址发信时显示的姓名
 	Replies go to	回复发送到
 	(the account's own)	（帐户自己的签名）
+	Write new mail from this address	用此地址写新邮件
+	A new message starts from this address, not from {email}. Pick another in From as ever.	新邮件从此地址开始，而不是 {email}。仍可在“发件人”中另选一个。
+	{address} (new mail)	{address}（新邮件）
 	Add…	添加…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	其文件夹显示在此帐户下。你需要在 Exchange 服务器上拥有访问权限；拥有完全访问权限的邮箱会自动打开。
 	Mailboxes you have full access to open by themselves.	拥有完全访问权限的邮箱会自动打开。
@@ -1103,6 +1108,7 @@ month	May	5月
 	Check before sending	发送前检查
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} 看起来像 {like} 的地址，但其实不是。地址正确吗？
 	{n} people who may not know each other will all see each other's addresses.	{n} 个可能互不相识的人都会看到彼此的地址。
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	在收件人中发现了需要查看的地方，但无法显示。发送前请检查收件人。
 	Put everyone in Bcc	把所有人放进密送
 	Each of them gets the message without seeing who else did; you're in To	每个人收到邮件时都看不到其他收件人；你在收件人栏
 	Open links without their tracking	打开链接时去掉跟踪
@@ -1442,6 +1448,7 @@ month	May	5月
 	Calendar and contacts couldn't be read: changes to them won't be saved	无法读取日历和联系人：对它们的更改不会保存
 	Your rules couldn't be read: changes to them won't be saved	无法读取你的规则：对它们的更改不会保存
 	Snoozed mail couldn't be read: changes to it won't be saved	无法读取已暂停提醒的邮件：对它们的更改不会保存
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	无法读取发件箱中待发回复所答复的邮件：这些邮件可能不会标记为已答复
 	Checking your data file	正在检查数据文件
 	Opening your mail…	正在打开邮件…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} 上次未正常关闭。MailCraft 正在检查它；大文件可能需要一两分钟。
@@ -1459,6 +1466,8 @@ month	May	5月
 	Some results may be missing: still indexing	可能缺少部分结果：仍在编制索引
 	Some long messages were searched only in part	部分长邮件只搜索了一部分
 	Couldn't read the date “{value}”	无法读取日期“{value}”
+	Couldn't read “{value}”	无法读取“{value}”
+	Part of a long search was left out	长搜索的一部分被略去了
 	Received after	接收日期晚于
 	Received before	接收日期早于
 	About {h} h {m} min left	大约还剩 {h} 小时 {m} 分钟
@@ -1705,3 +1714,7 @@ month	May	5月
 	Nothing to do	没有待办事项
 	Nothing in the next 7 days	未来 7 天没有安排
 	Show the calendar, what's coming up and your tasks beside the mail	在邮件旁显示日历、即将到来的约会和任务
+	Read / Unread (Ctrl+Q / Ctrl+U)	已读 / 未读 (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	无法下载 {name}: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	窗口出了问题，正在进行的操作已停止。MailCraft 可以继续使用；日志中记录了出错的位置。
+	Font size	字号

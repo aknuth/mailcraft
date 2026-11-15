@@ -17,6 +17,11 @@ const WAITING_MAX: usize = 500;
 /// moves it.
 const WAIT: i64 = 30 * 60;
 
+/// The error of mail that couldn't be filed in `folder`.
+fn not_kept(folder: &str) -> impl Fn(mailcraft_store::StoreError) -> CmdError + '_ {
+    move |e| CmdError::Failed(format!("The mail couldn't be kept in {}, so it stays where it was: {e}", mailcraft_model::utf7::decode(folder)))
+}
+
 /// A message on its way to where it was moved or copied to.
 #[derive(Clone, Debug)]
 pub(crate) struct Transfer {
@@ -44,7 +49,7 @@ impl Session {
     /// Move (`moved`) or copy the selection into `folder` of `account`. Nothing is deleted where
     /// it was before its copy is there.
     pub fn transfer_selection(&mut self, account: &str, folder: &str, moved: bool) -> CmdResult {
-        let sel = self.selected();
+        let sel = self.selected_shared();
         if sel.is_empty() {
             return Err(CmdError::Disabled("no message selected".into()));
         }
@@ -65,6 +70,7 @@ impl Session {
         // and one already on its way there isn't sent twice.
         let sel: Vec<&Summary> = sel
             .iter()
+            .map(|m| &**m)
             .filter(|m| m.key.folder != OUTBOX && !(moved && m.key.account == account && m.key.folder == folder))
             .filter(|m| !self.transfers.iter().any(|t| t.key == m.key && t.account == account && t.folder == folder))
             .collect();
@@ -80,6 +86,10 @@ impl Session {
         }
         let (mut ready, mut waiting): (Vec<Transfer>, Vec<Transfer>) = (Vec::new(), Vec::new());
         let mut missing = 0usize;
+        // Into a folder kept here, each is filed as its source is read (read once, written with
+        // others), and the folder's list naming them saved once nothing refuses the rest.
+        let store = self.store.clone();
+        let (mut filing, mut filed): (Option<Filing>, Vec<MessageKey>) = (None, Vec::new());
         for m in &sel {
             let t = Transfer {
                 key: m.key.clone(),
@@ -94,11 +104,21 @@ impl Session {
                 message_id: m.message_id.clone(),
             };
             // Exchange's text first is MailCraft's, not the message's: its source is asked for.
-            match self.body_raw(&m.key).is_some_and(|raw| !mime::is_text_first(&raw)) {
-                true => ready.push(t),
+            match self.body_raw(&m.key).filter(|raw| !mime::is_text_first(raw)) {
+                Some(raw) if here => {
+                    if filing.is_none() {
+                        let store = store.as_ref().ok_or_else(|| CmdError::Failed("there is nowhere to keep it".into()))?;
+                        filing = Some(Filing::new(store, account, folder).map_err(not_kept(folder))?);
+                    }
+                    if let Some(f) = filing.as_mut() {
+                        Self::file_raw(f, raw, t.flags, t.date).map_err(not_kept(folder))?;
+                        filed.push(t.key);
+                    }
+                }
+                Some(_) => ready.push(t),
                 // Kept on this computer and not here: there's nowhere to ask for it.
-                false if self.takes_mail(&m.key.account) => missing += 1,
-                false => waiting.push(t),
+                None if self.takes_mail(&m.key.account) => missing += 1,
+                None => waiting.push(t),
             }
         }
         if self.transfers.iter().filter(|t| !t.sent).count().saturating_add(waiting.len()) > WAITING_MAX {
@@ -107,14 +127,11 @@ impl Session {
             )));
         }
         let next = if moved && here { self.successor(&self.selection.clone()) } else { None };
-        let (mut done, mut sending) = (0, 0);
-        if here {
-            done = ready.len();
-            self.file_and_remove(account, folder, ready, moved, None)?;
-        } else {
-            sending = ready.len();
-            self.send_copies(ready);
+        let (done, sending) = (filed.len(), ready.len());
+        if let Some(f) = filing {
+            self.file_and_remove(account, folder, f, filed, moved)?;
         }
+        self.send_copies(ready);
         for t in &waiting {
             // Asked for already (for this, or by the reading pane): it comes all the same.
             self.jobs.push(Job::FetchBody { key: t.key.clone() });
@@ -148,9 +165,6 @@ impl Session {
         // Put into an Inbox or Junk by hand, it didn't arrive there: no rules run on it (one
         // filed it straight out again), nothing announced, as mail moved within an account.
         if self.folder(&account, &folder).is_some_and(|f| matches!(f.role, FolderRole::Inbox | FolderRole::Junk)) {
-            if self.moved_in.len() > 2000 {
-                self.moved_in.clear();
-            }
             for t in mail.iter().filter(|t| !t.message_id.is_empty()) {
                 self.moved_in.insert((account.clone(), folder.clone(), t.message_id.clone()));
             }
@@ -159,35 +173,12 @@ impl Session {
         self.transfers.extend(mail.into_iter().map(|t| Transfer { sent: true, ..t }));
     }
 
-    /// File `mail`, whose sources are here (or `given`, one's that just came), in `folder` of the
-    /// local `account`, then, `moved`, delete each where it was. Filing that fails deletes
-    /// nothing.
-    fn file_and_remove(&mut self, account: &str, folder: &str, mail: Vec<Transfer>, moved: bool, given: Option<&[u8]>) -> Result<(), CmdError> {
-        if mail.is_empty() {
-            return Ok(());
-        }
-        let store = self.store.clone().ok_or_else(|| CmdError::Failed("there is nowhere to keep it".into()))?;
-        let failed =
-            |e: mailcraft_store::StoreError| CmdError::Failed(format!("The mail couldn't be kept in {folder}, so it stays where it was: {e}"));
-        let mut st = store.load_folder(account, folder).map_err(failed)?;
-        if st.validity == 0 {
-            st.validity = 1;
-        }
-        let mut next = st.free_uid(account, folder).map_err(failed)?;
-        let mut from: Vec<MessageKey> = Vec::new();
-        for t in mail {
-            let Some(raw) = given.map(<[u8]>::to_vec).or_else(|| self.body_raw(&t.key)) else { continue };
-            let uid = mailcraft_store::FolderState::take_uid(&mut next, account, folder).map_err(failed)?;
-            let key = MessageKey { account: account.to_string(), folder: folder.to_string(), validity: st.validity, uid };
-            let size = u32::try_from(raw.len()).unwrap_or(u32::MAX);
-            let s = mime::summary_from_full(&raw, key.clone(), t.flags, size, t.date);
-            store.write_body(&key, &raw).map_err(failed)?;
-            st.messages.push(s.into());
-            from.push(t.key);
-        }
-        st.uid_next = next;
-        sort_newest_first(&mut st.messages);
-        store.save_folder(account, folder, &st).map_err(failed)?;
+    /// Keep what was filed in `filing`, in `folder` of the local `account`: the folder's list
+    /// saved naming it, then, `moved`, each of `from` deleted where it was. Filing that fails
+    /// deletes nothing (and takes away the sources it wrote).
+    fn file_and_remove(&mut self, account: &str, folder: &str, filing: Filing, from: Vec<MessageKey>, moved: bool) -> Result<(), CmdError> {
+        // A long write is kept until what was moved is deleted.
+        let _long = filing.finish().map_err(not_kept(folder))?;
         self.reload_folder(account, folder);
         self.recount_local(account, Some(&[folder.to_string()]));
         if moved {
@@ -197,21 +188,21 @@ impl Session {
         Ok(())
     }
 
-    /// Delete, where they were, messages whose copies are in `folder` now.
-    fn remove_moved(&mut self, keys: Vec<MessageKey>, folder: &str) {
-        let mut from: HashMap<String, Vec<MessageKey>> = HashMap::new();
-        for k in keys {
-            from.entry(k.account.clone()).or_default().push(k);
-        }
-        let mut accounts: Vec<String> = from.keys().cloned().collect();
-        accounts.sort();
-        for a in accounts {
-            let keys = from.remove(&a).unwrap_or_default();
+    /// Delete, where they were, messages whose copies are in `folder` now. Whether all of them
+    /// went.
+    fn remove_moved(&mut self, keys: Vec<MessageKey>, folder: &str) -> bool {
+        let mut all = true;
+        for (a, keys) in keys_by_account(keys) {
             // Its copy is there already: one that can't be deleted here stays, in both.
             if let Err(e) = self.apply_op_checked(&a, Op::Expunge { keys }) {
-                self.notice(format!("The mail was copied to {folder}, but couldn't be deleted where it was: {e}"), true);
+                self.notice(
+                    format!("The mail was copied to {}, but couldn't be deleted where it was: {e}", mailcraft_model::utf7::decode(folder)),
+                    true,
+                );
+                all = false;
             }
         }
+        all
     }
 
     /// A message's source came: it goes where it was moved or copied to while it wasn't here.
@@ -234,7 +225,13 @@ impl Session {
             }
             let held = self.import_holds(&t.account).and_then(|()| if t.moved { self.import_holds(&t.key.account) } else { Ok(()) });
             let (account, folder, moved) = (t.account.clone(), t.folder.clone(), t.moved);
-            if let Err(e) = held.and_then(|()| self.file_and_remove(&account, &folder, vec![t], moved, Some(raw))) {
+            let kept = held.and_then(|()| {
+                let store = self.store.clone().ok_or_else(|| CmdError::Failed("there is nowhere to keep it".into()))?;
+                let mut filing = Filing::new(&store, &account, &folder).map_err(not_kept(&folder))?;
+                Self::file_raw(&mut filing, raw.to_vec(), t.flags, t.date).map_err(not_kept(&folder))?;
+                self.file_and_remove(&account, &folder, filing, vec![t.key], moved)
+            });
+            if let Err(e) = kept {
                 self.notice(e.to_string(), true);
             }
         }
@@ -261,22 +258,28 @@ impl Session {
         failed: Vec<(MessageKey, String)>,
         moved: bool,
     ) {
-        let answered = |k: &MessageKey| done.contains(k) || failed.iter().any(|(f, _)| f == k);
+        // Looked up by key (each answer was looked for in the whole list: 10,000 took 0.85 s).
+        let answered: HashSet<&MessageKey> = done.iter().chain(failed.iter().map(|(k, _)| k)).collect();
         let done_count = done.len();
-        self.transfers.retain(|t| !(t.sent && t.account == account && t.folder == folder && answered(&t.key)));
+        self.transfers.retain(|t| !(t.sent && t.account == account && t.folder == folder && answered.contains(&t.key)));
+        drop(answered);
+        // Copies that couldn't be taken out where they were said so already: not "moved".
+        let mut said = false;
         if moved && !done.is_empty() {
             // The message open, if it's one of them, gives way to the next as in any move.
             let next = self.successor(&done);
-            let open = self.selection.iter().any(|k| done.contains(k));
-            self.remove_moved(done, folder);
-            if open {
+            let filed: HashSet<&MessageKey> = done.iter().collect();
+            let open = self.selection.iter().any(|k| filed.contains(k));
+            drop(filed);
+            said = !self.remove_moved(done, folder);
+            if open && !said {
                 self.after_removal(next);
             } else {
                 self.refresh_list();
             }
         }
         let arrived = done_count;
-        if arrived > 0 {
+        if arrived > 0 && !said {
             let did = if moved { "moved" } else { "copied" };
             let what = if arrived == 1 { "1 message".to_string() } else { format!("{arrived} messages") };
             self.notice(format!("{what} {did} to {}", mailcraft_model::utf7::decode(folder)), false);
@@ -284,7 +287,8 @@ impl Session {
         if let Some((_, why)) = failed.first() {
             let did = if moved { "moved" } else { "copied" };
             let n = failed.len();
-            self.notice(format!("{n} {} couldn't be {did} to {folder}: {why}", if n == 1 { "message" } else { "messages" }), true);
+            let to = mailcraft_model::utf7::decode(folder);
+            self.notice(format!("{n} {} couldn't be {did} to {to}: {why}", if n == 1 { "message" } else { "messages" }), true);
         }
     }
 

@@ -104,12 +104,12 @@ Content-Type: text/plain; charset=utf-8\r\n\r\nThe plan.\r\n";
     let Protection::Encrypted(body) = protection(&sent) else { panic!("{text}") };
     assert!(body.starts_with(b"-----BEGIN PGP MESSAGE-----\r\n"));
     // What was encrypted is the signed message, which reads back as what was signed.
-    let inner = with_entity(&sent, &encrypted);
+    let inner = super::super::with_entity(&sent, &encrypted);
     let Protection::Signed { content, signature } = protection(&inner) else { panic!("{}", String::from_utf8_lossy(&inner)) };
     assert_eq!(content, signed_over, "the signature covers exactly what's there");
     assert!(text.contains("Autocrypt: addr=riley") && !String::from_utf8_lossy(&encrypted).contains("Autocrypt"), "the key goes outside only");
     assert!(signature.starts_with(b"-----BEGIN PGP SIGNATURE-----\r\n"));
-    let read = crate::parse(&super::super::with_entity_protected(&inner, &content).0).unwrap_or_default();
+    let read = crate::parse(&super::super::with_entity_protected(&inner, &content).0).expect("the message parses");
     assert_eq!(read.subject, "Plan");
     assert_eq!(read.text.trim(), "The plan.");
     assert!(read.attachments.is_empty());

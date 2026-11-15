@@ -25,14 +25,7 @@ fn a_tables_footer_is_read_last() {
 #[test]
 fn a_footer_is_last_in_the_layout_too() {
     let html = r#"<table width="600"><thead><tr><th>ITEM</th><th>PRICE</th></tr></thead><tfoot><tr><td>TOTAL</td><td>$24.50</td></tr></tfoot><tbody><tr><td>MUG</td><td>$18.00</td></tr></tbody></table>"#;
-    let raw = format!(
-        "From: a@shop.example
-Subject: s
-Content-Type: text/html
-
-{html}"
-    );
-    let p = crate::parse(raw.as_bytes()).unwrap_or_default();
+    let p = crate::tests::util::message(html);
     assert!(!p.layout.is_empty(), "laid out");
     let order = |s: &str| (s.find("MUG"), s.find("TOTAL"));
     for (view, said) in [("layout", format!("{:?}", p.layout)), ("rich", format!("{:?}", p.rich)), ("text", p.text.clone())] {
@@ -90,14 +83,30 @@ fn footers_go_to_the_end_of_their_own_table() {
     );
 }
 
-/// Hostile markup is read once: footers and tables a megabyte deep, left open.
+/// Footers and tables a megabyte deep, left open.
+fn hostile_footers() -> impl Iterator<Item = String> {
+    ["<table><tfoot>", "<tfoot>", "<table><tfoot><tr><td>x</tfoot></table>", "<table>", "<!--<tfoot>", "<script><tfoot>", "< tfoot"]
+        .into_iter()
+        .map(|unit| unit.repeat(1_000_000 / unit.len()))
+}
+
+/// Hostile markup is read once: footers and tables a megabyte deep, left open. The bytes looked
+/// through are counted, held in proportion to the markup whatever the machine's load.
 #[test]
 fn hostile_footers_are_read_in_time() {
-    let started = std::time::Instant::now();
-    for unit in ["<table><tfoot>", "<tfoot>", "<table><tfoot><tr><td>x</tfoot></table>", "<table>", "<!--<tfoot>", "<script><tfoot>", "< tfoot"] {
-        let html = unit.repeat(1_000_000 / unit.len());
-        let out = footers_last(&html);
-        assert!(out.len() <= html.len(), "{unit}");
+    for html in hostile_footers() {
+        let out = mailcraft_model::work::linear(html.len(), || footers_last(&html));
+        assert!(out.len() <= html.len(), "{}", &html[..20]);
     }
-    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+/// How long those take: `cargo test --release -p mailcraft-mime --lib how_long_hostile_footers_take -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn how_long_hostile_footers_take() {
+    for html in hostile_footers() {
+        let started = std::time::Instant::now();
+        let _ = footers_last(&html);
+        println!("MEASURE footers of a megabyte of {:?}: {} ms", &html[..20], started.elapsed().as_millis());
+    }
 }

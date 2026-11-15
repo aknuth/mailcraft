@@ -72,6 +72,7 @@
 	Edit rule	Изменить правило
 	Email address	Адрес электронной почты
 	Enter the password for {email}.	Введите пароль для {email}.
+	Enter the password for {email}, which signs in as {user}.	Введите пароль для {email}: вход выполняется под именем {user}.
 	Favorites	Избранное
 	Feb	фев
 	File	Файл
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	Отмечать письма прочитанными при открытии
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Отправителей пока нет.
-	Not available: the sample mailbox has no server.	Недоступно: у примера почтового ящика нет сервера.
+	Not available: this mailbox has no server.	Недоступно: у этого почтового ящика нет сервера.
 	Not available: {error}	Недоступно: {error}
 	On	Включены
 	On from {from}	Включены с {from}
@@ -840,7 +841,8 @@
 	Formatted	С форматированием
 	HTML code	HTML-код
 	From a file…	Из файла…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	Вставьте HTML подписи, созданной в другом месте, или откройте подпись, сохранённую как веб-страница (.htm из Outlook). Она отправляется в том виде, в каком написана; пока вы пишете, в письме виден её текст.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	Вставьте HTML подписи, созданной в другом месте, или откройте подпись, сохранённую как веб-страница (.htm из Outlook). Она отправляется в том виде, в каком написана, и так же выглядит, пока вы пишете.
+	Your signature as it will be sent. To change it, pick Signature above the message.	Ваша подпись в том виде, в каком она будет отправлена. Чтобы изменить её, выберите «Подпись» над письмом.
 	{name} can't be read as a signature	{name} не удаётся прочитать как подпись
 	All contacts	Все контакты
 	Always open with this address book	Всегда открывать эту адресную книгу
@@ -932,6 +934,9 @@
 	Name on mail from it	Имя в письмах с этого адреса
 	Replies go to	Ответы приходят на
 	(the account's own)	(подпись учётной записи)
+	Write new mail from this address	Писать новые письма с этого адреса
+	A new message starts from this address, not from {email}. Pick another in From as ever.	Новое письмо начинается с этого адреса, а не с {email}. В поле «От» по-прежнему можно выбрать другой.
+	{address} (new mail)	{address} (новые письма)
 	Add…	Добавить…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	Его папки появятся в этой учётной записи. Нужен доступ к нему на сервере Exchange; ящики с полным доступом открываются сами.
 	Mailboxes you have full access to open by themselves.	Ящики с полным доступом открываются сами.
@@ -1106,6 +1111,7 @@ month	May	Май
 	Check before sending	Проверьте перед отправкой
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address} похож на адрес в {like}, но им не является. Это правильный адрес?
 	{n} people who may not know each other will all see each other's addresses.	{n} человек, возможно незнакомых друг с другом, увидят адреса всех остальных.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	Среди получателей найдено то, на что стоит взглянуть, но показать это нельзя. Проверьте их перед отправкой.
 	Put everyone in Bcc	Поместить всех в скрытую копию
 	Each of them gets the message without seeing who else did; you're in To	Каждый получит письмо, не видя остальных получателей; вы будете в поле «Кому»
 	Open links without their tracking	Открывать ссылки без отслеживания
@@ -1445,6 +1451,7 @@ month	May	Май
 	Calendar and contacts couldn't be read: changes to them won't be saved	Не удалось прочитать календарь и контакты: изменения в них не будут сохранены
 	Your rules couldn't be read: changes to them won't be saved	Не удалось прочитать ваши правила: изменения в них не будут сохранены
 	Snoozed mail couldn't be read: changes to it won't be saved	Не удалось прочитать отложенную почту: изменения в ней не будут сохранены
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	Не удалось прочитать, на какие письма отвечают ответы, ожидающие в «Исходящих»: эти письма могут не быть помечены как отвеченные
 	Checking your data file	Проверка файла данных
 	Opening your mail…	Открытие почты…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	Файл {file} в прошлый раз не был закрыт правильно. MailCraft проверяет его; для большого файла это может занять минуту-другую.
@@ -1462,6 +1469,8 @@ month	May	Май
 	Some results may be missing: still indexing	Некоторые результаты могут отсутствовать: индексация ещё идёт
 	Some long messages were searched only in part	Некоторые длинные сообщения просмотрены не полностью
 	Couldn't read the date “{value}”	Не удалось прочитать дату «{value}»
+	Couldn't read “{value}”	Не удалось прочитать «{value}»
+	Part of a long search was left out	Часть длинного запроса не учтена
 	Received after	Получено после
 	Received before	Получено до
 	About {h} h {m} min left	Осталось около {h} ч {m} мин
@@ -1708,3 +1717,7 @@ month	May	Май
 	Nothing to do	Дел нет
 	Nothing in the next 7 days	В ближайшие 7 дней ничего нет
 	Show the calendar, what's coming up and your tasks beside the mail	Показывать календарь, ближайшие встречи и задачи рядом с почтой
+	Read / Unread (Ctrl+Q / Ctrl+U)	Прочитано / Не прочитано (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	Не удалось загрузить {name}: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	В окне что-то пошло не так, и то, что оно делало, остановлено. MailCraft продолжает работу; в журнале указано, где это произошло.
+	Font size	Размер шрифта

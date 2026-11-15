@@ -6,29 +6,33 @@ use super::*;
 mod measure;
 #[cfg(test)]
 pub(crate) use measure::measured;
-pub(crate) use measure::{Fit, PictureWidth, measured_with};
+pub(crate) use measure::{Fit, Held, PictureWidth, fonts_stamp, measured_with};
+
+/// What every row of one table is drawn with.
+#[derive(Clone, Copy)]
+pub(crate) struct Rows<'a> {
+    /// The widths the table's columns ask for (a width set in one row is the whole column's, as
+    /// HTML sizes columns).
+    pub(super) columns: &'a [Option<mime::layout::Width>],
+    /// What the columns hold ([`measure`]).
+    pub(super) content: &'a [Option<Fit>],
+    /// The room across inside the table.
+    pub(super) width: f32,
+    /// The colour the table is drawn on.
+    pub(super) page: [u8; 3],
+    pub(super) room: Room,
+    /// How deep the table is ([`MAX_NESTED`]).
+    pub(super) depth: usize,
+}
 
 impl Body<'_> {
-    /// A table row: its cells side by side, or one under the other when there's no room.
-    /// `columns`: the widths the table's columns ask for (a width set in one row is the whole
-    /// column's, as HTML sizes columns), and `content` what they hold ([`measure`]). Side by
+    /// A table row: its cells side by side, or one under the other when there's no room. Side by
     /// side, the row is as tall as its tallest cell (or the height one asks for, issue #47): each
     /// cell's background fills it, and its content sits at the top, in the middle or at the
     /// bottom, as its `valign` says. Heights are those the
     /// cells' content took the frame before (egui lays out once), so a row settles a frame on.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn row(
-        &mut self,
-        st: &mut UiState,
-        ui: &mut Ui,
-        row: &[mime::layout::Cell],
-        columns: &[Option<mime::layout::Width>],
-        content: &[Option<Fit>],
-        width: f32,
-        page: [u8; 3],
-        room: Room,
-        depth: usize,
-    ) {
+    pub(crate) fn row(&mut self, st: &mut UiState, ui: &mut Ui, row: &[mime::layout::Cell], rows: Rows) {
+        let Rows { columns, content, width, page, room, depth } = rows;
         let (widths, stack) = cell_widths(row, columns, content, width, room.spacing);
         let heights_id = ui.next_auto_id().with("cell-heights");
         let known: Vec<f32> = ui.ctx().data(|d| d.get_temp(heights_id)).unwrap_or_default();
@@ -151,6 +155,11 @@ pub(super) fn table_place(own: mime::layout::Align, content: mime::layout::Align
     if own == mime::layout::Align::Left { content } else { own }
 }
 
+/// Wider than this unwrapped, what a cell holds is a paragraph: squeezed into a column narrower
+/// than [`MIN_COLUMN`] it reads badly, and the row's cells go one under the other. Shorter (a
+/// line of an address), it wraps once at most in a column that holds its widest word.
+const PARAGRAPH: f32 = 2.0 * MIN_COLUMN;
+
 /// Each cell's width in a row `width` wide, `spacing` between the cells, `columns` the widths the
 /// table's columns ask for and `content` what they hold ([`measure`]); and whether the cells
 /// stack instead, one too narrow to read beside the others. What cells ask for (pixels, or a
@@ -270,7 +279,11 @@ pub(crate) fn cell_widths(
     // Stacked when a column is squeezed too narrow to read; one as narrow as it asks (a
     // business card's photo, issue #11), or as its content (measured), stays beside the others:
     // one measured is squeezed when it can't hold its widest word, or when the row has less room
-    // than an even share of it would need and it would take more.
+    // than an even share of it would need and it would take more. Beside cells that say how
+    // wide they are (columns their writer set out), that's only for a paragraph, which would
+    // take much more: short lines (an address beside a name and a logo, issue #90) wrap a
+    // little and stay. A signature in three columns went one under the other in a pane of the
+    // usual width, its dividing line with it, where a browser keeps the columns.
     let even = if free > 0 { room / free as f32 } else { f32::INFINITY };
     let squeezed = |w: f32, asked: Option<f32>, fit: Option<Fit>, share: bool| {
         w < MIN_COLUMN
@@ -278,7 +291,7 @@ pub(crate) fn cell_widths(
                 // A share is as much of the row as it can have: too little only for what it holds.
                 (Some(_), f) if share => f.is_some_and(|f| w + 0.5 < f.min),
                 (Some(a), _) => w + 0.5 < a,
-                (None, Some(f)) if auto => w + 0.5 < f.min || (even < MIN_COLUMN && w + 0.5 < f.max),
+                (None, Some(f)) if auto => w + 0.5 < f.min || (even < MIN_COLUMN && w + 0.5 < f.max && (f.max > PARAGRAPH || fixed <= 0.0)),
                 (None, _) => true,
             }
     };
@@ -327,7 +340,6 @@ pub(super) fn room_margin(p: [f32; 4]) -> Margin {
 /// row (HTML sizes a whole column so; only the first row set it in a report whose other rows then
 /// lined up elsewhere).
 pub(crate) fn column_widths(rows: &[Vec<mime::layout::Cell>]) -> Vec<Option<mime::layout::Width>> {
-    const MAX_COLUMNS: usize = 64;
     let mut out: Vec<Option<mime::layout::Width>> = Vec::new();
     for row in rows {
         let mut col = 0usize;

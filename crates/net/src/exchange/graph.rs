@@ -10,16 +10,16 @@
 //! JMAP transport's ([`jmap::State`], [`jmap::folders`]). Several small requests go as one
 //! `$batch` (four per batch; see [`BATCH`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mailcraft_mime as mime;
-use mailcraft_model::{Flag, Flags, Folder, FolderRole, MessageKey, Op, SharedSummary, Summary, sort_newest_first, utf7};
-use mailcraft_store::{FolderState, Store};
+use mailcraft_model::{Flag, Flags, Folder, FolderRole, MessageKey, Op, Summary};
+use mailcraft_store::Store;
 use serde_json::{Value, json};
 
 use crate::http::{self, Request, Response};
 use crate::jmap::{self, Mailbox, State, VALIDITY};
-use crate::sync::{SyncOptions, SyncReport, WordQuery, fill_from_source, if_kept};
+use crate::sync::{SyncOptions, SyncReport, WordQuery};
 use crate::{NetError, Result};
 
 /// The Graph endpoint accounts use.
@@ -68,8 +68,13 @@ pub(crate) const NO_MAILBOX: &str = "this Microsoft account has no Outlook.com o
 If its mail is with another provider (such as Gmail), add it with that provider's settings instead";
 
 fn status_error(status: u16, body: &[u8]) -> Result<()> {
-    let error = serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("error").cloned());
-    let field = |k: &str| error.as_ref().and_then(|e| e.get(k)).and_then(Value::as_str).unwrap_or_default().to_string();
+    status_error_of(status, serde_json::from_slice::<Value>(body).ok().as_ref())
+}
+
+/// [`status_error`] of an answer already read (a `$batch` entry's body).
+fn status_error_of(status: u16, body: Option<&Value>) -> Result<()> {
+    let error = body.and_then(|v| v.get("error"));
+    let field = |k: &str| error.and_then(|e| e.get(k)).and_then(Value::as_str).unwrap_or_default().to_string();
     let detail = || {
         let message = field("message");
         if message.is_empty() { field("code") } else { message }
@@ -81,6 +86,10 @@ fn status_error(status: u16, body: &[u8]) -> Result<()> {
         200..=299 => Ok(()),
         401 => Err(NetError::Auth("Microsoft refused the sign-in; sign in again".into())),
         429 | 500..=599 => Err(NetError::Closed(format!("HTTP {status}"))),
+        404 => Err(NetError::No(format!("{} ({})", crate::ews::GONE, format!("HTTP 404 {}", detail()).trim()))),
+        400 if field("code").starts_with(crate::ews::INVALID_ID) => {
+            Err(NetError::No(format!("{} ({})", crate::ews::NO_SUCH_ID, format!("HTTP 400 {}", detail()).trim())))
+        }
         s => Err(NetError::No(format!("HTTP {s} {}", detail()).trim().to_string())),
     }
 }
@@ -89,7 +98,7 @@ fn json_body(body: &[u8]) -> Result<Value> {
     serde_json::from_slice(body).map_err(|e| NetError::Protocol(format!("Graph: {e}")))
 }
 
-fn seg(id: &str) -> String {
+pub(crate) fn seg(id: &str) -> String {
     http::pct(id)
 }
 
@@ -98,7 +107,7 @@ impl Client {
     pub fn connect(base: &str, token: &str) -> Result<Client> {
         let base = base.trim().trim_end_matches('/').to_string();
         let url = http::Url::parse(&base)?;
-        if !url.https && !matches!(url.host.as_str(), "127.0.0.1" | "localhost") {
+        if !url.https && !http::is_loopback(&url.host) {
             return Err(NetError::Tls("the Graph address isn't https".into()));
         }
         let c = Client { base, auth: format!("Bearer {token}") };
@@ -210,8 +219,7 @@ impl Client {
             if status == 404 {
                 continue;
             }
-            let bytes = serde_json::to_vec(&body).unwrap_or_default();
-            status_error(status, &bytes)?;
+            status_error_of(status, Some(&body))?;
         }
         Ok(())
     }
@@ -239,10 +247,11 @@ impl Client {
         let skip: Vec<String> = ids.iter().skip(roles.len()).flatten().cloned().collect();
 
         let mut out: Vec<Mailbox> = Vec::new();
+        let mut listed: HashSet<String> = HashSet::new();
         let mut pending: Vec<Value> = self.all(&format!("/me/mailFolders?$top=100&$select={FOLDER_FIELDS}"), MAX_FOLDERS)?;
         while let Some(f) = pending.pop() {
             let Some(id) = f.get("id").and_then(Value::as_str).map(str::to_string) else { continue };
-            if skip.contains(&id) || out.iter().any(|m| m.id == id) || out.len() >= MAX_FOLDERS {
+            if skip.contains(&id) || out.len() >= MAX_FOLDERS || !listed.insert(id.clone()) {
                 continue;
             }
             if f.get("childFolderCount").and_then(Value::as_u64).unwrap_or(0) > 0 {
@@ -261,8 +270,8 @@ impl Client {
         Ok(out)
     }
 
-    /// The newest `limit` messages of a folder with their list details ([`LIST_FIELDS`]), and its
-    /// (total, unread).
+    /// The newest `window` messages of a folder with their list details ([`LIST_FIELDS`]), and
+    /// its (total, unread).
     fn newest(&self, folder: &str, window: usize) -> Result<(Vec<Value>, (u32, u32))> {
         let page = window.clamp(1, 1000);
         let mut entries = self.all(
@@ -270,10 +279,9 @@ impl Client {
             window.min(100_000),
         )?;
         entries.retain(|m| m["id"].is_string());
-        let ids = entries;
         let f = self.get(&format!("/me/mailFolders/{}?$select=totalItemCount,unreadItemCount", seg(folder)))?;
         let count = |k: &str| f.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
-        Ok((ids, (count("totalItemCount"), count("unreadItemCount"))))
+        Ok((entries, (count("totalItemCount"), count("unreadItemCount"))))
     }
 
     /// Of these messages, those still in a folder, with their flags (through `$batch`).
@@ -308,7 +316,7 @@ impl Client {
     /// A message from its MIME source, as a draft (Graph files it in Drafts), moved to `folder`
     /// when that's somewhere else. Its id.
     pub fn import(&self, raw: &[u8], folder: Option<&str>) -> Result<String> {
-        let v = self.send_raw("POST", "/me/messages", "text/plain", crate::imap::base64(raw).into_bytes())?;
+        let v = self.send_raw("POST", "/me/messages", "text/plain", mailcraft_model::base64::encode(raw).into_bytes())?;
         let id = v.get("id").and_then(Value::as_str).ok_or_else(|| NetError::Protocol("Graph: the message wasn't made".into()))?.to_string();
         if let Some(f) = folder {
             let parent = v.get("parentFolderId").and_then(Value::as_str).unwrap_or_default();
@@ -322,7 +330,7 @@ impl Client {
 
     /// Send a MIME message; Exchange files the copy in Sent Items.
     pub fn send_mime(&self, raw: &[u8]) -> Result<()> {
-        self.send_raw("POST", "/me/sendMail", "text/plain", crate::imap::base64(raw).into_bytes()).map(|_| ()).map_err(|e| match e {
+        self.send_raw("POST", "/me/sendMail", "text/plain", mailcraft_model::base64::encode(raw).into_bytes()).map(|_| ()).map_err(|e| match e {
             NetError::No(m) | NetError::Bad(m) => NetError::Smtp(m),
             e => e,
         })
@@ -336,10 +344,7 @@ impl Client {
             v.get(k).and_then(|d| d.get("dateTime")).and_then(Value::as_str).and_then(|d| d.get(..10)).filter(|d| mailcraft_model::job::is_day(d))
         };
         let scheduled = status == "scheduled";
-        let reply = |k: &str| {
-            let html = v.get(k).and_then(Value::as_str).unwrap_or_default();
-            if html.contains('<') { mime::html_to_text(html).trim().to_string() } else { html.trim().to_string() }
-        };
+        let reply = |k: &str| crate::exchange::reply_text(v.get(k).and_then(Value::as_str).unwrap_or_default());
         let (text, external) = (reply("internalReplyMessage"), reply("externalReplyMessage"));
         let outside = match v.get("externalAudience").and_then(Value::as_str).unwrap_or("all").to_ascii_lowercase().as_str() {
             "none" => "none",
@@ -358,7 +363,7 @@ impl Client {
     }
 
     pub fn set_vacation(&self, v: &mailcraft_model::job::Vacation) -> Result<()> {
-        let html = |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\n', "<br>");
+        let html = crate::exchange::reply_html;
         let dated = v.from.is_some() || v.until.is_some();
         let audience = match v.outside.as_str() {
             "none" => "none",
@@ -510,7 +515,7 @@ fn batch_entry(i: usize, (method, url, body): &(&str, String, Option<Value>)) ->
 /// A batch entry's `Retry-After`, whatever case the key has and whether it's a string or number.
 fn entry_retry_after(r: &Value) -> Option<String> {
     let headers = r.get("headers")?.as_object()?;
-    match ["Retry-After", "retry-after", "RETRY-AFTER"].iter().find_map(|k| headers.get(*k))? {
+    match headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Retry-After"))?.1 {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
@@ -558,18 +563,19 @@ fn message_summary(m: &Value, key: MessageKey) -> Summary {
 /// The messages of `folder` the server finds for a search (issue #4), the newest `cap` of them:
 /// its words through `$search` (KQL), or, with none, its read and flag conditions through
 /// `$filter`. Those not kept yet come into its list and stay there past the window while the
-/// folder has them. Their keys, and how many came in.
+/// folder has them. Their keys, and how many came in. Nothing written once the account was
+/// removed since it had been removed `seen` times: an error then.
 pub fn find_on_server(
     c: &Client,
     st: &mut State,
     store: &Store,
-    account: &str,
+    (account, seen): (&str, u64),
     folder: &str,
     query: &WordQuery,
     cap: usize,
 ) -> Result<(Vec<MessageKey>, usize)> {
     let id = st.mailbox(folder)?.to_string();
-    let mut fs = store.load_folder(account, folder)?;
+    let fs = store.load_folder(account, folder)?;
     if fs.validity != VALIDITY {
         return Ok((Vec::new(), 0));
     }
@@ -593,41 +599,28 @@ pub fn find_on_server(
     let found: Vec<&Value> =
         found.iter().filter(|m| query.admits(&flags(m), m.get("hasAttachments").and_then(Value::as_bool).unwrap_or(false))).collect();
     let mut numbers = Vec::new();
-    let mut new = 0;
+    let mut have = crate::exchange::window::kept_numbers(&fs);
+    let mut new = Vec::new();
     for m in found {
         let Some(mid) = m.get("id").and_then(Value::as_str) else { continue };
         let key = MessageKey { account: account.to_string(), folder: folder.to_string(), validity: VALIDITY, uid: st.number(mid) };
         numbers.push(key.uid);
-        if fs.find(key.uid).is_none() {
-            fs.messages.push(message_summary(m, key).into());
-            new += 1;
+        if have.insert(key.uid) {
+            new.push(message_summary(m, key));
         }
     }
-    st.add_found(folder, &numbers);
-    if new > 0 {
-        sort_newest_first(&mut fs.messages);
-        fs.uid_next = fs.messages.iter().map(|m| m.key.uid).max().unwrap_or(0).saturating_add(1);
-        store.save_folder(account, folder, &fs)?;
-    }
-    Ok((numbers.iter().filter_map(|n| fs.find(*n).map(|m| m.key.clone())).collect(), new))
+    crate::exchange::window::found(st, store, (account, seen), folder, fs, &numbers, new)
 }
 
-/// Download one message's source (and cache it).
-pub fn fetch_body(c: &Client, st: &State, store: &Store, key: &MessageKey) -> Result<(Vec<u8>, Option<Summary>)> {
-    if let Some(raw) = store.read_body(key) {
-        return Ok((raw, None));
-    }
-    let id = st.id(key.uid).filter(|_| key.validity == VALIDITY).ok_or_else(|| NetError::No("the message is no longer on the server".into()))?;
-    let raw = c.download(id)?;
-    let filled = crate::sync::keep_source(store, key, &raw)?;
-    Ok((raw, filled))
+/// Download one message's source (and cache it, unless the account was removed since it had been
+/// removed `seen` times).
+pub fn fetch_body(c: &Client, st: &State, store: &Store, key: &MessageKey, seen: u64) -> Result<(Vec<u8>, Option<Summary>)> {
+    crate::exchange::window::fetch_body(st, store, key, seen, |id| c.download(id))
 }
 
 /// Apply one change on the server.
 pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
-    let ids = |keys: &[MessageKey]| -> Vec<(String, String)> {
-        keys.iter().filter(|k| k.validity == VALIDITY).filter_map(|k| Some((st.id(k.uid)?.to_string(), k.folder.clone()))).collect()
-    };
+    let ids = |keys: &[MessageKey]| crate::exchange::window::server_ids(st, keys);
     let patch_all = |keys: &[MessageKey], patch: Value| -> Result<()> {
         let reqs: Vec<(&str, String, Option<Value>)> =
             ids(keys).into_iter().map(|(id, _)| ("PATCH", format!("/me/messages/{}", seg(&id)), Some(patch.clone()))).collect();
@@ -654,14 +647,14 @@ pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
             c.batch_ok(&reqs)
         }
         Op::CreateFolder { path } => {
-            let (parent, name) = split_path(st, path)?;
+            let (parent, name) = st.split_path(path)?;
             let at = parent.map_or_else(|| "/me/mailFolders".to_string(), |p| format!("/me/mailFolders/{}/childFolders", seg(&p)));
             c.post(&at, &json!({"displayName": name})).map(|_| ())
         }
         Op::RenameFolder { from, to } => {
             let id = st.mailbox(from)?.to_string();
-            let (old_parent, _) = split_path(st, from)?;
-            let (parent, name) = split_path(st, to)?;
+            let (old_parent, _) = st.split_path(from)?;
+            let (parent, name) = st.split_path(to)?;
             let mut id = id;
             if parent != old_parent {
                 let dest = parent.clone().unwrap_or_else(|| "msgfolderroot".into());
@@ -679,14 +672,6 @@ pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
     }
 }
 
-/// The parent folder id (`None` at the top) and the leaf name of a folder path.
-fn split_path(st: &State, path: &str) -> Result<(Option<String>, String)> {
-    match path.rsplit_once('/') {
-        Some((parent, leaf)) => Ok((Some(st.mailbox(parent)?.to_string()), utf7::decode(leaf))),
-        None => Ok((None, utf7::decode(path))),
-    }
-}
-
 /// Store a draft in a folder.
 pub fn append(c: &Client, st: &State, folder: &str, raw: &[u8]) -> Result<String> {
     c.import(raw, Some(st.mailbox(folder)?))
@@ -695,14 +680,10 @@ pub fn append(c: &Client, st: &State, folder: &str, raw: &[u8]) -> Result<String
 /// Send a message. The MIME source names the recipients for Exchange, so anyone only on the
 /// envelope (Bcc) goes into a `Bcc:` header, which Exchange removes before delivery.
 pub fn send(c: &Client, raw: &[u8], recipients: &[String]) -> Result<()> {
-    let shown: Vec<String> = mime::parse(raw).map(|p| p.to.iter().chain(&p.cc).map(|a| a.email.to_ascii_lowercase()).collect()).unwrap_or_default();
-    let bcc: Vec<&str> = recipients.iter().map(String::as_str).filter(|r| !shown.contains(&r.to_ascii_lowercase())).collect();
-    if bcc.is_empty() {
-        return c.send_mime(raw);
+    match crate::exchange::window::with_bcc(raw, recipients) {
+        Some(with) => c.send_mime(&with),
+        None => c.send_mime(raw),
     }
-    let mut with = format!("Bcc: {}\r\n", bcc.join(", ")).into_bytes();
-    with.extend_from_slice(raw);
-    c.send_mime(&with)
 }
 
 mod directory;
@@ -762,5 +743,26 @@ mod tests {
         let e = status_error(403, br#"{"error": {"code": "ErrorAccessDenied", "message": "Access is denied."}}"#);
         assert!(matches!(e, Err(NetError::No(m)) if m == "HTTP 403 Access is denied."));
         assert!(Client::connect("http://graph.example.com/v1.0", "t").is_err(), "https only, except on this computer");
+        // A batch entry's refusal read from its body as it came, and its wait in any case.
+        let denied = json!({"error": {"code": "ErrorAccessDenied", "message": "Access is denied."}});
+        assert!(matches!(status_error_of(403, Some(&denied)), Err(NetError::No(m)) if m == "HTTP 403 Access is denied."));
+        assert!(status_error_of(200, Some(&Value::Null)).is_ok());
+        for headers in [json!({"Retry-after": "7"}), json!({"RETRY-AFTER": 7}), json!({"retry-After": "7"})] {
+            assert_eq!(entry_retry_after(&json!({ "headers": headers })).as_deref(), Some("7"));
+        }
+    }
+
+    /// A picture the body shows comes in the text first as such (its Content-ID, inline), as in
+    /// EWS's; a file, or a picture with no Content-ID, is a file.
+    #[test]
+    fn a_text_firsts_inline_picture_is_inline() {
+        let v = json!({"subject": "Logo", "body": {"contentType": "html", "content": "<p><img src=\"cid:logo@x\"></p>"},
+            "attachments": [
+                {"name": "logo.png", "contentType": "image/png", "size": 120, "isInline": true, "contentId": "logo@x"},
+                {"name": "notes.pdf", "contentType": "application/pdf", "size": 900, "isInline": false},
+                {"name": "odd.png", "contentType": "image/png", "size": 5, "isInline": true}]});
+        let p = mime::parse(&text_first::text_first(&v).unwrap()).unwrap();
+        let files: Vec<(&str, bool, Option<&str>)> = p.attachments.iter().map(|a| (a.name.as_str(), a.inline, a.content_id.as_deref())).collect();
+        assert_eq!(files, [("logo.png", true, Some("logo@x")), ("notes.pdf", false, None), ("odd.png", false, None)]);
     }
 }

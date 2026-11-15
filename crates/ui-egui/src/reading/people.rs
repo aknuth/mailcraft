@@ -7,10 +7,7 @@ pub(super) const MAX_PEOPLE_SHOWN: usize = 50;
 
 /// The contact someone is saved as, if they are (by address).
 pub(super) fn known_contact<'a>(s: &'a Session, email: &str) -> Option<&'a mailcraft_engine::model::vcard::Card> {
-    if email.trim().is_empty() {
-        return None;
-    }
-    s.people(email).into_iter().find(|x| x.card.emails.iter().any(|e| e.value.eq_ignore_ascii_case(email))).map(|x| x.card)
+    s.contact_by_address(email)
 }
 
 /// Someone's name above a message, as a link: lit and underlined under the pointer.
@@ -23,14 +20,16 @@ pub(super) fn person_link(ui: &mut Ui, t: &Tokens, text: RichText) -> egui::Resp
 }
 
 /// What a name above a message opens: a contact card on a click (or double-click), as
-/// Outlook's, and the same things on a right-click.
+/// Outlook's, and the same things on a right-click. The contact they're saved as is looked up
+/// only while one of them is open (for each name on every frame, it read through the address
+/// book up to fifty times a frame).
 pub(super) fn person_menus(s: &Session, t: &Tokens, r: &egui::Response, a: &EmailAddress, acts: &mut Vec<Action>) {
     if a.email.trim().is_empty() {
         return;
     }
-    let known = known_contact(s, &a.email);
-    egui::Popup::menu(r).id(r.id.with("card")).show(|ui| contact_card(ui, t, a, known, acts));
+    egui::Popup::menu(r).id(r.id.with("card")).show(|ui| contact_card(ui, t, a, known_contact(s, &a.email), acts));
     r.context_menu(|ui| {
+        let known = known_contact(s, &a.email);
         if ui.button(tl!("Send email")).clicked() {
             acts.push(Action::Run("mail.new", json!({"to": a.to_string()})));
             ui.close();

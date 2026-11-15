@@ -14,6 +14,7 @@
 //! had here. What Outlook has no place for stays in the item's text, as the import reads it back
 //! (`pst_pim::rest`).
 
+use mailcraft_model::hash::Fnv;
 use mailcraft_model::pim::{NOTE_COLORS, NOTE_YELLOW, Note, Pim};
 use mailcraft_pst::{
     GuidValue, PS_PUBLIC_STRINGS,
@@ -28,9 +29,8 @@ mod batch;
 use batch::write_batch;
 pub(super) use batch::{Lists, lists, properties};
 
-/// PSETID_Address and PSETID_Note (MS-OXPROPS 1.3.2).
-pub(super) const PSETID_ADDRESS: GuidValue = GuidValue::new(0x0006_2004, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
-const PSETID_NOTE: GuidValue = GuidValue::new(0x0006_200E, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+pub(super) use crate::data_files::outlook::PSETID_ADDRESS;
+use crate::data_files::outlook::PSETID_NOTE;
 /// A note's size in Outlook's window, as Outlook makes one (PidLidNoteWidth, PidLidNoteHeight).
 const NOTE_SIZE: (i32, i32) = (200, 166);
 /// Names tried for a new file's folder that the account's mail took already: "Notes (2)" and on.
@@ -141,9 +141,9 @@ impl Item {
     /// FNV-1a (64 bits) over the item's class, subject, text, properties and files, each part
     /// with its length, so the same item always gives the same digest, whatever version wrote it.
     fn digest(&self) -> u64 {
-        let mut h = Fnv(0xCBF2_9CE4_8422_2325);
+        let mut h = Fnv::new();
         self.digest_into(&mut h);
-        h.0
+        h.value()
     }
 
     fn digest_into(&self, h: &mut Fnv) {
@@ -213,14 +213,16 @@ fn value_digest(h: &mut Fnv, value: &Value) {
     }
 }
 
-/// An FNV-1a hash being made.
-struct Fnv(u64);
+/// A piece of what an item is digested from, its length first (so pieces can't run into each
+/// other): FNV-1a of the lot.
+trait Part {
+    fn part(&mut self, bytes: &[u8]);
+}
 
-impl Fnv {
+impl Part for Fnv {
     fn part(&mut self, bytes: &[u8]) {
-        for b in u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes().iter().chain(bytes) {
-            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01B3);
-        }
+        self.add(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        self.add(bytes);
     }
 }
 
@@ -248,9 +250,9 @@ pub(super) struct Written {
 /// What a mark says of the account whose item it is: a digest of its id (16 hex digits), so two
 /// accounts exported into one file each know their own copies and never take out the other's.
 fn owner_key(account: &str) -> String {
-    let mut h = Fnv(0xCBF2_9CE4_8422_2325);
+    let mut h = Fnv::new();
     h.part(account.as_bytes());
-    format!("{:016x}", h.0)
+    format!("{:016x}", h.value())
 }
 
 /// The account's items for each of the file's folders, those it has, each marked as `account`'s;
@@ -312,12 +314,14 @@ pub(super) fn write(
         *created = true;
     }
     for (role, items) in all {
-        let (names, recorded) = folder_for(path, role, existing, taken);
+        let (names, recorded) = folder_for(path, role, existing, taken)?;
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         // Added to again: an item the folder has as it is now isn't written twice, and the
         // copies it has of an item as it was before (its uid, another digest) go once the item
         // is in as it is now.
-        let had = if existing { already(path, &names) } else { Vec::new() };
+        // One that can't be read back isn't taken for a folder with none of them: they'd all go
+        // in again.
+        let had = if existing { already(path, &names).map_err(|e| format!("the data file couldn't be read back: {e}"))? } else { Vec::new() };
         let earlier = earlier_copies(&had, &items, &key);
         let marks: HashSet<&str> = had.iter().map(|(m, _)| m.as_str()).collect();
         let count = items.len();
@@ -366,12 +370,14 @@ pub(super) fn write(
 /// The folder `role`'s items go in, and whether the file records it as such already: the one a
 /// file added to records, else the role's name, or that name with a number when the account's mail
 /// took it, or a file added to has a folder of another kind by that name (its mail folder `Notes`,
-/// say).
-fn folder_for(path: &Path, role: Special, existing: bool, taken: &[Vec<String>]) -> (Vec<String>, bool) {
-    if existing && let Ok(Some(names)) = write::special_folder(path, role) {
-        return (names, true);
+/// say). An error when a file added to can't be read back: one whose record of the folder can't
+/// be read isn't taken for one that records none (the items went into a second folder, beside
+/// the copies in the one it records).
+pub(super) fn folder_for(path: &Path, role: Special, existing: bool, taken: &[Vec<String>]) -> Result<(Vec<String>, bool), String> {
+    if existing && let Some(names) = write::special_folder(path, role).map_err(|e| format!("the data file couldn't be read back: {e}"))? {
+        return Ok((names, true));
     }
-    let other = if existing { top_folders(path) } else { Vec::new() };
+    let other = if existing { top_folders(path).map_err(|e| format!("the data file couldn't be read back: {e}"))? } else { Vec::new() };
     let other: Vec<&str> = other.iter().filter(|(_, class)| !class.eq_ignore_ascii_case(role.container_class())).map(|(n, _)| n.as_str()).collect();
     let free = |name: &str| {
         !taken.iter().any(|t| t.first().is_some_and(|f| f.eq_ignore_ascii_case(name))) && !other.iter().any(|o| o.eq_ignore_ascii_case(name))
@@ -381,7 +387,7 @@ fn folder_for(path: &Path, role: Special, existing: bool, taken: &[Vec<String>])
         .chain((2..=MAX_SUFFIX).map(|n| format!("{name} ({n})")))
         .find(|n| free(n))
         .unwrap_or_else(|| name.to_string());
-    (vec![name], false)
+    Ok((vec![name], false))
 }
 
 /// The mark an item carries (`pst_pim::EXPORTED_ITEM`), when it has a uid.
@@ -393,23 +399,19 @@ fn mark(item: &Item) -> Option<&str> {
 }
 
 /// The folders at the top of the file at `path`: each one's name and container class (a folder
-/// that says none holds mail, `IPF.Note`); none when it can't be read.
-fn top_folders(path: &Path) -> Vec<(String, String)> {
-    let read = || -> io::Result<Vec<(String, String)>> {
-        let any = store_of(path)?;
-        let top = any.open_folder(any.ipm_subtree()?)?;
-        let Some(table) = top.hierarchy_table() else { return Ok(Vec::new()) };
-        let mut out = Vec::new();
-        for row in table.rows_matrix() {
-            let Ok(f) = any.open_folder(row.id()) else { continue };
-            let Ok(name) = f.properties().display_name() else { continue };
-            let class =
-                f.properties().get(0x3613).and_then(crate::pst::text_of).filter(|c| !c.trim().is_empty()).unwrap_or_else(|| "IPF.Note".into());
-            out.push((name, class));
-        }
-        Ok(out)
-    };
-    read().unwrap_or_default()
+/// that says none holds mail, `IPF.Note`).
+pub(super) fn top_folders(path: &Path) -> io::Result<Vec<(String, String)>> {
+    let any = store_of(path)?;
+    let top = any.open_folder(any.ipm_subtree()?)?;
+    let Some(table) = top.read_hierarchy_table()? else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for row in table.rows_matrix() {
+        let Ok(f) = any.open_folder(row.id()) else { continue };
+        let Ok(name) = f.properties().display_name() else { continue };
+        let class = f.properties().get(0x3613).and_then(crate::pst::text_of).filter(|c| !c.trim().is_empty()).unwrap_or_else(|| "IPF.Note".into());
+        out.push((name, class));
+    }
+    Ok(out)
 }
 
 /// What a mark says: the item's uid, the account whose it is ([`owner_key`]; none in a mark an
@@ -465,30 +467,41 @@ fn earlier_copies(had: &[(String, NodeId)], items: &[Item], owner: &str) -> Earl
 
 /// The marks of the items in the folder at `names` of the file at `path` (those MailCraft
 /// exported: the file's own have none, and are never taken for the account's), each with its
-/// node; none when there is no such folder, or it can't be read.
-fn already(path: &Path, names: &[&str]) -> Vec<(String, NodeId)> {
-    let read = || -> io::Result<Vec<(String, NodeId)>> {
-        let any = store_of(path)?;
-        let Some(id) = crate::pst_pim::Named::of(any.as_ref()).exported() else { return Ok(Vec::new()) };
-        let open = |row: u32| any.open_folder(row);
-        let mut folder = any.open_folder(any.ipm_subtree()?)?;
-        for name in names {
-            let Some(table) = folder.hierarchy_table() else { return Ok(Vec::new()) };
-            let next = table.rows_matrix().filter_map(|row| open(row.id()).ok()).find(|f| f.properties().display_name().is_ok_and(|n| n == *name));
-            let Some(next) = next else { return Ok(Vec::new()) };
-            folder = next;
-        }
-        let mut out = Vec::new();
-        for row in folder.contents_table().map(|t| t.rows_matrix().collect::<Vec<_>>()).unwrap_or_default() {
-            let node = row.id();
-            let Ok(props) = any.message_properties(node, &[id]) else { continue };
-            if let Some(mark) = props.get(id).and_then(crate::pst::text_of) {
-                out.push((mark, node));
+/// node; none when there is no such folder. What is there and can't be read is an error, never
+/// none: a list of folders or of items, a folder on the way that may be the one named, an item
+/// that may carry a mark (taken for none, every item went in again beside its copy).
+pub(super) fn already(path: &Path, names: &[&str]) -> io::Result<Vec<(String, NodeId)>> {
+    let any = store_of(path)?;
+    let Some(id) = crate::pst_pim::Named::of(any.as_ref()).exported() else { return Ok(Vec::new()) };
+    let mut folder = any.open_folder(any.ipm_subtree()?)?;
+    for name in names {
+        let Some(table) = folder.read_hierarchy_table()? else { return Ok(Vec::new()) };
+        let mut next = None;
+        for row in table.rows_matrix() {
+            let child = any.open_folder(row.id())?;
+            if child.properties().display_name().is_ok_and(|n| n == *name) {
+                next = Some(child);
+                break;
             }
         }
-        Ok(out)
-    };
-    read().unwrap_or_default()
+        let Some(next) = next else { return Ok(Vec::new()) };
+        folder = next;
+    }
+    let mut out = Vec::new();
+    let Some(table) = folder.read_contents_table()? else { return Ok(out) };
+    for row in table.rows_matrix() {
+        let node = row.id();
+        let props = match any.message_properties(node, &[id]) {
+            Ok(props) => props,
+            // Listed, and not in the file: no item there to carry a mark.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if let Some(mark) = props.get(id).and_then(crate::pst::text_of) {
+            out.push((mark, node));
+        }
+    }
+    Ok(out)
 }
 
 /// The categories, as an item's `Keywords`.

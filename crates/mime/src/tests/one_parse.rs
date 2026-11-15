@@ -20,7 +20,7 @@ fn with_files(files: &[(String, Vec<u8>)]) -> Vec<u8> {
             .collect(),
         ..Default::default()
     };
-    build(&d, &EmailAddress::new("Sam", "sam@studio.example"), 1_700_000_000, "<files@x>").unwrap_or_default()
+    build(&d, &EmailAddress::new("Sam", "sam@studio.example"), 1_700_000_000, "<files@x>").expect("the message builds")
 }
 
 #[test]
@@ -70,17 +70,4 @@ proptest! {
         had.sort_unstable();
         prop_assert_eq!(had, asked);
     }
-}
-
-/// Issue #41: HTML laid out in tables reads as text without box-drawing rules around each
-/// table, and its preview keeps one block's words apart from the next's.
-#[test]
-fn tables_read_as_text_without_rules() {
-    let raw = b"From: news@studio.example\r\nSubject: x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
-<table><tr><td>BANNER</td></tr></table><table><tr><td><p><b>First</b> block</p></td></tr></table>\r\n";
-    let p = parse(raw).unwrap();
-    assert!(!p.text.chars().any(|c| ('\u{2500}'..='\u{257F}').contains(&c)), "{:?}", p.text);
-    let key = MessageKey { account: "a".into(), folder: "INBOX".into(), validity: 1, uid: 1 };
-    let s = summary_from_header(raw, key, Flags::default(), 0, 0);
-    assert_eq!(s.preview, "BANNER First block");
 }

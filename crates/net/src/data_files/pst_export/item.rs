@@ -5,13 +5,11 @@
 use super::files::{File, Spill};
 use super::*;
 use mailcraft_pst::{
-    GuidValue, PS_PUBLIC_STRINGS,
+    PS_PUBLIC_STRINGS,
     write::{Name, NewProperty, NewValue},
 };
 
-/// PSETID_Common and PSETID_Task (MS-OXPROPS 1.3.2).
-pub(super) const PSETID_COMMON: GuidValue = GuidValue::new(0x0006_2008, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
-pub(super) const PSETID_TASK: GuidValue = GuidValue::new(0x0006_2003, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+pub(super) use crate::data_files::outlook::{PSETID_COMMON, PSETID_TASK, filetime};
 
 /// `PidTagMessageFlags`' mfRead and mfUnsent (MS-OXCMSG 2.2.1.6).
 const READ: i32 = 0x1;
@@ -29,8 +27,6 @@ const FLAGGED: i32 = 2;
 const RED_FLAG: i32 = 6;
 const TO_DO_MARKED: i32 = 1;
 const TASK_COMPLETE: i32 = 2;
-/// Seconds from 1601-01-01 to 1970-01-01.
-const EPOCH_1601: i64 = 11_644_473_600;
 /// The longest header block written (`PidTagTransportMessageHeaders`): a longer one is left out,
 /// as the import leaves it out.
 const MAX_HEADERS: usize = 256 * 1024;
@@ -105,11 +101,6 @@ pub(super) struct State {
     pub(super) pinned: bool,
 }
 
-/// Unix seconds as 100 ns since 1601 (0 before then).
-pub(super) fn filetime(unix: i64) -> i64 {
-    unix.saturating_add(EPOCH_1601).saturating_mul(10_000_000).max(0)
-}
-
 /// What the store keeps of `s`, a message in a folder of role `role`; `days`: when flagged ones
 /// are due and completed ones were done (local days, by [`Summary::follow_up_id`]).
 pub(super) fn state(s: &mailcraft_model::Summary, role: FolderRole, days: &FollowUpDays) -> State {
@@ -181,7 +172,7 @@ pub(super) fn owned_in(
             (p.text.clone(), html, files, kind, meeting)
         }
     };
-    let field = |name: &str| header_value(&headers, name).unwrap_or_default();
+    let field = |name: &str| mime::header_field(headers.as_bytes(), name).unwrap_or_default();
     let importance = match field("Importance").to_ascii_lowercase().as_str() {
         "high" => 2,
         "low" => 0,
@@ -222,29 +213,9 @@ pub(super) fn owned_in(
 
 /// A message's header block (up to its first blank line, whichever its line ends), as text.
 fn header_block(raw: &[u8]) -> String {
-    let crlf = raw.windows(4).position(|w| w == b"\r\n\r\n");
-    let lf = raw.windows(2).position(|w| w == b"\n\n");
-    let end = crlf.into_iter().chain(lf).min().unwrap_or(raw.len());
-    let head = String::from_utf8_lossy(raw.get(..end).unwrap_or_default()).into_owned();
+    let end = mime::header_end(raw).map_or(raw.len(), |blank| blank.start);
+    let head = String::from_utf8_lossy(mime::without_line_end(raw.get(..end).unwrap_or_default())).into_owned();
     if head.is_empty() { head } else { format!("{head}\r\n") }
-}
-
-/// A header field's value in a header block, its folded lines unfolded.
-pub(super) fn header_value(head: &str, name: &str) -> Option<String> {
-    let mut lines = head.lines();
-    while let Some(line) = lines.next() {
-        let Some((n, value)) = line.split_once(':') else { continue };
-        if line.starts_with([' ', '\t']) || !n.trim_end().eq_ignore_ascii_case(name) {
-            continue;
-        }
-        let mut value = value.trim().to_string();
-        for more in lines.by_ref().take_while(|l| l.starts_with([' ', '\t'])) {
-            value.push(' ');
-            value.push_str(more.trim());
-        }
-        return Some(value);
-    }
-    None
 }
 
 /// What the message is beyond the writer's own list: its read, draft and follow-up state, its
@@ -321,15 +292,17 @@ pub(super) fn properties<'a>(m: &'a Owned, categories: &'a [&'a str]) -> Vec<New
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_files::outlook::EPOCH_1601;
     use std::collections::BTreeMap;
 
     #[test]
     fn header_fields() {
         let head = header_block(b"Subject: x\r\nImportance: High\r\nX-Long: a\r\n b\r\n\r\nbody");
         assert_eq!(head, "Subject: x\r\nImportance: High\r\nX-Long: a\r\n b\r\n");
-        assert_eq!(header_value(&head, "importance").as_deref(), Some("High"));
-        assert_eq!(header_value(&head, "X-Long").as_deref(), Some("a b"));
-        assert_eq!(header_value(&head, "Missing"), None);
+        let header_value = |name: &str| mime::header_field(head.as_bytes(), name);
+        assert_eq!(header_value("importance").as_deref(), Some("High"));
+        assert_eq!(header_value("X-Long").as_deref(), Some("a b"));
+        assert_eq!(header_value("Missing"), None);
         assert_eq!(header_block(b"no header end"), "no header end\r\n");
         // A header with LF line ends, and a CRLF blank line further on, in the body: the body's
         // lines aren't header fields.
@@ -337,6 +310,39 @@ mod tests {
         assert_eq!(header_block(raw), "Subject: x\nFrom: a@b\r\n");
         let m = owned(raw, 0, State::default(), &Default::default(), None).unwrap();
         assert_eq!((m.importance, m.sensitivity), (1, None));
+        // Mixed line ends; a CRLF header with a bare-LF blank line in its body.
+        assert_eq!(header_block(b"Subject: x\r\nFrom: a@b\n\nbody\r\n\r\n"), "Subject: x\r\nFrom: a@b\r\n");
+        assert_eq!(header_block(b"Subject: x\r\n\r\nbody\n\nmore"), "Subject: x\r\n");
+        // A CRLF blank line after a bare-LF line, and the other way: the header ends there too,
+        // without a stray CR.
+        assert_eq!(header_block(b"Subject: x\nFrom: a@b\r\n\nbody"), "Subject: x\nFrom: a@b\r\n");
+        assert_eq!(header_block(b"Subject: x\n\r\nImportance: high\r\n\r\nbody"), "Subject: x\r\n");
+    }
+
+    /// Finding a 50 MB CRLF message's header block, which is near its start: the time it takes
+    /// (`cargo test --release -p mailcraft-net --lib header_block_of_a_big_message -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn header_block_of_a_big_message() {
+        let mut raw =
+            b"From: a@b.example\r\nSubject: big\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n".to_vec();
+        let line = [b"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3".as_slice(), b"\r\n"].concat();
+        while raw.len() < 50 * 1024 * 1024 {
+            raw.extend_from_slice(&line);
+        }
+        let runs = 20;
+        let start = std::time::Instant::now();
+        let mut len = 0;
+        for _ in 0..runs {
+            len += std::hint::black_box(header_block(std::hint::black_box(&raw))).len();
+        }
+        let each = start.elapsed() / runs;
+        assert_eq!(
+            len,
+            runs as usize
+                * "From: a@b.example\r\nSubject: big\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n".len()
+        );
+        println!("MEASURE header_block of a {} MB CRLF message: {each:?} each", raw.len() / (1024 * 1024));
     }
 
     /// A message without a `Date:` gets no submit time, not 1970-01-01.

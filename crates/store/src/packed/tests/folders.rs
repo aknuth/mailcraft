@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::*;
 
@@ -23,10 +23,6 @@ pub(super) fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     out
-}
-
-fn inbox(uid: u32) -> MessageKey {
-    MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid }
 }
 
 /// A folder layout at `app` with account `a1` and one message in it.
@@ -54,7 +50,6 @@ fn stores_on_one_folder_layout_share_it() {
     assert_eq!(s.read_body(&inbox(2)).unwrap(), b"Subject: two\r\n\r\nbody");
     assert!(!app.join("a1").exists());
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// The app holds its folder layout alone: a second window's store on it, alone or not, is told
@@ -67,6 +62,7 @@ fn the_apps_folder_layout_is_its_alone() {
     let first = Store::open_alone(&app).unwrap();
     for refused in [Store::open_alone(&app).unwrap_err(), Store::open(&app).unwrap_err(), Store::open_packed(&app, t.join("Files")).unwrap_err()] {
         assert!(refused.to_string().contains("open in another copy of MailCraft"), "{refused}");
+        assert!(refused.is_open_elsewhere(), "{refused}");
     }
     assert_eq!(first.read_body(&inbox(1)).unwrap(), b"Subject: one\r\n\r\nbody");
     let clone = first.clone();
@@ -80,7 +76,6 @@ fn the_apps_folder_layout_is_its_alone() {
     let again = Store::open_alone(&app).unwrap();
     assert_eq!(again.read_body(&inbox(1)).unwrap(), b"Subject: one\r\n\r\nbody");
     drop(again);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// The leases' folder is never brought into a data file, nor taken for an account's, even one
@@ -101,7 +96,6 @@ fn the_leases_folder_stays_out_of_data_files() {
     assert_eq!(s.load_accounts().unwrap().len(), 2, "the accounts are accounts.json's");
     assert_eq!(s.read_body(&inbox(1)).unwrap(), b"Subject: one\r\n\r\nbody");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// What the child below is told: the folder it opens.
@@ -114,7 +108,7 @@ fn another_process_on_the_folder_layout_keeps_its_folders() {
     let t = temp("folders-process");
     let app = t.join("app");
     drop(layout(&app));
-    let mut child = commits::child("packed::tests::folders::child_holds_the_folders", &[(CHILD_DIR, app.display().to_string())]);
+    let mut child = child("packed::tests::folders::child_holds_the_folders", &[(CHILD_DIR, app.display().to_string())]);
     let out = child.stdout.take().unwrap();
     let ready = std::io::BufReader::new(out).lines().map_while(|l| l.ok()).any(|l| l.contains("folders-held"));
     assert!(ready, "the child got as far as opening the folders");
@@ -125,21 +119,10 @@ fn another_process_on_the_folder_layout_keeps_its_folders() {
 
     child.kill().unwrap();
     let _ = child.wait();
-    // The system lets go of a dead process's locks a moment after it ends (Windows).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let s = loop {
-        match Store::open_packed(&app, t.join("Files")) {
-            Ok(s) => break s,
-            Err(e) if Instant::now() < deadline && e.to_string().contains("open in another copy") => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => panic!("the dead process's lease wasn't let go: {e}"),
-        }
-    };
+    let s = retry_while_held(|| Store::open_packed(&app, t.join("Files")), |e| e.to_string().contains("open in another copy"));
     assert!(!app.join("a1").exists(), "the folder came in");
     assert_eq!(s.read_body(&inbox(2)).unwrap(), b"Subject: child\r\n\r\nbody", "with what the child wrote");
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// The other process of [`another_process_on_the_folder_layout_keeps_its_folders`]: opens the

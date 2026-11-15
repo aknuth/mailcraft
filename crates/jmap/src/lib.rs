@@ -22,7 +22,7 @@
 pub mod sse;
 pub mod url;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mailcraft_mime as mime;
 use mailcraft_model::{Flag, Flags, Folder, FolderRole, MessageKey, Op, SharedSummary, Summary, sort_newest_first, utf7};
@@ -30,14 +30,12 @@ use mailcraft_store::{FolderState, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub use url::{Url, base64, pct};
+pub use url::{Url, pct};
 
 mod search;
 mod state;
 mod sync;
-use search::*;
 pub use search::*;
-use state::*;
 pub use state::*;
 pub use sync::{sync_folder, sync_folder_as};
 
@@ -57,6 +55,8 @@ pub const VALIDITY: u32 = 1;
 const INBOX: &str = "INBOX";
 /// Deepest mailbox nesting followed.
 const MAX_DEPTH: usize = 32;
+/// Most messages asked for in one `Email/get` (less when the server says so).
+const GET_CHUNK: usize = 200;
 
 /// What can go wrong, in the categories the callers act on.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +80,14 @@ pub enum Error {
     Send(String),
     #[error("{0}")]
     Store(#[from] StoreError),
+}
+
+impl Error {
+    /// Whether a change that met it waits in its queue for the next connection (the network,
+    /// the sign-in), rather than being given up as refused.
+    pub fn stops_the_queue(&self) -> bool {
+        matches!(self, Error::Io(_) | Error::Closed(_) | Error::Tls(_) | Error::Auth(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -187,7 +195,11 @@ fn expand(template: &str, vars: &[(&str, &str)]) -> String {
 impl<H: Http> Client<H> {
     /// Fetch the session and check it offers mail. `bearer` signs in with an OAuth access token.
     pub async fn connect(http: H, url: &str, user: &str, secret: &str, bearer: bool) -> Result<Client<H>> {
-        let auth = if bearer { format!("Bearer {secret}") } else { format!("Basic {}", base64(format!("{user}:{secret}").as_bytes())) };
+        let auth = if bearer {
+            format!("Bearer {secret}")
+        } else {
+            format!("Basic {}", mailcraft_model::base64::encode(format!("{user}:{secret}").as_bytes()))
+        };
         let session = session_url(url);
         let resp = http.send(Request::get(&session, 1 << 20).header("Authorization", &auth).header("Accept", "application/json")).await?;
         check(&resp)?;
@@ -330,10 +342,15 @@ impl<H: Http> Client<H> {
         Ok((ids, counts))
     }
 
+    /// How many messages to ask for in one `Email/get`.
+    fn get_chunk(&self) -> usize {
+        self.max_get.clamp(1, GET_CHUNK)
+    }
+
     /// Headers and details of messages, for the list.
     async fn headers(&self, ids: &[String]) -> Result<Vec<Value>> {
         let mut out = Vec::new();
-        for chunk in ids.chunks(self.max_get.min(200)) {
+        for chunk in ids.chunks(self.get_chunk()) {
             let r = self
                 .mail(vec![(
                     "Email/get",
@@ -469,7 +486,7 @@ impl<H: Http> Client<H> {
                 email: text(i.get("email"), 254),
                 name: text(i.get("name"), 200),
                 reply_to: text(reply_to, 254),
-                signature: None,
+                ..Default::default()
             }
         });
         Ok(found.filter(|i| mailcraft_model::addr::is_valid_email(&i.email)).collect())
@@ -610,7 +627,8 @@ fn flag_keyword(f: Flag) -> Option<&'static str> {
 /// `2024-05-01T09:30:00Z` (RFC 3339, as JMAP's UTCDate) in Unix seconds.
 pub fn utc_date(s: &str) -> Option<i64> {
     let s = s.trim();
-    let num = |a: usize, b: usize| s.get(a..b).and_then(|x| x.parse::<i64>().ok());
+    let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+    let num = |a: usize, b: usize| s.get(a..b).filter(|x| digits(x)).and_then(|x| x.parse::<i64>().ok());
     let (y, mo, d, h, mi, se) = (num(0, 4)?, num(5, 7)?, num(8, 10)?, num(11, 13)?, num(14, 16)?, num(17, 19)?);
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
         return None;
@@ -620,8 +638,8 @@ pub fn utc_date(s: &str) -> Option<i64> {
     let tail = s.get(19..)?.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
     if let Some(off) = tail.strip_prefix('+').map(|o| (1, o)).or_else(|| tail.strip_prefix('-').map(|o| (-1, o))) {
         let (sign, o) = off;
-        let oh = o.get(0..2).and_then(|x| x.parse::<i64>().ok())?;
-        let om = o.get(3..5).and_then(|x| x.parse::<i64>().ok())?;
+        let oh = o.get(0..2).filter(|x| digits(x)).and_then(|x| x.parse::<i64>().ok())?;
+        let om = o.get(3..5).filter(|x| digits(x)).and_then(|x| x.parse::<i64>().ok())?;
         t -= sign * (oh * 3600 + om * 60);
     }
     Some(t)
@@ -655,23 +673,54 @@ impl Mailbox {
 /// `/` (in modified UTF-7, as IMAP names are kept); the Inbox is `INBOX`.
 pub fn folders(account: &str, boxes: &[Mailbox]) -> Vec<(Folder, String)> {
     let by_id: HashMap<&str, &Mailbox> = boxes.iter().map(|b| (b.id.as_str(), b)).collect();
-    let mut out: Vec<(Folder, String)> = Vec::new();
-    for b in boxes {
-        let mut parts: Vec<String> = Vec::new();
-        let mut cur = Some(b);
-        while let Some(m) = cur {
-            if parts.len() >= MAX_DEPTH {
-                break;
+    let paths: Vec<String> = boxes
+        .iter()
+        .map(|b| {
+            let mut parts: Vec<String> = Vec::new();
+            let mut cur = Some(b);
+            while let Some(m) = cur {
+                if parts.len() >= MAX_DEPTH {
+                    break;
+                }
+                parts.push(if m.role == FolderRole::Inbox { INBOX.to_string() } else { utf7::encode(&m.name.replace('/', "∕")) });
+                cur = m.parent.as_deref().and_then(|p| by_id.get(p).copied()).filter(|p| p.id != b.id);
             }
-            parts.push(if m.role == FolderRole::Inbox { INBOX.to_string() } else { utf7::encode(&m.name.replace('/', "∕")) });
-            cur = m.parent.as_deref().and_then(|p| by_id.get(p).copied()).filter(|p| p.id != b.id);
+            parts.reverse();
+            parts.join("/")
+        })
+        .collect();
+    // Of mailboxes with one path, the one with the lowest id keeps it (whatever order the server
+    // lists them in, the same one; ids that are numbers count up, so most often the oldest).
+    let mut owner: HashMap<&str, &str> = HashMap::new();
+    for (b, path) in boxes.iter().zip(&paths) {
+        let id = owner.entry(path.as_str()).or_insert(b.id.as_str());
+        if (b.id.len(), b.id.as_str()) < (id.len(), *id) {
+            *id = b.id.as_str();
         }
-        parts.reverse();
-        let mut path = parts.join("/");
-        // Two mailboxes with one path (or an unnamed one) stay apart.
-        if path.is_empty() || out.iter().any(|(f, _)| f.path == path) {
-            path = format!("{path}~{}", b.id.chars().filter(char::is_ascii_alphanumeric).take(16).collect::<String>());
-        }
+    }
+    let owns = |b: &Mailbox, path: &str| !path.is_empty() && owner.get(path) == Some(&b.id.as_str());
+    // Two mailboxes with one path (or an unnamed one) stay apart: the others get their id after
+    // it. That path can be taken too (a mailbox named so, or an id that reads the same once cut
+    // to what a path holds), so each is checked against those given, a number after it until
+    // it's free; they're given in the order of their ids, so in the same way whatever order the
+    // server lists them in.
+    let mut taken: HashSet<String> = boxes.iter().zip(&paths).filter(|(b, p)| owns(b, p)).map(|(_, p)| p.clone()).collect();
+    let mut others: Vec<usize> = (0..boxes.len()).filter(|i| !boxes.get(*i).zip(paths.get(*i)).is_some_and(|(b, p)| owns(b, p))).collect();
+    others.sort_by_key(|i| boxes.get(*i).map(|b| (b.id.len(), b.id.as_str())));
+    let mut apart: HashMap<usize, String> = HashMap::with_capacity(others.len());
+    for i in others {
+        let (Some(b), Some(path)) = (boxes.get(i), paths.get(i)) else { continue };
+        let first = format!("{path}~{}", b.id.chars().filter(char::is_ascii_alphanumeric).take(16).collect::<String>());
+        // Free within as many tries as there are mailboxes to have taken them.
+        let free =
+            std::iter::once(first.clone()).chain((2..boxes.len().saturating_add(3)).map(|n| format!("{first}~{n}"))).find(|p| !taken.contains(p));
+        let given = free.unwrap_or(first);
+        taken.insert(given.clone());
+        apart.insert(i, given);
+    }
+    let mut out: Vec<(Folder, String)> = Vec::with_capacity(boxes.len());
+    for (i, (b, path)) in boxes.iter().zip(&paths).enumerate() {
+        let path = apart.remove(&i).unwrap_or_else(|| path.clone());
         let folder = Folder {
             account: account.to_string(),
             path,
@@ -724,7 +773,7 @@ impl<H: Http> Client<H> {
     /// Of these messages, those still in a mailbox, with their keywords.
     async fn still_in(&self, mailbox: &str, ids: &[String]) -> Result<Vec<(String, Flags)>> {
         let mut out = Vec::new();
-        for chunk in ids.chunks(self.max_get.clamp(1, 200)) {
+        for chunk in ids.chunks(self.get_chunk()) {
             let r = self
                 .mail(vec![("Email/get", json!({"accountId": self.account, "ids": chunk, "properties": ["id", "keywords", "mailboxIds"]}))])
                 .await?;
@@ -742,12 +791,13 @@ impl<H: Http> Client<H> {
 /// The messages of `folder` the server finds for `filter` ([`search_filter`]), the newest `cap`
 /// of them: those not kept yet come into its list, and stay there past the window while the
 /// server has them there (issue #4). Their keys, and how many came in. A folder never synced is
-/// left to its sync.
+/// left to its sync. Nothing written once the account was removed since it had been removed
+/// `seen` times ([`Store::while_kept`]): an error then.
 pub async fn find_on_server<H: Http>(
     c: &Client<H>,
     st: &mut State,
     store: &Store,
-    account: &str,
+    (account, seen): (&str, u64),
     folder: &str,
     filter: &Value,
     cap: usize,
@@ -759,12 +809,14 @@ pub async fn find_on_server<H: Http>(
     }
     let ids = c.search(&mailbox, filter, cap.min(FOUND_MAX)).await?;
     let numbers: Vec<u32> = ids.iter().map(|id| st.number(id)).collect();
-    let missing: Vec<String> = ids.iter().zip(&numbers).filter(|(_, n)| fs.find(**n).is_none()).map(|(id, _)| id.clone()).collect();
+    // The numbers kept, in a set (looked up in the list, each found was a pass over the folder).
+    let mut kept: HashSet<u32> = fs.messages.iter().map(|m| m.key.uid).collect();
+    let missing: Vec<String> = ids.iter().zip(&numbers).filter(|(_, n)| !kept.contains(*n)).map(|(id, _)| id.clone()).collect();
     let mut new = 0;
     for e in c.headers(&missing).await? {
         let Some(id) = e.get("id").and_then(Value::as_str) else { continue };
         let key = MessageKey { account: account.to_string(), folder: folder.to_string(), validity: VALIDITY, uid: st.number(id) };
-        if fs.find(key.uid).is_none() {
+        if kept.insert(key.uid) {
             fs.messages.push(email_summary(&e, key).into());
             new += 1;
         }
@@ -773,14 +825,17 @@ pub async fn find_on_server<H: Http>(
     if new > 0 {
         sort_newest_first(&mut fs.messages);
         fs.uid_next = fs.messages.iter().map(|m| m.key.uid).max().unwrap_or(0).saturating_add(1);
-        store.save_folder(account, folder, &fs)?;
+        sync::if_kept(store, account, seen, || store.save_folder(account, folder, &fs))?;
     }
-    Ok((numbers.iter().filter_map(|n| fs.find(*n).map(|m| m.key.clone())).collect(), new))
+    // (The first kept under a number, as a search of the list found it.)
+    let keys: HashMap<u32, &MessageKey> = fs.messages.iter().rev().map(|m| (m.key.uid, &m.key)).collect();
+    Ok((numbers.iter().filter_map(|n| keys.get(n).map(|k| (*k).clone())).collect(), new))
 }
 
 /// Download one message's source (and cache it), with its summary as its folder now has it, filled
-/// from it ([`keep_source`]); one cached already comes as it is, with no summary.
-pub async fn fetch_body<H: Http>(c: &Client<H>, st: &State, store: &Store, key: &MessageKey) -> Result<(Vec<u8>, Option<Summary>)> {
+/// from it ([`keep_source`]); one cached already comes as it is, with no summary. Not kept once
+/// the account was removed since it had been removed `seen` times: an error then.
+pub async fn fetch_body<H: Http>(c: &Client<H>, st: &State, store: &Store, key: &MessageKey, seen: u64) -> Result<(Vec<u8>, Option<Summary>)> {
     if let Some(raw) = store.read_body(key) {
         return Ok((raw, None));
     }
@@ -788,7 +843,7 @@ pub async fn fetch_body<H: Http>(c: &Client<H>, st: &State, store: &Store, key: 
     let id = st.id(key.uid).filter(|_| key.validity == VALIDITY).ok_or_else(gone)?.to_string();
     let blob = c.blobs(std::slice::from_ref(&id)).await?.remove(&id).ok_or_else(gone)?;
     let raw = c.download(&blob).await?;
-    let filled = keep_source(store, key, &raw)?;
+    let filled = sync::if_kept(store, &key.account, seen, || keep_source(store, key, &raw))?;
     Ok((raw, filled))
 }
 
@@ -828,12 +883,12 @@ pub async fn apply_remote<H: Http>(c: &Client<H>, st: &State, op: &Op) -> Result
         }
         Op::Expunge { keys } => c.set_emails(Map::new(), ids(keys).into_iter().map(|(id, _)| id).collect()).await,
         Op::CreateFolder { path } => {
-            let (parent, name) = split_path(st, path)?;
+            let (parent, name) = st.split_path(path)?;
             c.set_mailboxes(json!({"create": {"f": {"name": name, "parentId": parent}}})).await.map(|_| ())
         }
         Op::RenameFolder { from, to } => {
             let id = st.mailbox(from)?.to_string();
-            let (parent, name) = split_path(st, to)?;
+            let (parent, name) = st.split_path(to)?;
             c.set_mailboxes(json!({"update": {id: {"name": name, "parentId": parent}}})).await.map(|_| ())
         }
         Op::DeleteFolder { path } => {
@@ -841,14 +896,6 @@ pub async fn apply_remote<H: Http>(c: &Client<H>, st: &State, op: &Op) -> Result
             c.set_mailboxes(json!({"destroy": [id], "onDestroyRemoveEmails": true})).await.map(|_| ())
         }
         Op::EmptyFolder { path } => c.empty(st.mailbox(path)?).await,
-    }
-}
-
-/// The parent mailbox id (`None` at the top) and the leaf name of a folder path.
-fn split_path(st: &State, path: &str) -> Result<(Option<String>, String)> {
-    match path.rsplit_once('/') {
-        Some((parent, leaf)) => Ok((Some(st.mailbox(parent)?.to_string()), utf7::decode(leaf))),
-        None => Ok((None, utf7::decode(path))),
     }
 }
 

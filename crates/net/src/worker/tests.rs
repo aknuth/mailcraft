@@ -5,6 +5,8 @@ use mailcraft_pst::write;
 use mailcraft_store::search;
 
 use super::*;
+use crate::fakes::measure::percentile;
+use crate::waiting::{events_until, eventually, until};
 
 mod calendar_only;
 mod check_every;
@@ -12,8 +14,45 @@ mod counts;
 mod drafts;
 mod filed_once;
 mod index_bench;
+mod index_damaged;
+mod kept_bench;
+mod kept_files;
+mod offline_answers;
+mod opening;
+mod outbox_once;
 mod pop_filed;
+mod read_errors;
 mod removed;
+mod unstarted;
+
+/// An account `id` on an IMAP server of the tests' own at `port` on this computer, signing in as
+/// `me@studio.example`.
+pub(crate) fn imap_account(id: &str, port: u16) -> AccountConfig {
+    AccountConfig {
+        id: id.into(),
+        email: "me@studio.example".into(),
+        username: "me@studio.example".into(),
+        imap: mailcraft_model::ServerConfig { host: "127.0.0.1".into(), port, security: mailcraft_model::Security::None },
+        ..Default::default()
+    }
+}
+
+/// An outgoing server on this computer where nothing listens (port 1).
+pub(crate) fn no_smtp() -> mailcraft_model::ServerConfig {
+    mailcraft_model::ServerConfig { host: "127.0.0.1".into(), port: 1, security: mailcraft_model::Security::None }
+}
+
+/// The POP account `p1` on a server of the tests' own at `port` on this computer, signing in as
+/// `me@pop.example`.
+pub(crate) fn pop_account(port: u16) -> AccountConfig {
+    AccountConfig {
+        id: "p1".into(),
+        email: "me@pop.example".into(),
+        username: "me@pop.example".into(),
+        pop: Some(mailcraft_model::ServerConfig { host: "127.0.0.1".into(), port, security: mailcraft_model::Security::None }),
+        ..Default::default()
+    }
+}
 
 /// Sent Items asked for after each of several messages is read once.
 #[test]
@@ -53,7 +92,7 @@ fn a_mailbox_microsoft_wont_open_says_why() {
     let st = crate::fake::State::new();
     st.lock().unwrap().not_connected.push("zoe@hotmail.example".into());
     let port = crate::fake::serve_tcp(&st);
-    let store = crate::fake::tests_store("closed-mailbox");
+    let store = crate::fake::store("closed-mailbox");
     let pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
     let mut acc = AccountConfig {
         id: "a1".into(),
@@ -73,12 +112,13 @@ fn a_mailbox_microsoft_wont_open_says_why() {
     acc.oauth_user = Some("someone@else.example".into());
     let w = Worker::new(acc, Auth::shared("refresh"), store, pool.sink.clone(), SyncOptions::default());
     let e = w.imap_with_token("zoe@hotmail.example", crate::fake::GOOD_TOKEN).err().unwrap();
-    assert!(matches!(&e, NetError::Refused(m) if m.contains("signed in as someone@else.example")), "{e:?}");
+    assert!(matches!(&e, NetError::MailboxClosed(m) if m.contains("signed in as someone@else.example")), "{e:?}");
+    assert_eq!(e.failure(), mailcraft_model::FailureKind::MicrosoftImapClosed);
     // A token that's simply refused is still a sign-in to ask for again.
     let w = Worker::new(
         AccountConfig { oauth_user: None, ..w.acc.clone() },
         Auth::shared("refresh"),
-        crate::fake::tests_store("closed-mailbox-2"),
+        crate::fake::store("closed-mailbox-2"),
         pool.sink.clone(),
         SyncOptions::default(),
     );
@@ -108,23 +148,30 @@ fn a_mailcraft_data_file_is_imported() {
     let path = file.to_string_lossy().into_owned();
     p.submit(Job::InspectDataFile { path: path.clone() });
     p.submit(Job::InspectDataFile { path: t.join("gone.pst").to_string_lossy().into_owned() });
-    let end = Instant::now() + Duration::from_secs(20);
-    let mut facts = Vec::new();
-    while Instant::now() < end && facts.len() < 2 {
-        facts.extend(p.wait(Duration::from_millis(100)).into_iter().filter_map(|e| match e {
+    let looked = |e: &Event| matches!(e, Event::DataFileInspected { .. });
+    let seen = events_until(&p, "both files looked at", |seen| seen.iter().filter(|e| looked(e)).count() >= 2);
+    let facts: Vec<_> = seen
+        .into_iter()
+        .filter_map(|e| match e {
             Event::DataFileInspected { facts, .. } => Some(facts),
             _ => None,
-        }));
-    }
+        })
+        .collect();
     let size = std::fs::metadata(&file).unwrap().len();
-    assert!(facts.iter().any(|f| f.path == path && f.kind == "mailcraft" && f.size == size && f.modified > 0 && f.error.is_none()), "{facts:?}");
-    assert!(facts.iter().any(|f| f.path.ends_with("gone.pst") && f.kind == "pst" && f.error.is_some()), "{facts:?}");
+    assert!(
+        facts.iter().any(|f| f.path == path
+            && f.kind == mailcraft_model::job::DataFileKind::MailCraft
+            && f.size == size
+            && f.modified > 0
+            && f.error.is_none()),
+        "{facts:?}"
+    );
+    assert!(
+        facts.iter().any(|f| f.path.ends_with("gone.pst") && f.kind == mailcraft_model::job::DataFileKind::Pst && f.error.is_some()),
+        "{facts:?}"
+    );
     p.submit(Job::ImportPst { account: "p1".into(), path, resume: false });
-    let end = Instant::now() + Duration::from_secs(20);
-    let mut seen = Vec::new();
-    while Instant::now() < end && !seen.iter().any(|e| matches!(e, Event::Imported { done: true, .. })) {
-        seen.extend(p.wait(Duration::from_millis(100)));
-    }
+    let seen = until(&p, "the import to end", |e| matches!(e, Event::Imported { done: true, .. }));
     assert!(seen.iter().any(|e| matches!(e, Event::Imported { messages: 1, done: true, error: None, .. })), "{seen:?}");
     assert!(
         seen.iter().any(|e| matches!(e, Event::Imported { report: Some(r), .. } if r.messages == 1 && r.folders == 1 && (r.contacts, r.notes) == (0, 1) && r.runs == 1 && r.skips.is_empty() && !r.data_file.is_empty())),
@@ -144,7 +191,7 @@ fn pool_without_password_asks_for_one() {
     let mut p = Pool::new(store, Arc::new(MemoryCredentials::default()));
     let a = AccountConfig { id: "a1".into(), ..Default::default() };
     p.submit(Job::Start { account: a, password: None });
-    let seen = until(&p, |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
+    let seen = until(&p, "the password asked for", |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
     assert!(seen.iter().all(|e| matches!(e, Event::Status { .. })), "{seen:?}");
     assert!(p.poll().is_empty());
     p.submit(Job::SyncAll { account: "a1".into() });
@@ -203,12 +250,9 @@ fn the_keychain_is_asked_on_the_accounts_thread() {
     let mut p = Pool::new(store, asked.clone());
     let a = AccountConfig { id: "a1".into(), ..Default::default() };
     p.submit(Job::Start { account: a.clone(), password: None });
-    until(&p, |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
+    until(&p, "the password asked for", |e| matches!(e, Event::Status { status: SyncStatus::NeedsPassword { .. }, .. }));
     p.submit(Job::Start { account: a, password: Some(Secret("pw".into())) });
-    let end = Instant::now() + Duration::from_secs(10);
-    while asked.0.lock().unwrap().len() < 2 && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    eventually("the password looked for and kept", || asked.0.lock().unwrap().len() >= 2);
     assert_eq!(*asked.0.lock().unwrap(), ["get on mail-a1", "set on mail-a1"]);
     assert_eq!(asked.1.get(&AccountConfig { id: "a1".into(), ..Default::default() }).as_deref(), Some("pw"));
     p.submit(Job::Remove { account: "a1".into() });
@@ -221,11 +265,10 @@ fn the_keychain_is_asked_on_the_accounts_thread() {
 fn a_draft_kept_offline_doesnt_write_over_a_list_that_cant_be_read() {
     let store = Store::failing();
     keep_draft(&store, "a1", "Drafts", None, b"Subject: first\r\n\r\nOne\r\n".to_vec(), false, &Order::default()).unwrap();
-    store.fail(Some(PENDING_DRAFTS), None);
+    store.fail(Some(KEPT_DRAFTS), None);
     assert!(keep_draft(&store, "a1", "Drafts", None, b"Subject: second\r\n\r\nTwo\r\n".to_vec(), false, &Order::default()).is_err());
     store.fail(None, None);
-    let kept: Vec<PendingDraft> = store.load_account_doc("a1", PENDING_DRAFTS).unwrap();
-    assert_eq!(kept.iter().map(|d| d.raw.clone()).collect::<Vec<_>>(), [b"Subject: first\r\n\r\nOne\r\n".to_vec()]);
+    assert_eq!(kept_raws(&store, "a1").unwrap(), [b"Subject: first\r\n\r\nOne\r\n".to_vec()]);
 }
 
 /// The search index kept up by the pool: an account synced, then asked for, is searchable.
@@ -238,22 +281,16 @@ fn synced_mail_is_indexed_and_found() {
         s.add("INBOX", "second", &["\\Seen"]);
     }
     let port = crate::fake::serve_tcp(&st);
-    let store = crate::fake::tests_store("indexed");
+    let store = crate::fake::store("indexed");
     crate::fakes::fake_dav::looked_for_today(&store, "a1");
     let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
-    let account = AccountConfig {
-        id: "a1".into(),
-        email: "me@studio.example".into(),
-        username: "me@studio.example".into(),
-        imap: mailcraft_model::ServerConfig { host: "127.0.0.1".into(), port, security: mailcraft_model::Security::None },
-        ..Default::default()
-    };
+    let account = imap_account("a1", port);
     pool.submit(Job::Start { account, password: Some(Secret("pw".into())) });
-    until(&pool, |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
+    until(&pool, "online", |e| matches!(e, Event::Status { status: SyncStatus::Online { .. }, .. }));
     // Asked twice in a row: one pass.
     pool.submit(Job::Index { account: "a1".into(), folders: vec!["INBOX".into()] });
     pool.submit(Job::Index { account: "a1".into(), folders: Vec::new() });
-    let seen = until(&pool, |e| matches!(e, Event::Indexed { finished: true, .. }));
+    let seen = until(&pool, "the index finished", |e| matches!(e, Event::Indexed { finished: true, .. }));
     let Some(Event::Indexed { work, generation, failed, .. }) = seen.last() else { panic!("{seen:?}") };
     assert_eq!((work.done, work.total, *failed), (2, 2, 0));
     let mut r = search::Reader::open(&store, "a1").unwrap().unwrap();
@@ -266,23 +303,6 @@ fn synced_mail_is_indexed_and_found() {
         assert!(!matches!(pool.wait(Duration::from_millis(100)), Some(Event::Indexed { .. })), "a second pass ran");
     }
     pool.submit(Job::Remove { account: "a1".into() });
-    let _ = std::fs::remove_dir_all(store.root());
-}
-
-/// Events until one `f` takes, all of them.
-fn until(pool: &Pool, mut f: impl FnMut(&Event) -> bool) -> Vec<Event> {
-    let end = Instant::now() + Duration::from_secs(30);
-    let mut seen = Vec::new();
-    while Instant::now() < end {
-        if let Some(e) = pool.wait(Duration::from_millis(100)) {
-            let done = f(&e);
-            seen.push(e);
-            if done {
-                return seen;
-            }
-        }
-    }
-    panic!("never came: {seen:?}")
 }
 
 /// An account of `n` messages in its Inbox, each with its source: `word{uid}` and `common`.
@@ -470,7 +490,7 @@ fn no_pass_runs_during_an_import() {
         assert!(!matches!(pool.wait(Duration::from_millis(100)), Some(Event::Indexed { .. })), "a pass ran during the import");
     }
     drop(importing);
-    until(&pool, |e| matches!(e, Event::Indexed { work, finished: true, .. } if work.done == 2));
+    until(&pool, "both indexed", |e| matches!(e, Event::Indexed { work, finished: true, .. } if work.done == 2));
 }
 
 /// A data file's messages go into the index as the import writes them: the pass asked for at
@@ -498,10 +518,10 @@ fn an_imported_file_leaves_nothing_to_index() {
     let store = Store::memory();
     let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
     pool.submit(Job::ImportPst { account: "p1".into(), path: file.to_string_lossy().into_owned(), resume: false });
-    until(&pool, |e| matches!(e, Event::Imported { messages: 1, done: true, error: None, .. }));
+    until(&pool, "the import", |e| matches!(e, Event::Imported { messages: 1, done: true, error: None, .. }));
     let reads = store.reads();
     pool.submit(Job::Index { account: "p1".into(), folders: Vec::new() });
-    let seen = until(&pool, |e| matches!(e, Event::Indexed { finished: true, .. }));
+    let seen = until(&pool, "the index finished", |e| matches!(e, Event::Indexed { finished: true, .. }));
     assert!(matches!(seen.last(), Some(Event::Indexed { work, failed: 0, .. }) if work.total == 0), "{seen:?}");
     assert_eq!(store.reads(), reads, "no message read");
     let mut r = search::Reader::open(&store, "p1").unwrap().unwrap();
@@ -520,7 +540,7 @@ fn a_pass_puts_right_what_summaries_say_of_files() {
     let mut pool = Pool::new(s.clone(), Arc::new(MemoryCredentials::default()));
     pool.submit(Job::Index { account: "a1".into(), folders: Vec::new() });
     let mut known = Vec::new();
-    until(&pool, |e| {
+    until(&pool, "the index finished", |e| {
         if let Event::AttachmentsKnown { folder, with, without, .. } = e {
             known.push((folder.clone(), with.clone(), without.clone()));
         }
@@ -533,12 +553,12 @@ fn a_pass_puts_right_what_summaries_say_of_files() {
     // planned on): the folder wasn't marked, so the next pass puts it right again.
     s.save_folder("a1", "INBOX", &before).unwrap();
     pool.submit(Job::Index { account: "a1".into(), folders: Vec::new() });
-    let seen = until(&pool, |e| matches!(e, Event::Indexed { finished: true, .. }));
+    let seen = until(&pool, "the index finished", |e| matches!(e, Event::Indexed { finished: true, .. }));
     assert_eq!(seen.iter().filter(|e| matches!(e, Event::AttachmentsKnown { .. })).count(), 1, "{seen:?}");
     assert!(!s.load_folder("a1", "INBOX").unwrap().find(1).unwrap().has_attachments);
     // The next pass finds them right: nothing to tell.
     pool.submit(Job::Index { account: "a1".into(), folders: Vec::new() });
-    let seen = until(&pool, |e| matches!(e, Event::Indexed { finished: true, .. }));
+    let seen = until(&pool, "the index finished", |e| matches!(e, Event::Indexed { finished: true, .. }));
     assert!(!seen.iter().any(|e| matches!(e, Event::AttachmentsKnown { .. })), "{seen:?}");
 }
 
@@ -551,12 +571,12 @@ fn summaries_not_put_right_are_tried_again() {
     s.fail(None, Some("state.json"));
     let mut pool = Pool::new(s.clone(), Arc::new(MemoryCredentials::default()));
     pool.submit(Job::Index { account: "a1".into(), folders: Vec::new() });
-    let seen = until(&pool, |e| matches!(e, Event::Indexed { finished: true, .. }));
+    let seen = until(&pool, "the index finished", |e| matches!(e, Event::Indexed { finished: true, .. }));
     assert!(!seen.iter().any(|e| matches!(e, Event::AttachmentsKnown { .. })), "{seen:?}");
     assert!(s.load_folder("a1", "INBOX").unwrap().find(1).unwrap().has_attachments, "not written");
     s.fail(None, None);
     pool.submit(Job::Index { account: "a1".into(), folders: Vec::new() });
-    let seen = until(&pool, |e| matches!(e, Event::Indexed { finished: true, .. }));
+    let seen = until(&pool, "the index finished", |e| matches!(e, Event::Indexed { finished: true, .. }));
     let known: Vec<_> = seen.iter().filter(|e| matches!(e, Event::AttachmentsKnown { .. })).collect();
     assert_eq!(known.len(), 1, "{seen:?}");
     let st = s.load_folder("a1", "INBOX").unwrap();
@@ -723,16 +743,9 @@ fn a_mark_read_waits_little_for_an_index_pass() {
         },
     )
     .unwrap();
-    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rng = crate::fakes::random::Rng::new(0x9E37_79B9_7F4A_7C15);
     for uid in 1..=n {
-        let words: String = (0..800)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                format!("w{} ", x % 50_000)
-            })
-            .collect();
+        let words: String = (0..800).map(|_| format!("w{} ", rng.next_u64() % 50_000)).collect();
         let key = MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 7, uid };
         s.write_body(&key, format!("Subject: m\r\nMessage-ID: <m{uid}@x>\r\n\r\n{words}\r\n").as_bytes()).unwrap();
     }
@@ -746,7 +759,7 @@ fn a_mark_read_waits_little_for_an_index_pass() {
     };
     let at = |took: &mut Vec<f64>, q: usize| {
         took.sort_by(f64::total_cmp);
-        took.get((took.len() * q / 100).min(took.len().saturating_sub(1))).copied().unwrap_or(0.0)
+        percentile(took, q).unwrap_or(0.0)
     };
     let mut alone: Vec<f64> = (0..50).map(|i| mark(i % 2 == 0)).collect();
     let (alone50, alone99) = (at(&mut alone, 50), at(&mut alone, 99));
@@ -784,15 +797,22 @@ fn a_mark_read_waits_little_for_an_index_pass() {
 fn a_change_is_made_off_the_callers_thread() {
     let s = indexed_mail(3);
     let mut pool = Pool::new(s.clone(), Arc::new(MemoryCredentials::default()));
+    // The thread each event is said on: the change's own are said where it's made.
+    let said_on: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let on = said_on.clone();
+    pool.set_waker(Arc::new(move || on.lock().unwrap().push(std::thread::current().name().map(str::to_string))));
     let key = MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 7, uid: 2 };
     pool.submit(Job::Apply { account: "a1".into(), op: Op::SetFlag { keys: vec![key], flag: Flag::Seen, on: true } });
-    until(&pool, |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "INBOX"));
+    until(&pool, "the Inbox changed", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "INBOX"));
     assert!(s.load_folder("a1", "INBOX").unwrap().messages.iter().any(|m| m.key.uid == 2 && m.flags.seen));
     assert_eq!(s.load_ops("a1").unwrap().len(), 1, "queued for the server");
     let me = std::thread::current().name().map(str::to_string);
-    let on = edits::APPLIED_ON.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    assert!(on.iter().any(|(_, t)| t.as_deref() == Some("mail-edits")), "{on:?}");
-    assert!(!on.iter().any(|(_, t)| *t == me), "made on the caller's thread: {on:?}");
+    // The waker runs just after the event is sent: it may come a moment after it.
+    let made_there = || said_on.lock().unwrap().iter().any(|t| t.as_deref() == Some("mail-edits"));
+    eventually("the change's thread said", made_there);
+    let on = said_on.lock().unwrap().clone();
+    assert!(on.iter().any(|t| t.as_deref() == Some("mail-edits")), "{on:?}");
+    assert!(!on.contains(&me), "made on the caller's thread: {on:?}");
 }
 
 /// Changes made in a row are made in that order, and are all on disk once the pool has shut
@@ -850,7 +870,7 @@ fn a_change_the_cache_cant_take_is_said_and_read_again() {
     let mut pool = Pool::new(s.clone(), Arc::new(MemoryCredentials::default()));
     let key = MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 7, uid: 1 };
     pool.submit(Job::Apply { account: "a1".into(), op: Op::SetFlag { keys: vec![key], flag: Flag::Seen, on: true } });
-    let seen = until(&pool, |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "INBOX"));
+    let seen = until(&pool, "the Inbox changed", |e| matches!(e, Event::FolderChanged { folder, .. } if folder == "INBOX"));
     assert!(matches!(seen.as_slice(), [.., Event::Notice { .. }, Event::FolderChanged { .. }]), "{seen:?}");
     s.fail(None, None);
     assert!(s.load_ops("a1").unwrap().is_empty(), "nothing queued that the cache doesn't have");

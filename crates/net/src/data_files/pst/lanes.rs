@@ -107,26 +107,16 @@ pub(super) struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
+    /// For a file imported into `account`, as `out` writes it.
     pub(super) fn new(path: &'a Path, opts: &'a ImportOptions, account: &'a str, out: &Out<'_>) -> Self {
         Ctx {
-            path,
-            opts,
             account,
             filetag: filetag(path),
             packs: out.store.packs(account),
             index: out.indexing(),
             budget: out.budget.clone(),
             tally: out.tally.clone(),
-            resume: None,
-            changed: AtomicBool::new(false),
-            halt: AtomicBool::new(false),
-            damaged: AtomicBool::new(false),
-            panics: AtomicUsize::new(0),
-            live: AtomicUsize::new(0),
-            orphaned: AtomicBool::new(false),
-            links: item::LinkReads::default(),
-            #[cfg(test)]
-            items_taken: std::sync::atomic::AtomicU64::new(0),
+            ..Ctx::looking(path, opts)
         }
     }
 
@@ -172,6 +162,21 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Where the planner lets a test put a fault: nothing outside tests (a test's are in `tests`).
+#[cfg(not(test))]
+impl Ctx<'_> {
+    /// As the planner looks at the folder that is `index` into the file.
+    pub(super) fn fault_looking(&self, _index: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The size an item of `size` is handed out with, after `handed` others (`sent`: one of the
+    /// Sent Items folder, read last).
+    pub(super) fn fault_handing(&self, _handed: u64, _sent: bool, size: u64) -> u64 {
+        size
+    }
+}
+
 /// The lanes read at most this many items at once.
 const MAX_LANES: usize = 12;
 
@@ -190,11 +195,10 @@ fn filetag(path: &Path) -> String {
             }
         }
     }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in head.get(..got).unwrap_or_default().iter().chain(&size.to_le_bytes()) {
-        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{:08x}", h >> 32)
+    let mut h = mailcraft_model::hash::Fnv::new();
+    h.add(head.get(..got).unwrap_or_default());
+    h.add(&size.to_le_bytes());
+    format!("{:08x}", h.value() >> 32)
 }
 
 /// The jobs, shared by the lanes: each takes the next in turn.
@@ -227,17 +231,30 @@ pub(super) fn gone(ctx: &Ctx<'_>, jobs: &Jobs, n: usize) {
 /// Answers a job when dropped, unless it was answered: a lane that unwinds with a job in hand
 /// still answers it, so the writer, which applies items in order, never waits for one.
 struct Answer<'a> {
-    job: Option<(u64, usize, u64, bool, u32, u64)>,
+    job: Option<Asked>,
     results: &'a Sender<Done>,
+}
+
+/// What the writer is told of a job, whatever came of it: its number, the plan's folder it's
+/// in, its size as the file gives it, whether the folder is contacts or a calendar, and the
+/// folder's node and the item's row in it.
+struct Asked {
+    seq: u64,
+    folder: usize,
+    size: u64,
+    pim: bool,
+    node: u32,
+    row: u64,
 }
 
 impl<'a> Answer<'a> {
     fn new(job: &Job, results: &'a Sender<Done>) -> Self {
-        Answer { job: Some((job.seq, job.folder, job.size, job.pim, job.folder_node, job.row)), results }
+        let asked = Asked { seq: job.seq, folder: job.folder, size: job.size, pim: job.pim, node: job.folder_node, row: job.row };
+        Answer { job: Some(asked), results }
     }
 
     fn send(&mut self, outcome: Outcome, charge: u64) {
-        if let Some((seq, folder, size, pim, node, row)) = self.job.take() {
+        if let Some(Asked { seq, folder, size, pim, node, row }) = self.job.take() {
             let _ = self.results.send(Done { seq, step: Step::Item { folder, size, pim, node, row, outcome }, charge });
         }
     }
@@ -348,19 +365,13 @@ fn one(ctx: &Ctx<'_>, job: &Job, read: &ReadItem<'_>, charge: &mut u64) -> Outco
 /// invitation and a task request; appointments, contacts and tasks in a mail folder aren't
 /// ([`is_pim`]).
 pub(super) fn is_mail(class: &str) -> bool {
-    let class = class.to_ascii_lowercase();
-    class.is_empty()
-        || ["ipm.note", "ipm.schedule", "report.", "ipm.post", "ipm.document", "ipm.outlook.recall", "ipm.recall", "ipm.sharing", "ipm.taskrequest"]
-            .iter()
-            .any(|c| class.starts_with(c))
+    super::item::Class::of(class).is_mail()
 }
 
 /// Whether an item of `class` is a contact, contact group, calendar item, task, note or journal
 /// entry, which goes to the address book, calendar, tasks or notes wherever it's found.
 pub(super) fn is_pim(class: &str) -> bool {
-    let class = class.to_ascii_lowercase();
-    !class.starts_with("ipm.taskrequest")
-        && ["ipm.contact", "ipm.distlist", "ipm.appointment", "ipm.task", "ipm.stickynote", "ipm.activity"].iter().any(|c| class.starts_with(c))
+    super::item::Class::of(class).is_pim()
 }
 
 /// An item's bytes as read: its text and its files'.
@@ -547,6 +558,31 @@ pub(super) mod tests {
         /// Items at this row of their folder (from 0) or past it wait, before they're read, until
         /// the import is asked to stop: their folder stays part-way for as long as a test looks.
         HoldRow(u64),
+        /// …until the import is thrown away: a pause meanwhile (the import's own, its data file
+        /// let go of under it, among them) doesn't let them go, so the import can't end before.
+        HoldRowUntilDiscard(u64),
+    }
+
+    /// The planner's faults ([`Fault::PlanAt`], [`Fault::PlannerAfter`], [`Fault::Understate`]).
+    impl Ctx<'_> {
+        /// Looking at the folder that is `index` into the file fails at [`Fault::PlanAt`].
+        pub(in super::super) fn fault_looking(&self, index: usize) -> io::Result<()> {
+            match self.opts.fault {
+                Some(Fault::PlanAt(n)) if index == n => Err(io::Error::other("a test's plan fault")),
+                _ => Ok(()),
+            }
+        }
+
+        /// Handing out an item after `handed` others: the walk fails at [`Fault::PlannerAfter`]
+        /// (the Sent Items folder read after it, `sent`, doesn't), and the file says every item
+        /// is a byte at [`Fault::Understate`].
+        pub(in super::super) fn fault_handing(&self, handed: u64, sent: bool, size: u64) -> u64 {
+            match self.opts.fault {
+                Some(Fault::PlannerAfter(n)) if handed == n && !sent => panic!("a test's planner fault"),
+                Some(Fault::Understate) => 1,
+                _ => size,
+            }
+        }
     }
 
     /// What a test does to each item of a data file read (whether it's one of the Sent Items
@@ -601,6 +637,12 @@ pub(super) mod tests {
                 // A guard against hanging: a test that never stops it fails on its own.
                 let end = std::time::Instant::now() + Duration::from_secs(120);
                 while !ctx.opts.stop.raised() && std::time::Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Some(Fault::HoldRowUntilDiscard(row)) if job.row >= row => {
+                let end = std::time::Instant::now() + Duration::from_secs(120);
+                while ctx.opts.stop.how() != Some(StopHow::Discard) && std::time::Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }

@@ -18,18 +18,20 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             let kept = s.keep_drafts();
             Ok(json!({ "kept": kept }))
         }),
-        CommandSpec::new("compose.update", "Edit message", "Message", compose_update)
+        CommandSpec::new("compose.update", "Edit message", "Message", compose_update).leaves_body()
             .params(r#"{"to"?: string, "cc"?: string, "bcc"?: string, "subject"?: string, "body"?: string, "marks"?: bool (the body uses **bold**, *italic*, - lists…), "account"?: string, "from"?: string (one of the account's addresses; "" for its own), "importance"?: "high"|"normal"|"low", "readReceipt"?: bool, "replyTo"?: string (where replies go), "sendAfter"?: number (Unix seconds: held in the Outbox until then; 0 sends at once)}"#)
             .when(has_compose),
-        CommandSpec::new("compose.attach", "Attach file", "Message › Insert", attach).params(r#"{"path": string} | {"name": string, "data": [bytes]}"#).when(has_compose),
+        CommandSpec::new("compose.attach", "Attach file", "Message › Insert", attach).params(r#"{"path": string} | {"name": string, "handed": number (a file handed over: Session::hand)} | {"name": string, "data": [bytes]}"#).when(has_compose),
         CommandSpec::new("compose.insertPicture", "Insert picture", "Message › Insert", insert_picture)
-            .params(r#"{"path": string} | {"name": string, "data": [bytes]}, "insert"?: bool (default true), "at"?: number (character; default the end), "width"?: number (CSS pixels it's shown and sent at; default its own width), "line"?: bool (on a line of its own), "quoteCell"?: number (into that block of text of the quoted original, `at` counted in it)"#)
+            .params(r#"{"path": string} | {"name": string, "handed": number (a file handed over: Session::hand)} | {"name": string, "data": [bytes]}, "insert"?: bool (default true), "at"?: number (character; default the end), "width"?: number (CSS pixels it's shown and sent at; default its own width), "line"?: bool (on a line of its own), "quoteCell"?: number (into that block of text of the quoted original, `at` counted in it)"#)
             .when(has_compose),
         CommandSpec::new("compose.resizePicture", "Picture size", "Message › Picture", resize_picture)
             .params(r#"{"cid": string, "width"?: number (CSS pixels; 0 or none: its own width)}"#)
             .when(has_compose),
+        CommandSpec::new("compose.signaturePictures", "Show the signature's pictures", "Message › Signature", |s, _| s.show_signature_pictures())
+            .when(has_compose),
         CommandSpec::new("compose.format", "Plain text / Formatted", "Message › Format", |s, v| {
-            let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+            let c = s.composing_mut()?;
             c.plain = p::bool(v, "plain").unwrap_or(!c.plain);
             Ok(json!({"plain": c.plain}))
         })
@@ -50,18 +52,8 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("compose.hideRecipients", "Put everyone in Bcc", "Message", |s, _| s.hide_recipients()).when(has_compose),
         CommandSpec::new("compose.saveDraft", "Save draft", "Message", |s, _| s.save_draft()).key("Mod+S").when(has_compose),
         CommandSpec::new("compose.discard", "Discard", "Message", discard).when(has_compose),
-        CommandSpec::new("compose.popOut", "Pop out", "Message", |s, _| {
-            let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
-            c.window = true;
-            Ok(json!({"window": true}))
-        })
-        .when(has_compose),
-        CommandSpec::new("compose.popIn", "Pop in", "Message", |s, _| {
-            let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
-            c.window = false;
-            Ok(json!({"window": false}))
-        })
-        .when(has_compose),
+        CommandSpec::new("compose.popOut", "Pop out", "Message", |s, _| pop_out(s, true)).when(has_compose),
+        CommandSpec::new("compose.popIn", "Pop in", "Message", |s, _| pop_out(s, false)).when(has_compose),
         CommandSpec::new("compose.close", "Close", "Message", close_compose).params(r#"{"save"?: bool (keep it in Drafts; default true)}"#).when(has_compose),
         CommandSpec::new("contacts.suggest", "Suggest recipients", "Message › To", |s, v| {
             let q = p::req_str(v, "query")?.to_string();
@@ -83,6 +75,12 @@ pub(super) fn commands() -> Vec<CommandSpec> {
     ]
 }
 
+/// The message being written in a window of its own (`window`), or back in the main one.
+fn pop_out(s: &mut Session, window: bool) -> CmdResult {
+    s.composing_mut()?.window = window;
+    Ok(json!({ "window": window }))
+}
+
 pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
     let account = p::str(v, "account").map(str::to_string);
     if let Some(a) = &account
@@ -94,7 +92,7 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
     let from = match p::str(v, "from") {
         Some(address) => {
             let of = account.clone().or_else(|| s.compose.as_ref().map(|c| c.account.clone())).unwrap_or_default();
-            let config = s.account(&of).map(|a| &a.config).ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+            let config = s.account(&of).map(|a| &a.config).ok_or_else(|| CmdError::Disabled(NOT_WRITING.into()))?;
             match config.identity(address) {
                 Some(i) => Some(i.email.clone()),
                 None if address.trim().is_empty() || config.email.eq_ignore_ascii_case(address.trim()) => Some(String::new()),
@@ -103,10 +101,20 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
         }
         None => None,
     };
-    let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    // The address another account writes its new mail from (issue #88).
+    let new_mail_from = account.as_deref().and_then(|a| s.account(a)).map(|a| a.config.new_mail_from().to_string()).unwrap_or_default();
+    let c = s.composing_mut()?;
     if c.sending {
         return Err(CmdError::Disabled("the message is being sent".into()));
     }
+    // Every param that can be refused is read before anything changes: a refusal changes nothing.
+    let importance = match p::str(v, "importance") {
+        None => None,
+        Some("high") => Some(1),
+        Some("low") => Some(-1),
+        Some("normal") => Some(0),
+        Some(other) => return Err(CmdError::Params(format!("importance `{other}` isn't high, normal or low"))),
+    };
     let cap = |x: &str| x.chars().take(1 << 20).collect::<String>();
     for (k, field) in [("to", &mut c.to), ("cc", &mut c.cc), ("bcc", &mut c.bcc), ("subject", &mut c.subject)] {
         if let Some(x) = p::str(v, k) {
@@ -123,15 +131,10 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
         }
     }
     if !c.bcc.is_empty() {
-        c.show_cc = true;
+        c.show_bcc = true;
     }
-    if let Some(i) = p::str(v, "importance") {
-        c.importance = match i {
-            "high" => 1,
-            "low" => -1,
-            "normal" => 0,
-            other => return Err(CmdError::Params(format!("importance `{other}` isn't high, normal or low"))),
-        };
+    if let Some(i) = importance {
+        c.importance = i;
     }
     if let Some(r) = p::bool(v, "readReceipt") {
         c.read_receipt = r;
@@ -147,9 +150,10 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
     if account.is_some() || from.is_some() {
         let (was, was_from) = (c.account.clone(), c.from.clone());
         if let Some(a) = account {
-            // Another account's addresses aren't this one's: its own, unless one is picked.
+            // Another account's addresses aren't this one's: the one that account writes new
+            // mail from (an answer goes from its own), unless one is picked.
             if a != c.account {
-                c.from.clear();
+                c.from = if c.mode.is_none() { new_mail_from } else { String::new() };
             }
             c.account = a;
         }
@@ -164,30 +168,65 @@ pub(super) fn compose_update(s: &mut Session, v: &Value) -> CmdResult {
 
 /// Largest attachment accepted (most servers refuse messages over 25–35 MB).
 pub(super) const ATTACH_MAX: usize = 25 << 20;
+/// [`ATTACH_MAX`] in MB, as the messages say it.
+const ATTACH_MAX_MB: usize = ATTACH_MAX >> 20;
 
-/// A file from `path`, or `name` and `data` (bytes), at most 25 MB.
-pub(super) fn file_param(v: &Value) -> Result<(String, Vec<u8>), CmdError> {
+/// Most files kept handed over at once ([`Session::hand`]): each command takes its own.
+const HANDED_KEPT: usize = 4;
+
+impl Session {
+    /// A file's bytes handed over by the window (one picked in the browser, a picture pasted)
+    /// for the command that follows, which names it `"handed": n` (and takes it, or it's let go
+    /// of when that command ends). Given as `"data"`, a JSON list
+    /// with a value per byte (24 bytes each on wasm32), a 25 MB file took about 600 MB.
+    pub fn hand(&mut self, data: Vec<u8>) -> u64 {
+        self.last_handed = self.last_handed.wrapping_add(1);
+        if self.handed.len() >= HANDED_KEPT {
+            self.handed.remove(0);
+        }
+        self.handed.push((self.last_handed, data));
+        self.last_handed
+    }
+
+    /// The file `v` names with `"handed"`, taken (each is used once); an error when it names one
+    /// that isn't here, `None` when it names none.
+    pub(crate) fn take_handed(&mut self, v: &Value) -> Result<Option<Vec<u8>>, CmdError> {
+        let Some(n) = v.get("handed") else { return Ok(None) };
+        let i = n.as_u64().and_then(|n| self.handed.iter().position(|(k, _)| *k == n));
+        let i = i.ok_or_else(|| CmdError::Params("`handed`: no such file was handed over".into()))?;
+        Ok(Some(self.handed.remove(i).1))
+    }
+
+    /// Let go of the file `v` names with `"handed"`, when it's still here: its command ended
+    /// without taking it (unknown, not available now, or refused before it read its file), and
+    /// nothing else will. It stayed, up to 25 MB of it, until four more were handed over.
+    pub(crate) fn drop_handed(&mut self, v: &Value) {
+        if let Some(n) = v.get("handed").and_then(Value::as_u64) {
+            self.handed.retain(|(k, _)| *k != n);
+        }
+    }
+}
+
+/// A file from `path`, or `name` and the bytes handed over (`handed`) or given (`data`), at most
+/// [`ATTACH_MAX`].
+pub(super) fn file_param(s: &mut Session, v: &Value) -> Result<(String, Vec<u8>), CmdError> {
+    let too_big = || CmdError::Failed(format!("attachments are limited to {ATTACH_MAX_MB} MB"));
     let (name, data) = if let Some(path) = p::str(v, "path") {
         let pb = std::path::PathBuf::from(path);
-        let data = read_capped(path, ATTACH_MAX as u64).map_err(|e| match e {
-            CmdError::Params(m) if m.ends_with("too big") => CmdError::Failed(format!("{path} is larger than 25 MB")),
-            other => other,
-        })?;
+        let data = read_within(path, ATTACH_MAX as u64, || CmdError::Failed(format!("{path} is larger than {ATTACH_MAX_MB} MB")))?;
         (pb.file_name().and_then(|n| n.to_str()).unwrap_or("attachment").to_string(), data)
+    } else if let Some(data) = s.take_handed(v)? {
+        (p::req_str(v, "name")?.to_string(), data)
     } else {
         let name = p::req_str(v, "name")?.to_string();
-        let data: Vec<u8> = v
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| CmdError::Params("`path`, or `name` and `data`, are required".into()))?
-            .iter()
-            .take(ATTACH_MAX + 1)
-            .map(|b| b.as_u64().and_then(|x| u8::try_from(x).ok()).ok_or_else(|| CmdError::Params("`data` must be bytes".into())))
-            .collect::<Result<_, _>>()?;
+        if v.get("data").and_then(Value::as_array).is_some_and(|list| list.len() > ATTACH_MAX) {
+            return Err(too_big());
+        }
+        let data = p::bytes(v, "data", ATTACH_MAX)?.ok_or_else(|| CmdError::Params("`path`, or `name` and `data`, are required".into()))?;
         (name, data)
     };
     if data.len() > ATTACH_MAX {
-        return Err(CmdError::Failed("attachments are limited to 25 MB".into()));
+        return Err(too_big());
     }
     Ok((name, data))
 }
@@ -198,11 +237,11 @@ pub(super) fn compose_size(c: &crate::Compose) -> usize {
 }
 
 pub(super) fn attach(s: &mut Session, v: &Value) -> CmdResult {
-    let (name, data) = file_param(v)?;
-    let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    let (name, data) = file_param(s, v)?;
+    let c = s.composing_mut()?;
     let total: usize = compose_size(c) + data.len();
     if total > ATTACH_MAX {
-        return Err(CmdError::Failed("attachments are limited to 25 MB in total".into()));
+        return Err(CmdError::Failed(format!("attachments are limited to {ATTACH_MAX_MB} MB in total")));
     }
     let name = sanitize_filename(&name);
     let mime = mime_from_name(&name).to_string();
@@ -213,16 +252,16 @@ pub(super) fn attach(s: &mut Session, v: &Value) -> CmdResult {
 /// Place a picture in the text. With `"insert": false` the mark isn't added to the text (the
 /// editor puts it at the cursor itself).
 pub(super) fn insert_picture(s: &mut Session, v: &Value) -> CmdResult {
-    let (name, data) = file_param(v)?;
+    let (name, data) = file_param(s, v)?;
     let name = sanitize_filename(&name);
     let mime = mime_from_name(&name).to_string();
     if !mime.starts_with("image/") {
         return Err(CmdError::Params(format!("{name} isn't a picture")));
     }
     let cid = s.new_cid();
-    let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    let c = s.composing_mut()?;
     if compose_size(c) + data.len() > ATTACH_MAX {
-        return Err(CmdError::Failed("pictures and attachments are limited to 25 MB in total".into()));
+        return Err(CmdError::Failed(format!("pictures and attachments are limited to {ATTACH_MAX_MB} MB in total")));
     }
     c.inline.push(mailcraft_mime::InlinePicture { cid: cid.clone(), name, mime, data });
     c.plain = false;
@@ -280,7 +319,7 @@ pub(super) fn resize_picture(s: &mut Session, v: &Value) -> CmdResult {
     use mailcraft_mime::rich::{PICTURE, Style};
     let cid = p::req_str(v, "cid")?;
     let width = picture_width(v);
-    let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    let c = s.composing_mut()?;
     c.styles.fit(&c.body);
     let at: Vec<usize> =
         c.body.chars().enumerate().filter(|(i, ch)| *ch == PICTURE && c.styles.style(*i).picture.as_deref() == Some(cid)).map(|(i, _)| i).collect();
@@ -309,7 +348,7 @@ pub fn insert_picture_at(c: &mut crate::session::Compose, at: usize, cid: &str, 
 
 pub(super) fn remove_attachment(s: &mut Session, v: &Value) -> CmdResult {
     let i = p::u64(v, "index").ok_or_else(|| CmdError::Params("`index` is required".into()))?;
-    let c = s.compose.as_mut().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    let c = s.composing_mut()?;
     let i = usize::try_from(i).map_err(|_| CmdError::Params("bad index".into()))?;
     if i >= c.attachments.len() {
         return Err(CmdError::Params(format!("no attachment {i}")));
@@ -321,9 +360,10 @@ pub(super) fn remove_attachment(s: &mut Session, v: &Value) -> CmdResult {
 /// Close the message being written: kept in Drafts (unless `save` is false or nothing was
 /// written), as closing a message window in Outlook offers.
 pub(super) fn close_compose(s: &mut Session, v: &Value) -> CmdResult {
-    let c = s.compose.clone().ok_or_else(|| CmdError::Disabled("no message is being written".into()))?;
+    // What's needed of it, not a copy of it all (attachments and pictures, up to 25 MB).
+    let (id, account, sending) = s.composing().map(|c| (c.id, c.account.clone(), c.sending))?;
     let written = s.compose_written();
-    let saved = if p::bool(v, "save").unwrap_or(true) && written && !c.sending {
+    let saved = if p::bool(v, "save").unwrap_or(true) && written && !sending {
         s.save_draft()?;
         true
     } else {
@@ -332,14 +372,14 @@ pub(super) fn close_compose(s: &mut Session, v: &Value) -> CmdResult {
     if saved {
         // Said saved once it is: on this computer at once; a server's save has only begun, and
         // the message is held until it ends (#53), coming back with the reason if it fails.
-        if s.account(&c.account).is_none_or(|a| a.is_local()) {
+        if s.account(&account).is_none_or(|a| a.is_local()) {
             s.notice("Saved in Drafts", false);
         }
         s.let_go_saved();
     } else {
         s.let_go_compose();
     }
-    Ok(json!({"closed": c.id, "saved": saved}))
+    Ok(json!({"closed": id, "saved": saved}))
 }
 
 pub(super) fn discard(s: &mut Session, _: &Value) -> CmdResult {
@@ -369,18 +409,23 @@ impl Session {
 pub(super) fn save_attachment(s: &mut Session, v: &Value) -> CmdResult {
     let index = p::u64(v, "index").and_then(|i| usize::try_from(i).ok()).ok_or_else(|| CmdError::Params("`index` is required".into()))?;
     let path = p::req_str(v, "path")?;
-    // Opened from a message, a program, script or shortcut would run: never handed on.
     if p::bool(v, "open").unwrap_or(false) {
-        let leaf = std::path::Path::new(path).file_name().unwrap_or_default();
-        let name = leaf.to_string_lossy().into_owned();
-        if mailcraft_mime::runs_code(&name) {
-            return Err(CmdError::Disabled(format!("{name} could run a program, so it isn't opened from here; save it and check it first")));
-        }
+        refuse_runnable(path)?;
     }
     let data = s.attachment_bytes(index)?;
     std::fs::write(path, &data).map_err(|e| CmdError::Failed(format!("{path}: {e}")))?;
     mark_from_internet(std::path::Path::new(path), &data);
     Ok(json!({"saved": path, "bytes": data.len()}))
+}
+
+/// A file saved at `path` to be opened by another app: refused when it could run a program (a
+/// program, script or shortcut opened from a message would run), never handed on.
+pub(super) fn refuse_runnable(path: &str) -> Result<(), CmdError> {
+    let name = std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy().into_owned();
+    if mailcraft_mime::runs_code(&name) {
+        return Err(CmdError::Disabled(format!("{name} could run a program, so it isn't opened from here; save it and check it first")));
+    }
+    Ok(())
 }
 
 /// Windows' mark that a file came from the internet (its `Zone.Identifier` stream, zone 3), as
@@ -424,22 +469,44 @@ pub(super) fn save_all_attachments(s: &mut Session, v: &Value) -> CmdResult {
     let raw = s.readable_raw(&r.key).ok_or_else(|| CmdError::Failed("the message isn't downloaded".into()))?;
     // Only some of them, when asked (the ones selected).
     let only: Option<Vec<u64>> = v.get("indices").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).take(10_000).collect());
-    let mut saved = Vec::new();
-    for a in parsed.attachments.iter().filter(|a| !a.inline && only.as_ref().is_none_or(|o| o.contains(&(a.index as u64)))) {
-        let Some(data) = mailcraft_mime::attachment_data(&raw, a.index) else { continue };
-        let name = sanitize_filename(&a.name);
-        let (stem, ext) = name.rsplit_once('.').map_or((name.clone(), String::new()), |(s, e)| (s.to_string(), format!(".{e}")));
-        let mut path = dir.join(&name);
-        let mut n = 2;
-        while path.exists() && n < 1000 {
-            path = dir.join(format!("{stem} ({n}){ext}"));
-            n += 1;
+    let names: std::collections::HashMap<usize, &str> = parsed
+        .attachments
+        .iter()
+        .filter(|a| !a.inline && only.as_ref().is_none_or(|o| o.contains(&(a.index as u64))))
+        .map(|a| (a.index, a.name.as_str()))
+        .collect();
+    let wanted: Vec<usize> = names.keys().copied().collect();
+    let (mut saved, mut failed) = (Vec::new(), None);
+    // The message parsed once for all of them (it was once per file: a 25 MB message with 30
+    // files read 30 times), each file written as it's decoded.
+    mailcraft_mime::attachments_moved(&raw, &wanted, &mut |index, data| {
+        let Some(name) = names.get(&index).filter(|_| failed.is_none()) else { return };
+        match save_beside(&dir, name, &data) {
+            Ok(path) => saved.push(path),
+            Err(e) => failed = Some(e),
         }
-        std::fs::write(&path, &data).map_err(|e| CmdError::Failed(format!("{}: {e}", path.display())))?;
-        mark_from_internet(&path, &data);
-        saved.push(path.to_string_lossy().to_string());
+    });
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(json!({"saved": saved})),
     }
-    Ok(json!({"saved": saved}))
+}
+
+/// Highest number a saved file's name is given when the name is taken (`name (999).txt`).
+const NUMBERED_MAX: u32 = 999;
+
+/// `data` saved in `dir` as `name` (made safe), or with a number when that's taken; refused when
+/// every number is taken too, so that no file there is written over.
+fn save_beside(dir: &std::path::Path, name: &str, data: &[u8]) -> Result<String, CmdError> {
+    let name = sanitize_filename(name);
+    let (stem, ext) = name.rsplit_once('.').map_or((name.clone(), String::new()), |(s, e)| (s.to_string(), format!(".{e}")));
+    let path = std::iter::once(dir.join(&name))
+        .chain((2..=NUMBERED_MAX).map(|n| dir.join(format!("{stem} ({n}){ext}"))))
+        .find(|p| !p.exists())
+        .ok_or_else(|| CmdError::Failed(format!("{}: {name} and every numbered copy up to ({NUMBERED_MAX}) are there already", dir.display())))?;
+    std::fs::write(&path, data).map_err(|e| CmdError::Failed(format!("{}: {e}", path.display())))?;
+    mark_from_internet(&path, data);
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// An attachment as text, for previewing (`message` kind: an attached email, parsed).

@@ -72,17 +72,27 @@ impl Node {
     /// The rest follow, for a value a reader can't read (`width:600px;width:calc(…)`): a
     /// browser takes the last it can.
     pub(super) fn styles_as_written(&self, prop: &str) -> Vec<String> {
-        let Some(style) = self.attr("style") else { return Vec::new() };
+        let decls = self.styles.get_or_init(|| {
+            let Some(style) = self.attr("style") else { return Vec::new() };
+            style
+                .split(';')
+                .filter_map(|d| {
+                    let (k, v) = d.split_once(':')?;
+                    let v = v.trim();
+                    let (value, important) = match v.to_ascii_lowercase().find("!important") {
+                        Some(at) => (v.get(..at).unwrap_or(v).trim().to_string(), true),
+                        None => (v.to_string(), false),
+                    };
+                    Some(StyleDecl { prop: k.trim().to_ascii_lowercase(), value, important })
+                })
+                .collect()
+        });
         let (mut marked, mut plain) = (Vec::new(), Vec::new());
-        for d in style.split(';').rev() {
-            let Some((k, v)) = d.split_once(':') else { continue };
-            if !k.trim().eq_ignore_ascii_case(prop) {
-                continue;
-            }
-            let v = v.trim();
-            match v.to_ascii_lowercase().find("!important") {
-                Some(at) => marked.push(v.get(..at).unwrap_or(v).trim().to_string()),
-                None => plain.push(v.to_string()),
+        for d in decls.iter().rev().filter(|d| d.prop.eq_ignore_ascii_case(prop)) {
+            if d.important {
+                marked.push(d.value.clone());
+            } else {
+                plain.push(d.value.clone());
             }
         }
         marked.extend(plain);
@@ -90,7 +100,7 @@ impl Node {
     }
 
     /// The picture behind it: the `background` attribute, or `url(…)` in `background-image` or
-    /// `background`. Web, `cid:` and `data:` addresses only (nothing that runs).
+    /// `background`. Web and `cid:` addresses only (nothing that runs, and no `data:` picture).
     pub(super) fn background_image(&self) -> Option<String> {
         let from_css = || {
             let v = self.style_as_written("background-image").or_else(|| self.style_as_written("background"))?;
@@ -219,7 +229,7 @@ impl Node {
                 }
             })
             .collect();
-        Node { tag: self.tag.clone(), attrs, kids: self.kids.iter().map(copy).collect() }
+        Node { tag: self.tag.clone(), attrs, kids: self.kids.iter().map(copy).collect(), styles: Default::default() }
     }
 
     /// How what's in it lines up, when it says (`align`, `text-align`).
@@ -252,7 +262,7 @@ impl Node {
         if v.ends_with('%') {
             return None;
         }
-        let px = v.parse::<f32>().ok().or_else(|| length_px(v))?;
+        let px = length_px(v)?;
         (px.is_finite() && px >= 1.0).then(|| (px.round() as u16).min(MAX_CELL_HEIGHT))
     }
 
@@ -449,7 +459,7 @@ impl Node {
         if !style.is_empty() {
             attrs.push(("style".into(), style.join(";")));
         }
-        Node { tag: "a".into(), attrs, kids: self.kids.iter().map(copy).collect() }
+        Node { tag: "a".into(), attrs, kids: self.kids.iter().map(copy).collect(), styles: Default::default() }
     }
 
     /// A table's room between and around its cells (`cellspacing`; HTML's 2 when not said).
@@ -585,7 +595,7 @@ impl Node {
             Kid::Text(_) => true,
             Kid::El(e) if !block_tag(&e.tag) => !e.has_block_inside(0),
             // A title may hold a box of its own (`<h2><div>`, as a template writes one).
-            Kid::El(e) => e.tag.len() == 2 && e.tag.starts_with('h') && e.tag != "hr" && !e.has_table(0),
+            Kid::El(e) => e.is_title() && !e.has_table(0),
         })
     }
 
@@ -600,7 +610,6 @@ impl Node {
         only.font_size().or_else(|| only.wrapped_font_size(depth + 1))
     }
 
-    /// Its size in pixels, when its style or `<font size>` sets one.
     /// The size of the text in it, in pixels, given the size of what's around it (`0`: not
     /// known). A size of nothing (`font-size: 0`, on a template's columns) is passed over.
     pub(super) fn text_size(&self, around: u16) -> u16 {
@@ -629,6 +638,7 @@ impl Node {
         }
     }
 
+    /// Its size in pixels, when its style or `<font size>` sets one.
     pub(super) fn font_size(&self) -> Option<f32> {
         self.style("font-size")
             .as_deref()

@@ -16,8 +16,6 @@ use std::collections::HashMap;
 use mailcraft_model::ical::{self, CalEvent};
 use mailcraft_model::pim::{BookInfo, CalendarInfo, DavSync, LOCAL, Pim, StoredCard, StoredEvent};
 use mailcraft_model::vcard;
-use quick_xml::Reader;
-use quick_xml::events::Event as X;
 
 use crate::http::{self, Request, Response, Url};
 use crate::{NetError, Result};
@@ -50,160 +48,6 @@ pub struct Item {
     /// Whose it is, when it's someone else's: the end of their principal's address (sabre/dav
     /// names them by address: `accounting@example.com`).
     pub owner: Option<String>,
-}
-
-fn local(name: &str) -> String {
-    name.rsplit(':').next().unwrap_or("").to_ascii_lowercase()
-}
-
-/// Read a `207 Multi-Status` body.
-pub fn multistatus(xml: &str) -> Vec<Item> {
-    let mut r = Reader::from_str(xml);
-    let mut stack: Vec<String> = Vec::new();
-    let mut out: Vec<Item> = Vec::new();
-    let mut cur: Option<Item> = None;
-    // The properties of the propstat being read, kept only if its status is 200.
-    let mut pending = Item::default();
-    let mut status = String::new();
-    let mut text = String::new();
-    let mut privileges: Vec<String> = Vec::new();
-    while let Ok(ev) = r.read_event() {
-        // `<x/>` is a start and an end at once.
-        let empty = matches!(ev, X::Empty(_));
-        match ev {
-            X::Start(e) | X::Empty(e) if stack.len() < 64 => {
-                let name = local(e.name().as_ref());
-                let parent = stack.last().cloned().unwrap_or_default();
-                if parent == "resourcetype" {
-                    pending.kinds.push(name.clone());
-                }
-                if name == "comp" && parent == "supported-calendar-component-set" {
-                    for a in e.attributes().flatten() {
-                        if local(a.key.as_ref()) == "name" {
-                            pending.comps.push(a.value.to_ascii_uppercase());
-                        }
-                    }
-                }
-                if stack.iter().any(|s| s == "privilege") {
-                    privileges.push(name.clone());
-                }
-                match name.as_str() {
-                    "response" => {
-                        cur = Some(Item::default());
-                    }
-                    "propstat" => {
-                        pending = Item::default();
-                        status.clear();
-                    }
-                    _ => {}
-                }
-                text.clear();
-                if !empty {
-                    stack.push(name);
-                } else {
-                    end_tag(&name, &stack, &mut cur, &mut pending, &mut status, &mut privileges, &text, &mut out);
-                }
-            }
-            X::Text(t) => {
-                if text.len() < MAX_BODY {
-                    text.push_str(&t);
-                }
-            }
-            X::CData(t) => {
-                if text.len() < MAX_BODY {
-                    text.push_str(&t);
-                }
-            }
-            X::GeneralRef(g) => {
-                let name = g.to_string();
-                let c = match name.as_str() {
-                    "amp" => Some('&'),
-                    "lt" => Some('<'),
-                    "gt" => Some('>'),
-                    "quot" => Some('"'),
-                    "apos" => Some('\''),
-                    n => n
-                        .strip_prefix("#x")
-                        .or_else(|| n.strip_prefix("#X"))
-                        .and_then(|h| u32::from_str_radix(h, 16).ok())
-                        .or_else(|| n.strip_prefix('#').and_then(|d| d.parse().ok()))
-                        .and_then(char::from_u32),
-                };
-                if let Some(c) = c {
-                    text.push(c);
-                }
-            }
-            X::End(e) => {
-                let name = local(e.name().as_ref());
-                if stack.last() == Some(&name) {
-                    stack.pop();
-                }
-                end_tag(&name, &stack, &mut cur, &mut pending, &mut status, &mut privileges, &text, &mut out);
-                text.clear();
-            }
-            X::Eof => break,
-            _ => {}
-        }
-        if out.len() > 100_000 {
-            break;
-        }
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn end_tag(
-    name: &str,
-    stack: &[String],
-    cur: &mut Option<Item>,
-    pending: &mut Item,
-    status: &mut String,
-    privileges: &mut Vec<String>,
-    text: &str,
-    out: &mut Vec<Item>,
-) {
-    let parent = stack.last().map(String::as_str).unwrap_or("");
-    match name {
-        "href" if parent == "response" => {
-            if let Some(c) = cur.as_mut() {
-                c.href = text.trim().to_string();
-            }
-        }
-        "href" => {
-            // An href inside a property: file it under the property.
-            if let Some(prop) = stack.iter().rev().find(|s| s.as_str() != "href" && s.as_str() != "prop") {
-                pending.hrefs.entry(prop.clone()).or_default().push(text.trim().to_string());
-            }
-        }
-        "status" if parent == "propstat" => *status = text.to_string(),
-        "current-user-privilege-set" => {
-            pending.writable = Some(privileges.iter().any(|p| p == "write" || p == "all" || p == "write-content" || p == "bind"));
-            privileges.clear();
-        }
-        "propstat" => {
-            let ok = status.split_whitespace().nth(1).is_none_or(|c| c.starts_with('2'));
-            if ok && let Some(c) = cur.as_mut() {
-                let p = std::mem::take(pending);
-                c.props.extend(p.props);
-                for (k, v) in p.hrefs {
-                    c.hrefs.entry(k).or_default().extend(v);
-                }
-                c.kinds.extend(p.kinds);
-                c.comps.extend(p.comps);
-                c.writable = c.writable.or(p.writable);
-            }
-        }
-        "response" => {
-            if let Some(c) = cur.take() {
-                out.push(c);
-            }
-        }
-        _ => {
-            if parent == "prop" && !text.trim().is_empty() {
-                pending.props.insert(name.to_string(), text.trim().to_string());
-            }
-        }
-    }
 }
 
 /// Where an account's calendars and contacts are looked for: from its address and mail server,
@@ -278,7 +122,7 @@ pub struct Dav {
 
 impl Dav {
     pub fn new(user: &str, password: &str) -> Dav {
-        let basic = format!("Basic {}", crate::imap::base64(format!("{user}:{password}").as_bytes()));
+        let basic = format!("Basic {}", mailcraft_model::base64::encode(format!("{user}:{password}").as_bytes()));
         Dav { user: user.into(), password: password.into(), basic, digest: std::sync::Mutex::default(), guard: std::sync::Mutex::default() }
     }
 
@@ -366,10 +210,10 @@ impl Dav {
     /// One request, following redirects (WebDAV methods keep their method and body).
     fn request(&self, method: &str, url: &str, depth: Option<&str>, body: &str, extra: &[(&str, &str)]) -> Result<(Response, String)> {
         let mut url = url.to_string();
-        for _ in 0..6 {
+        for _ in 0..=http::MAX_REDIRECTS {
             // Plain http only to this computer (a test server): the password never crosses the
             // network in the clear, wherever a redirect or a server's href points.
-            if Url::parse(&url).is_ok_and(|u| !u.https && !local_host(&u.host)) {
+            if Url::parse(&url).is_ok_and(|u| !u.https && !http::is_loopback(&u.host)) {
                 return Err(NetError::Tls(format!("{url} isn't https: MailCraft won't send the calendar password there")));
             }
             let mut req = if body.is_empty() {
@@ -390,14 +234,7 @@ impl Dav {
                 req = req.header(k, v);
             }
             let resp = self.send(&req)?;
-            if matches!(resp.status, 301 | 302 | 303 | 307 | 308)
-                && let Some(loc) = resp.header("Location")
-            {
-                let from = Url::parse(&url)?;
-                let next = from.join(loc)?;
-                if from.https && !next.https {
-                    return Err(NetError::Tls("redirected from https to http".into()));
-                }
+            if let Some(next) = http::next_hop(&Url::parse(&url)?, &resp)? {
                 url = format!("{}{}", next.origin(), next.path);
                 continue;
             }
@@ -548,7 +385,7 @@ impl Dav {
     pub fn multiget(&self, kind: Kind, collection: &str, hrefs: &[String]) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
         for chunk in hrefs.chunks(BATCH) {
-            let refs: String = chunk.iter().map(|h| format!("<d:href>{}</d:href>", xml_escape(&path_of(h)))).collect();
+            let refs: String = chunk.iter().map(|h| format!("<d:href>{}</d:href>", crate::xml::esc(&path_of(h)))).collect();
             let body = match kind {
                 Kind::Calendars => format!(
                     "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:calendar-multiget xmlns:d=\"{DAV}\" xmlns:c=\"{CALDAV}\"><d:prop><d:getetag/><c:calendar-data/></d:prop>{refs}</c:calendar-multiget>"
@@ -600,11 +437,7 @@ impl Dav {
         }
     }
 
-    pub fn delete(&self, url: &str, etag: &str) -> Result<()> {
-        self.remove(url, etag)?.map_err(|r| NetError::No(r.to_string()))
-    }
-
-    /// [`Dav::delete`], telling why the server didn't delete it (`Err` inside).
+    /// Delete an item (when it still has `etag`, if given): why the server didn't (`Err` inside).
     pub fn remove(&self, url: &str, etag: &str) -> Result<std::result::Result<(), Refused>> {
         let mut req = Request { method: "DELETE".into(), url: url.into(), max: 1 << 20, ..Default::default() };
         if !etag.is_empty() {
@@ -624,7 +457,7 @@ impl Dav {
     pub fn find_uid(&self, calendar: &str, uid: &str) -> Result<Vec<String>> {
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:calendar-query xmlns:d=\"{DAV}\" xmlns:c=\"{CALDAV}\"><d:prop><d:getetag/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VEVENT\"><c:prop-filter name=\"UID\"><c:text-match collation=\"i;octet\">{}</c:text-match></c:prop-filter></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>",
-            xml_escape(uid)
+            crate::xml::esc(&ical::stored_uid(uid))
         );
         let (resp, at) = self.request("REPORT", calendar, Some("1"), &body, &[])?;
         if resp.status != 207 {
@@ -708,10 +541,6 @@ fn mark_foreign(items: &mut [Item], at: &str, home: &str) {
     }
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
 /// An href (absolute, or a path) made absolute against the address it came from.
 fn absolute(base: &str, href: &str) -> Result<String> {
     let u = Url::parse(base)?.join(href.trim())?;
@@ -771,15 +600,10 @@ pub fn given_url(given: &str) -> Option<String> {
     let lower = g.to_ascii_lowercase();
     let full = if lower.starts_with("https://") || lower.starts_with("http://") { g.to_string() } else { format!("https://{g}") };
     let u = Url::parse(&full).ok()?;
-    if !u.https && !local_host(&u.host) {
+    if !u.https && !http::is_loopback(&u.host) {
         return None;
     }
     Some(format!("{}{}", u.origin(), if u.path.is_empty() { "/" } else { &u.path }))
-}
-
-/// This computer, by name or address.
-fn local_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 /// The collection an address is in (`…/calendars/me/default` → `…/calendars/me/`); none above a
@@ -799,6 +623,8 @@ fn path_of(url: &str) -> String {
 
 pub(crate) mod digest;
 pub(crate) mod guard;
+mod multistatus;
+pub use multistatus::multistatus;
 mod syncing;
 pub use syncing::sync;
 #[cfg(test)]

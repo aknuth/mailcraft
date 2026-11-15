@@ -25,45 +25,23 @@ fn has_reading(s: &Session) -> Option<&'static str> {
     }
 }
 
-/// Commands that only move about the list (or open another message) or change the list or the
-/// view without acting on the open message (a search typed or remembered as the box is left
-/// for a result, a filter, the sort), and those about
-/// an account's data file (the window tells the idle policy how long it's been every half
-/// minute): they leave its body being got ready on another thread, where every other command
-/// waits for it.
-pub(crate) fn leaves_body_waiting(id: &str) -> bool {
-    matches!(
-        id,
-        "list.open"
-            | "list.select"
-            | "list.selectRange"
-            | "list.selectAll"
-            | "list.next"
-            | "list.prev"
-            | "list.first"
-            | "list.last"
-            | "list.pageDown"
-            | "list.pageUp"
-            | "folder.open"
-            | "folder.unified"
-            | "list.filter"
-            | "list.focusTab"
-            | "list.messages"
-            | "search.run"
-            | "search.clear"
-            | "search.remember"
-            | "search.forgetRecent"
-            | "searchFolder.open"
-            | "view.arrange"
-            | "view.reverseSort"
-            | "view.folderPane"
-            | "compose.update"
-    ) || id.starts_with("list.extend")
-        || id.starts_with("dataFile.")
-}
+/// Why a command about the message being written can't run.
+const NOT_WRITING: &str = "no message is being written";
 
 fn has_compose(s: &Session) -> Option<&'static str> {
-    if s.compose.is_some() { None } else { Some("no message is being written") }
+    if s.compose.is_some() { None } else { Some(NOT_WRITING) }
+}
+
+impl Session {
+    /// The message being written, or the error that there's none.
+    pub(crate) fn composing(&self) -> Result<&crate::Compose, CmdError> {
+        self.compose.as_ref().ok_or_else(|| CmdError::Disabled(NOT_WRITING.into()))
+    }
+
+    /// The message being written, to change, or the error that there's none.
+    pub(crate) fn composing_mut(&mut self) -> Result<&mut crate::Compose, CmdError> {
+        self.compose.as_mut().ok_or_else(|| CmdError::Disabled(NOT_WRITING.into()))
+    }
 }
 
 /// A message being written, from an account that can send it.
@@ -78,6 +56,36 @@ fn has_account(s: &Session) -> Option<&'static str> {
 /// Connecting needs an account, and not working offline.
 fn can_connect(s: &Session) -> Option<&'static str> {
     has_account(s).or(if s.prefs.work_offline { Some("working offline") } else { None })
+}
+
+/// A command switching one of [`crate::session::Prefs`]' settings on or off: `"on"` says which,
+/// none switches it; it answers `{"on": bool}`. `params` when it says more than `{"on"?: bool}`.
+macro_rules! toggle {
+    ($id:literal, $label:literal, $location:literal, $field:ident) => {
+        toggle!($id, $label, $location, $field, r#"{"on"?: bool}"#)
+    };
+    ($id:literal, $label:literal, $location:literal, $field:ident, $params:literal) => {
+        CommandSpec::new($id, $label, $location, |s, v| {
+            s.prefs.$field = p::bool(v, "on").unwrap_or(!s.prefs.$field);
+            Ok(json!({"on": s.prefs.$field}))
+        })
+        .params($params)
+    };
+}
+
+/// Do a Quick Step to the selection, by its number (from 1): Ctrl+Shift+1 to 9.
+macro_rules! quick_step {
+    ($n:literal) => {
+        CommandSpec::new(concat!("quickStep.", $n), concat!("Quick Step ", $n), "Home › Quick Steps", |s, _| s.run_quick_step(None, Some($n - 1)))
+            .key(concat!("Mod+Shift+", $n))
+            .when(has_selection)
+    };
+}
+
+/// Show one of Mail, Calendar, People, Tasks and Notes.
+fn set_module(s: &mut Session, module: crate::Module) -> CmdResult {
+    s.module = module;
+    Ok(json!({"module": s.module}))
 }
 
 mod accounts;
@@ -119,11 +127,36 @@ pub fn registry() -> Registry {
 
 /// `account` from the params, else the account of the folder on screen.
 fn account_param(s: &Session, v: &Value) -> Result<String, CmdError> {
-    match p::str(v, "account") {
-        Some(a) if s.account(a).is_some() => Ok(a.to_string()),
-        Some(a) => Err(CmdError::Params(format!("no account `{a}`"))),
-        None => s.current_account().map(|a| a.config.id.clone()).ok_or_else(|| CmdError::Disabled("add an account first".into())),
-    }
+    s.account_or_shown(p::str(v, "account"))
+}
+
+/// The `categories` of an event or a task (a text split at `,` and `;`, or a list): trimmed,
+/// each once whatever its letters (`Vec::dedup` kept a repeat that wasn't next to the first), at
+/// most 20 of 100 characters. `None` when none are given.
+fn categories_param(v: &Value) -> Option<Vec<String>> {
+    let given: Vec<&str> = match v.get("categories")? {
+        Value::String(x) => x.split([',', ';']).collect(),
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    let mut seen = std::collections::HashSet::new();
+    // Cut before they're compared: two that differ only past the cut are one once kept.
+    let cut = |c: &str| c.trim().chars().take(100).collect::<String>().trim_end().to_string();
+    let list = given.into_iter().map(cut).filter(|c| !c.is_empty()).filter(|c| seen.insert(c.to_lowercase()));
+    Some(list.take(20).collect())
+}
+
+/// The `repeat` of an event or a task: `Some(None)` for none, `Some(Some(rule))`, `None` when it
+/// isn't given. A rule of its own (`FREQ=…`) can't hold a line break, which would end the line it
+/// goes into (an event's was let through, and made safe only as it was written).
+fn repeat_param(v: &Value) -> Result<Option<Option<String>>, CmdError> {
+    Ok(match p::str(v, "repeat").map(str::trim) {
+        None => None,
+        Some("" | "none" | "never") => Some(None),
+        Some(r @ ("daily" | "weekly" | "monthly" | "yearly")) => Some(Some(format!("FREQ={}", r.to_ascii_uppercase()))),
+        Some(r) if r.to_ascii_uppercase().starts_with("FREQ=") && r.len() < 500 && !r.contains(['\r', '\n']) => Some(Some(r.to_string())),
+        Some(r) => return Err(CmdError::Params(format!("`{r}` is not a repeat"))),
+    })
 }
 
 fn key_param(s: &Session, v: &Value) -> Result<mailcraft_model::MessageKey, CmdError> {
@@ -136,20 +169,40 @@ fn key_param(s: &Session, v: &Value) -> Result<mailcraft_model::MessageKey, CmdE
 
 /// A file's bytes, refused when it's bigger than `max` (read no further than that).
 pub(crate) fn read_capped(path: &str, max: u64) -> Result<Vec<u8>, CmdError> {
-    use std::io::Read;
-    // Only a plain file: a device (`/dev/zero`) reads forever and a pipe blocks on opening,
-    // whatever size they report.
-    match std::fs::metadata(path) {
-        Err(e) => return Err(CmdError::Failed(format!("{path}: {e}"))),
-        Ok(m) if !m.is_file() => return Err(CmdError::Params(format!("{path} isn't a file"))),
-        Ok(m) if m.len() > max => return Err(CmdError::Params(format!("{path} is too big"))),
-        Ok(_) => {}
+    read_within(path, max, || CmdError::Params(format!("{path} is too big")))
+}
+
+/// [`read_capped`], refused with `too_big` when the file is bigger than `max`: a caller says so
+/// in its own words without reading the words of another error.
+pub(crate) fn read_within(path: &str, max: u64, too_big: impl Fn() -> CmdError) -> Result<Vec<u8>, CmdError> {
+    if plain_file_size(path)? > max {
+        return Err(too_big());
     }
-    let f = std::fs::File::open(path).map_err(|e| CmdError::Failed(format!("{path}: {e}")))?;
-    let mut bytes = Vec::new();
-    f.take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| CmdError::Failed(format!("{path}: {e}")))?;
+    read_more(path, open_file(path)?, Vec::new(), max, too_big)
+}
+
+/// The size of the file at `path`, refused when it isn't a plain file: a device (`/dev/zero`)
+/// reads forever and a pipe blocks on opening, whatever size they report.
+fn plain_file_size(path: &str) -> Result<u64, CmdError> {
+    match std::fs::metadata(path) {
+        Err(e) => Err(CmdError::Failed(format!("{path}: {e}"))),
+        Ok(m) if !m.is_file() => Err(CmdError::Params(format!("{path} isn't a file"))),
+        Ok(m) => Ok(m.len()),
+    }
+}
+
+/// The file at `path` opened to read (after [`plain_file_size`]).
+fn open_file(path: &str) -> Result<std::fs::File, CmdError> {
+    std::fs::File::open(path).map_err(|e| CmdError::Failed(format!("{path}: {e}")))
+}
+
+/// The rest of `f` after `bytes`, refused with `too_big` once there's more than `max` in all.
+fn read_more(path: &str, f: impl std::io::Read, mut bytes: Vec<u8>, max: u64, too_big: impl Fn() -> CmdError) -> Result<Vec<u8>, CmdError> {
+    use std::io::Read;
+    let room = max.saturating_add(1).saturating_sub(bytes.len() as u64);
+    f.take(room).read_to_end(&mut bytes).map_err(|e| CmdError::Failed(format!("{path}: {e}")))?;
     if bytes.len() as u64 > max {
-        return Err(CmdError::Params(format!("{path} is too big")));
+        return Err(too_big());
     }
     Ok(bytes)
 }

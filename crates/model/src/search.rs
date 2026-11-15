@@ -1,4 +1,4 @@
-//! Search: the query language of the search box and an inverted index for fast offline search.
+//! Search: the query language of the search box, and the words a message is indexed by.
 //!
 //! The syntax follows the familiar mail-client form: bare words match anywhere (as word
 //! prefixes, so `proj` finds "project"), `"quoted phrases"` match as written, and keywords narrow
@@ -12,9 +12,8 @@
 //! otherwise must all match). Words are read [folded](fold): `resume` finds "Résumé".
 //!
 //! A query is checked against a message with [`Query::eval`], which answers yes, no, or (when the
-//! message's text isn't known well enough) "can't tell" ([`Tri`]). [`Index`] maps every word of
-//! every message to the messages containing it (a `BTreeMap`, so a prefix is one range scan): a
-//! query asks it for candidates and then checks each, so it may over-approximate but never misses.
+//! message's text isn't known well enough) "can't tell" ([`Tri`]). The words a message is indexed
+//! by are its [`placed_tokens`]; the index itself, on disk, is the store's (`mailcraft_store::search`).
 
 use crate::Summary;
 
@@ -22,7 +21,6 @@ mod advanced;
 pub mod dates;
 pub mod fold;
 mod fold_table;
-mod index;
 mod matching;
 mod parse;
 #[cfg(test)]
@@ -30,11 +28,8 @@ mod tests;
 
 pub use advanced::Advanced;
 pub use dates::{DateBound, DatePoint, DateSpec, Edge, Relative};
-pub use fold::{
-    MAX_TOKEN_CHARS, Placed, TOKENIZER_VERSION, fold_all, fold_text, fold_word, folded_has_phrase, index_tokens, parts, placed_tokens, tokens,
-};
-pub use index::Index;
-pub use matching::{Doc, SummaryText, TextField, TextSource, Tri, indexed};
+pub use fold::{MAX_TOKEN_CHARS, Placed, TOKENIZER_VERSION, fold_all, fold_word, folded_has_phrase, parts, placed_tokens, tokens};
+pub use matching::{Doc, DocText, SummaryText, TextField, TextSource, Tri, WholeText, indexed};
 use parse::split_tokens;
 pub(crate) use parse::split_tokens_with;
 
@@ -112,7 +107,17 @@ pub struct Clause {
 pub enum Problem {
     /// A date that isn't one (`received:2024-13`, `after:party`): the term as typed.
     Date(String),
+    /// A size, or a yes or no, that isn't one (`larger:abc`, `isread:x`): the term as typed.
+    Value(String),
+    /// More terms than a search takes ([`MAX_TERMS`]), or more names in a list than it takes
+    /// ([`MAX_LIST`]): the rest were left out.
+    TooLong,
 }
+
+/// The most terms a search takes; those past them are left out ([`Problem::TooLong`]).
+pub const MAX_TERMS: usize = 64;
+/// The most names a list takes (`from:ana,jun,…`).
+pub const MAX_LIST: usize = 50;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Query {
@@ -125,18 +130,6 @@ impl Query {
     pub fn is_empty(&self) -> bool {
         self.clauses.is_empty()
     }
-}
-
-/// The text a summary contributes to the index.
-pub fn summary_text(m: &Summary) -> String {
-    let mut s = String::with_capacity(128 + m.preview.len());
-    s.push_str(&m.subject);
-    s.push(' ');
-    matching::push_addresses(std::slice::from_ref(&m.from), &mut s);
-    matching::push_addresses(&m.to, &mut s);
-    matching::push_addresses(&m.cc, &mut s);
-    s.push_str(&m.preview);
-    s
 }
 
 /// Most characters of a message's text kept for search; a longer one is cut there

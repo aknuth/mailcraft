@@ -6,10 +6,12 @@ use super::*;
 
 pub(crate) mod boot;
 mod lanes;
+pub(crate) mod launch;
 mod print;
 pub(crate) mod start;
 pub(crate) mod state_writer;
 pub(crate) mod tray;
+pub(crate) mod video_frames;
 pub(crate) mod window_frame;
 
 pub(crate) struct PoolBackend(pub(crate) Pool);
@@ -28,10 +30,8 @@ impl Backend for PoolBackend {
 
 #[derive(Default)]
 pub(crate) struct Desktop {
-    /// Where video frames come from (looked up once).
-    pub(crate) frame_source: Option<Option<video::Source>>,
-    /// Video frames being made or made, by file.
-    pub(crate) frames: std::collections::HashMap<PathBuf, Arc<std::sync::Mutex<Option<VideoFrame>>>>,
+    /// Video frames being made, a few at a time.
+    pub(crate) frames: video_frames::VideoFrames,
     /// The data files' folder in use, and the app folder whose data files can be moved (`None`
     /// when the place was chosen at start: `--data`, `--sample`, `MAILCRAFT_DATA`).
     pub(crate) data: Option<PathBuf>,
@@ -93,6 +93,12 @@ impl Services for Desktop {
         if let Some(guard) = &self.frame_guard {
             guard.before_zoom();
         }
+    }
+
+    /// The system's cursor, in physical pixels (winit makes MailCraft per-monitor DPI aware).
+    #[cfg(target_os = "windows")]
+    fn pointer_on_screen(&mut self) -> Option<[i32; 2]> {
+        winsafe::GetCursorPos().ok().map(|p| [p.x, p.y])
     }
 
     fn clock(&self) -> (i64, i32) {
@@ -235,22 +241,20 @@ impl Services for Desktop {
     fn cjk_font(&mut self, lang: &str) -> Option<(Vec<u8>, u32)> {
         // The language's own font first (Chinese, Japanese and Korean draw shared characters
         // differently), then any that has the characters at all.
-        let (windows, macos, noto_index): (&[&str], &[&str], u32) = match lang {
-            "ja" => (&["YuGothM.ttc", "msgothic.ttc"], &["ヒラギノ角ゴシック W3.ttc", "Hiragino Sans GB.ttc"], 0),
-            "ko" => (&["malgun.ttf", "gulim.ttc"], &["AppleSDGothicNeo.ttc"], 1),
-            "zh-hant" => (&["msjh.ttc", "mingliu.ttc"], &["PingFang.ttc"], 3),
-            _ => (&["msyh.ttc", "simsun.ttc"], &["PingFang.ttc", "Hiragino Sans GB.ttc"], 2),
+        let (windows, noto_index): (&[&str], u32) = match lang {
+            "ja" => (&["YuGothM.ttc", "msgothic.ttc"], 0),
+            "ko" => (&["malgun.ttf", "gulim.ttc"], 1),
+            "zh-hant" => (&["msjh.ttc", "mingliu.ttc"], 3),
+            _ => (&["msyh.ttc", "simsun.ttc"], 2),
         };
-        let mut candidates: Vec<(String, u32)> = Vec::new();
+        let mut candidates: Vec<(PathBuf, u32)> = Vec::new();
         if cfg!(target_os = "windows") {
-            let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+            let fonts = windows_fonts_dir();
             for f in windows.iter().chain(["msyh.ttc", "YuGothM.ttc", "malgun.ttf"].iter()) {
-                candidates.push((format!("{dir}\\Fonts\\{f}"), 0));
+                candidates.push((fonts.join(f), 0));
             }
         } else if cfg!(target_os = "macos") {
-            for f in macos.iter().chain(["PingFang.ttc", "AppleSDGothicNeo.ttc"].iter()) {
-                candidates.push((format!("/System/Library/Fonts/{f}"), 0));
-            }
+            candidates.extend(macos_cjk_fonts(lang).into_iter().map(|p| (p, 0)));
         } else {
             // Noto Sans CJK collections hold Japanese, Korean, Simplified and Traditional faces.
             for p in [
@@ -258,26 +262,31 @@ impl Services for Desktop {
                 "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
             ] {
-                candidates.push((p.to_string(), noto_index));
+                candidates.push((PathBuf::from(p), noto_index));
             }
-            candidates.push(("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf".into(), 0));
+            candidates.push((PathBuf::from("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"), 0));
         }
         candidates.iter().find_map(|(p, i)| std::fs::read(p).ok().map(|b| (b, *i)))
     }
     fn rtl_font(&mut self) -> Option<Vec<u8>> {
         // Fonts with both Arabic and Hebrew first.
-        let candidates: &[&str] = if cfg!(target_os = "windows") {
-            &["C:\\Windows\\Fonts\\tahoma.ttf", "C:\\Windows\\Fonts\\arial.ttf"]
+        let candidates: Vec<PathBuf> = if cfg!(target_os = "windows") {
+            let fonts = windows_fonts_dir();
+            vec![fonts.join("tahoma.ttf"), fonts.join("arial.ttf")]
         } else if cfg!(target_os = "macos") {
-            &["/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Supplemental/Tahoma.ttf"]
+            ["/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Supplemental/Tahoma.ttf"]
+                .map(PathBuf::from)
+                .into()
         } else {
-            &[
+            [
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                 "/usr/share/fonts/dejavu/DejaVuSans.ttf",
                 "/usr/share/fonts/TTF/DejaVuSans.ttf",
                 "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
                 "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
             ]
+            .map(PathBuf::from)
+            .into()
         };
         candidates.iter().find_map(|p| std::fs::read(p).ok())
     }
@@ -293,30 +302,16 @@ impl Services for Desktop {
             || (std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none())
     }
     fn video_frame(&mut self, path: &Path) -> VideoFrame {
-        if let Some(slot) = self.frames.get(path) {
-            return slot.lock().map(|g| g.clone().unwrap_or(VideoFrame::Pending)).unwrap_or(VideoFrame::Unavailable);
-        }
-        let source = self.frame_source.get_or_insert_with(video::source).clone();
-        let Some(source) = source else { return VideoFrame::Unavailable };
-        let slot = Arc::new(std::sync::Mutex::new(None));
-        self.frames.insert(path.to_path_buf(), slot.clone());
-        let video = path.to_path_buf();
-        let spawned = std::thread::Builder::new().name("video-thumbnail".into()).spawn(move || {
-            let png = video::frame(&source, &video);
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(png.map_or(VideoFrame::Unavailable, VideoFrame::Ready));
-            }
-        });
-        if spawned.is_err() {
-            return VideoFrame::Unavailable;
-        }
-        VideoFrame::Pending
+        self.frames.frame(path)
     }
     fn background(&mut self, lane: mailcraft_ui_egui::Lane, work: mailcraft_ui_egui::Work) -> Result<(), mailcraft_ui_egui::Work> {
         self.lanes.submit(lane, work)
     }
     fn has_background(&self) -> bool {
         self.lanes.available()
+    }
+    fn tend_background(&mut self) {
+        self.lanes.tend();
     }
     fn pick_folder(&mut self) -> Option<PathBuf> {
         let folder = self.dialog("Save attachments to").pick_folder();
@@ -393,7 +388,7 @@ impl Services for Desktop {
         #[cfg(windows)]
         let portable = self.portable;
         // Off the UI thread: the notification service can be slow, or missing.
-        std::thread::spawn(move || {
+        off_thread(std::thread::Builder::new().name("notify".into()), "notification", move || {
             let mut n = notify_rust::Notification::new();
             n.summary(&title).body(&body).appname("MailCraft");
             // Windows names a toast after its app id (PowerShell's when none is given). A
@@ -406,6 +401,57 @@ impl Services for Desktop {
                 log::warn!("notification: {e}");
             }
         });
+    }
+}
+
+/// Windows' Fonts folder, in the Windows folder (`%WINDIR%`), which needn't be `C:\Windows`.
+pub(crate) fn windows_fonts_dir() -> PathBuf {
+    windows_fonts_dir_in(std::env::var_os("WINDIR"))
+}
+
+/// [`windows_fonts_dir`] with `windir` for `%WINDIR%` (`C:\Windows` when it's unset, empty or
+/// relative).
+fn windows_fonts_dir_in(windir: Option<std::ffi::OsString>) -> PathBuf {
+    windir.map(PathBuf::from).filter(|d| d.is_absolute()).unwrap_or_else(|| PathBuf::from("C:\\Windows")).join("Fonts")
+}
+
+/// Where macOS 26 keeps PingFang, out of `/System/Library/Fonts`, where it was before: its first
+/// face is the Simplified Chinese one.
+const MACOS_PINGFANG_UI: &str = "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved/PingFangUI.ttc";
+
+/// The Mac's fonts for Chinese, Japanese or Korean (`lang`), first preferred: the language's own,
+/// then any that has the characters at all. PingFang moved in macOS 26 (PdfCraft found it): where
+/// `PingFang.ttc` is gone, Chinese came out in a Japanese or Korean font. For Traditional Chinese,
+/// STHeiti comes before the moved PingFang's first face, which is Simplified.
+fn macos_cjk_fonts(lang: &str) -> Vec<PathBuf> {
+    let own: &[&str] = match lang {
+        "ja" => &["ヒラギノ角ゴシック W3.ttc", "Hiragino Sans GB.ttc"],
+        "ko" => &["AppleSDGothicNeo.ttc"],
+        "zh-hant" => &["PingFang.ttc", "STHeiti Light.ttc", "STHeiti Medium.ttc", MACOS_PINGFANG_UI],
+        _ => &["PingFang.ttc", MACOS_PINGFANG_UI, "Hiragino Sans GB.ttc"],
+    };
+    let fonts = Path::new("/System/Library/Fonts");
+    let mut list: Vec<PathBuf> = Vec::new();
+    for f in own.iter().chain(&["PingFang.ttc", MACOS_PINGFANG_UI, "AppleSDGothicNeo.ttc"]) {
+        // An absolute path is taken as it is.
+        let path = fonts.join(f);
+        if !list.contains(&path) {
+            list.push(path);
+        }
+    }
+    list
+}
+
+/// Run `f` on a thread of its own made by `builder`: false, and `what` logged, when the system
+/// won't start one (short of resources), where `std::thread::spawn` panicked on the window's
+/// thread.
+fn off_thread(builder: std::thread::Builder, what: &str, f: impl FnOnce() + Send + 'static) -> bool {
+    match builder.spawn(f) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("{what}: no thread to run it on ({e})");
+            false
+        }
     }
 }
 
@@ -458,36 +504,65 @@ fn office_pictures_in(html: String, temp: &Path) -> String {
     })
 }
 
-/// The file a `file:` address names (`file:///C:/Users/…/clip_image001.png`, with `%20` and
-/// the like decoded); `None` for any other address.
+/// The file on this computer a `file:` address names (`file:///C:/Users/…/clip_image001.png`,
+/// with `%20` and the like decoded), read as a `file:` link MailCraft is started with is;
+/// `None` for any other address, or one to another computer.
 fn office_file(src: &str) -> Option<PathBuf> {
     let src = src.trim();
-    let rest = src.get(..5).filter(|s| s.eq_ignore_ascii_case("file:")).and_then(|_| src.get(5..))?;
-    let rest = rest.trim_start_matches('/');
-    let mut bytes = Vec::with_capacity(rest.len());
-    let raw = rest.as_bytes();
-    let mut i = 0;
-    while let Some(&b) = raw.get(i) {
-        let hex = |k: usize| raw.get(k).and_then(|h| (*h as char).to_digit(16));
-        match (b, hex(i + 1), hex(i + 2)) {
-            (b'%', Some(a), Some(b2)) => {
-                bytes.push(u8::try_from(a * 16 + b2).ok()?);
-                i += 3;
-            }
-            _ => {
-                bytes.push(b);
-                i += 1;
-            }
-        }
-    }
-    let path = String::from_utf8(bytes).ok()?;
-    // `C:/…` on Windows; `/tmp/…` elsewhere.
-    Some(if cfg!(windows) { PathBuf::from(path) } else { PathBuf::from(format!("/{path}")) })
+    src.get(..5).filter(|s| s.eq_ignore_ascii_case("file:"))?;
+    crate::args::from_file_link(src).map(PathBuf::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chinese on macOS 26, where PingFang is in another folder, comes in PingFang still, never in
+    /// a Japanese or Korean font first; Traditional Chinese in STHeiti before the moved PingFang,
+    /// whose first face is Simplified. Each font is looked for once.
+    #[test]
+    fn the_macs_chinese_font_is_found_where_macos_26_keeps_it() {
+        let at = |list: &[PathBuf], name: &str| list.iter().position(|p| p.ends_with(name));
+        let moved = PathBuf::from(MACOS_PINGFANG_UI);
+        let simplified = macos_cjk_fonts("zh-hans");
+        assert_eq!(simplified[0], Path::new("/System/Library/Fonts/PingFang.ttc"));
+        assert_eq!(simplified[1], moved);
+        assert!(at(&simplified, "Hiragino Sans GB.ttc") > Some(1) && at(&simplified, "AppleSDGothicNeo.ttc") > Some(1));
+        let traditional = macos_cjk_fonts("zh-hant");
+        assert!(at(&traditional, "STHeiti Medium.ttc") < traditional.iter().position(|p| *p == moved));
+        assert!(traditional.iter().position(|p| *p == moved) < at(&traditional, "AppleSDGothicNeo.ttc"));
+        for lang in ["ja", "ko", "zh-hans", "zh-hant"] {
+            let list = macos_cjk_fonts(lang);
+            assert!(list.contains(&moved), "{lang}");
+            assert!(list.iter().enumerate().all(|(i, p)| !list[..i].contains(p)), "{lang}: {list:?}");
+        }
+        assert_eq!(macos_cjk_fonts("ko")[0], Path::new("/System/Library/Fonts/AppleSDGothicNeo.ttc"));
+    }
+
+    /// A thread the system won't start (here a stack no system gives) is said, not a panic on
+    /// the window's thread, as `std::thread::spawn` made it for each new-mail notification.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_thread_that_cant_start_isnt_a_panic() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(off_thread(std::thread::Builder::new(), "test", move || tx.send(()).unwrap_or_default()));
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "ran");
+        assert!(!off_thread(std::thread::Builder::new().stack_size(1 << 50), "test", || {}));
+    }
+
+    /// Found in audit (#229): the UI and right-to-left fonts were looked for in `C:\Windows`
+    /// whatever folder Windows is in (the CJK fonts in `%WINDIR%`). All three come from the
+    /// Windows folder now; `C:\Windows` only when `%WINDIR%` says nothing usable.
+    #[test]
+    fn fonts_come_from_the_windows_folder() {
+        let elsewhere = if cfg!(windows) { r"D:\Windows" } else { "/opt/windows" };
+        assert_eq!(windows_fonts_dir_in(Some(elsewhere.into())), Path::new(elsewhere).join("Fonts"));
+        for unusable in [None, Some("".into()), Some("Windows".into())] {
+            assert_eq!(windows_fonts_dir_in(unusable), PathBuf::from("C:\\Windows").join("Fonts"));
+        }
+        #[cfg(windows)]
+        assert!(windows_fonts_dir().is_dir(), "{}", windows_fonts_dir().display());
+    }
 
     /// The next dialog opens where the last answer was: a file's folder, or the folder picked;
     /// a cancelled dialog leaves it, and a folder that's gone isn't offered.
@@ -544,5 +619,26 @@ mod tests {
         );
         assert_eq!(office_file("http://x/a.png"), None);
         std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    /// Found in audit (#225): a picture's `file:` address is read as the `file:` links MailCraft
+    /// is started with are. One to another computer was taken as a path from the folder
+    /// MailCraft runs in (`server.example/share/x.png`).
+    #[test]
+    fn office_pictures_are_read_from_this_computer_only() {
+        assert_eq!(office_file("file://server.example/share/x.png"), None);
+        assert_eq!(office_file("FILE://Server/msohtmlclip1/01/a.png"), None);
+        let (link, path) = if cfg!(windows) {
+            (
+                "file:///C:/Users/Zoe/AppData/Local/Temp/msohtmlclip1/01/clip%20image001.png",
+                "C:/Users/Zoe/AppData/Local/Temp/msohtmlclip1/01/clip image001.png",
+            )
+        } else {
+            ("file:///tmp/msohtmlclip1/01/clip%20image001.png", "/tmp/msohtmlclip1/01/clip image001.png")
+        };
+        assert_eq!(office_file(link), Some(PathBuf::from(path)));
+        assert_eq!(office_file(&link.replace("file:///", "  File://localhost/")), Some(PathBuf::from(path)));
+        assert_eq!(office_file("file:"), None);
+        assert_eq!(office_file("files:///tmp/a.png"), None);
     }
 }

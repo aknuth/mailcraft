@@ -13,7 +13,6 @@ use mailcraft_model::{lookalike, utf7};
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let mut q = Query::parse(&text);
-    let _ = q.index_words();
     let _ = q.text_words();
     let _ = q.needs_text();
     // A clock read from the input too, so dates are placed at the ends of time.
@@ -38,7 +37,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = utf7::encode(&utf7::decode(&text));
     let (name, email) = text.split_once('\n').unwrap_or((&text, &text));
     let known = ["paypal.com".to_string(), "studio.example".to_string(), lookalike::domain_of(email)].into();
-    let _ = lookalike::check_sender(&mailcraft_model::EmailAddress::new(name, email), &known);
     let _ = lookalike::skeleton(email);
     let mut people = lookalike::KnownPeople::new();
     people.add(&mailcraft_model::EmailAddress::new("Jane Director", "jane@studio.example"));

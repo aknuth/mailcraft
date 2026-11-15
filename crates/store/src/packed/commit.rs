@@ -126,13 +126,37 @@ struct Waiting {
     undurable: HashMap<String, usize>,
     /// The account whose data file the thread is sealing now (it holds the file meanwhile).
     sealing: Option<String>,
-    running: bool,
+    thread: SealThread,
     stop: bool,
     /// MailCraft is closing ([`Packs::seal_all`]): every commit is sealed.
     closing: bool,
     /// The most any data file has had waiting, and the biggest batch.
     #[cfg(test)]
     peak: (usize, usize),
+}
+
+/// The thread that seals data files once quiet.
+#[derive(Debug, Default)]
+enum SealThread {
+    /// Started with the first write that isn't sealed (again, once one has ended).
+    #[default]
+    NotStarted,
+    Running,
+    /// It couldn't be started, last tried then: writes go unsealed until the next seal of their
+    /// own (a crash meanwhile checks the file as it opens), and it's tried again once
+    /// [`START_AGAIN`] has passed, not on every write (each paid for a failed start, and logged it).
+    Unavailable(Instant),
+}
+
+/// How long after the sealing thread couldn't be started it's tried again.
+const START_AGAIN: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the sealing thread can't be started from this thread (as when the system has no
+    /// more threads), and how many times it was tried.
+    pub(super) static NO_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static STARTS_TRIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Seals {
@@ -187,15 +211,52 @@ impl Seals {
             return;
         }
         w.due.insert(account.to_string(), (Arc::downgrade(db), Instant::now()));
-        if !w.running {
-            let seals = self.clone();
-            match std::thread::Builder::new().name("data-file-seal".into()).spawn(move || seals.run()) {
-                Ok(_) => w.running = true,
-                Err(e) => log::warn!("data files won't be sealed as they go quiet: {e}"),
-            }
+        let start = match &w.thread {
+            SealThread::NotStarted => true,
+            SealThread::Running => false,
+            SealThread::Unavailable(tried) => tried.elapsed() >= START_AGAIN,
+        };
+        if start {
+            w.thread = match self.start() {
+                Ok(()) => SealThread::Running,
+                Err(e) => {
+                    // Told once: tried again later, quietly.
+                    if matches!(w.thread, SealThread::NotStarted) {
+                        log::warn!("data files won't be sealed as they go quiet: {e}");
+                    }
+                    SealThread::Unavailable(Instant::now())
+                }
+            };
         }
         drop(w);
         self.wake.notify_one();
+    }
+
+    /// The sealing thread started ([`Seals::run`]).
+    fn start(self: &Arc<Self>) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            STARTS_TRIED.set(STARTS_TRIED.get().saturating_add(1));
+            if NO_THREAD.get() {
+                return Err(io::Error::other("no thread (a test)"));
+            }
+        }
+        let seals = self.clone();
+        std::thread::Builder::new().name("data-file-seal".into()).spawn(move || seals.run()).map(drop)
+    }
+
+    /// Tests: the sealing thread last failed to start `ago`.
+    #[cfg(test)]
+    pub(super) fn thread_failed(&self, ago: Duration) {
+        if let Some(at) = Instant::now().checked_sub(ago) {
+            self.lock().thread = SealThread::Unavailable(at);
+        }
+    }
+
+    /// Tests: whether the sealing thread is running.
+    #[cfg(test)]
+    pub(super) fn thread_running(&self) -> bool {
+        matches!(self.lock().thread, SealThread::Running)
     }
 
     /// The thread: each data file sealed once it has been quiet for [`QUIET`], one at a time.
@@ -225,7 +286,7 @@ impl Seals {
             w.sealing = None;
             self.sealed.notify_all();
         }
-        w.running = false;
+        w.thread = SealThread::NotStarted;
     }
 
     /// `account`'s data file was sealed by a commit of its own, begun to commit `at` (its writer
@@ -310,12 +371,26 @@ pub(super) fn seal(db: &Database, seals: &Seals, account: &str) -> io::Result<()
 /// is held: a commit that began before and wasn't sealed has said so by then (it says so before
 /// it commits), so none slips in unsealed between the look and the seal.
 pub(super) fn seal_if_due(db: &Database, seals: &Seals, account: &str) -> io::Result<()> {
-    let mut tx = db.begin_write().map_err(disk)?;
+    let tx = db.begin_write().map_err(disk)?;
     if !seals.seal_due(account) {
         return tx.abort().map_err(disk);
     }
+    commit_sealed(tx, seals, account)
+}
+
+/// A sealed commit of `account`'s data file that makes only the changes `f` makes (to `META`).
+pub(super) fn seal_with(db: &Database, seals: &Seals, account: &str, f: impl FnOnce(&redb::WriteTransaction) -> io::Result<()>) -> io::Result<()> {
+    let tx = db.begin_write().map_err(disk)?;
+    f(&tx)?;
+    commit_sealed(tx, seals, account)
+}
+
+/// `tx` committed sealed and durable: what was waiting for the disk is on it, and nothing
+/// written before it waits for a seal any more (the thread would only seal the file again).
+fn commit_sealed(mut tx: redb::WriteTransaction, seals: &Seals, account: &str) -> io::Result<()> {
     tx.set_quick_repair(true);
     let before = seals.count(account, None);
+    // Taken with the writer held: a write noted after it still waits for its seal.
     let at = Instant::now();
     tx.commit().map_err(|e| {
         seals.restore(account, before);
@@ -323,21 +398,6 @@ pub(super) fn seal_if_due(db: &Database, seals: &Seals, account: &str) -> io::Re
     })?;
     seals.timed(true, at.elapsed());
     seals.sealed(account, at);
-    Ok(())
-}
-
-/// A sealed commit of `account`'s data file that makes only the changes `f` makes (to `META`).
-pub(super) fn seal_with(db: &Database, seals: &Seals, account: &str, f: impl FnOnce(&redb::WriteTransaction) -> io::Result<()>) -> io::Result<()> {
-    let mut tx = db.begin_write().map_err(disk)?;
-    tx.set_quick_repair(true);
-    f(&tx)?;
-    let before = seals.count(account, None);
-    let at = Instant::now();
-    tx.commit().map_err(|e| {
-        seals.restore(account, before);
-        disk(e)
-    })?;
-    seals.timed(true, at.elapsed());
     Ok(())
 }
 
@@ -442,9 +502,9 @@ impl Packs {
         // A file made new that couldn't say so as it was made says in its writes that everything
         // in it is kept as this build keeps it (none of it needs compressing again), until one of
         // them reaches the disk: one that doesn't is lost to a crash or a full drive.
-        let fresh = Packs::lock(&self.fresh).contains(account);
+        let fresh = lock(&self.fresh).contains(account);
         if fresh {
-            self.write_fresh_meta(&tx)?;
+            self.write_fresh_meta(&tx, account)?;
         }
         // Being copied (asked with the writer held: the copy took it once after it began, so a
         // write that didn't see it had committed by then): what this changes is taken again.
@@ -471,7 +531,7 @@ impl Packs {
             self.seals.timed(how.seal, at.elapsed());
         }
         if fresh && how.durable {
-            Packs::lock(&self.fresh).remove(account);
+            lock(&self.fresh).remove(account);
         }
         if let Some(keys) = touched {
             self.copied_again(account, keys);
@@ -522,6 +582,17 @@ impl Packs {
     /// Sources made ready away from the writer, moved in: one transaction per data file, that only
     /// stores them (compressing them in it held the file several times as long).
     pub(crate) fn write_prepared(&self, items: Vec<(PathBuf, Prepared)>, durable: bool) -> Result<()> {
+        for (a, files) in self.sources_by_account(items)? {
+            let bytes = files.iter().map(|(_, p)| p.kept_len()).fold(0usize, usize::saturating_add);
+            let how = if durable { Commit::PLAIN } else { Commit::BATCH };
+            self.change_with(&a, how, bytes, |t| put_prepared(t, &files)).map_err(|source| StoreError::Io { path: a.clone(), source })?;
+        }
+        Ok(())
+    }
+
+    /// Sources by the account whose data file they go in, each with its key there; one that goes
+    /// in none is written to the disk now.
+    fn sources_by_account(&self, items: Vec<(PathBuf, Prepared)>) -> Result<BTreeMap<String, Vec<(String, Prepared)>>> {
         let mut by_account: BTreeMap<String, Vec<(String, Prepared)>> = BTreeMap::new();
         for (p, prepared) in items {
             match self.place(&p) {
@@ -529,22 +600,7 @@ impl Packs {
                 Place::Account(_) | Place::Disk => write_atomic(&p, &prepared.into_raw().map_err(io_err(&p))?)?,
             }
         }
-        for (a, files) in by_account {
-            let bytes = files.iter().map(|(_, p)| p.kept_len()).fold(0usize, usize::saturating_add);
-            let how = if durable { Commit::PLAIN } else { Commit::BATCH };
-            self.change_with(&a, how, bytes, |t| {
-                for (k, prepared) in &files {
-                    if prepared.kept {
-                        t.put_kept(k, &prepared.bytes)?;
-                    } else {
-                        t.put(k, &prepared.bytes)?;
-                    }
-                }
-                Ok(())
-            })
-            .map_err(|source| StoreError::Io { path: a.clone(), source })?;
-        }
-        Ok(())
+        Ok(by_account)
     }
 
     /// Sources and the documents saying what they are (an import's checkpoint), in one durable,
@@ -552,13 +608,8 @@ impl Packs {
     /// Refused with nothing written once the file was let go of after a failed write since it
     /// was let go of `reopened` times ([`Packs::reopened`]).
     pub(crate) fn write_batch(&self, items: Vec<(PathBuf, Prepared)>, docs: Vec<(PathBuf, Vec<u8>)>, reopened: u64) -> Result<()> {
-        let mut by_account: BTreeMap<String, (Vec<(String, Prepared)>, Vec<(String, Vec<u8>)>)> = BTreeMap::new();
-        for (p, prepared) in items {
-            match self.place(&p) {
-                Place::In(a, k) => by_account.entry(a).or_default().0.push((k, prepared)),
-                Place::Account(_) | Place::Disk => write_atomic(&p, &prepared.into_raw().map_err(io_err(&p))?)?,
-            }
-        }
+        let mut by_account: BTreeMap<String, (Vec<(String, Prepared)>, Vec<(String, Vec<u8>)>)> =
+            self.sources_by_account(items)?.into_iter().map(|(a, files)| (a, (files, Vec::new()))).collect();
         for (p, bytes) in docs {
             match self.place(&p) {
                 Place::In(a, k) => by_account.entry(a).or_default().1.push((k, bytes)),
@@ -567,13 +618,7 @@ impl Packs {
         }
         for (a, (files, docs)) in by_account {
             self.change_since(&a, Commit::SEALED, 0, Some(reopened), |t| {
-                for (k, prepared) in &files {
-                    if prepared.kept {
-                        t.put_kept(k, &prepared.bytes)?;
-                    } else {
-                        t.put(k, &prepared.bytes)?;
-                    }
-                }
+                put_prepared(t, &files)?;
                 for (k, bytes) in &docs {
                     t.put(k, bytes)?;
                 }
@@ -605,7 +650,7 @@ impl Packs {
             w.closing = true;
             w.due.clear();
         }
-        let open: Vec<(String, Arc<Database>)> = Packs::lock(&self.open).dbs.iter().map(|(a, db)| (a.clone(), db.clone())).collect();
+        let open: Vec<(String, Arc<Database>)> = lock(&self.open).dbs.iter().map(|(a, db)| (a.clone(), db.clone())).collect();
         let mut done = Ok(());
         for (a, db) in open {
             if let Err(e) = seal(&db, &self.seals, &a) {
@@ -617,6 +662,19 @@ impl Packs {
         }
         done
     }
+}
+
+/// Sources made ready ([`Store::prepare`](crate::Store::prepare)) put in a data file's tables
+/// as they were made: compressed ones as kept, the rest as they are.
+fn put_prepared(t: &mut Tables<'_>, files: &[(String, Prepared)]) -> io::Result<()> {
+    for (k, prepared) in files {
+        if prepared.kept {
+            t.put_kept(k, &prepared.bytes)?;
+        } else {
+            t.put(k, &prepared.bytes)?;
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Packs {

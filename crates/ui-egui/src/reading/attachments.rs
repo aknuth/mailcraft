@@ -1,5 +1,7 @@
 //! The reading pane: attachments, their cards and their previews (pictures, PDF, video, Office files).
 
+use std::sync::Arc;
+
 use super::*;
 
 pub(super) fn kind_icon(k: AttachmentKind) -> Icon {
@@ -19,13 +21,12 @@ pub(super) fn video_preview(
 ) -> Option<egui::TextureHandle> {
     let id = (key.clone(), a.index);
     let now = st.pictures.frame();
-    if let Some((t, used)) = st.video_thumbs.get_mut(&id) {
-        *used = now;
-        return t.clone();
+    if let Some(t) = st.video_thumbs.get(&id, now) {
+        return t;
     }
     // As many shown in this frame as are kept: this chip shows its kind's icon (one past them
     // was read, written and decoded again every frame).
-    if st.video_thumbs.len() >= VIDEO_THUMBS && st.video_thumbs.values().all(|(_, used)| *used == now) {
+    if st.video_thumbs.full_of(now) {
         return None;
     }
     // The platform's decoder reads files, and the browser has none.
@@ -39,7 +40,7 @@ pub(super) fn video_preview(
         None => match st.videos.file(key, a.index, &a.name, s.store.as_ref()) {
             None => return None,
             Some(None) => {
-                keep_video_thumb(st, id, None);
+                st.video_thumbs.keep(id, None, now);
                 return None;
             }
             Some(Some(p)) => {
@@ -50,7 +51,9 @@ pub(super) fn video_preview(
     };
     // The platform's frame, its pixels decoded on the pictures lane too.
     let limit = ctx.input(|i| i.max_texture_side).try_into().unwrap_or(u32::MAX);
-    let pixels = match st.video_frames.entry(path).or_insert(crate::VideoFrame::Pending) {
+    let (frame, used) = st.video_frames.entry(path.clone()).or_insert((crate::VideoFrame::Pending, now));
+    *used = now;
+    let pixels = match frame {
         crate::VideoFrame::Pending => None,
         crate::VideoFrame::Ready(png) => st.videos.frame(key, a.index, png, limit),
         crate::VideoFrame::Unavailable => Some(None),
@@ -60,25 +63,35 @@ pub(super) fn video_preview(
         return None;
     };
     let tex = pixels.map(|(image, options)| ctx.load_texture(format!("video-{}-{}", key.to_id(), a.index), image, options));
-    keep_video_thumb(st, id, tex.clone());
+    // Made into its thumbnail: the platform's frame isn't needed while that's kept (one that
+    // couldn't be made stays noted, so it isn't asked for again).
+    if st.video_thumbs.keep(id, tex.clone(), now) && st.video_frames.get(&path).is_some_and(|(f, _)| matches!(f, crate::VideoFrame::Ready(_))) {
+        st.video_frames.remove(&path);
+    }
     tex
 }
 
 /// Most video thumbnails kept (those shown least recently go first, never one shown in this
-/// frame).
-const VIDEO_THUMBS: usize = 64;
+/// frame; past them, one more isn't kept).
+pub(crate) const VIDEO_THUMBS: usize = 64;
 
-fn keep_video_thumb(st: &mut UiState, id: (MessageKey, usize), tex: Option<egui::TextureHandle>) {
+/// Most frames kept that the platform made and no thumbnail was made of yet (their message
+/// left before they came): those asked for least recently go first.
+const VIDEO_FRAMES_WAITING: usize = 16;
+
+/// Once a frame: of the platform's frames waiting to be made thumbnails, no more than
+/// [`VIDEO_FRAMES_WAITING`], those asked for least recently let go of (asked again, the
+/// platform makes them again). Found in audit (#228): every video's frame was kept for the
+/// session.
+pub(crate) fn bound_video_frames(st: &mut UiState) {
     let now = st.pictures.frame();
-    while st.video_thumbs.len() >= VIDEO_THUMBS {
-        let Some(oldest) = st.video_thumbs.iter().filter(|(_, (_, used))| *used < now).min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        st.video_thumbs.remove(&oldest);
-    }
-    if st.video_thumbs.len() < VIDEO_THUMBS {
-        st.video_thumbs.insert(id, (tex, now));
+    let ready = |f: &crate::VideoFrame| matches!(f, crate::VideoFrame::Ready(_));
+    let mut waiting: Vec<(u64, std::path::PathBuf)> =
+        st.video_frames.iter().filter(|(_, (f, used))| ready(f) && *used < now).map(|(p, (_, used))| (*used, p.clone())).collect();
+    let over = st.video_frames.values().filter(|(f, _)| ready(f)).count().saturating_sub(VIDEO_FRAMES_WAITING);
+    waiting.sort_unstable();
+    for (_, path) in waiting.into_iter().take(over) {
+        st.video_frames.remove(&path);
     }
 }
 
@@ -297,6 +310,7 @@ pub(super) fn settle_attachment_click(st: &mut UiState, ui: &Ui) {
 /// selected either.
 pub(super) fn close_attachment_view(st: &mut UiState) {
     st.attachment_view = None;
+    st.attachment_shown = None;
     st.attachment_click = None;
     st.attachment_selected = None;
     st.attachments_active = false;
@@ -334,7 +348,7 @@ pub(super) fn preview_header(t: &Tokens, ui: &mut Ui, a: &mime::AttachmentInfo, 
 
 /// What an attachment is read as, kept while it's shown.
 #[derive(Clone)]
-pub(super) enum Shown {
+pub(crate) enum Shown {
     Text { header: Vec<(String, String)>, text: String },
     Office(mime::office::Preview),
     Pdf,
@@ -342,23 +356,43 @@ pub(super) enum Shown {
     Nothing,
 }
 
+/// The attachment previewed, as it was read for that ([`read_shown`]): one at a time, let go of
+/// when the preview closes ([`close_attachment_view`]) or another is previewed.
+pub(crate) struct ShownAttachment {
+    key: MessageKey,
+    index: usize,
+    /// The message as it was shown when the file was read: another (the whole message after
+    /// its text came first, issue #24, or the message downloaded again) is read from again.
+    parsed: Arc<mime::Parsed>,
+    shown: Arc<Shown>,
+}
+
 /// The attachment, as the reading pane previews it: a picture at the pane's width, a PDF's
 /// pages, text, an attached email, a Word document, an Excel workbook or a PowerPoint
-/// presentation's slides; other files say there's no preview, with Open and Save As.
-pub(super) fn attachment_preview(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey, a: &mime::AttachmentInfo, acts: &mut Vec<Action>) {
+/// presentation's slides; other files say there's no preview, with Open and Save As. `parsed`
+/// is the message shown, which the attachment is part of.
+pub(super) fn attachment_preview(
+    s: &Session,
+    st: &mut UiState,
+    ui: &mut Ui,
+    key: &MessageKey,
+    parsed: &Arc<mime::Parsed>,
+    a: &mime::AttachmentInfo,
+    acts: &mut Vec<Action>,
+) {
     let t = st.tokens;
-    let id = egui::Id::unique(("attachment-shown", key.to_id(), a.index));
-    let shown = match ui.ctx().data(|d| d.get_temp::<std::sync::Arc<Shown>>(id)) {
-        Some(x) => x,
+    let kept = st.attachment_shown.as_ref().filter(|k| k.key == *key && k.index == a.index && Arc::ptr_eq(&k.parsed, parsed));
+    let shown = match kept {
+        Some(k) => k.shown.clone(),
         None => {
             // A picture or a PDF is read with the message's others (`Pictures`), not here.
             let data = match a.kind() {
                 AttachmentKind::Image | AttachmentKind::Pdf => None,
                 _ => s.store.as_ref().and_then(|st| st.read_body(key)).and_then(|raw| shown_data(&raw, a)),
             };
-            let x = std::sync::Arc::new(read_shown(a, data.as_deref()));
-            ui.ctx().data_mut(|d| d.insert_temp(id, x.clone()));
-            x
+            let shown = Arc::new(read_shown(a, data.as_deref()));
+            st.attachment_shown = Some(ShownAttachment { key: key.clone(), index: a.index, parsed: parsed.clone(), shown: shown.clone() });
+            shown
         }
     };
     let width = ui.available_width();

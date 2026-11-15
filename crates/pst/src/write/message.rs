@@ -1,16 +1,17 @@
 //! A message written: its properties, its recipients, its attachments and those attached to it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 
 use super::edit::Editor;
 use super::heap::{BuiltProps, build_props, value_type};
 use super::named::NamedIds;
-use super::table::{Built, Cell, NewRow, ROW_ID, ROW_VERSION, Schema, build_table, kept_elsewhere};
+use super::table::{Built, Cell, NewRow, ROW_ID, ROW_VERSION, Schema, build_table};
 use super::text::Text;
 use super::types::*;
+use super::{FIRST_SUBNODE, entry_id};
 use crate::ltp::{Bytes, ObjectRef, PropertyType as P, PropertyValue};
-use crate::ndb::{Format, SubNodes};
+use crate::ndb::{Format, NID_TYPE_ATTACHMENT, NID_TYPE_INTERNAL, NID_TYPE_NORMAL_MESSAGE, SubNodes};
 use crate::util::short;
 
 const ATTACH_BY_VALUE: i32 = 1;
@@ -20,12 +21,7 @@ const MESSAGE_FLAG_HAS_ATTACH: i32 = 0x10;
 
 const NID_RECIPIENT_TABLE: u32 = 0x0692;
 const NID_ATTACHMENT_TABLE: u32 = 0x0671;
-const NID_TYPE_ATTACHMENT: u32 = 0x05;
-const NID_TYPE_INTERNAL: u32 = 0x01;
-pub(crate) const NID_TYPE_NORMAL_MESSAGE: u32 = 0x04;
 
-/// A message's values kept in subnodes of the message get indexes from here.
-const FIRST_VALUE_NODE: u32 = 0x80;
 const FIRST_ATTACHMENT: u32 = 0x100;
 const FIRST_ATTACHMENT_DATA: u32 = 0x200;
 
@@ -179,9 +175,10 @@ fn string(kind: u16, text: Text, s: &str) -> Option<Cell> {
     text.cell(kind, s).map(Cell::Bytes)
 }
 
-fn recipient_table(format: Format, list: &[NewRecipient<'_>], version: u32, text: Text) -> io::Result<Built> {
-    let st = text.string_type();
-    let columns = [
+/// The recipient table template's columns, as MS-PST gives them (2.4.5): a new file's
+/// template has these.
+pub(crate) fn recipient_template_columns(st: u16) -> Vec<(u16, u16)> {
+    vec![
         (0x0C15, P::INT32),
         (0x0E0F, P::BOOLEAN),
         (0x0FF9, P::BINARY),
@@ -192,13 +189,31 @@ fn recipient_table(format: Format, list: &[NewRecipient<'_>], version: u32, text
         (0x3003, st),
         (0x300B, P::BINARY),
         (0x3900, P::INT32),
-        (0x39FE, st),
         (0x39FF, st),
         (0x3A40, P::BOOLEAN),
-        (0x5FFD, P::INT32),
-        (0x5FFF, P::INT32),
-    ];
-    let schema = Schema::new(&columns)?;
+    ]
+}
+
+/// A message's recipient table's columns: the template's, and the SMTP address
+/// (`PidTagSmtpAddress`), flags (`PidTagRecipientFlags`) and tracking status
+/// (`PidTagRecipientTrackStatus`) each recipient carries beyond them, in order of ID. The template
+/// keeps to the specification's list: every table says its own columns (`TCINFO`), so what a
+/// message's table has more is read from the table, not the template.
+fn recipient_columns(st: u16) -> Vec<(u16, u16)> {
+    let mut columns = recipient_template_columns(st);
+    columns.extend([(0x39FE, st), (0x5FFD, P::INT32), (0x5FFF, P::INT32)]);
+    columns.sort_by_key(|(id, _)| *id);
+    columns
+}
+
+/// An attachment table's columns: the template's and every message's (MS-PST 2.4.6).
+pub(crate) fn attachment_columns(st: u16) -> Vec<(u16, u16)> {
+    vec![(0x0E20, P::INT32), (0x3704, st), (0x3705, P::INT32), (0x370B, P::INT32)]
+}
+
+fn recipient_table(format: Format, list: &[NewRecipient<'_>], version: u32, text: Text) -> io::Result<Built> {
+    let st = text.string_type();
+    let schema = Schema::new(&recipient_columns(st))?;
     let mut rows = Vec::with_capacity(list.len());
     for (i, r) in list.iter().enumerate() {
         let id = u32::try_from(i + 1).map_err(|_| short())?;
@@ -229,7 +244,7 @@ fn recipient_table(format: Format, list: &[NewRecipient<'_>], version: u32, text
             .collect();
         rows.push(NewRow { id, cells });
     }
-    build_table(format, &schema, &rows, 0)
+    build_table(format, &schema, rows, 0)
 }
 
 /// The bytes a built table takes.
@@ -244,14 +259,6 @@ fn props_bytes(b: &BuiltProps) -> usize {
 }
 
 impl Editor {
-    fn write_props_into(&mut self, built: BuiltProps, subs: &mut SubNodes) -> io::Result<u64> {
-        for (nid, bytes) in built.external {
-            let bid = self.write_tree(&bytes)?;
-            subs.insert(nid, (bid, 0));
-        }
-        self.write_leaves(&built.blocks)
-    }
-
     fn write_table_into(&mut self, nid: u32, built: Built, subs: &mut SubNodes) -> io::Result<()> {
         let inner = BTreeMap::new();
         let (data, sub) = self.write_built(built, inner)?;
@@ -271,7 +278,7 @@ impl Editor {
     ) -> io::Result<(Built, usize)> {
         let format = self.format();
         let st = text.string_type();
-        let schema = Schema::new(&[(0x0E20, P::INT32), (0x3704, st), (0x3705, P::INT32), (0x370B, P::INT32)])?;
+        let schema = Schema::new(&attachment_columns(st))?;
         let mut rows = Vec::with_capacity(list.len());
         let mut total = 0usize;
         for (i, a) in list.iter().enumerate() {
@@ -335,7 +342,7 @@ impl Editor {
                 .collect();
             rows.push(NewRow { id: node, cells });
         }
-        Ok((build_table(format, &schema, &rows, 0)?, total))
+        Ok((build_table(format, &schema, rows, 0)?, total))
     }
 
     /// Writes an attachment's file and says how many bytes it is and in which subnode.
@@ -388,11 +395,11 @@ impl Editor {
             self.write_table_into(NID_ATTACHMENT_TABLE, table, &mut subs)?;
         }
         // Built twice: its size is one of its own properties, of a fixed width.
-        let sized = build_props(format, message_properties(m, !attachments.is_empty(), named, nid, version, 0, text)?, FIRST_VALUE_NODE)?;
+        let sized = build_props(format, message_properties(m, !attachments.is_empty(), named, nid, version, 0, text)?, FIRST_SUBNODE)?;
         total = total.checked_add(props_bytes(&sized)).ok_or_else(short)?;
         // Outlook leaves the heap's six-byte header out of a message's size.
         let size = i32::try_from(total.saturating_sub(6)).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a message too big to keep"))?;
-        let built = build_props(format, message_properties(m, !attachments.is_empty(), named, nid, version, size, text)?, FIRST_VALUE_NODE)?;
+        let built = build_props(format, message_properties(m, !attachments.is_empty(), named, nid, version, size, text)?, FIRST_SUBNODE)?;
         let data = self.write_props_into(built, &mut subs)?;
         let sub = self.write_subnodes(&subs)?;
         Ok((data, sub, total))
@@ -415,72 +422,153 @@ fn finish_attachment(format: Format, mut props: Vec<(u16, PropertyValue)>, data_
     if !props.iter().any(|(id, _)| *id == 0x3701) {
         props.push((0x3701, PropertyValue::Binary(Bytes::default())));
     }
-    super::heap::build_props_linked(format, props, FIRST_VALUE_NODE, data_node.map(|n| (0x3701, P::BINARY, n)))
+    super::heap::build_props_linked(format, props, FIRST_SUBNODE, data_node.map(|n| (0x3701, P::BINARY, n)))
 }
 
-/// The cell of a message's row in its folder's contents table for a column.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn contents_cell(
-    id: u16,
-    kind: u16,
-    m: &NewMessage<'_>,
-    has_attachments: bool,
-    named: &NamedIds,
-    record_key: &[u8; 16],
-    folder: u32,
-    nid: u32,
-    version: u32,
-    size: i32,
-    text: Text,
-) -> Option<Cell> {
-    // An added property's value, as the message has it.
-    if id != 0x0E07 {
-        for p in m.properties {
-            if named.property_id(&p.key).ok() == Some(id) {
-                if let NewValue::Unicode(s) = p.value {
-                    return string(kind, text, s);
-                }
-                let v = text.narrow(p.value.property_value());
-                if value_type(&v) != kind {
-                    return None;
-                }
-                let bytes = super::heap::value_bytes(&v);
-                return Some(if kept_elsewhere(kind) { Cell::Bytes(bytes) } else { Cell::Fixed(bytes) });
-            }
+/// The properties given with a message by the ID each is written with: the first given for an ID,
+/// as it is the one a contents table's row shows. A named property the file has no ID for is left
+/// out.
+pub(crate) fn given_by_id<'a>(m: &NewMessage<'a>, named: &NamedIds) -> HashMap<u16, NewValue<'a>> {
+    let mut given = HashMap::new();
+    for p in m.properties {
+        if let Ok(id) = named.property_id(&p.key) {
+            given.entry(id).or_insert(p.value);
         }
     }
-    let entry = |node: u32| {
-        let mut e = vec![0u8; 4];
-        e.extend_from_slice(record_key);
-        e.extend(node.to_le_bytes());
-        e
-    };
-    let list = |t: RecipientType| {
-        let d = display(m, t);
-        if d.is_empty() { None } else { string(kind, text, &d) }
-    };
-    match (id, kind) {
-        #[allow(clippy::cast_possible_wrap)]
-        (ROW_ID, P::INT32) => int(nid as i32),
-        #[allow(clippy::cast_possible_wrap)]
-        (ROW_VERSION, P::INT32) => int(version as i32),
-        (0x001A, _) => string(kind, text, m.message_class),
-        (0x0037 | 0x0E1D | 0x0070 | 0x3001, _) => string(kind, text, m.subject),
-        (0x0042 | 0x0C1A, _) => string(kind, text, m.sender_name),
-        (0x0C1F, _) => string(kind, text, m.sender_email),
-        (0x0E02, _) => list(RecipientType::Bcc),
-        (0x0E03, _) => list(RecipientType::Cc),
-        (0x0E04, _) => list(RecipientType::To),
-        (0x1035, _) => string(kind, text, m.message_id),
-        (0x0039 | 0x0E06 | 0x3008, P::TIME) => Some(Cell::Fixed(m.delivery_time.to_le_bytes().to_vec())),
-        (0x0E17, P::INT32) => int(0),
-        (0x0E07, P::INT32) => int(message_flags(m, has_attachments)),
-        (0x0E08, P::INT32) => int(size),
-        (0x0E1B, P::BOOLEAN) => boolean(has_attachments),
-        (0x3FDE, P::INT32) => int(65001),
-        (0x0E09, P::BINARY) => Some(Cell::Bytes(entry(folder))),
-        (0x0FFF, P::BINARY) => Some(Cell::Bytes(entry(nid))),
-        (0x300B, P::BINARY) => Some(Cell::Bytes(m.message_id.as_bytes().to_vec())),
-        _ => None,
+    given
+}
+
+/// A new message's row in its folder's contents table: what its cells are made of, worked out
+/// once for the row.
+pub(crate) struct ContentsRow<'a> {
+    pub(crate) message: &'a NewMessage<'a>,
+    pub(crate) has_attachments: bool,
+    /// The properties given with it, from [`given_by_id`].
+    pub(crate) given: HashMap<u16, NewValue<'a>>,
+    pub(crate) record_key: &'a [u8; 16],
+    pub(crate) folder: u32,
+    pub(crate) nid: u32,
+    pub(crate) version: u32,
+    pub(crate) size: i32,
+    pub(crate) text: Text,
+}
+
+impl ContentsRow<'_> {
+    /// The row's cell for a column.
+    pub(crate) fn cell(&self, id: u16, kind: u16) -> Option<Cell> {
+        let (m, text) = (self.message, self.text);
+        // An added property's value, as the message has it.
+        if id != 0x0E07
+            && let Some(value) = self.given.get(&id)
+        {
+            if let NewValue::Unicode(s) = value {
+                return string(kind, text, s);
+            }
+            let v = text.narrow(value.property_value());
+            if value_type(&v) != kind {
+                return None;
+            }
+            let bytes = super::heap::value_bytes(&v);
+            return Some(if P(kind).row_width().is_none() { Cell::Bytes(bytes) } else { Cell::Fixed(bytes) });
+        }
+        let list = |t: RecipientType| {
+            let d = display(m, t);
+            if d.is_empty() { None } else { string(kind, text, &d) }
+        };
+        match (id, kind) {
+            #[allow(clippy::cast_possible_wrap)]
+            (ROW_ID, P::INT32) => int(self.nid as i32),
+            #[allow(clippy::cast_possible_wrap)]
+            (ROW_VERSION, P::INT32) => int(self.version as i32),
+            (0x001A, _) => string(kind, text, m.message_class),
+            (0x0037 | 0x0E1D | 0x0070 | 0x3001, _) => string(kind, text, m.subject),
+            (0x0042 | 0x0C1A, _) => string(kind, text, m.sender_name),
+            (0x0C1F, _) => string(kind, text, m.sender_email),
+            (0x0E02, _) => list(RecipientType::Bcc),
+            (0x0E03, _) => list(RecipientType::Cc),
+            (0x0E04, _) => list(RecipientType::To),
+            (0x1035, _) => string(kind, text, m.message_id),
+            (0x0039 | 0x0E06 | 0x3008, P::TIME) => Some(Cell::Fixed(m.delivery_time.to_le_bytes().to_vec())),
+            (0x0E17, P::INT32) => int(0),
+            (0x0E07, P::INT32) => int(message_flags(m, self.has_attachments)),
+            (0x0E08, P::INT32) => int(self.size),
+            (0x0E1B, P::BOOLEAN) => boolean(self.has_attachments),
+            (0x3FDE, P::INT32) => int(65001),
+            (0x0E09, P::BINARY) => Some(Cell::Bytes(entry_id(self.record_key, self.folder))),
+            (0x0FFF, P::BINARY) => Some(Cell::Bytes(entry_id(self.record_key, self.nid))),
+            (0x300B, P::BINARY) => Some(Cell::Bytes(m.message_id.as_bytes().to_vec())),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A message's recipient table keeps the columns, and their order, it always had: the
+    /// template's and three more.
+    #[test]
+    fn a_messages_recipients_have_the_template_columns_and_three_more() {
+        let st = P::UNICODE;
+        let expected = vec![
+            (0x0C15, P::INT32),
+            (0x0E0F, P::BOOLEAN),
+            (0x0FF9, P::BINARY),
+            (0x0FFE, P::INT32),
+            (0x0FFF, P::BINARY),
+            (0x3001, st),
+            (0x3002, st),
+            (0x3003, st),
+            (0x300B, P::BINARY),
+            (0x3900, P::INT32),
+            (0x39FE, st),
+            (0x39FF, st),
+            (0x3A40, P::BOOLEAN),
+            (0x5FFD, P::INT32),
+            (0x5FFF, P::INT32),
+        ];
+        assert_eq!(recipient_columns(st), expected);
+        assert!(recipient_template_columns(st).iter().all(|c| expected.contains(c)));
+    }
+
+    /// A contents row shows the first property given for a column's ID, nothing when its type
+    /// isn't the column's, and the message's own flags whatever is given for them.
+    #[test]
+    fn a_contents_row_shows_the_first_property_given_for_a_column() {
+        let props = [
+            NewProperty::tagged(0x0E17, NewValue::Integer32(5)),
+            NewProperty::tagged(0x0E17, NewValue::Integer32(6)),
+            NewProperty::tagged(0x0E08, NewValue::Unicode("not a size")),
+            NewProperty::tagged(0x0E07, NewValue::Integer32(0x7777)),
+        ];
+        let m = NewMessage {
+            subject: "Subject",
+            sender_name: "Ann",
+            sender_email: "ann@example.org",
+            recipients: &[],
+            body: "Body",
+            html_body: None,
+            message_id: "<m@example.org>",
+            delivery_time: 0,
+            message_class: "IPM.Note",
+            properties: &props,
+        };
+        let key = [7u8; 16];
+        let row = ContentsRow {
+            message: &m,
+            has_attachments: false,
+            given: given_by_id(&m, &NamedIds::default()),
+            record_key: &key,
+            folder: 0x8022,
+            nid: 0x20_0024,
+            version: 1,
+            size: 10,
+            text: Text::plain(Format::Unicode),
+        };
+        assert_eq!(row.cell(0x0E17, P::INT32), int(5));
+        assert_eq!(row.cell(0x0E08, P::INT32), None);
+        assert_eq!(row.cell(0x0E07, P::INT32), int(message_flags(&m, false)));
+        assert_eq!(row.cell(0x0FFF, P::BINARY), Some(Cell::Bytes(entry_id(&key, 0x20_0024))));
     }
 }

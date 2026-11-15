@@ -1,6 +1,18 @@
-//! The store: message bodies, changes waiting for the server, and the Outbox.
+//! The store: message bodies, changes waiting for the server, the Outbox, and the drafts kept
+//! until their account connects.
 
 use crate::*;
+
+mod filing;
+#[cfg(test)]
+mod tests;
+mod waiting;
+pub use filing::Filing;
+pub use waiting::Waiting;
+
+/// The end of the mark an Outbox message taken out leaves where its files couldn't go
+/// ([`Store::outbox_remove`]).
+const GONE: &str = ".gone";
 
 /// The data files' commits that waited for the disk, timed: sealed ones and the others. For
 /// measuring what sealing costs; nothing for other stores.
@@ -135,8 +147,15 @@ impl Store {
     /// Many message sources at once: one transaction for all of them in a data file (importing
     /// hundreds of thousands, a commit each spent most of the time waiting for the disk). Each is
     /// compressed before the transaction starts, so the data file is held only to store them.
-    pub fn write_bodies(&self, bodies: &[(MessageKey, Vec<u8>)]) -> Result<()> {
-        let prepared = bodies.iter().map(|(k, raw)| (k.clone(), Store::prepare(self.packs(&k.account), raw.clone()))).collect();
+    /// Taken by value: each source is moved into what's written, the batch never held twice.
+    pub fn write_bodies(&self, bodies: Vec<(MessageKey, Vec<u8>)>) -> Result<()> {
+        let prepared = bodies
+            .into_iter()
+            .map(|(k, raw)| {
+                let packs = self.packs(&k.account);
+                (k, Store::prepare(packs, raw))
+            })
+            .collect();
         self.write_prepared(prepared, true)
     }
 
@@ -185,16 +204,16 @@ impl Store {
     /// How many times `account`'s data file was let go of after a write the disk failed (a full
     /// drive), to open again at its last durable commit: what was written without waiting for the
     /// disk before then may be gone. A writer that sees it change since it began (an import)
-    /// writes nothing more that counts on that. Always 0 for other stores.
+    /// writes nothing more that counts on that. The count stays while the account is kept online
+    /// only (a writer going on across the switch compares with what it saw as it began). Always 0
+    /// for other stores.
     pub fn data_file_reopened(&self, account: &str) -> u64 {
-        if self.is_online_only(account) {
-            return 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(x) = self.data_files() {
+            return x.reopened(&safe_segment(account));
         }
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.reopened(&safe_segment(account)),
-            _ => 0,
-        }
+        let _ = account;
+        0
     }
 
     /// The drive of a store's data files full (`true`: growing one fails as on a full drive) or
@@ -251,29 +270,23 @@ impl Store {
     /// instead of writing pages out and reading them back. The file is opened again with it at
     /// once if nobody's using it, or as soon as nobody is. Nothing to do for other stores.
     pub fn bulk_begin(&self, account: &str, cache_bytes: usize) {
-        if self.is_online_only(account) {
-            return;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((x, a)) = self.in_data_file(account) {
+            x.bulk_begin(&a, cache_bytes);
         }
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.bulk_begin(&safe_segment(account), cache_bytes),
-            _ => {
-                let _ = cache_bytes;
-            }
-        }
+        let _ = (account, cache_bytes);
     }
 
     /// `account`'s bulk write is over: its data file's cache goes back to its usual size, letting
     /// go of the memory (a clean close and an open, at once if nobody's using it, otherwise as
-    /// soon as nobody is).
+    /// soon as nobody is). Ended however the account is kept now: one begun before it went
+    /// online only ends too.
     pub fn bulk_end(&self, account: &str) {
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.bulk_end(&safe_segment(account)),
-            _ => {
-                let _ = account;
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(x) = self.data_files() {
+            x.bulk_end(&safe_segment(account));
         }
+        let _ = account;
     }
 
     /// `account` takes a long write (a local move of more than a batch of mail) until what this
@@ -284,55 +297,47 @@ impl Store {
     /// sealed commit checked against [`Store::data_file_reopened`] (`write_batch`). Nothing to do
     /// for other stores.
     pub fn long_write(&self, account: &str) -> LongWrite<'_> {
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) if !self.is_online_only(account) => {
-                let account = safe_segment(account);
-                x.long_begin(&account);
-                LongWrite { store: self, account: Some(account) }
-            }
-            _ => {
-                let _ = account;
-                LongWrite { store: self, account: None }
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((x, a)) = self.in_data_file(account) {
+            x.long_begin(&a);
+            return LongWrite { store: self, account: Some(a) };
         }
+        let _ = account;
+        LongWrite { store: self, account: None }
     }
 
     /// The cache `account`'s data file is open with, in bytes (none: it isn't open, or the store
-    /// keeps no data files).
+    /// keeps no data files). Whatever the account is kept as now: it's the file's own.
     #[doc(hidden)]
     pub fn data_file_cache(&self, account: &str) -> Option<usize> {
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.cache_of(&safe_segment(account)),
-            _ => {
-                let _ = account;
-                None
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(x) = self.data_files() {
+            return x.cache_of(&safe_segment(account));
         }
+        let _ = account;
+        None
     }
 
     /// How `account`'s data file's cache has been used since the store opened ([`CacheUse`]):
-    /// for measuring. Default for other stores.
+    /// for measuring, so it counts while the account was kept in it, online only now or not.
+    /// Default for other stores.
     pub fn cache_use(&self, account: &str) -> CacheUse {
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.cache_use(&safe_segment(account)),
-            _ => {
-                let _ = account;
-                CacheUse::default()
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(x) = self.data_files() {
+            return x.cache_use(&safe_segment(account));
         }
+        let _ = account;
+        CacheUse::default()
     }
 
     /// The data files' commits that waited for the disk since the store opened, sealed and not,
     /// timed ([`CommitTimes`]): for measuring. Nothing for other stores.
     pub fn commit_times(&self) -> CommitTimes {
-        match &self.files.main {
-            #[cfg(not(target_arch = "wasm32"))]
-            Files::Packed(x) => x.commit_times(),
-            _ => CommitTimes::default(),
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(x) = self.data_files() {
+            return x.commit_times();
         }
+        CommitTimes::default()
     }
 
     pub fn remove_body(&self, key: &MessageKey) {
@@ -381,6 +386,12 @@ impl Store {
     /// Queue a message to send when the account is back online.
     pub fn outbox_add(&self, account: &str, item: &OutboxItem, raw: &[u8]) -> Result<()> {
         let dir = self.outbox_dir(account);
+        // A mark an earlier message of the id left would keep this one out of the Outbox.
+        let gone = dir.join(format!("{}{GONE}", item.id));
+        match self.files.remove_file(&gone) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_err(&gone)(e)),
+            _ => {}
+        }
         self.files.write(&dir.join(format!("{}.eml", item.id)), raw)?;
         self.write_json(&dir.join(format!("{}.json", item.id)), item)
     }
@@ -390,17 +401,23 @@ impl Store {
         self.write_json(&self.outbox_dir(account).join(format!("{}.json", item.id)), item)
     }
 
-    /// Queued messages, oldest first.
+    /// Queued messages, oldest first: each with its source, and not taken out
+    /// ([`Store::outbox_remove`]).
     pub fn outbox(&self, account: &str) -> Vec<OutboxItem> {
         let dir = self.outbox_dir(account);
-        let mut items: Vec<OutboxItem> = self
-            .files
-            .list(&dir)
-            .into_iter()
+        let files = self.files.list(&dir);
+        let there = |name: &str| files.iter().any(|(n, _)| n == name);
+        let mut items: Vec<OutboxItem> = files
+            .iter()
             .filter(|(name, _)| name.ends_with(".json"))
-            .filter_map(|(_, p)| self.files.read(&p).ok())
+            .filter_map(|(_, p)| self.files.read(p).ok())
             .filter_map(|b| serde_json::from_slice::<OutboxItem>(&b).ok())
-            .filter(|i| self.files.is_file(&dir.join(format!("{}.eml", i.id))))
+            .filter(|i| there(&format!("{}.eml", i.id)) && !there(&format!("{}{GONE}", i.id)))
+            .map(|mut i| {
+                // One kept before `refused` was says so in its error's words.
+                i.refused |= i.error.as_deref().is_some_and(|e| e.starts_with(crate::OUTBOX_REFUSED));
+                i
+            })
             .collect();
         items.sort_by_key(|i| (i.queued, i.id));
         items
@@ -410,13 +427,89 @@ impl Store {
         self.files.read(&self.outbox_dir(account).join(format!("{id}.eml"))).ok()
     }
 
-    pub fn outbox_remove(&self, account: &str, id: u64) {
+    /// A message taken out of the Outbox (sent, deleted, or taken back to be changed): never
+    /// listed again, so never sent again. Its files are removed; one that can't be (another
+    /// program holding it, a failing disk) leaves a mark beside it (`<id>.gone`) that keeps the
+    /// message out of the list, and [`Store::outbox_sweep`] removes what's left later. An error
+    /// only when the message is still in the Outbox: neither file went, nor could the mark be
+    /// written.
+    pub fn outbox_remove(&self, account: &str, id: u64) -> Result<()> {
         let dir = self.outbox_dir(account);
-        let _ = self.files.remove_file(&dir.join(format!("{id}.json")));
-        let _ = self.files.remove_file(&dir.join(format!("{id}.eml")));
+        let mut left = Vec::new();
+        for name in [format!("{id}.json"), format!("{id}.eml")] {
+            let path = dir.join(name);
+            match self.files.remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => left.push((path, e)),
+                _ => {}
+            }
+        }
+        let still = left.len() == 2;
+        let Some((path, why)) = left.into_iter().next() else { return Ok(()) };
+        match self.files.write(&dir.join(format!("{id}{GONE}")), b"") {
+            Ok(()) => log::warn!("{account}: Outbox message {id}: {} couldn't be removed ({why}); marked as gone", path.display()),
+            Err(e) if still => {
+                log::warn!("{account}: Outbox message {id}: not marked as gone either ({e})");
+                return Err(io_err(&path)(why));
+            }
+            // Without one of its files it isn't listed: what's left is litter, not mail to send.
+            Err(e) => log::warn!("{account}: Outbox message {id}: {} couldn't be removed ({why}), nor marked ({e})", path.display()),
+        }
+        Ok(())
     }
 
-    /// Cached sources across all folders of an account, as (key, path) pairs, for indexing.
+    /// What [`Store::outbox_remove`] couldn't remove when it was asked, removed now where it can
+    /// be: a marked message's files, then its mark.
+    pub fn outbox_sweep(&self, account: &str) {
+        let dir = self.outbox_dir(account);
+        for (name, mark) in self.files.list(&dir) {
+            let Some(id) = name.strip_suffix(GONE) else { continue };
+            let removed = |ext: &str| match self.files.remove_file(&dir.join(format!("{id}{ext}"))) {
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+                Ok(()) => true,
+            };
+            // Both tried, each time.
+            let (json, eml) = (removed(".json"), removed(".eml"));
+            if json && eml {
+                let _ = self.files.remove_file(&mark);
+            }
+        }
+    }
+
+    fn kept_drafts_dir(&self, account: &str) -> PathBuf {
+        self.account_dir(account).join("drafts-kept")
+    }
+
+    /// Keep a draft's source on this computer until its account connects (`<id>.eml`, as the
+    /// Outbox keeps its messages); which drafts are kept, and where each goes, is the caller's.
+    pub fn kept_draft_add(&self, account: &str, id: u64, raw: &[u8]) -> Result<()> {
+        self.files.write(&self.kept_drafts_dir(account).join(format!("{id}.eml")), raw)
+    }
+
+    /// A kept draft's source; `None` when there's none.
+    pub fn kept_draft_raw(&self, account: &str, id: u64) -> Result<Option<Vec<u8>>> {
+        let path = self.kept_drafts_dir(account).join(format!("{id}.eml"));
+        match self.files.read(&path) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(&path)(e)),
+        }
+    }
+
+    /// A kept draft's source removed (one not there is no matter).
+    pub fn kept_draft_remove(&self, account: &str, id: u64) -> Result<()> {
+        let path = self.kept_drafts_dir(account).join(format!("{id}.eml"));
+        match self.files.remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_err(&path)(e)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The ids of the kept drafts' sources there are.
+    pub fn kept_draft_ids(&self, account: &str) -> Vec<u64> {
+        self.files.list(&self.kept_drafts_dir(account)).into_iter().filter_map(|(n, _)| n.strip_suffix(".eml").and_then(|n| n.parse().ok())).collect()
+    }
+
+    /// The uids of the sources cached for one folder at one validity (in no set order).
     pub fn cached_bodies(&self, account: &str, folder: &str, validity: u32) -> Vec<u32> {
         let dir = self.folder_dir(account, folder).join(validity.to_string());
         self.files.list(&dir).into_iter().filter_map(|(n, _)| n.strip_suffix(".eml").and_then(|n| n.parse().ok())).collect()

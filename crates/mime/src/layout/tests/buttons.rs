@@ -3,11 +3,6 @@
 
 use super::*;
 
-fn message(html: &str) -> crate::Parsed {
-    let raw = format!("From: a@shop.example\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n{html}");
-    crate::parse(raw.as_bytes()).unwrap_or_default()
-}
-
 /// Every one-cell table of a colour in `b`, at any depth: the buttons.
 fn buttons(b: &[Block]) -> Vec<&Table> {
     fn walk<'a>(b: &'a [Block], out: &mut Vec<&'a Table>) {
@@ -124,15 +119,19 @@ fn a_css_button_has_its_room_and_round_corners() {
     }
 }
 
-/// Hostile buttons: thousands of them stay quick, past the most drawn as their words on their
-/// colour; sizes and corners that would be huge are held to what's drawn.
+/// Five thousand buttons of sizes and corners that would be huge, in a table.
+fn hostile_buttons() -> String {
+    let one = r##"<a href="https://x.example/" style="display:inline-block;padding:9999px;background:#06c;border-radius:1e30px;width:99999px;height:1e9px;line-height:-4px">Go</a><br>"##;
+    format!("<table width=600><tr><td>{}</td></tr></table>", one.repeat(5_000))
+}
+
+/// Hostile buttons: thousands of them stay quick (the work counted, held in proportion to the
+/// message), past the most drawn as their words on their colour; sizes and corners that would be
+/// huge are held to what's drawn.
 #[test]
 fn hostile_buttons_are_survived() {
-    let one = r##"<a href="https://x.example/" style="display:inline-block;padding:9999px;background:#06c;border-radius:1e30px;width:99999px;height:1e9px;line-height:-4px">Go</a><br>"##;
-    let html = format!("<table width=600><tr><td>{}</td></tr></table>", one.repeat(5_000));
-    let t = std::time::Instant::now();
-    let b = html_layout(&html);
-    assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+    let html = hostile_buttons();
+    let b = mailcraft_model::work::linear(html.len(), || html_layout(&html));
     let found = buttons(&b);
     assert!(!found.is_empty() && found.len() <= MAX_BUTTONS, "{}", found.len());
     let c = &found[0].rows[0][0];
@@ -145,4 +144,81 @@ fn hostile_buttons_are_survived() {
         let p = message(&format!("<table width=600><tr><td>{vml}</td></tr></table>"));
         assert!(p.text.contains("Go"), "{vml}");
     }
+}
+
+/// A newsletter laid out in nested tables, its style sheet written into every element (long
+/// `style`s, as `inline_css` leaves them), boxes of two boxes nested deep, and the hostile buttons
+/// above, timed. Run under the heavy lock:
+/// `cargo test --release -p mailcraft-mime --lib measure_layout_newsletter -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_layout_newsletter() {
+    let style = "font-family:Helvetica,Arial,sans-serif;font-size:14px;line-height:20px;color:#333333;padding:4px 8px;margin:0;border:0;text-align:left;vertical-align:top;background-color:#ffffff;mso-line-height-rule:exactly";
+    let cell = format!(
+        "<td style=\"{style}\"><div style=\"{style}\"><p style=\"{style}\">Some words of a story <a href=\"https://news.example/a\" style=\"{style};text-decoration:none\">read more</a></p></div></td>"
+    );
+    let row = format!("<tr>{cell}{cell}</tr>");
+    let mut html = format!("<table width=\"600\" style=\"{style}\">{}</table>", row.repeat(20));
+    for _ in 0..8 {
+        html = format!("<table width=\"600\" style=\"{style}\"><tr><td style=\"{style}\">{html}{html}</td></tr></table>");
+        if html.len() > 700_000 {
+            break;
+        }
+    }
+    let t = std::time::Instant::now();
+    let b = html_layout(&html);
+    println!("MEASURE layout of {} KB: {} ms", html.len() / 1024, t.elapsed().as_millis());
+    assert!(!b.is_empty());
+    // Boxes of two boxes, twelve deep (4,096 at the bottom).
+    let mut boxes = "<p>A few words.</p>".to_string();
+    for _ in 0..12 {
+        boxes = format!("<div style=\"{style}\">{boxes}</div><div style=\"{style}\">{boxes}</div>");
+    }
+    let t = std::time::Instant::now();
+    let b = html_layout(&boxes);
+    println!("MEASURE layout of boxes in boxes, {} KB: {} ms", boxes.len() / 1024, t.elapsed().as_millis());
+    assert!(!b.is_empty());
+    let buttons = hostile_buttons();
+    let t = std::time::Instant::now();
+    let b = html_layout(&buttons);
+    println!("MEASURE layout of 5,000 hostile buttons, {} KB: {} ms", buttons.len() / 1024, t.elapsed().as_millis());
+    assert!(!b.is_empty());
+}
+
+/// A newsletter of 1,500 cells of about 130 characters laid out, then made the text to edit under
+/// a reply ([`flatten`]), timed. Run under the heavy lock:
+/// `cargo test --release -p mailcraft-mime --lib measure_flatten -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_flatten() {
+    let cell = "<td><b>A heading</b> and some words of a long newsletter, kept to see what quoting it under a reply costs.</td>";
+    let rows: String = (0..750).map(|_| format!("<tr>{cell}{cell}</tr>")).collect();
+    let b = html_layout(&format!("<table width=\"600\">{rows}</table>"));
+    let t = std::time::Instant::now();
+    let (text, styles) = flatten(&b);
+    println!("MEASURE flatten 1500 cells ({} KB): {} ms", text.len() / 1024, t.elapsed().as_millis());
+    assert_eq!(styles.chars.len(), text.chars().count());
+}
+
+/// A laid-out message made the text to edit under a reply reads as appending each of its pieces
+/// with [`crate::rich::append`] does (it's built without fitting all of it for each piece).
+#[test]
+fn flattened_as_appended_piece_by_piece() {
+    let html = r##"<table width="600"><tr><td style="color:#c00"><b>Sale</b> on <i>everything</i></td><td align="right"><a href="https://shop.example/">Shop</a></td></tr>
+        <tr><td colspan="2"><p>Two lines</p><p style="text-align:center">centred</p></td></tr></table><p>After the table <u>under</u> it.</p>"##;
+    let b = html_layout(html);
+    let (text, styles) = flatten(&b);
+    let (mut want, mut want_styles) = (String::new(), crate::rich::Styles::plain(""));
+    for (lines, align) in text_blocks(&b) {
+        let (t, st) = cell_text(lines, align);
+        if t.trim().is_empty() && !t.contains(crate::rich::PICTURE) {
+            continue;
+        }
+        if !want.is_empty() {
+            crate::rich::append(&mut want, &mut want_styles, "\n", &crate::rich::Styles::plain("\n"));
+        }
+        crate::rich::append(&mut want, &mut want_styles, &t, &st);
+    }
+    assert!(!text.is_empty());
+    assert_eq!((text, styles), (want, want_styles));
 }

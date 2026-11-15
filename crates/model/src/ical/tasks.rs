@@ -7,10 +7,6 @@
 use super::*;
 use crate::pim::{Task, TaskPriority, TaskStatus};
 
-/// The most tasks read from one file, lines kept of one, and categories.
-const MAX_TASKS: usize = 20_000;
-const MAX_EXTRA: usize = 200;
-const MAX_CATEGORIES: usize = 20;
 /// Outlook's statuses iCalendar has no word for.
 pub const TASK_STATUS: &str = "X-MAILCRAFT-TASK-STATUS";
 
@@ -42,11 +38,12 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
     // Components open around the line: outside a task, those besides the calendar itself; in
     // one, those nested in it, whether the outermost of them is an alarm, and whether it's kept
     // (one that begins once the task's kept lines are full is left out whole, so what's kept
-    // always ends what it begins).
+    // always ends what it begins), and the depth of one nested in a kept one and left out so.
     let mut outer = 0usize;
     let mut depth = 0usize;
     let mut in_alarm = false;
     let mut keep = false;
+    let mut dropped_from: Option<usize> = None;
     for &l in all {
         let what = || l.value.trim().to_ascii_uppercase();
         match l.name.as_str() {
@@ -58,6 +55,7 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
                             depth = 0;
                             in_alarm = false;
                             keep = false;
+                            dropped_from = None;
                         }
                         "VCALENDAR" => {}
                         _ => outer = outer.saturating_add(1),
@@ -67,9 +65,12 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
                 depth = depth.saturating_add(1);
                 if depth == 1 {
                     in_alarm = what() == "VALARM";
-                    keep = !in_alarm && r.task.extra.len() < MAX_EXTRA;
+                    keep = !in_alarm && r.task.extra.len() < EXTRA_MAX;
+                    dropped_from = None;
+                } else if keep && dropped_from.is_none() && r.task.extra.len() >= EXTRA_MAX {
+                    dropped_from = Some(depth);
                 }
-                if keep {
+                if keep && dropped_from.is_none() {
                     r.task.extra.push(l.raw.clone());
                 }
                 continue;
@@ -82,10 +83,12 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
                     continue;
                 };
                 if depth > 0 {
-                    depth -= 1;
-                    if keep {
-                        r.task.extra.push(l.raw.clone());
+                    match dropped_from {
+                        None if keep => r.task.extra.push(l.raw.clone()),
+                        Some(d) if d == depth => dropped_from = None,
+                        _ => {}
                     }
+                    depth -= 1;
                     if depth == 0 {
                         in_alarm = false;
                         keep = false;
@@ -94,7 +97,7 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
                 }
                 if what() == "VTODO"
                     && let Some(r) = cur.take()
-                    && out.len() < MAX_TASKS
+                    && out.len() < MAX_ITEMS
                 {
                     out.push(finish(r, zones));
                 }
@@ -106,14 +109,14 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
         if depth > 0 {
             if in_alarm && l.name == "TRIGGER" && r.trigger.is_none() {
                 r.trigger = Some(l);
-            } else if keep && r.task.extra.len() < MAX_EXTRA {
+            } else if keep && dropped_from.is_none() && r.task.extra.len() < EXTRA_MAX {
                 r.task.extra.push(l.raw.clone());
             }
             continue;
         }
         let t = &mut r.task;
         match l.name.as_str() {
-            "UID" => t.uid = l.value.trim().to_string(),
+            "UID" => t.uid = stored_uid(&l.value),
             "SUMMARY" => t.title = unescape(&l.value),
             "DESCRIPTION" => t.notes = unescape(&l.value),
             "DTSTART" => t.start = day_of(zones, l),
@@ -131,18 +134,12 @@ pub(super) fn read_tasks(all: &[&Line], zones: &FileZones) -> Vec<Task> {
             TASK_STATUS => r.own_status = TaskStatus::from_code(&l.value),
             "PERCENT-COMPLETE" => t.percent = l.value.trim().parse::<i64>().map_or(0, |p| u8::try_from(p.clamp(0, 100)).unwrap_or(0)),
             "PRIORITY" => t.priority = TaskPriority::from_ical(l.value.trim().parse().unwrap_or(0)),
-            "CATEGORIES" => {
-                for c in split_text_list(&l.value) {
-                    if !t.categories.contains(&c) && t.categories.len() < MAX_CATEGORIES {
-                        t.categories.push(c);
-                    }
-                }
-            }
+            "CATEGORIES" => add_categories(&mut t.categories, &l.value),
             "RRULE" => t.rrule = Some(l.value.trim().to_string()).filter(|r| !r.is_empty()),
             "LAST-MODIFIED" => t.modified = zones.time(l, "").map_or(0, |(t, _, _)| t),
             "DTSTAMP" | "CREATED" | "SEQUENCE" => {}
             _ => {
-                if t.extra.len() < MAX_EXTRA {
+                if t.extra.len() < EXTRA_MAX {
                     t.extra.push(l.raw.clone());
                 }
             }
@@ -180,7 +177,7 @@ fn finish(r: Reading<'_>, zones: &FileZones) -> Task {
 }
 
 /// One `VTODO`, folded; `now` is its `DTSTAMP`.
-pub fn write_task(t: &Task, now: i64, out: &mut String) {
+pub(super) fn write_task(t: &Task, now: i64, out: &mut String) {
     let clean = |s: &str| s.replace(['\r', '\n'], "");
     let mut lines: Vec<String> = vec!["BEGIN:VTODO".into(), format!("UID:{}", clean(&t.uid)), format!("DTSTAMP:{}", stamp(now))];
     if t.modified > 0 {
@@ -228,13 +225,7 @@ pub fn write_task(t: &Task, now: i64, out: &mut String) {
     }
     lines.extend(whole(&t.extra, &["VEVENT"]));
     if let Some(at) = t.reminder {
-        lines.extend([
-            "BEGIN:VALARM".to_string(),
-            "ACTION:DISPLAY".to_string(),
-            "DESCRIPTION:Reminder".to_string(),
-            format!("TRIGGER;VALUE=DATE-TIME:{}", stamp(at)),
-            "END:VALARM".to_string(),
-        ]);
+        lines.extend(display_alarm(format!("TRIGGER;VALUE=DATE-TIME:{}", stamp(at))));
     }
     lines.push("END:VTODO".into());
     for l in lines {

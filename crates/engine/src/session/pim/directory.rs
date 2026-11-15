@@ -67,7 +67,8 @@ impl Session {
             let fresh = self.directory.answers.get(&k).is_some_and(|a| match a.at {
                 None => true,
                 Some(_) if force => false,
-                Some(at) => now - at < if a.people.is_empty() { NONE_FOR } else { FOUND_FOR },
+                // A failure keeps who was found before, but isn't their answer.
+                Some(at) => now - at < if a.error.is_some() || a.people.is_empty() { NONE_FOR } else { FOUND_FOR },
             });
             if fresh {
                 continue;
@@ -173,7 +174,7 @@ impl Session {
         };
         let mut asked = Vec::new();
         for id in wanted {
-            let Some(config) = self.account(&id).map(|a| a.config.clone()) else { return Err(CmdError::Params(format!("no account `{id}`"))) };
+            let config = self.config_of(&id)?;
             if config.graph.is_none() || config.oauth.is_none() {
                 return Err(CmdError::Params(format!("{}: only an Exchange Online account signed in with Microsoft asks for this", config.email)));
             }

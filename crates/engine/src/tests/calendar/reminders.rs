@@ -6,6 +6,8 @@ use mailcraft_model::pim::{CalendarInfo, DavSync, ReminderAnswer, StoredEvent};
 
 use super::*;
 
+mod kept;
+
 const CAL: &str = "cal-1";
 
 /// An event with a 15-minute reminder, an hour after `NOW`; `daily` makes it a series.
@@ -47,7 +49,7 @@ fn due(s: &Session) -> Vec<String> {
     s.due_reminders(s.clock.now).into_iter().map(|r| r.uid).collect()
 }
 
-fn key_of(s: &Session, uid: &str) -> String {
+fn reminder_key(s: &Session, uid: &str) -> String {
     s.due_reminders(s.clock.now).into_iter().find(|r| r.uid == uid).map(|r| r.key).unwrap()
 }
 
@@ -60,7 +62,7 @@ fn an_answer_on_exchange_waits_for_the_server() {
         account_with("reminder-exchange", vec![with_reminder("one", "AAMk-one", false), with_reminder("daily", "AAMk-daily", true)], true);
     s.clock.now = NOW + 3600 - 10 * 60;
     assert_eq!(due(&s).len(), 2, "{:?}", due(&s));
-    let (one, daily) = (key_of(&s, "one"), key_of(&s, "daily"));
+    let (one, daily) = (reminder_key(&s, "one"), reminder_key(&s, "daily"));
     s.run("reminders.dismiss", &json!({"key": one})).unwrap();
     s.run("reminders.snooze", &json!({"key": daily, "minutes": 5})).unwrap();
     assert!(due(&s).is_empty());
@@ -90,7 +92,7 @@ fn an_answer_on_exchange_waits_for_the_server() {
     assert!(s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { account } if *account == id)), "the server is told at once");
     // The same occurrence answered again replaces its answer.
     s.clock.now += 300;
-    let daily = key_of(&s, "daily");
+    let daily = reminder_key(&s, "daily");
     s.run("reminders.dismiss", &json!({"key": daily})).unwrap();
     let answers = &s.pim.get(&id).unwrap().reminder_answers;
     assert_eq!(answers.len(), 2);
@@ -110,7 +112,7 @@ fn a_dismissal_on_caldav_acknowledges_the_alarm() {
     let (mut s, id) =
         account_with("reminder-caldav", vec![with_reminder("one", "/cal/one.ics", false), with_reminder("two", "/cal/two.ics", false)], false);
     s.clock.now = NOW + 3600 - 10 * 60;
-    let (one, two) = (key_of(&s, "one"), key_of(&s, "two"));
+    let (one, two) = (reminder_key(&s, "one"), reminder_key(&s, "two"));
     s.run("reminders.snooze", &json!({"key": two, "minutes": 5})).unwrap();
     assert!(!s.find_event("two").unwrap().1.dirty, "a snooze isn't the server's");
     s.run("reminders.dismiss", &json!({"key": one})).unwrap();
@@ -140,6 +142,40 @@ fn a_dismissal_on_caldav_acknowledges_the_alarm() {
     let now_due = due(&s);
     assert!(!now_due.contains(&"three".to_string()), "{now_due:?}");
     assert!(now_due.contains(&"four".to_string()), "acknowledged before this alarm: still due ({now_due:?})");
+}
+
+/// A task's reminder is answered here alone, and its server hears nothing; an event that has a
+/// task's uid is still told to its server (any task with the uid kept it from being told).
+#[test]
+fn a_tasks_reminder_stays_here_and_an_event_with_its_uid_is_told() {
+    let (mut s, id) = account_with("reminder-task-uid", vec![with_reminder("same", "/cal/same.ics", false)], false);
+    let reminds = NOW + 600;
+    let task = mailcraft_model::pim::Task { uid: "same".into(), title: "Call back".into(), reminder: Some(reminds), ..Default::default() };
+    s.pim_mut(&id).tasks.push(mailcraft_model::pim::StoredTask { task });
+    s.clock.now = NOW + 3600 - 10 * 60;
+    let keys: Vec<String> = s.due_reminders(s.clock.now).into_iter().map(|r| r.key).collect();
+    let (of_task, of_event) = (format!("{id}|same|{reminds}"), format!("{id}|same|{}", NOW + 3600));
+    assert!(keys.contains(&of_task) && keys.contains(&of_event), "{keys:?}");
+    s.run("reminders.dismiss", &json!({"key": of_task})).unwrap();
+    let (_, e) = s.find_event("same").unwrap();
+    assert!(!e.dirty && ical::acknowledged(&e.event).is_none(), "the task's: not the event's server's");
+    assert!(!s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { .. })));
+    s.run("reminders.dismiss", &json!({"key": of_event})).unwrap();
+    let (_, e) = s.find_event("same").unwrap();
+    assert!(e.dirty && ical::acknowledged(&e.event) == Some(s.clock.now), "the event's: told");
+}
+
+/// A dismissal of an event whose uid has a `|` in it (a server's uid can) is told to its server
+/// too: its key was read back as another account's, and nothing was told.
+#[test]
+fn a_uid_with_a_bar_is_told_to_the_server() {
+    let (mut s, id) = account_with("reminder-bar", vec![with_reminder("one|two|", "/cal/bar.ics", false)], false);
+    s.clock.now = NOW + 3600 - 10 * 60;
+    let k = reminder_key(&s, "one|two|");
+    s.run("reminders.dismiss", &json!({"key": k})).unwrap();
+    let (_, e) = s.find_event("one|two|").unwrap();
+    assert!(e.dirty && ical::acknowledged(&e.event) == Some(s.clock.now));
+    assert!(s.take_jobs().iter().any(|j| matches!(j, Job::SyncDav { account } if *account == id)));
 }
 
 /// Acknowledging replaces an alarm's earlier `ACKNOWLEDGED`, takes out snooze alarms, leaves the

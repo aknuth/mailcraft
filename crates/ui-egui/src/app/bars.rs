@@ -1,6 +1,7 @@
 //! The top bar (the ribbon's tabs, search, sync, settings), the status bar, and notices.
 
 use crate::*;
+use mailcraft_engine::model::FailureKind;
 
 /// A row of the top bar: its tabs, its buttons, the search box.
 pub(crate) const BAR_ROW_H: f32 = 30.0;
@@ -23,25 +24,14 @@ impl MailApp {
     pub(crate) fn top_bar(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let own = self.services.own_title_bar();
         let inner = ui.max_rect();
-        if own {
-            // The panel's whole rect, its margins too: the buttons sit flush with the window's
-            // corner, and the bar's free space drags the window (laid first, so the controls on
-            // it keep their clicks).
-            let t = self.ui.tokens;
-            let bar = inner.expand2(vec2(f32::from(super::frame::TOP_BAR_MARGIN.0), f32::from(super::frame::TOP_BAR_MARGIN.1)));
-            super::caption::drag_area(ui, bar, &[]);
-            let top = egui::Rect::from_min_size(bar.min, vec2(bar.width(), super::frame::TOP_BAR_H));
-            let live = !super::caption::laid_over_a_dialog(ui.ctx());
-            super::caption::caption_buttons(ui, &t, top, live);
-        }
+        // The panel's whole rect, its margins too: the window's buttons sit flush with its corner.
+        let bar = inner.expand2(vec2(f32::from(super::frame::TOP_BAR_MARGIN.0), f32::from(super::frame::TOP_BAR_MARGIN.1)));
         // The bar's contents keep clear of the window's buttons.
-        let room = if own { super::caption::CAPTIONS_W - f32::from(super::frame::TOP_BAR_MARGIN.0) } else { 0.0 };
-        let full = egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x - room, inner.max.y));
+        let t = self.ui.tokens;
+        let full = if own { super::caption::title_bar(ui, &t, bar) } else { inner };
         let controls = ui.scope_builder(egui::UiBuilder::new().max_rect(full), |ui| self.top_bar_rows(ui, full, own, acts)).inner;
         if own {
-            let bar = inner.expand2(vec2(f32::from(super::frame::TOP_BAR_MARGIN.0), f32::from(super::frame::TOP_BAR_MARGIN.1)));
-            let top = egui::Rect::from_min_size(bar.min, vec2(bar.width(), super::frame::TOP_BAR_H));
-            super::caption::note_bar(ui.ctx(), bar, top, controls);
+            super::caption::note_bar(ui.ctx(), bar, super::caption::top_row(bar), controls);
         }
     }
 
@@ -145,7 +135,8 @@ impl MailApp {
         let can_undo = !self.session.undo.is_empty();
         ui.with_layout(bidi::row_from_end(Align::Center), |ui| {
             let dark = t.dark;
-            let (icon, tip) = if dark { (Icon::Sun, tl!("Switch to light mode")) } else { (Icon::Moon, tl!("Switch to dark mode")) };
+            // The buttons' words in English: the button translates them.
+            let (icon, tip) = if dark { (Icon::Sun, "Switch to light mode") } else { (Icon::Moon, "Switch to dark mode") };
             if widgets::bar_icon_button(ui, icon, tip, &t).clicked() {
                 acts.push(Action::SetDark(Some(!dark)));
             }
@@ -154,10 +145,10 @@ impl MailApp {
             }
             // Quick access, as Outlook's title bar: Send / Receive all folders, and Undo the
             // last move, delete, flag or category (Ctrl+Z).
-            if can_sync && widgets::bar_icon_button(ui, Icon::Sync, tl!("Send / Receive all folders (F9)"), &t).clicked() {
+            if can_sync && widgets::bar_icon_button(ui, Icon::Sync, "Send / Receive all folders (F9)", &t).clicked() {
                 acts.push(Action::Run("mail.sync", json!({})));
             }
-            if can_undo && widgets::bar_icon_button(ui, Icon::Back, tl!("Undo (Ctrl+Z)"), &t).clicked() {
+            if can_undo && widgets::bar_icon_button(ui, Icon::Back, "Undo (Ctrl+Z)", &t).clicked() {
                 acts.push(Action::Run("edit.undo", json!({})));
             }
         })
@@ -165,128 +156,22 @@ impl MailApp {
         .rect
     }
 
+    /// The status bar: what's shown and waiting, the background work, and the accounts.
     pub(crate) fn status_bar(&mut self, ui: &mut Ui) {
         let t = self.ui.tokens;
+        // In People, how many contacts it shows (the list as People keeps it).
+        let people_items = (self.session.module == Module::People).then(|| people::shown(&self.session, &mut self.ui).at.len());
         let s = &self.session;
         let mut again: Option<String> = None;
         let mut restart = false;
         let mut details = self.ui.import_details.clone();
         let mut acts = Vec::new();
         ui.with_layout(bidi::row_from_start(Align::Center), |ui| {
-            // The items of what's shown: the list's mail, or (in People) the contacts.
-            if s.module == Module::People {
-                ui.label(RichText::new(tf!("Items: {n}", n = people::shown(s, &self.ui).len())).color(t.dim).small());
-            } else if s.module == Module::Mail {
-                let unread = s.list.iter().filter(|m| !m.flags.seen).count();
-                ui.label(RichText::new(tf!("Items: {n}", n = s.list.len())).color(t.dim).small());
-                if unread > 0 {
-                    ui.label(RichText::new(tf!("Unread: {n}", n = unread)).color(t.dim).small());
-                }
-            }
-            if !s.outbox.is_empty() {
-                ui.label(RichText::new(tf!("Outbox: {n}", n = s.outbox.len())).color(t.warn).small());
-            }
-            if s.prefs.work_offline {
-                ui.label(RichText::new(tl!("Working offline")).color(t.warn).small());
-            }
+            item_counts(ui, s, people_items, t);
             // A test build's next version: how far it's downloaded, then restart into it.
             restart = self.update_status(ui);
-            // The most important background work: a data file's import, then its compaction,
-            // then the search index.
-            let now = ui.input(|i| i.time);
-            if !super::importing::status_segment(ui, s, &t, &mut details, &mut acts)
-                && let Some((text, permille, hover)) = background_work(s, &self.ui.compact, now)
-            {
-                ui.add_space(6.0);
-                // A compaction's segment opens its dialog again (hidden, it went on).
-                if progress::segment(ui, &t, &text, permille, &hover).clicked()
-                    && let Some(account) = super::compacting::shown(s)
-                {
-                    acts.push(Action::Dialog(Dialog::Compacting { account: account.to_string(), closing: false, since: None }));
-                }
-            }
-            ui.with_layout(bidi::row_from_end(Align::Center), |ui| {
-                let dot = |ui: &mut Ui, color: egui::Color32| {
-                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                    ui.painter().circle_filled(r.center(), 4.0, color);
-                };
-                // One account: its own status. Several: one status for them all (a line per
-                // account didn't fit), with each on hover; only those that need you stand out.
-                if s.accounts.len() <= 1 {
-                    for a in &s.accounts {
-                        let (color, text) = account_status(s, &t, a);
-                        // "Password needed" is a link: click it to enter the password again.
-                        if needs_you(a) {
-                            if ui.link(RichText::new(text).color(t.danger).small()).on_hover_text(why(a)).clicked() {
-                                again = Some(a.config.id.clone());
-                            }
-                        } else {
-                            ui.label(RichText::new(text).color(t.dim).small()).on_hover_text(&a.config.email);
-                        }
-                        dot(ui, color);
-                    }
-                    return;
-                }
-                let each: Vec<String> =
-                    s.accounts.iter().map(|a| tf!("{account}: {status}", account = a.config.email, status = account_status(s, &t, a).1)).collect();
-                let each = each.join("\n");
-                let busy = s.accounts.iter().any(|a| matches!(a.status, SyncStatus::Syncing { .. }));
-                let connecting = s.accounts.iter().any(|a| matches!(a.status, SyncStatus::Connecting));
-                let failed = s.accounts.iter().filter(|a| matches!(a.status, SyncStatus::Error { .. }) && !needs_you(a)).count();
-                let online = s.accounts.iter().any(|a| matches!(a.status, SyncStatus::Online { .. }));
-                let (color, text) = if busy {
-                    (t.accent, tl!("Updating…").to_string())
-                } else if connecting {
-                    (t.accent, tl!("Connecting…").to_string())
-                } else if failed == 1 {
-                    // One is one: it read "1 accounts disconnected".
-                    (t.warn, tl!("1 account disconnected").to_string())
-                } else if failed > 0 {
-                    (t.warn, tf!("{n} accounts disconnected", n = failed))
-                } else if online {
-                    (t.ok, tl!("All folders are up to date").to_string())
-                } else {
-                    (t.faint, tl!("Offline").to_string())
-                };
-                ui.label(RichText::new(text).color(t.dim).small()).on_hover_text(&each);
-                dot(ui, color);
-                // Accounts waiting for you: a link each (it signs in again), as many as fit beside
-                // the counts on the left; the rest as "+N", each on hover (a dozen of them ran over
-                // "Items" and "Unread").
-                let waiting: Vec<&mailcraft_engine::AccountState> = s.accounts.iter().rev().filter(|a| needs_you(a)).collect();
-                let mut shown = 0;
-                for a in &waiting {
-                    let text = tf!("{account}: {status}", account = a.config.email, status = account_status(s, &t, a).1);
-                    let width = ui.painter().layout_no_wrap(text.clone(), egui::TextStyle::Small.resolve(ui.style()), t.danger).size().x;
-                    // Room for this one and a "+N" after it.
-                    if ui.available_width() < width + 70.0 {
-                        break;
-                    }
-                    ui.add_space(10.0);
-                    if ui.link(RichText::new(text).color(t.danger).small()).on_hover_text(why(a)).clicked() {
-                        again = Some(a.config.id.clone());
-                    }
-                    dot(ui, t.danger);
-                    shown += 1;
-                }
-                let rest: Vec<&&mailcraft_engine::AccountState> = waiting.iter().skip(shown).collect();
-                if let Some(first) = rest.first() {
-                    ui.add_space(10.0);
-                    let each: Vec<String> =
-                        rest.iter().map(|a| tf!("{account}: {status}", account = a.config.email, status = account_status(s, &t, a).1)).collect();
-                    if ui
-                        .link(RichText::new(format!("+{}", rest.len())).color(t.danger).small())
-                        .on_hover_text(each.join(
-                            "
-",
-                        ))
-                        .clicked()
-                    {
-                        again = Some(first.config.id.clone());
-                    }
-                    dot(ui, t.danger);
-                }
-            });
+            background_segment(ui, s, &self.ui.compact, t, &mut details, &mut acts);
+            ui.with_layout(bidi::row_from_end(Align::Center), |ui| accounts_status(ui, s, t, &mut again));
         });
         self.ui.import_details = details;
         for a in acts {
@@ -355,16 +240,145 @@ impl MailApp {
     }
 }
 
+/// The status bar's start: the items of what's shown (the list's mail, or in People the
+/// contacts), what waits in the Outbox, and whether MailCraft works offline.
+fn item_counts(ui: &mut Ui, s: &Session, people: Option<usize>, t: Tokens) {
+    if let Some(n) = people {
+        ui.label(RichText::new(tf!("Items: {n}", n = n)).color(t.dim).small());
+    } else if s.module == Module::Mail {
+        let unread = s.list.iter().filter(|m| !m.flags.seen).count();
+        ui.label(RichText::new(tf!("Items: {n}", n = s.list.len())).color(t.dim).small());
+        if unread > 0 {
+            ui.label(RichText::new(tf!("Unread: {n}", n = unread)).color(t.dim).small());
+        }
+    }
+    if !s.outbox.is_empty() {
+        ui.label(RichText::new(tf!("Outbox: {n}", n = s.outbox.len())).color(t.warn).small());
+    }
+    if s.prefs.work_offline {
+        ui.label(RichText::new(tl!("Working offline")).color(t.warn).small());
+    }
+}
+
+/// The most important background work: a data file's import, then its compaction, then the
+/// search index.
+fn background_segment(
+    ui: &mut Ui,
+    s: &Session,
+    compact: &super::compacting::CompactUi,
+    t: Tokens,
+    details: &mut Option<String>,
+    acts: &mut Vec<Action>,
+) {
+    let now = ui.input(|i| i.time);
+    if !super::importing::status_segment(ui, s, &t, details, acts)
+        && let Some((text, permille, hover)) = background_work(s, compact, now)
+    {
+        ui.add_space(6.0);
+        // A compaction's segment opens its dialog again (hidden, it went on).
+        if progress::segment(ui, &t, &text, permille, &hover).clicked()
+            && let Some(account) = super::compacting::shown(s)
+        {
+            acts.push(Action::Dialog(Dialog::Compacting { account: account.to_string(), closing: false, since: None }));
+        }
+    }
+}
+
+/// A dot of an account's colour after its status.
+fn dot(ui: &mut Ui, color: egui::Color32) {
+    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+    ui.painter().circle_filled(r.center(), 4.0, color);
+}
+
+/// The accounts, at the bar's end. One account: its own status. Several: one status for them
+/// all (a line per account didn't fit), with each on hover; only those that need you stand
+/// out. `again`: the account whose link was clicked, to sign in again.
+fn accounts_status(ui: &mut Ui, s: &Session, t: Tokens, again: &mut Option<String>) {
+    if s.accounts.len() <= 1 {
+        for a in &s.accounts {
+            let (color, text) = account_status(s, &t, a);
+            // "Password needed" is a link: click it to enter the password again.
+            if needs_you(a) {
+                if ui.link(RichText::new(text).color(t.danger).small()).on_hover_text(why(a)).clicked() {
+                    *again = Some(a.config.id.clone());
+                }
+            } else {
+                ui.label(RichText::new(text).color(t.dim).small()).on_hover_text(&a.config.email);
+            }
+            dot(ui, color);
+        }
+        return;
+    }
+    // Each account's line, made once for the hover of them all and for those waiting.
+    let lines: Vec<String> =
+        s.accounts.iter().map(|a| tf!("{account}: {status}", account = a.config.email, status = account_status(s, &t, a).1)).collect();
+    all_accounts(ui, s, t, &lines);
+    waiting_accounts(ui, s, t, &lines, again);
+}
+
+/// Several accounts' one status: updating, connecting, how many are disconnected, else up to
+/// date or offline; each account's line (`lines`) on hover.
+fn all_accounts(ui: &mut Ui, s: &Session, t: Tokens, lines: &[String]) {
+    let each = lines.join("\n");
+    let busy = s.accounts.iter().any(|a| matches!(a.status, SyncStatus::Syncing { .. }));
+    let connecting = s.accounts.iter().any(|a| matches!(a.status, SyncStatus::Connecting));
+    let failed = s.accounts.iter().filter(|a| matches!(a.status, SyncStatus::Error { .. }) && !needs_you(a)).count();
+    let online = s.accounts.iter().any(|a| matches!(a.status, SyncStatus::Online { .. }));
+    let (color, text) = if busy {
+        (t.accent, tl!("Updating…").to_string())
+    } else if connecting {
+        (t.accent, tl!("Connecting…").to_string())
+    } else if failed == 1 {
+        // One is one: it read "1 accounts disconnected".
+        (t.warn, tl!("1 account disconnected").to_string())
+    } else if failed > 0 {
+        (t.warn, tf!("{n} accounts disconnected", n = failed))
+    } else if online {
+        (t.ok, tl!("All folders are up to date").to_string())
+    } else {
+        (t.faint, tl!("Offline").to_string())
+    };
+    ui.label(RichText::new(text).color(t.dim).small()).on_hover_text(&each);
+    dot(ui, color);
+}
+
+/// Accounts waiting for you: a link each (it signs in again), as many as fit beside the counts
+/// on the left; the rest as "+N", each on hover (a dozen of them ran over "Items" and
+/// "Unread"). `lines`: each account's, in the order of the accounts.
+fn waiting_accounts(ui: &mut Ui, s: &Session, t: Tokens, lines: &[String], again: &mut Option<String>) {
+    let waiting: Vec<(&mailcraft_engine::AccountState, &String)> = s.accounts.iter().zip(lines).rev().filter(|(a, _)| needs_you(a)).collect();
+    let mut shown = 0;
+    for (a, text) in &waiting {
+        let width = ui.painter().layout_no_wrap(text.to_string(), egui::TextStyle::Small.resolve(ui.style()), t.danger).size().x;
+        // Room for this one and a "+N" after it.
+        if ui.available_width() < width + 70.0 {
+            break;
+        }
+        ui.add_space(10.0);
+        if ui.link(RichText::new(text.as_str()).color(t.danger).small()).on_hover_text(why(a)).clicked() {
+            *again = Some(a.config.id.clone());
+        }
+        dot(ui, t.danger);
+        shown += 1;
+    }
+    let rest = waiting.get(shown..).unwrap_or_default();
+    if let Some((first, _)) = rest.first() {
+        ui.add_space(10.0);
+        let each: Vec<&str> = rest.iter().map(|(_, line)| line.as_str()).collect();
+        if ui.link(RichText::new(format!("+{}", rest.len())).color(t.danger).small()).on_hover_text(each.join("\n")).clicked() {
+            *again = Some(first.config.id.clone());
+        }
+        dot(ui, t.danger);
+    }
+}
+
 /// An account that waits for you to do something: sign in (again, or with Microsoft rather than
 /// a password), or choose what to do about a mailbox Microsoft won't open over IMAP.
 pub(crate) fn needs_you(a: &mailcraft_engine::AccountState) -> bool {
     match &a.status {
         SyncStatus::NeedsPassword { .. } => true,
-        SyncStatus::Error { error } => {
-            error.starts_with(mailcraft_engine::model::MICROSOFT_IMAP_CLOSED)
-                || error.starts_with(mailcraft_engine::model::MICROSOFT_NO_PASSWORDS)
-                || error.contains(mailcraft_engine::model::LOCAL_CERTIFICATE)
-        }
+        // Every kind but `Other` waits for you.
+        SyncStatus::Error { kind, .. } => !kind.is_other(),
         _ => false,
     }
 }
@@ -389,7 +403,7 @@ pub(crate) fn background_work(s: &Session, compact: &super::compacting::CompactU
 /// An account's address, and what's wrong with it when something is (for hovering its status).
 pub(crate) fn why(a: &mailcraft_engine::AccountState) -> String {
     match &a.status {
-        SyncStatus::Error { error } | SyncStatus::NeedsPassword { error } if !error.is_empty() => {
+        SyncStatus::Error { error, .. } | SyncStatus::NeedsPassword { error } if !error.is_empty() => {
             format!("{}\n{}", a.config.email, tl!(error))
         }
         _ => a.config.email.clone(),
@@ -403,15 +417,9 @@ pub(crate) fn account_status(s: &Session, t: &Tokens, a: &mailcraft_engine::Acco
         return words;
     }
     match &a.status {
-        SyncStatus::Error { error } if error.starts_with(mailcraft_engine::model::MICROSOFT_NO_PASSWORDS) => {
-            (t.danger, tl!("Sign in with Microsoft").to_string())
-        }
-        SyncStatus::Error { error } if error.starts_with(mailcraft_engine::model::MICROSOFT_IMAP_CLOSED) => {
-            (t.danger, tl!("Mailbox won't open").to_string())
-        }
-        SyncStatus::Error { error } if error.contains(mailcraft_engine::model::LOCAL_CERTIFICATE) => {
-            (t.danger, tl!("Certificate not trusted yet").to_string())
-        }
+        SyncStatus::Error { kind: FailureKind::MicrosoftNoPasswords, .. } => (t.danger, tl!("Sign in with Microsoft").to_string()),
+        SyncStatus::Error { kind: FailureKind::MicrosoftImapClosed, .. } => (t.danger, tl!("Mailbox won't open").to_string()),
+        SyncStatus::Error { kind: FailureKind::LocalCertificate { .. }, .. } => (t.danger, tl!("Certificate not trusted yet").to_string()),
         SyncStatus::Online { at } => (t.ok, tf!("Updated {time}", time = i18n::date(&mailcraft_engine::model::dates::list_time(*at, &s.clock)))),
         SyncStatus::Syncing { folder } => {
             (t.accent, tf!("Updating {folder}…", folder = s.folder(&a.config.id, folder).map(i18n::folder).unwrap_or_default()))
@@ -423,6 +431,6 @@ pub(crate) fn account_status(s: &Session, t: &Tokens, a: &mailcraft_engine::Acco
         // An account that signs in in the browser has no password to ask for.
         SyncStatus::NeedsPassword { .. } if a.config.oauth.is_some() => (t.danger, tl!("Sign in again").to_string()),
         SyncStatus::NeedsPassword { .. } => (t.danger, tl!("Password needed").to_string()),
-        SyncStatus::Error { error } => (t.warn, tf!("Disconnected: {error}", error = widgets::shorten(error, 60))),
+        SyncStatus::Error { error, .. } => (t.warn, tf!("Disconnected: {error}", error = widgets::shorten(error, 60))),
     }
 }

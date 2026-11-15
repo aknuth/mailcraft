@@ -2,9 +2,40 @@ use mailcraft_model::{Flag, Flags};
 
 use super::*;
 
-/// A big folder's list is kept in pages by number: read back newest first as it was; a flag
-/// change writes one page, new mail the last one; shrunk, the pages go; and a list kept whole
-/// (from before) still reads.
+mod changes;
+mod counts;
+mod flagging;
+mod folder_uids;
+mod lists;
+mod merging;
+pub(crate) mod process;
+pub(crate) mod random;
+
+/// The folders a test made ([`scratch`]), removed when its thread ends, whether the test passed
+/// or failed (after the test's own values, its stores among them, have gone).
+#[derive(Default)]
+struct Scratch(Vec<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for folder in &self.0 {
+            // Leftovers in the temporary folder are harmless; a failed clean-up isn't a failed test.
+            let _ = fs::remove_dir_all(folder);
+        }
+    }
+}
+
+thread_local!(static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default());
+
+/// A folder for the test, `mailcraft-<name>-<pid>` in the temporary folder (not made yet): what a
+/// run before left there is removed now, and the folder with all in it once the test is over.
+pub(crate) fn scratch(name: &str) -> PathBuf {
+    let folder = std::env::temp_dir().join(format!("mailcraft-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&folder);
+    SCRATCH.with(|s| s.borrow_mut().0.push(folder.clone()));
+    folder
+}
+
 /// Files handed to other apps go in a folder of the user's own, made when missing; on Linux
 /// and the BSDs not in the shared /tmp, and owner-only.
 #[test]
@@ -24,11 +55,13 @@ fn scratch_folders_are_the_users_own() {
     let _ = fs::remove_dir(&a);
 }
 
+/// A big folder's list is kept in pages by number: read back newest first as it was; a flag
+/// change writes one page, new mail the last one; shrunk, the pages go; and a list kept whole
+/// (from before) still reads.
 #[test]
 fn a_big_folder_list_is_kept_in_pages() {
     for packed in [false, true] {
-        let dir = std::env::temp_dir().join(format!("mailcraft-pages-{packed}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch(&format!("pages-{packed}"));
         let s = if packed { Store::open_packed(dir.join("app"), dir.join("Files")).unwrap() } else { Store::open(&dir).unwrap() };
         let n = PAGE_MESSAGES as u32 * 2 + 500;
         let msg = |uid: u32| Summary {
@@ -82,7 +115,6 @@ fn a_big_folder_list_is_kept_in_pages() {
         s.save_folder("a1", "INBOX", &st).unwrap();
         assert_eq!(s.load_folder("a1", "INBOX").unwrap(), st);
         assert!(!s.files.is_file(&s.folder_dir("a1", "INBOX").join("state-0.json")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -125,8 +157,7 @@ fn a_files_flip_writes_only_the_pages_it_touches() {
 }
 
 pub(crate) fn temp_store(name: &str) -> Store {
-    let dir = std::env::temp_dir().join(format!("mailcraft-store-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = scratch(&format!("store-{name}"));
     Store::open(dir).unwrap()
 }
 
@@ -338,7 +369,6 @@ fn accounts_folders_and_state_round_trip() {
     assert!(!s.has_body(k));
     assert_eq!(s.load_folder("a1", "INBOX").unwrap(), FolderState::default());
     s.remove_account("a1").unwrap();
-    let _ = fs::remove_dir_all(s.root());
 }
 
 #[test]
@@ -347,7 +377,6 @@ fn damaged_files_start_fresh() {
     fs::write(s.root().join("accounts.json"), b"{not json").unwrap();
     assert!(s.load_accounts().unwrap().is_empty());
     assert!(s.root().join("accounts.json.bad").exists());
-    let _ = fs::remove_dir_all(s.root());
 }
 
 #[test]
@@ -387,7 +416,6 @@ fn ops_apply_locally_and_persist() {
     assert_eq!(s.load_ops("a1").unwrap(), ops);
     s.save_ops("a1", &[]).unwrap();
     assert!(s.load_ops("a1").unwrap().is_empty());
-    let _ = fs::remove_dir_all(s.root());
 }
 
 #[test]
@@ -431,7 +459,6 @@ fn folder_ops_move_caches_with_folders() {
     let paths: Vec<String> = s.load_folders("a1").unwrap().into_iter().map(|f| f.path).collect();
     assert_eq!(paths, vec!["INBOX".to_string(), "Clients".to_string()]);
     assert!(!s.has_body(&moved.messages[0].key));
-    let _ = fs::remove_dir_all(s.root());
 }
 
 #[test]
@@ -449,12 +476,11 @@ fn outbox_queues_and_forgets() {
     s.outbox_update("a1", &i).unwrap();
     assert_eq!(s.outbox("a1")[0], i);
     assert_eq!(s.outbox_raw("a1", 7).unwrap(), b"Subject: later\r\n\r\nx");
-    s.outbox_remove("a1", 3);
+    s.outbox_remove("a1", 3).unwrap();
     assert_eq!(s.outbox("a1").len(), 1);
     // Damaged bookkeeping is skipped, not fatal.
     fs::write(s.root().join("a1").join("outbox").join("9.json"), b"{nope").unwrap();
     assert_eq!(s.outbox("a1").len(), 1);
-    let _ = fs::remove_dir_all(s.root());
 }
 
 #[test]
@@ -464,7 +490,6 @@ fn hostile_names_stay_inside_the_root() {
     let p = s.body_path(&key);
     assert!(p.starts_with(s.root()));
     assert!(!p.to_string_lossy().contains(".."));
-    let _ = fs::remove_dir_all(s.root());
 }
 
 #[test]
@@ -543,7 +568,7 @@ hi"
     let item = OutboxItem { id: 5, from: "z@x".into(), recipients: vec!["a@y".into()], ..Default::default() };
     s.outbox_add("a1", &item, b"x").unwrap();
     assert_eq!(s.outbox("a1"), vec![item]);
-    s.outbox_remove("a1", 5);
+    s.outbox_remove("a1", 5).unwrap();
     assert!(s.outbox("a1").is_empty());
 
     // What outlasts the page: here everything but message sources.
@@ -598,7 +623,7 @@ fn a_memory_folder_lists_only_its_own_files() {
         .into_iter()
         .map(|k| (k, b"Subject: x\r\n\r\nx".to_vec()))
         .collect();
-    s.write_bodies(&bodies).unwrap();
+    s.write_bodies(bodies).unwrap();
     let mut cached = s.cached_bodies("a1", "INBOX", 7);
     cached.sort_unstable();
     assert_eq!(cached, [1, 2]);
@@ -687,8 +712,7 @@ fn a_list_goes_on_from_its_tail_as_if_never_stopped() {
 #[test]
 fn sources_past_a_number_are_dropped_by_number() {
     for packed in [false, true] {
-        let dir = std::env::temp_dir().join(format!("mailcraft-drop-from-{packed}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = scratch(&format!("drop-from-{packed}"));
         let s = if packed { Store::open_packed(dir.join("app"), dir.join("Files")).unwrap() } else { Store::open(&dir).unwrap() };
         let key = |folder: &str, validity: u32, uid: u32| MessageKey { account: "a1".into(), folder: folder.into(), validity, uid };
         let batch =
@@ -708,7 +732,6 @@ fn sources_past_a_number_are_dropped_by_number() {
         assert_eq!(s.drop_bodies_from("a1", "INBOX", 1, 10).unwrap(), 0);
         assert_eq!(s.drop_bodies_from("a1", "Nowhere", 1, 1).unwrap(), 0);
         drop(s);
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -741,5 +764,49 @@ fn a_list_of_shared_summaries_is_kept_as_it_was_before() {
     let old = Before { validity: 3, uid_next: 10, highest_modseq: 77, messages: plain.clone(), window: 0 };
     assert_eq!(written, serde_json::to_string(&old).unwrap());
     assert_eq!(serde_json::to_vec(&st.messages).unwrap(), serde_json::to_vec(&plain).unwrap());
-    let _ = fs::remove_dir_all(dir);
+}
+
+/// Turning online-only on with one of the account's files unreadable leaves it all where it was,
+/// and says so. That file was left behind unread and its only copy removed with the rest (its
+/// changes waiting for the server among what could go).
+#[test]
+fn online_only_with_a_file_that_cant_be_read_keeps_it() {
+    let s = Store::failing();
+    s.save_folder("a1", "INBOX", &FolderState { validity: 3, uid_next: 2, messages: vec![msg(1, false).into()], ..Default::default() }).unwrap();
+    s.save_ops("a1", &[Op::SetFlag { keys: vec![msg(1, false).key], flag: Flag::Seen, on: true }]).unwrap();
+    s.fail(Some("ops.json"), None);
+    assert!(s.set_online_only("a1", true).is_err());
+    // Files are moved one at a time: the one read last failing, those moved before it go again.
+    let dir = s.account_dir("a1");
+    let listed = s.files.main.walk(&dir);
+    let (Some(first), Some(last)) = (listed.first(), listed.last()) else { panic!("{listed:?}") };
+    let last_name = last.file_name().unwrap().to_string_lossy().to_string();
+    assert!(!first.ends_with(&last_name), "{listed:?}");
+    s.fail(Some(&last_name), None);
+    assert!(s.set_online_only("a1", true).is_err());
+    assert!(s.files.held.walk(&dir).is_empty(), "nothing of it is left in memory");
+    s.fail(None, None);
+    assert!(!s.is_online_only("a1"));
+    assert_eq!((s.load_ops("a1").unwrap().len(), s.load_folder("a1", "INBOX").unwrap().messages.len()), (1, 1), "still there");
+    // Readable again, all of it goes over.
+    s.set_online_only("a1", true).unwrap();
+    assert_eq!((s.load_ops("a1").unwrap().len(), s.load_folder("a1", "INBOX").unwrap().messages.len()), (1, 1));
+}
+
+/// The browser's cache is in memory, kept in IndexedDB by what it changes: a change waiting for
+/// the server goes out with those changes and comes back from them on the next visit, and
+/// leaves with them once sent (the page held its queue itself, and lost it to a reload).
+#[test]
+fn a_memory_cache_keeps_its_queued_changes_between_visits() {
+    let s = Store::memory();
+    s.track_changes();
+    let op = Op::SetFlag { keys: vec![msg(1, false).key], flag: Flag::Flagged, on: true };
+    s.add_op("a1", op.clone()).unwrap();
+    let kept: Vec<(String, Vec<u8>)> = s.take_changes().into_iter().filter_map(|(p, b)| Some((p, b?))).collect();
+    assert_eq!(kept.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["a1/ops.json"]);
+    let next = Store::memory_from(kept);
+    next.track_changes();
+    assert_eq!(next.load_ops("a1").unwrap(), std::slice::from_ref(&op), "back on the next visit");
+    next.remove_op("a1", &op).unwrap();
+    assert_eq!(next.take_changes(), [("a1/ops.json".to_string(), None)], "gone from what's kept once sent");
 }

@@ -2,10 +2,14 @@
 
 use super::*;
 
+mod categories;
+mod folder_pane;
+
 #[test]
 fn organising_renders_and_rules_save() {
-    let (mut a, dir) = app("organise");
+    let (mut a, _) = app("organise");
     let ctx = egui::Context::default();
+    ctx.enable_accesskit();
     frame(&ctx, &mut a, vec![]);
     let k = a.session.list[1].key.clone();
     a.run("list.select", json!({"key": k.to_id()}));
@@ -16,28 +20,29 @@ fn organising_renders_and_rules_save() {
     frame(&ctx, &mut a, vec![]);
     a.run("list.focusTab", json!({"value": "other"}));
     frame(&ctx, &mut a, vec![]);
-    // The rule editor saves a rule; the Rules dialog lists it.
-    a.ui.dialog = Some(Dialog::rule_from("zoe@studio.example", ""));
+    // The rule editor saves the rule its form says; the Rules dialog lists it.
+    a.ui.dialog = Some(Dialog::rule_from("zoe@studio.example"));
     frame(&ctx, &mut a, vec![]);
     if let Some(Dialog::EditRule(f)) = a.ui.dialog.as_mut() {
         f.action = crate::dialogs::RuleDo::Categorize;
         f.target = "Work".into();
     }
-    a.act(crate::Action::Submit(
-        "rules.set",
-        json!({"rules": [{"name": "Zoe", "conditions": [{"if": "from", "value": "zoe@"}], "actions": [{"do": "categorize", "value": "Work"}]}]}),
-    ));
-    assert_eq!(a.session.rules.len(), 1);
+    // A frame for the dialog to settle, taller with its Category row.
+    frame(&ctx, &mut a, vec![]);
+    click_named(&ctx, &mut a, "Save");
+    assert!(a.ui.dialog.is_none(), "saved and closed: {:?}", a.ui.dialog);
+    use mailcraft_engine::model::organize::{Condition, RuleAction};
+    let rules: Vec<_> = a.session.rules.iter().map(|r| (r.conditions.clone(), r.actions.clone())).collect();
+    assert_eq!(rules, [(vec![Condition::From("zoe@studio.example".into())], vec![RuleAction::Categorize("Work".into())])]);
     a.ui.dialog = Some(Dialog::Rules);
     frame(&ctx, &mut a, vec![]);
     frame(&ctx, &mut a, vec![]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Junk Email: the menu blocks the sender, and the lists in Options draw, long ones in part.
 #[test]
 fn junk_lists_block_and_draw() {
-    let (mut a, dir) = app("junk-lists");
+    let (mut a, _) = app("junk-lists");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.run("list.open", json!({"key": "sample:1:1:INBOX"}));
@@ -51,20 +56,43 @@ fn junk_lists_block_and_draw() {
     frame(&ctx, &mut a, vec![]);
     frame(&ctx, &mut a, vec![]);
     assert!(a.ui.backstage.is_some());
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Each Search Folder offered is known by what it searches for, not by its place in the list:
+/// its name from its kind, one that asks for people and one for a search, and each fixed one
+/// opened again as itself.
+#[test]
+fn search_folder_presets_are_known_by_kind() {
+    use crate::dialogs::{PresetKind, SEARCH_PRESETS, SearchFolderForm};
+    for (label, kind) in SEARCH_PRESETS {
+        assert_eq!(kind.label(), label);
+        if let PresetKind::Fixed(query) = kind {
+            let f = SearchFolderForm::edit(&mailcraft_engine::SearchFolder { name: label.into(), query: query.into() });
+            assert_eq!((f.preset, f.final_query()), (kind, query.to_string()));
+        }
+    }
+    for asks in [PresetKind::People, PresetKind::Custom] {
+        assert_eq!(SEARCH_PRESETS.iter().filter(|p| p.1 == asks).count(), 1, "{asks:?}");
+    }
+    assert_eq!(SearchFolderForm::new().preset, SEARCH_PRESETS[0].1);
+    // Custom starts from the search of the one it was.
+    let mut f = SearchFolderForm::new();
+    f.preset = PresetKind::Custom;
+    f.apply_preset(PresetKind::Fixed("is:flagged"));
+    assert_eq!((f.query.as_str(), f.name.as_str()), ("is:flagged", "Unread mail"), "a name typed (here, the first's) stays");
 }
 
 /// Search Folders: made from the dialog (a kind, or people), opened from the pane, the heading
 /// its name and the search box left empty; the dialog shows the reason when refused.
 #[test]
 fn search_folders_are_made_from_the_dialog_and_open() {
-    let (mut a, dir) = app("search-folders");
+    let (mut a, _) = app("search-folders");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let mut f = crate::dialogs::SearchFolderForm::new();
     assert_eq!(f.final_query(), "is:unread");
     let before = f.preset;
-    f.preset = 8;
+    f.preset = crate::dialogs::PresetKind::People;
     f.apply_preset(before);
     assert_eq!(f.name, "Mail from specific people", "the name follows the kind until one is typed");
     f.people = "zoe@studio.example; Ana Lima, , \"x".into();
@@ -86,7 +114,7 @@ fn search_folders_are_made_from_the_dialog_and_open() {
     assert!(matches!(&a.ui.dialog, Some(Dialog::SearchFolder(f)) if f.error.is_some()));
     // Edited: a preset's search shows as that kind, anything else as Custom.
     let edit = crate::dialogs::SearchFolderForm::edit(&a.session.prefs.search_folders[0]);
-    assert_eq!((edit.preset, edit.query.as_str()), (9, "from:zoe@studio.example,\"Ana Lima\",x"));
+    assert_eq!((edit.preset, edit.query.as_str()), (crate::dialogs::PresetKind::Custom, "from:zoe@studio.example,\"Ana Lima\",x"));
     a.ui.dialog = Some(Dialog::SearchFolder(Box::new(edit)));
     frame(&ctx, &mut a, vec![]);
     // Many, with long names, draw.
@@ -97,13 +125,12 @@ fn search_folders_are_made_from_the_dialog_and_open() {
     frame(&ctx, &mut a, vec![]);
     a.run("search.run", json!({"query": "storyboard"}));
     assert!(crate::view_title(&a.session).contains("storyboard"));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Quick Steps: made from the dialog, done with Ctrl+Shift+1, changed and deleted from it.
 #[test]
 fn quick_steps_are_made_and_done_with_their_keys() {
-    let (mut a, dir) = app("quick-steps");
+    let (mut a, _) = app("quick-steps");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     let mut f = crate::dialogs::QuickStepForm::new(&a.session);
@@ -143,7 +170,6 @@ fn quick_steps_are_made_and_done_with_their_keys() {
     assert_eq!(a.session.prefs.quick_steps.len(), 1);
     // Nothing to do: the dialog can't be saved.
     assert!(crate::dialogs::QuickStepForm { name: "x".into(), ..Default::default() }.actions().is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #4: the search box's recent searches (those with what's typed so far; none, closed)
@@ -151,7 +177,7 @@ fn quick_steps_are_made_and_done_with_their_keys() {
 /// closes them; where it looks named in every language's terms.
 #[test]
 fn the_search_box_drops_down_recent_and_advanced_search() {
-    let (mut a, dir) = app("search-box");
+    let (mut a, _) = app("search-box");
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     a.session.prefs.recent_searches = vec!["budget".into(), "storyboard".into()];
@@ -176,22 +202,18 @@ fn the_search_box_drops_down_recent_and_advanced_search() {
     for scope in mailcraft_engine::SearchScope::ALL {
         assert!(!crate::scope_label(scope).is_empty());
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #11: Favorites can be hidden from the top of the folder pane (View › Favorites), not
 /// only collapsed, and shown again.
 #[test]
 fn favorites_can_be_hidden() {
-    let (mut a, dir) = app("favorites-hidden");
+    let (mut a, _) = app("favorites-hidden");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     let headings = |a: &mut MailApp| {
-        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-        let nodes = out.platform_output.accesskit_update.map(|u| u.nodes).unwrap_or_default();
-        nodes.iter().filter(|(_, n)| n.label().is_some_and(|l| l.contains("Favorites"))).count()
+        let nodes = named(&ctx, a, egui::vec2(1280.0, 800.0));
+        nodes.iter().filter(|n| n.label.as_ref().is_some_and(|l| l.contains("Favorites"))).count()
     };
     headings(&mut a);
     assert!(headings(&mut a) > 0, "shown at first");
@@ -201,7 +223,6 @@ fn favorites_can_be_hidden() {
     a.run("view.favorites", json!({}));
     headings(&mut a);
     assert!(headings(&mut a) > 0, "shown again");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Issue #28: a keyword another program set shows on the message (in the list, the reading pane
@@ -209,8 +230,9 @@ fn favorites_can_be_hidden() {
 /// keyword; a keyword another category has is refused in the dialog.
 #[test]
 fn categories_from_other_programs_render_and_join_the_list() {
-    let (mut a, dir) = app("categories-28");
+    let (mut a, _) = app("categories-28");
     let ctx = egui::Context::default();
+    ctx.enable_accesskit();
     frame(&ctx, &mut a, vec![]);
     let k = a.session.list[0].key.clone();
     a.run("list.select", json!({"key": k.to_id()}));
@@ -227,13 +249,13 @@ fn categories_from_other_programs_render_and_join_the_list() {
     if let Some(Dialog::NewCategory { name, .. }) = a.ui.dialog.as_mut() {
         *name = "Rückfrage".into();
     }
-    a.act(crate::Action::Submit("category.create", json!({"name": "Rückfrage", "keyword": "r=c3=bcckfrage", "color": 4})));
-    assert!(a.ui.dialog.is_none());
+    click_named(&ctx, &mut a, "Create");
+    assert!(a.ui.dialog.is_none(), "{:?}", a.ui.dialog);
     assert_eq!(a.session.category("rückfrage").map(|c| c.keyword.as_str()), Some("r=c3=bcckfrage"));
     // Taken: the dialog stays, saying why.
     a.ui.dialog = Some(Dialog::new_category(&a.session));
     a.act(crate::Action::Submit("category.create", json!({"name": "Other", "keyword": "R=C3=BCCKFRAGE"})));
-    assert!(matches!(&a.ui.dialog, Some(Dialog::NewCategory { error: Some(e), .. }) if e.contains("Rückfrage")), "{:?}", a.ui.dialog.is_some());
+    assert!(matches!(&a.ui.dialog, Some(Dialog::NewCategory { error: Some(e), .. }) if e.contains("Rückfrage")), "{:?}", a.ui.dialog);
     // Edited: renamed, keyword kept.
     let c = a.session.category("Rückfrage").cloned().unwrap();
     a.ui.dialog = Some(Dialog::edit_category(&c));
@@ -241,22 +263,17 @@ fn categories_from_other_programs_render_and_join_the_list() {
     a.act(crate::Action::Submit("category.edit", json!({"name": "Rückfrage", "newName": "Nachfrage", "color": 2})));
     assert_eq!(a.session.category("Nachfrage").map(|c| c.keyword.as_str()), Some("r=c3=bcckfrage"));
     frame(&ctx, &mut a, vec![]);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A follow-up marked complete shows as done: the list row says so (and draws its tick where the
 /// flag was), the reading pane says on which day, and Clear Flag takes it away.
 #[test]
 fn a_completed_follow_up_shows_as_done() {
-    let (mut a, dir) = app("follow-up-complete");
+    let (mut a, _) = app("follow-up-complete");
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     let labels = |ctx: &egui::Context, a: &mut MailApp| -> Vec<String> {
-        let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-        let tree = out.platform_output.accesskit_update.expect("AccessKit is on");
-        tree.nodes.iter().filter_map(|(_, n)| n.label().or(n.value()).map(str::to_string)).collect()
+        named(ctx, a, egui::vec2(1280.0, 800.0)).iter().filter_map(Named::name).map(str::to_string).collect()
     };
     frame(&ctx, &mut a, vec![]);
     let m = a.session.list[1].clone();
@@ -282,5 +299,237 @@ fn a_completed_follow_up_shows_as_done() {
     a.run("mail.flag", json!({"on": false}));
     let shown = labels(&ctx, &mut a);
     assert!(!shown.iter().any(|l| l.contains("Completed")), "{shown:?}");
-    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A rule with more than the editor shows (two conditions, any of which will do, two actions,
+/// the one account it's for) keeps all of that when it's opened and saved with only its name
+/// changed, and keeps the rest when what the editor shows is changed. It was saved as the
+/// editor's one condition and one action, for every account, and its move to Junk came back as
+/// a move to Archive.
+#[test]
+fn a_rule_shown_in_part_keeps_the_rest() {
+    use crate::dialogs::{RuleDo, RuleForm, RuleTest};
+    use mailcraft_engine::model::FolderRole;
+    use mailcraft_engine::model::organize::{Condition, Rule, RuleAction};
+    let rule = Rule {
+        name: "Studio".into(),
+        enabled: true,
+        account: Some("sample".into()),
+        conditions: vec![Condition::From("zoe@".into()), Condition::Subject("cut".into())],
+        match_all: false,
+        actions: vec![RuleAction::Flag, RuleAction::MoveToRole(FolderRole::Junk)],
+        stop: true,
+    };
+    let mut f = RuleForm::from_rule(0, &rule);
+    f.name = "Studio mail".into();
+    assert_eq!(f.to_rule().unwrap(), Rule { name: "Studio mail".into(), ..rule.clone() });
+    // What it shows, changed: that changes, the rest stays.
+    let mut f = RuleForm::from_rule(0, &rule);
+    (f.test, f.text) = (RuleTest::To, "ana@".into());
+    (f.action, f.target) = (RuleDo::Categorize, "Work".into());
+    let saved = f.to_rule().unwrap();
+    assert_eq!(saved.conditions, [Condition::To("ana@".into()), Condition::Subject("cut".into())]);
+    assert_eq!(saved.actions, [RuleAction::Categorize("Work".into()), RuleAction::MoveToRole(FolderRole::Junk)]);
+    assert_eq!((saved.match_all, saved.account.as_deref(), saved.stop), (false, Some("sample"), true));
+    // One with nothing to show (no conditions, no actions) gets none it didn't have.
+    let bare = Rule { conditions: Vec::new(), actions: Vec::new(), ..rule.clone() };
+    let mut f = RuleForm::from_rule(0, &bare);
+    f.name = "Bare".into();
+    assert_eq!(f.to_rule().unwrap(), Rule { name: "Bare".into(), ..bare });
+}
+
+/// A rule that moved mail to a folder of one account, changed to do something else, is for every
+/// account, as a new rule of that kind is: it kept the move's account, which the editor shows for
+/// no other action. One that still moves mail to a folder (an action the editor doesn't show)
+/// keeps it, and so does one whose move goes to another folder.
+#[test]
+fn a_rule_that_no_longer_moves_is_for_every_account() {
+    use crate::dialogs::{RuleDo, RuleForm};
+    use mailcraft_engine::model::organize::{Condition, Rule, RuleAction};
+    let rule = Rule {
+        name: "Studio".into(),
+        enabled: true,
+        account: Some("sample".into()),
+        conditions: vec![Condition::From("zoe@".into())],
+        match_all: true,
+        actions: vec![RuleAction::MoveTo("Projects".into()), RuleAction::MarkRead],
+        stop: false,
+    };
+    let mut f = RuleForm::from_rule(0, &rule);
+    (f.action, f.target) = (RuleDo::Flag, String::new());
+    let saved = f.to_rule().unwrap();
+    assert_eq!((saved.actions.as_slice(), saved.account), ([RuleAction::Flag, RuleAction::MarkRead].as_slice(), None));
+    // As the same rule made new.
+    let new = RuleForm { index: None, original: None, ..f }.to_rule().unwrap();
+    assert_eq!(new.account, None);
+    // A second move to a folder still needs the account its folder is in.
+    let two = Rule { actions: vec![RuleAction::MoveTo("Projects".into()), RuleAction::MoveTo("Clients".into())], ..rule.clone() };
+    let mut f = RuleForm::from_rule(0, &two);
+    (f.action, f.target) = (RuleDo::Flag, String::new());
+    let saved = f.to_rule().unwrap();
+    assert_eq!(
+        (saved.actions.as_slice(), saved.account.as_deref()),
+        ([RuleAction::Flag, RuleAction::MoveTo("Clients".into())].as_slice(), Some("sample"))
+    );
+    // The move sent elsewhere keeps it.
+    let mut f = RuleForm::from_rule(0, &rule);
+    f.target = "Clients".into();
+    assert_eq!(f.to_rule().unwrap().account.as_deref(), Some("sample"));
+}
+
+/// The folder search in Move to and Move folder finds a folder by the name it shows
+/// ("Posteingang" in German), as well as by its path on the server ("INBOX").
+#[test]
+fn folder_search_finds_the_name_shown() {
+    let (mut a, _) = app("move-search");
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    let k = a.session.list[1].key.clone();
+    a.run("list.select", json!({"key": k.to_id()}));
+    // The folders the dialog lists: what it draws after the search box's text, before its buttons.
+    let rows = |a: &mut MailApp, dialog: Dialog, typed: &str| {
+        a.ui.dialog = Some(dialog);
+        frame(&ctx, a, vec![]);
+        let texts: Vec<String> = drawn_strings(&ctx, a, egui::vec2(1280.0, 800.0)).iter().map(|t| t.trim().to_string()).collect();
+        let from = texts.iter().rposition(|t| t == typed).map_or(texts.len(), |i| i + 1);
+        let buttons = texts.len().saturating_sub(2).max(from);
+        texts[from..buttons].to_vec()
+    };
+    a.ui.language = "de".into();
+    for typed in ["posteingang", "inbox"] {
+        assert_eq!(rows(&mut a, Dialog::MoveTo { filter: typed.into(), copy: false }, typed), ["Posteingang"], "Move to, {typed:?}");
+    }
+    assert_eq!(rows(&mut a, Dialog::MoveTo { filter: "entw".into(), copy: false }, "entw"), ["Entwürfe"]);
+    let moving = |filter: &str| Dialog::MoveFolder { account: "sample".into(), folder: "Projects".into(), filter: filter.into(), error: None };
+    for typed in ["posteingang", "inbox"] {
+        assert_eq!(rows(&mut a, moving(typed), typed), ["Posteingang"], "Move folder, {typed:?}");
+    }
+    assert_eq!(rows(&mut a, moving("gel"), "gel"), ["Gelöschte Elemente"]);
+    crate::i18n::set_current(crate::i18n::Lang::EN);
+}
+
+/// `n` rules, the fourth moving mail to "Projects/Short film", the others flagging it.
+fn many_rules(n: usize) -> Vec<mailcraft_engine::model::organize::Rule> {
+    use mailcraft_engine::model::organize::{Condition, Rule, RuleAction};
+    (0..n)
+        .map(|i| Rule {
+            name: format!("Rule {i}"),
+            enabled: i % 3 != 2,
+            account: Some("sample".into()),
+            conditions: vec![Condition::From(format!("s{i}@")), Condition::Subject("report".into())],
+            match_all: i % 2 == 0,
+            actions: vec![
+                if i == 3 { RuleAction::MoveTo("Projects/Short film".into()) } else { RuleAction::MoveTo(format!("Projects/p{i}")) },
+                RuleAction::Flag,
+            ],
+            stop: false,
+        })
+        .collect()
+}
+
+/// The Rules dialog's frame: each text drawn that can be seen (not wholly outside its clip), where.
+fn rules_drawn(ctx: &egui::Context, a: &mut MailApp, find: &str) -> Vec<(String, egui::Pos2)> {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("rules-find"), find.to_string()));
+    a.ui.dialog = Some(Dialog::Rules);
+    frame(ctx, a, vec![]);
+    drawn_text(ctx, a, egui::vec2(1280.0, 800.0)).into_iter().filter(Drawn::seen).map(|d| (d.text, d.rect.min)).collect()
+}
+
+/// The Rules dialog: each rule's line says what it does (a folder by the names the folder pane
+/// shows), the find box keeps the rules it names, and a rule's switch turns that rule alone off.
+#[test]
+fn the_rules_dialog_describes_finds_and_switches() {
+    let (mut a, _) = app("rules-dialog");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    frame(&ctx, &mut a, vec![]);
+    a.session.rules = many_rules(8);
+    let texts: Vec<String> = rules_drawn(&ctx, &mut a, "").into_iter().map(|(t, _)| t).collect();
+    let rows: Vec<&String> = texts.iter().filter(|t| t.starts_with("Rule ")).collect();
+    assert_eq!(rows.len(), 8, "{texts:?}");
+    assert_eq!(rows[3], "Rule 3If it from “s3@” or subject has “report”: move to Projects › Short film, flag");
+    assert_eq!(rows[0], "Rule 0If it from “s0@” and subject has “report”: move to Projects › p0, flag");
+    let texts: Vec<String> = rules_drawn(&ctx, &mut a, "SHORT film").into_iter().map(|(t, _)| t).collect();
+    assert_eq!(
+        texts.iter().filter(|t| t.starts_with("Rule ")).collect::<Vec<_>>(),
+        ["Rule 3If it from “s3@” or subject has “report”: move to Projects › Short film, flag"]
+    );
+    let texts: Vec<String> = rules_drawn(&ctx, &mut a, "rule 7").into_iter().map(|(t, _)| t).collect();
+    assert_eq!(texts.iter().filter(|t| t.starts_with("Rule ")).count(), 1);
+    let texts: Vec<String> = rules_drawn(&ctx, &mut a, "nothing like it").into_iter().map(|(t, _)| t).collect();
+    assert!(texts.iter().any(|t| t == "No rule matches."), "{texts:?}");
+    // The second rule's switch, clicked: it alone goes off.
+    let _ = rules_drawn(&ctx, &mut a, "");
+    let nodes = named(&ctx, &mut a, egui::vec2(1280.0, 800.0));
+    let mut boxes: Vec<egui::Pos2> = nodes.iter().filter(|n| n.role == egui::accesskit::Role::CheckBox).filter_map(Named::centre).collect();
+    boxes.sort_by(|p, q| p.y.total_cmp(&q.y));
+    click(&ctx, &mut a, boxes[1]);
+    let mut expected = many_rules(8);
+    expected[1].enabled = false;
+    assert_eq!(a.session.rules, expected);
+}
+
+/// The Rules dialog's lines follow the language as it's switched, between languages that word
+/// "If it …: …" alike too (Italian and Brazilian Portuguese, the two Chineses): the lines kept
+/// from the frame before stayed in the language they were made in.
+#[test]
+fn the_rules_dialog_follows_the_language() {
+    let (mut a, _) = app("rules-language");
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    a.session.rules = many_rules(2);
+    for (code, from) in
+        [("it", "arriva da «s0@»"), ("pt-br", "vier de “s0@”"), ("zh-hans", "来自“s0@”"), ("zh-hant", "來自「s0@」"), ("it", "arriva da «s0@»")]
+    {
+        a.ui.language = code.into();
+        let texts: Vec<String> = rules_drawn(&ctx, &mut a, "").into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t.starts_with("Rule 0") && t.contains(from)), "{code}: {texts:?}");
+    }
+    crate::i18n::set_current(crate::i18n::Lang::EN);
+}
+
+/// A frame of the Rules dialog with 300 rules moving mail into folders of an account of 3,000,
+/// every rule shown, eleven found and none, and a fingerprint of what it draws (the same before and
+/// after a change that only makes it faster). Run in release under the machine's lock:
+/// `cargo test --release -p mailcraft-ui-egui --lib measure_rules_dialog -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_rules_dialog() {
+    use std::hash::{Hash, Hasher};
+    let (mut a, _) = app("measure-rules");
+    let ctx = egui::Context::default();
+    frame(&ctx, &mut a, vec![]);
+    let base = a.session.accounts[0].folders[0].clone();
+    for n in 0..3000 {
+        let f = mailcraft_engine::model::Folder { path: format!("Projects/p{n}"), role: mailcraft_engine::model::FolderRole::Other, ..base.clone() };
+        a.session.accounts[0].folders.push(f);
+    }
+    a.session.rules = many_rules(300);
+    // The folder pane, which would draw the 3,000 folders behind the dialog, kept small.
+    a.run("view.folderPane", json!({"minimized": true}));
+    let timed = |a: &mut MailApp| {
+        let t = std::time::Instant::now();
+        for _ in 0..50 {
+            frame(&ctx, a, vec![]);
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / 50.0
+    };
+    // The window without the dialog, to take away.
+    frame(&ctx, &mut a, vec![]);
+    let window = timed(&mut a);
+    println!("MEASURE the window alone (3000 folders): {window:.2} ms a frame");
+    for find in ["", "rule 12", "no such rule"] {
+        let drawn = rules_drawn(&ctx, &mut a, find);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (t, p) in &drawn {
+            (t, p.x.to_bits(), p.y.to_bits()).hash(&mut h);
+        }
+        let each = timed(&mut a);
+        println!(
+            "MEASURE rules dialog, 300 rules, 3000 folders, find {find:?}: {each:.2} ms a frame, the dialog {:.2} ms; drawn {} texts, {:016x}",
+            each - window,
+            drawn.len(),
+            h.finish()
+        );
+    }
 }

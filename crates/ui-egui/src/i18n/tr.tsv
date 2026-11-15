@@ -72,6 +72,7 @@
 	Edit rule	Kuralı düzenle
 	Email address	E-posta adresi
 	Enter the password for {email}.	{email} için parolayı girin.
+	Enter the password for {email}, which signs in as {user}.	{email} için parolayı girin; {user} olarak oturum açar.
 	Favorites	Sık Kullanılanlar
 	Feb	Şub
 	File	Dosya
@@ -409,7 +410,7 @@
 	Mark messages as read when opened	Açılan iletileri okundu olarak işaretle
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	Henüz gönderici yok.
-	Not available: the sample mailbox has no server.	Kullanılamıyor: örnek posta kutusunun sunucusu yok.
+	Not available: this mailbox has no server.	Kullanılamıyor: bu posta kutusunun sunucusu yok.
 	Not available: {error}	Kullanılamıyor: {error}
 	On	Açık
 	On from {from}	{from} tarihinden itibaren açık
@@ -841,7 +842,8 @@
 	Formatted	Biçimli
 	HTML code	HTML kodu
 	From a file…	Dosyadan…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	Başka bir yerde hazırlanmış bir imzanın HTML'ini yapıştırın veya web sayfası olarak kaydedilmiş birini (Outlook'un .htm dosyası) açın. Yazıldığı gibi gönderilir; siz yazarken ileti onun metnini gösterir.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	Başka bir yerde hazırlanmış bir imzanın HTML'ini yapıştırın veya web sayfası olarak kaydedilmiş birini (Outlook'un .htm dosyası) açın. Yazıldığı gibi gönderilir ve siz yazarken de öyle görünür.
+	Your signature as it will be sent. To change it, pick Signature above the message.	İmzanız gönderileceği biçimde. Değiştirmek için iletinin üstündeki İmza'yı seçin.
 	{name} can't be read as a signature	{name} imza olarak okunamıyor
 	All contacts	Tüm kişiler
 	Always open with this address book	Her zaman bu adres defteriyle aç
@@ -933,6 +935,9 @@
 	Name on mail from it	Bu adresten giden postadaki ad
 	Replies go to	Yanıtlar şuraya gider
 	(the account's own)	(hesabın imzası)
+	Write new mail from this address	Yeni iletileri bu adresten yaz
+	A new message starts from this address, not from {email}. Pick another in From as ever.	Yeni ileti {email} adresinden değil, bu adresten başlar. Kimden alanında her zamanki gibi başka birini seçebilirsiniz.
+	{address} (new mail)	{address} (yeni iletiler)
 	Add…	Ekle…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	Klasörleri bu hesabın altında görünür. Exchange sunucusunda ona erişiminiz olmalıdır; tam erişiminiz olanlar kendiliğinden açılır.
 	Mailboxes you have full access to open by themselves.	Tam erişiminiz olan posta kutuları kendiliğinden açılır.
@@ -1107,6 +1112,7 @@ month	May	Mayıs
 	Check before sending	Göndermeden önce denetleyin
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address}, {like} etki alanında bir adrese benziyor ama değil. Doğru adres mi?
 	{n} people who may not know each other will all see each other's addresses.	Birbirini tanımayabilecek {n} kişi, hepsi birbirinin adresini görecek.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	Alıcılarda bakılması gereken bir şey bulundu ama gösterilemiyor. Göndermeden önce alıcıları gözden geçirin.
 	Put everyone in Bcc	Herkesi Bcc'ye koy
 	Each of them gets the message without seeing who else did; you're in To	Her biri iletiyi başka kimin aldığını görmeden alır; siz Kime alanındasınız
 	Open links without their tracking	Bağlantıları izleme olmadan aç
@@ -1446,6 +1452,7 @@ month	May	Mayıs
 	Calendar and contacts couldn't be read: changes to them won't be saved	Takvim ve kişiler okunamadı: bunlarda yapılan değişiklikler kaydedilmeyecek
 	Your rules couldn't be read: changes to them won't be saved	Kurallarınız okunamadı: bunlarda yapılan değişiklikler kaydedilmeyecek
 	Snoozed mail couldn't be read: changes to it won't be saved	Ertelenen postalar okunamadı: bunlarda yapılan değişiklikler kaydedilmeyecek
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	Giden Kutusunda bekleyen yanıtların hangi postaları yanıtladığı okunamadı: bu postalar yanıtlandı olarak işaretlenmeyebilir
 	Checking your data file	Veri dosyanız denetleniyor
 	Opening your mail…	Postanız açılıyor…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file} geçen sefer düzgün kapatılmadı. MailCraft onu denetliyor; büyük bir dosya bir iki dakika sürebilir.
@@ -1463,6 +1470,8 @@ month	May	Mayıs
 	Some results may be missing: still indexing	Bazı sonuçlar eksik olabilir: dizinleme sürüyor
 	Some long messages were searched only in part	Bazı uzun iletilerde yalnızca bir kısmı arandı
 	Couldn't read the date “{value}”	“{value}” tarihi okunamadı
+	Couldn't read “{value}”	“{value}” okunamadı
+	Part of a long search was left out	Uzun bir aramanın bir kısmı dışarıda bırakıldı
 	Received after	Şundan sonra alınan
 	Received before	Şundan önce alınan
 	About {h} h {m} min left	Yaklaşık {h} sa {m} dk kaldı
@@ -1709,3 +1718,7 @@ month	May	Mayıs
 	Nothing to do	Yapılacak bir şey yok
 	Nothing in the next 7 days	Önümüzdeki 7 günde bir şey yok
 	Show the calendar, what's coming up and your tasks beside the mail	Takvimi, yaklaşanları ve görevlerinizi postanın yanında gösterin
+	Read / Unread (Ctrl+Q / Ctrl+U)	Okundu / Okunmadı (Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	{name} indirilemedi: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Pencerede bir şeyler ters gitti ve yaptığı iş durduruldu. MailCraft çalışmaya devam ediyor; nerede olduğu günlükte yazıyor.
+	Font size	Yazı tipi boyutu

@@ -15,9 +15,13 @@ use super::*;
 
 mod addresses;
 mod cards;
+mod opened;
 mod pgp;
+mod reading;
 mod revocation;
+pub(crate) use addresses::OwnCerts;
 pub use cards::CardSearch;
+pub(crate) use opened::Opened;
 pub(crate) use pgp::PgpState;
 pub use pgp::{KeySource, KnownKey, PGP_DOC, PgpSettings, Reach, Scheme};
 pub use revocation::RevocationCheck;
@@ -25,9 +29,6 @@ pub(crate) use revocation::Revocations;
 
 /// An account's S/MIME settings (the account document `smime.json`).
 pub const SMIME_DOC: &str = "smime.json";
-
-/// The most decrypted messages held in memory at once.
-const OPENED_MAX: usize = 64;
 
 /// An account's S/MIME: its certificate, what new messages do, whom it can encrypt to.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +60,18 @@ pub struct SmimeSettings {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub known: BTreeMap<String, KnownCert>,
 }
+
+/// The S/MIME settings of an account with none kept: [`SmimeSettings::default`].
+static NO_SMIME: SmimeSettings = SmimeSettings {
+    chain: Vec::new(),
+    older: Vec::new(),
+    sign: false,
+    encrypt: false,
+    keep_subject: false,
+    auto_encrypt: false,
+    keep_unlocked: false,
+    known: BTreeMap::new(),
+};
 
 /// Someone's certificate, from a signed message of theirs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,20 +165,6 @@ pub(crate) fn is_sealed(raw: &[u8]) -> bool {
         || matches!(mime::pgp::protection(raw), mime::pgp::Protection::Encrypted(_))
 }
 
-/// Whether `raw` is encrypted as it stands (S/MIME, or OpenPGP in its own part or in its text).
-pub(crate) fn is_encrypted(raw: &[u8]) -> bool {
-    if matches!(mime::smime::protection(raw), mime::smime::Protection::Encrypted(_)) {
-        return true;
-    }
-    match mime::pgp::protection(raw) {
-        mime::pgp::Protection::Encrypted(_) => true,
-        mime::pgp::Protection::Inline { body, .. } => {
-            matches!(mailcraft_pgp::inline(&body), Some(mailcraft_pgp::Inline::Message(block)) if mailcraft_pgp::is_encrypted(block))
-        }
-        _ => false,
-    }
-}
-
 impl Session {
     pub(crate) fn load_smime(&mut self) {
         let Some(store) = self.store.clone() else { return };
@@ -173,35 +172,34 @@ impl Session {
             let s: SmimeSettings = store.load_account_doc(&a.config.id, SMIME_DOC).unwrap_or_default();
             self.smime.insert(a.config.id.clone(), s);
         }
+        let ids: Vec<String> = self.smime.keys().cloned().collect();
+        for id in ids {
+            self.read_own_certs(&id);
+        }
         self.load_pgp();
     }
 
     fn save_smime(&mut self, account: &str) {
+        // A certificate replaced keeps their count, which the reach shown was told apart by.
+        self.forget_reach();
+        // Every change to its certificates is kept: what they are is read again with it.
+        self.read_own_certs(account);
         let (Some(store), Some(s)) = (&self.store, self.smime.get(account)) else { return };
         if let Err(e) = store.save_account_doc(account, SMIME_DOC, s) {
             self.notice(format!("the S/MIME settings could not be saved: {e}"), true);
         }
     }
 
-    /// An account's S/MIME settings.
-    pub fn smime_settings(&self, account: &str) -> SmimeSettings {
-        self.smime.get(account).cloned().unwrap_or_default()
-    }
-
-    /// The account's certificate, when it has one.
-    pub fn identity(&self, account: &str) -> Option<smime::CertInfo> {
-        self.smime.get(account).and_then(|s| s.chain.first()).and_then(|c| smime::cert::info(c).ok())
-    }
-
-    /// The account's older certificates, kept to read mail encrypted to them, newest first.
-    pub fn older_identities(&self, account: &str) -> Vec<smime::CertInfo> {
-        self.smime.get(account).map(|s| s.older.iter().filter_map(|c| smime::cert::info(c).ok()).collect()).unwrap_or_default()
+    /// An account's S/MIME settings, as kept (the defaults for one with none), borrowed: they
+    /// hold up to 5000 people's certificates, and most ask only whether it signs.
+    pub fn smime_settings(&self, account: &str) -> &SmimeSettings {
+        self.smime.get(account).unwrap_or(&NO_SMIME)
     }
 
     /// Forget an older certificate (`fingerprint`, its [`smime::CertInfo::fingerprint`]) and its
     /// key: mail encrypted to it can't be read any more.
     pub fn forget_older_identity(&mut self, account: &str, fingerprint: &str) -> CmdResult {
-        let config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let config = self.config_of(account)?;
         let s = self.smime.entry(account.to_string()).or_default();
         let before = s.older.len();
         s.older.retain(|c| smime::cert::info(c).map(|i| !i.fingerprint.eq_ignore_ascii_case(fingerprint.trim())).unwrap_or(true));
@@ -215,7 +213,7 @@ impl Session {
 
     /// Sign and encrypt with an older certificate again; the one in use is kept for reading.
     pub fn use_older_identity(&mut self, account: &str, fingerprint: &str) -> CmdResult {
-        let config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let config = self.config_of(account)?;
         if !self.older_identities(account).iter().any(|i| i.fingerprint.eq_ignore_ascii_case(fingerprint.trim())) {
             return Err(CmdError::Params(format!("no older certificate `{fingerprint}`")));
         }
@@ -231,12 +229,13 @@ impl Session {
     /// The roots a signer's chain may reach to be trusted: this computer's, and the root of each
     /// certificate the user imported (a `.p12` from an authority this computer doesn't know, a
     /// company's own one, brings it: importing it is trusting it, as other mail programs ask).
-    fn anchors(&self) -> Vec<Vec<u8>> {
-        let mut roots = self.trust_roots.clone();
+    /// Borrowed, not copied: they're asked for each signed message shown.
+    fn anchors(&self) -> Vec<&[u8]> {
+        let mut roots: Vec<&[u8]> = self.trust_roots.iter().map(Vec::as_slice).collect();
         for s in self.smime.values() {
             for c in s.chain.iter().skip(1).filter(|c| smime::cert::self_signed(c)) {
-                if !roots.contains(c) {
-                    roots.push(c.clone());
+                if !roots.contains(&c.as_slice()) {
+                    roots.push(c);
                 }
             }
         }
@@ -252,7 +251,7 @@ impl Session {
     /// [`Session::import_identity`] from the file's bytes (the browser's picker gives no path).
     /// Empty: the one the browser kept, unlocked with `password`.
     pub fn import_identity_data(&mut self, account: &str, data: Vec<u8>, password: &str) -> CmdResult {
-        let config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let config = self.config_of(account)?;
         if data.len() > 1 << 20 {
             return Err(CmdError::Params("that file is too big for a certificate".into()));
         }
@@ -262,7 +261,7 @@ impl Session {
 
     /// Forget the account's certificate (and the keychain's key); older ones kept for reading stay.
     pub fn forget_identity(&mut self, account: &str) -> CmdResult {
-        let config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let config = self.config_of(account)?;
         self.jobs.push(Job::ForgetIdentity { account: config });
         let keeps_pgp = self.pgp_key(account).is_some();
         let s = self.smime.entry(account.to_string()).or_default();
@@ -280,7 +279,7 @@ impl Session {
     /// The browser (gap 7): keep `account`'s certificates unlocked between visits, or stop (their
     /// kept password forgotten). The desktop keeps keys in the system's keychain already.
     pub fn keep_unlocked(&mut self, account: &str, on: bool) -> CmdResult {
-        let config = self.account(account).map(|a| a.config.clone()).ok_or_else(|| CmdError::Params(format!("no account `{account}`")))?;
+        let config = self.config_of(account)?;
         if !self.jmap_only {
             return Err(CmdError::Disabled("the desktop app keeps certificates in the system's keychain: they stay unlocked".into()));
         }
@@ -341,257 +340,9 @@ impl Session {
         }
     }
 
-    /// What `raw` shows once its protection is taken off, and what that protection was: a
-    /// signature checked, the content inside an encryption (when it's been decrypted; if not, it's
-    /// asked for and the message stays as it is until it comes). `key` is the message. One whose
-    /// header says it isn't protected is given back as it is, neither copied nor parsed.
-    pub(super) fn unwrap<'a>(&mut self, key: &MessageKey, raw: &'a [u8]) -> (std::borrow::Cow<'a, [u8]>, Option<Security>) {
-        if !mime::smime::is_protected(raw) {
-            return (std::borrow::Cow::Borrowed(raw), None);
-        }
-        let mut cur = raw.to_vec();
-        let mut sec = Security::default();
-        let mut any = false;
-        // The keys it brings (Autocrypt, attached), first: its own signature may be by one.
-        self.learn_keys(&key.account, raw);
-        for _ in 0..4 {
-            match mime::smime::protection(&cur) {
-                mime::smime::Protection::None => match self.unwrap_pgp(key, &cur, &mut sec) {
-                    pgp::Step::Not => break,
-                    pgp::Step::Next(next) => {
-                        any = true;
-                        cur = next;
-                    }
-                    pgp::Step::Stop => {
-                        any = true;
-                        break;
-                    }
-                },
-                mime::smime::Protection::Signed { content, signature } => {
-                    any = true;
-                    // Checked against the From that's shown: the one inside when the signed
-                    // part carries its own (a message from one address, signed by its real
-                    // sender, read as signed by the other it named inside otherwise).
-                    let (next, headers) = mime::smime::with_entity_protected(&cur, &content);
-                    if sec.signed.is_none() {
-                        sec.signed = Some(self.check_signature(&key.account, &signature, Some(&content), &sender(&next)));
-                    }
-                    sec.headers |= headers;
-                    cur = next;
-                }
-                mime::smime::Protection::Opaque(cms) => {
-                    any = true;
-                    let inside = smime::carried(&cms).ok().map(|content| mime::smime::with_entity_protected(&cur, &content));
-                    if sec.signed.is_none() {
-                        let from = inside.as_ref().map_or_else(|| sender(&cur), |(next, _)| sender(next));
-                        sec.signed = Some(self.check_signature(&key.account, &cms, None, &from));
-                    }
-                    match inside {
-                        Some((next, headers)) => {
-                            sec.headers |= headers;
-                            cur = next;
-                        }
-                        None => break,
-                    }
-                }
-                mime::smime::Protection::Encrypted(cms) => {
-                    any = true;
-                    // One encryption is decrypted; another inside it stays as it is.
-                    if sec.lock.is_some() {
-                        break;
-                    }
-                    if let Some((entity, authenticated)) = self.opened.get(key) {
-                        sec.lock = Some(Lock::Open { authenticated: *authenticated });
-                        let (next, headers) = mime::smime::with_entity_protected(&cur, entity);
-                        sec.headers |= headers;
-                        cur = next;
-                        continue;
-                    }
-                    sec.lock = Some(match self.decrypt_errors.get(key) {
-                        Some(e) => Lock::Failed(e.clone()),
-                        None => self.ask_decrypt(key, cms),
-                    });
-                    break;
-                }
-            }
-        }
-        // Keys attached inside what was protected.
-        if any {
-            self.learn_keys(&key.account, &cur);
-        }
-        (std::borrow::Cow::Owned(cur), any.then_some(sec))
-    }
-
-    /// A message as it reads: what [`Session::unwrap`] shows, without checking anything again.
-    pub fn readable_raw(&self, key: &MessageKey) -> Option<Vec<u8>> {
-        Some(self.as_written(key, self.body_raw(key)?).0)
-    }
-
-    /// `raw` (message `key`) with its protection taken off as far as it can be (an encryption
-    /// not decrypted yet stays), and whether a signature and an encryption were.
-    pub(crate) fn as_written(&self, key: &MessageKey, raw: Vec<u8>) -> (Vec<u8>, bool, bool) {
-        let mut cur = raw;
-        let (mut signed, mut encrypted) = (false, false);
-        for _ in 0..4 {
-            cur = match mime::smime::protection(&cur) {
-                mime::smime::Protection::None => {
-                    let kind = mime::pgp::protection(&cur);
-                    let sealed = is_encrypted(&cur);
-                    match self.readable_pgp(key, &cur) {
-                        Some(next) => {
-                            encrypted |= sealed;
-                            signed |= !sealed && !matches!(kind, mime::pgp::Protection::None);
-                            next
-                        }
-                        None => break,
-                    }
-                }
-                mime::smime::Protection::Signed { content, .. } => {
-                    signed = true;
-                    mime::smime::with_entity(&cur, &content)
-                }
-                mime::smime::Protection::Opaque(cms) => match smime::carried(&cms) {
-                    Ok(c) => {
-                        signed = true;
-                        mime::smime::with_entity(&cur, &c)
-                    }
-                    Err(_) => break,
-                },
-                mime::smime::Protection::Encrypted(_) => match self.opened.get(key) {
-                    Some((entity, _)) => {
-                        encrypted = true;
-                        mime::smime::with_entity(&cur, entity)
-                    }
-                    None => break,
-                },
-            };
-        }
-        (cur, signed, encrypted)
-    }
-
-    /// Whether what was decrypted for `key` is to be taken: asked for, and not an answer to
-    /// an asking from before its folder's keys moved on (those come first, in order).
-    pub(crate) fn decrypt_awaited(&mut self, key: &MessageKey) -> bool {
-        if let Some(n) = self.stale_decrypts.get_mut(key) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.stale_decrypts.remove(key);
-            }
-            return false;
-        }
-        self.opening.remove(key) || key.folder != crate::session::OUTBOX
-    }
-
     /// `account`'s messages being signed or encrypted are let go (the account is gone).
     pub(crate) fn forget_protecting(&mut self, account: &str) {
         self.protecting.retain(|_, p| p.compose.account != account);
-    }
-
-    /// What was decrypted, and what's being, of the messages in `folder` is forgotten: its keys
-    /// name other messages now (the Outbox's count its rows). An answer still to come for one
-    /// asked before is that message's, not the one its key names now: it's let pass.
-    pub(crate) fn forget_opened_in(&mut self, folder: &str) {
-        if self.stale_decrypts.len() > 256 {
-            self.stale_decrypts.clear();
-        }
-        for k in self.opening.iter().filter(|k| k.folder == folder) {
-            *self.stale_decrypts.entry(k.clone()).or_default() += 1;
-        }
-        self.opened.retain(|k, _| k.folder != folder);
-        self.opening.retain(|k| k.folder != folder);
-        self.decrypt_errors.retain(|k, _| k.folder != folder);
-        self.pgp.forget_folder(folder);
-    }
-
-    fn ask_decrypt(&mut self, key: &MessageKey, cms: Vec<u8>) -> Lock {
-        let Some(config) = self.account(&key.account).map(|a| a.config.clone()) else { return Lock::Failed("its account is gone".into()) };
-        if self.identity(&key.account).is_none() && self.smime.get(&key.account).is_none_or(|s| s.older.is_empty()) {
-            return Lock::Failed("this account has no certificate to decrypt it with (File › Info › Security)".into());
-        }
-        if self.opening.insert(key.clone()) {
-            self.jobs.push(Job::Decrypt { account: config, key: key.clone(), cms });
-        }
-        Lock::Opening
-    }
-
-    /// A signature checked: whether it holds, and whether its certificate is to be trusted for
-    /// mail from `from`. A certificate that holds for its sender is remembered, to encrypt to them.
-    fn check_signature(&mut self, account: &str, cms: &[u8], content: Option<&[u8]>, from: &str) -> SignedBy {
-        match smime::verify(cms, content) {
-            Ok((signed, _)) => {
-                let roots = self.anchors();
-                let (mut problems, path) = smime::cert::check_with_path(&signed.signer, &signed.certs, &roots, self.clock.now, from)
-                    .unwrap_or_else(|_| (vec![smime::Problem::UnknownIssuer], Vec::new()));
-                // Its authority is asked only when it's one this computer trusts: where to ask
-                // is written in the certificate, and one anyone made names a server of theirs
-                // (which then heard that, and when, the message was read).
-                let known_authority = !problems.contains(&smime::Problem::UnknownIssuer);
-                let revocation = if known_authority { self.revocation_of(&path, &mut problems) } else { None };
-                // Remembered to encrypt to them: one that's theirs and in date. One from no
-                // authority this computer trusts only where none is kept yet.
-                let theirs = problems.iter().all(|p| matches!(p, smime::Problem::UnknownIssuer));
-                if theirs && !from.is_empty() {
-                    self.remember_cert(account, from, &signed, problems.is_empty());
-                }
-                SignedBy {
-                    seal: if problems.is_empty() { Seal::Trusted } else { Seal::Untrusted(problems) },
-                    cert: smime::cert::info(&signed.signer).ok(),
-                    key: None,
-                    at: signed.signed_at,
-                    weak: signed.weak,
-                    revocation,
-                }
-            }
-            Err(e) => SignedBy {
-                seal: Seal::Broken(match e {
-                    smime::Error::BadSignature => "the message was changed after it was signed, or the signature isn't the sender's".into(),
-                    other => other.to_string(),
-                }),
-                cert: None,
-                key: None,
-                at: None,
-                weak: false,
-                revocation: None,
-            },
-        }
-    }
-
-    /// The certificate `signed` came with is the one to encrypt to `from` with. It doesn't
-    /// take the place of another kept for them when it's the lesser one: any mail naming them
-    /// did (one signed with a certificate its sender made, and the next message to them was
-    /// encrypted to that sender; an old message read again, and to the certificate they had
-    /// before). A trusted one (`trusted`: nothing is wrong with it) that can still be
-    /// encrypted to gives way only to a trusted one that isn't older. One that isn't trusted
-    /// gives way to whichever came last, as ever: by their dates, one made today in someone's
-    /// name stayed for good over the one they really sign with.
-    fn remember_cert(&mut self, account: &str, from: &str, signed: &smime::Signed, trusted: bool) {
-        let now = self.clock.now;
-        // The one kept, when it's trusted and still good to encrypt to: in date, not withdrawn.
-        let good = |cert: &[u8]| smime::cert::info(cert).is_ok_and(|i| i.not_before <= now && i.not_after >= now) && !self.heard_revoked(cert);
-        let kept_holds = self.smime.get(account).and_then(|s| s.known.get(from)).is_some_and(|k| k.trusted && good(&k.cert));
-        let s = self.smime.entry(account.to_string()).or_default();
-        // The same one seen again where its authority isn't known stays the one that was.
-        let trusted = trusted || s.known.get(from).is_some_and(|k| k.trusted && k.cert == signed.signer);
-        let known = KnownCert { cert: signed.signer.clone(), gcm: signed.reads_gcm(), seen: now, trusted };
-        if let Some(kept) = s.known.get(from).filter(|k| k.cert != known.cert) {
-            let since = |cert: &[u8]| smime::cert::info(cert).map_or(i64::MIN, |i| i.not_before);
-            let older = since(&known.cert) < since(&kept.cert);
-            if kept_holds && (!trusted || older) {
-                return;
-            }
-        }
-        let changed = s.known.get(from).is_none_or(|k| k.cert != known.cert || k.gcm != known.gcm || k.trusted != known.trusted);
-        // At most a few thousand people; the oldest seen goes first.
-        if s.known.len() >= 5000
-            && !s.known.contains_key(from)
-            && let Some(oldest) = s.known.iter().min_by_key(|(_, k)| k.seen).map(|(e, _)| e.clone())
-        {
-            s.known.remove(&oldest);
-        }
-        s.known.insert(from.to_string(), known);
-        if changed {
-            self.save_smime(account);
-        }
     }
 
     /// The certificate to encrypt to `email` with, and whether they read AES-GCM.
@@ -601,7 +352,7 @@ impl Session {
         // One of the account's own addresses: its own certificate, that address's when it
         // has one.
         if self.account(account).is_some_and(|a| a.config.has_address(&email)) {
-            return self.own_cert_for(account, &email).map(|(c, _)| c).or_else(|| s.chain.first().cloned()).map(|c| (c, true));
+            return self.own_cert_for(account, &email).map(|(c, _)| c).or_else(|| s.chain.first().map(Vec::as_slice)).map(|c| (c.to_vec(), true));
         }
         let k = s.known.get(&email)?;
         // Out of date certificates aren't encrypted to, nor one its authority withdrew.
@@ -624,7 +375,7 @@ impl Session {
         // The certificate of the address it's from (issue #81): one that names another address
         // would sign as someone who isn't the sender. Only encrypted, the account's own does
         // for the copy it keeps.
-        let own = match self.own_cert_for(&c.account, from).map(|(c, _)| c) {
+        let own = match self.own_cert_for(&c.account, from).map(|(c, _)| c.to_vec()) {
             Some(own) => own,
             None if s.chain.is_empty() && s.older.is_empty() => {
                 return Err(CmdError::Params(
@@ -704,11 +455,7 @@ impl Session {
                     }
                     let signing = s.sign;
                     self.save_smime(&account);
-                    // Mail that couldn't be read for want of a key is tried again (the one shown at once).
-                    let failed: Vec<MessageKey> = self.decrypt_errors.drain().map(|(k, _)| k).collect();
-                    for k in failed {
-                        self.show_again(&k);
-                    }
+                    self.retry_failed_decrypts();
                     let who = |i: smime::CertInfo| i.emails.first().cloned().unwrap_or(i.name);
                     match reading.and_then(|c| smime::cert::info(&c).ok()) {
                         Some(old) => {
@@ -722,7 +469,7 @@ impl Session {
                             );
                         }
                         None => {
-                            let who = self.identity(&account).map(who).unwrap_or_default();
+                            let who = self.identity(&account).cloned().map(who).unwrap_or_default();
                             let then = if signing { "new messages are signed" } else { "it signs and encrypts from now on" };
                             self.notice(format!("Your certificate for {who} is ready: {then}"), false);
                         }
@@ -746,14 +493,7 @@ impl Session {
                     return;
                 }
                 match (content, error) {
-                    (Some(Private(entity)), None) => {
-                        if self.opened.len() >= OPENED_MAX
-                            && let Some(k) = self.opened.keys().next().cloned()
-                        {
-                            self.opened.remove(&k);
-                        }
-                        self.opened.insert(key.clone(), (entity, authenticated));
-                    }
+                    (Some(Private(entity)), None) => self.keep_opened(&key, entity, authenticated),
                     (_, e) => {
                         self.decrypt_errors.insert(key.clone(), e.unwrap_or_else(|| "it can't be decrypted".into()));
                     }
@@ -765,6 +505,27 @@ impl Session {
             Event::HeldKeys { keys, error } => self.heard_held_keys(keys, error),
             e @ (Event::PgpKeys { .. } | Event::PgpDecrypted { .. }) => self.apply_pgp(e),
             _ => {}
+        }
+    }
+
+    /// Keep what was decrypted of `key` (the MIME entity inside, and whether it was
+    /// authenticated) in memory. Past [`opened::OPENED_MAX`] the oldest goes, with what its
+    /// signature said: never one shown, which would ask for its key (a keychain or card prompt)
+    /// again.
+    fn keep_opened(&mut self, key: &MessageKey, entity: Vec<u8>, authenticated: bool) {
+        let (reading, windows) = (&self.reading, &self.windows);
+        let shown = |k: &MessageKey| reading.as_ref().is_some_and(|r| r.key == *k) || windows.iter().any(|w| w.key == *k);
+        if let Some(gone) = self.opened.keep(key, entity, authenticated, shown) {
+            self.pgp.forget_message(&gone);
+        }
+    }
+
+    /// Mail that couldn't be read for want of a key is tried again, now there's one (the one
+    /// shown at once).
+    fn retry_failed_decrypts(&mut self) {
+        let failed: Vec<MessageKey> = self.decrypt_errors.drain().map(|(k, _)| k).collect();
+        for k in failed {
+            self.show_again(&k);
         }
     }
 

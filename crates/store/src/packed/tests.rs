@@ -1,6 +1,9 @@
 use mailcraft_model::{AccountConfig, Flags, MessageKey, Summary};
 
 use crate::Store;
+use crate::tests::process::{child, command, retry_while_held};
+use crate::tests::random::noise;
+use crate::tests::scratch;
 
 mod beside;
 mod bulk;
@@ -10,18 +13,66 @@ mod compaction;
 mod folders;
 mod full;
 mod health;
+mod kept;
 mod long;
+mod measure;
+mod online;
 mod opening;
 mod shrink;
 
 fn temp(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("mailcraft-packed-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    d
+    scratch(&format!("packed-{name}"))
+}
+
+/// Only Windows' sharing and lock violations say something else has a data file open: elsewhere
+/// the same numbers are other errors (a broken pipe, a number out of range). On Windows, a data
+/// file held open to no one else is said to be in use as it's read.
+#[test]
+fn only_windows_sharing_violations_say_a_data_file_is_in_use() {
+    for code in [32, 33] {
+        assert_eq!(super::held_elsewhere(&std::io::Error::from_raw_os_error(code)), cfg!(windows), "{code}");
+    }
+    assert!(!super::held_elsewhere(&std::io::Error::from_raw_os_error(5)), "access denied");
+    assert!(!super::held_elsewhere(&std::io::Error::other("no number")));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = temp("held");
+        std::fs::create_dir_all(&t).unwrap();
+        let file = t.join("held.mailcraft");
+        std::fs::write(&file, b"anything").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        let e = super::read_data_file(&file, &t.join("read.tmp"), &|| false, &mut |_| Ok(())).unwrap_err();
+        drop(held);
+        assert!(e.to_string().contains("in use"), "{e}");
+    }
 }
 
 fn account(id: &str, email: &str) -> AccountConfig {
     AccountConfig { id: id.into(), email: email.into(), ..Default::default() }
+}
+
+/// A data store with account `a1`, at `t`.
+fn packed_store(t: &std::path::Path) -> Store {
+    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
+    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    s
+}
+
+/// The data files of a data store.
+fn packs(s: &Store) -> &crate::packed::Packs {
+    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    packs
+}
+
+/// Message `uid` in `a1`'s Inbox.
+fn inbox(uid: u32) -> MessageKey {
+    MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid }
+}
+
+/// Mail text of about `n` bytes (compresses well).
+fn text(n: usize, seed: u64) -> Vec<u8> {
+    format!("Subject: note {seed}\r\n\r\n").bytes().chain(b"the figures for the quarter are in ".iter().copied().cycle().take(n)).collect()
 }
 
 /// A new account starts from an existing data file: its folders, mail and documents come in,
@@ -122,7 +173,6 @@ fn an_account_starts_from_an_existing_data_file() {
     s.import_data_file("p9", &crafted).unwrap();
     assert!(s.files.exists(&t.join("app").join("p9").join("ok").join("fine.json")));
     assert!(!t.join("app").join("escape.json").exists() && !t.join("escape.json").exists() && !t.join("b").exists());
-    let _ = std::fs::remove_dir_all(&t);
 }
 #[test]
 fn each_account_is_one_data_file_named_after_it() {
@@ -175,7 +225,6 @@ fn each_account_is_one_data_file_named_after_it() {
     // Deleting (what never held anyone's mail) takes the file.
     s.delete_account("a1").unwrap();
     assert!(!t.join("MailCraft Files").join("zoe@studio.example (2).mailcraft").exists() && kept.exists());
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// Big files go in pieces that fill their pages (a whole value took the next power of two
@@ -184,8 +233,7 @@ fn each_account_is_one_data_file_named_after_it() {
 #[test]
 fn big_files_are_kept_in_pieces_and_come_back_whole() {
     let t = temp("pieces");
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(&t);
     // Bytes that don't compress, so they're kept in pieces as they are.
     let big = noise(1_234_567, 1);
     let edge = noise(super::WHOLE_MAX + 1, 2);
@@ -194,7 +242,7 @@ fn big_files_are_kept_in_pieces_and_come_back_whole() {
 x"
     .to_vec();
     let key = |uid: u32| MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid };
-    s.write_bodies(&[(key(1), big.clone()), (key(2), edge.clone()), (key(3), small.clone())]).unwrap();
+    s.write_bodies(vec![(key(1), big.clone()), (key(2), edge.clone()), (key(3), small.clone())]).unwrap();
     assert_eq!(s.read_body(&key(1)).unwrap(), big);
     assert_eq!(s.read_body(&key(2)).unwrap(), edge);
     assert_eq!(s.read_body(&key(3)).unwrap(), small);
@@ -232,7 +280,7 @@ x"
     let bodies: Vec<(MessageKey, Vec<u8>)> =
         (0..120u32).map(|i| (key(i), noise(70_000 + (i as usize * 2_731) % 200_000, u64::from(i) + 9))).collect();
     let stored: usize = bodies.iter().map(|(_, b)| b.len()).sum();
-    s.write_bodies(&bodies).unwrap();
+    s.write_bodies(bodies.clone()).unwrap();
     let file2 = s.data_file("a1").unwrap();
     drop(s);
     let pages = |path: &std::path::Path| {
@@ -257,12 +305,10 @@ x"
     let whole = pages(&whole_file);
     assert!(pieced < stored as u64 * 112 / 100, "pieces took {pieced} for {stored}");
     assert!(pieced * 100 < whole * 85, "pieces {pieced}, whole values {whole}");
-    let _ = std::fs::remove_dir_all(t2);
     let sizes = super::piece_sizes(big.len());
     assert_eq!(sizes.iter().sum::<usize>(), big.len());
     assert!(sizes.iter().all(|n| *n <= 16 * super::PAGE - super::PAGE_SLACK));
     assert!(super::piece_sizes(0).is_empty() && super::piece_sizes(1) == [1]);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// A file in pieces is read back as written whether it's kept compressed (uncompressed as its
@@ -272,14 +318,13 @@ x"
 #[test]
 fn a_file_in_pieces_reads_back_compressed_or_not() {
     let t = temp("pieces-read");
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(&t);
     let key = |uid: u32| MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid };
     // An attachment's base64 (kept compressed, in about 40 pieces) and noise (kept as it is).
     let attached: Vec<u8> = b"Subject: sheet\r\n\r\n".iter().copied().chain(base64(&noise(2_000_000, 5))).collect();
     let raw = noise(1_500_000, 6);
     assert!(super::pack(&attached).starts_with(super::DEFLATED) && super::pack(&attached).len() > 16 * super::PAGE * 4);
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     let pieces_of = |uid: u32| -> (String, usize) {
         let inside = s.body_path(&key(uid)).strip_prefix(t.join("app").join("a1")).unwrap().to_str().unwrap().replace('\\', "/");
         let db = packs.db("a1", false).unwrap().unwrap();
@@ -307,20 +352,6 @@ fn a_file_in_pieces_reads_back_compressed_or_not() {
         }
     }
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
-}
-
-/// Bytes that don't compress (xorshift).
-fn noise(n: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..n)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
 }
 
 /// Text (mail, folder lists) is kept compressed and reads back as written; what doesn't
@@ -329,8 +360,7 @@ fn noise(n: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn text_is_kept_compressed() {
     let t = temp("deflate");
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(&t);
     let key = |uid: u32| MessageKey { account: "a1".into(), folder: "INBOX".into(), validity: 1, uid };
     let text: Vec<u8> = "Subject: report
 
@@ -357,7 +387,6 @@ fn text_is_kept_compressed() {
         z.finish().unwrap()
     };
     assert!(super::unpack(bomb).is_err());
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// Base64 (as attachments travel in mail) in lines of 76.
@@ -463,7 +492,6 @@ fn folders_from_before_come_into_the_data_file() {
     assert_eq!(s.read_body(&k).unwrap(), b"Subject: kept\r\n\r\nbody");
     assert_eq!(s.load_account_doc::<Vec<String>>("a1", "pop-seen.json").unwrap(), vec!["u1".to_string()]);
     assert!(t.join("Files").join("zoe@studio.example.mailcraft").is_file());
-    let _ = std::fs::remove_dir_all(t);
 }
 
 #[test]
@@ -482,7 +510,6 @@ fn a_damaged_data_file_is_set_aside() {
     // Started again, it's a file this build made: everything in it is kept as this build keeps it.
     assert!(s.data_file_health("a1").unwrap().unwrap().recompressed);
     drop(s);
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// Whether any file under `dir` holds `needle`.
@@ -531,7 +558,7 @@ fn an_online_only_account_leaves_nothing_on_disk() {
     assert_eq!(s.read_body(&k("a1", 1)).unwrap(), b"Subject: EARLIER-ZOE\r\n\r\nEARLIER-ZOE body");
     // New mail, changes, the Outbox and documents: in memory only.
     fill(&s, "a1", 2, "SECRET-ZOE");
-    s.write_bodies(&[(k("a1", 3), b"Subject: x\r\n\r\nSECRET-BATCH".to_vec()), (k("a2", 3), b"Subject: x\r\n\r\nANA-BATCH".to_vec())]).unwrap();
+    s.write_bodies(vec![(k("a1", 3), b"Subject: x\r\n\r\nSECRET-BATCH".to_vec()), (k("a2", 3), b"Subject: x\r\n\r\nANA-BATCH".to_vec())]).unwrap();
     s.save_ops("a1", &[mailcraft_model::Op::Expunge { keys: vec![k("a1", 1)] }]).unwrap();
     s.outbox_add("a1", &crate::OutboxItem { id: 4, ..Default::default() }, b"Subject: later\r\n\r\nSECRET-OUTBOX").unwrap();
     s.save_account_doc("a1", "pim.json", &serde_json::json!({"notes": ["SECRET-NOTE"]})).unwrap();
@@ -569,7 +596,6 @@ fn an_online_only_account_leaves_nothing_on_disk() {
     assert!(!s.is_online_only("a1") && s.load_folder("a1", "INBOX").unwrap().messages.is_empty());
     drop(s);
     assert!(!on_disk(&t, b"BACK-ON-DISK"));
-    let _ = std::fs::remove_dir_all(t);
 }
 
 /// An account's data file reached from several threads at once, before anything has opened
@@ -598,16 +624,16 @@ fn threads_opening_a_data_file_together_all_get_it() {
             assert_eq!(h.join().unwrap(), Ok(()), "round {round}");
         }
         drop(s);
-        let _ = std::fs::remove_dir_all(&t);
     }
 }
 
-/// Listing a real data file's mail, timed (counts and timings only): `MC_DATA` names a copy of a
-/// data folder (opening a data file may write to it, so never the original), its data files in
-/// "MailCraft Files".
+/// Listing a real data file's mail, timed (counts and timings told, not held to a mark):
+/// `MC_DATA` names a copy of a data folder (opening a data file may write to it, so never the
+/// original), its data files in "MailCraft Files". Each folder's cached mail is listed once
+/// each, and its own files without the mail inside its folders.
 #[test]
 #[ignore = "needs a copy of a real data folder in MC_DATA"]
-fn a_real_data_files_mail_is_listed_quickly() {
+fn a_real_data_files_mail_listing_is_timed() {
     let Some(root) = std::env::var_os("MC_DATA").map(std::path::PathBuf::from) else { return };
     let s = Store::open_packed(&root, root.join("MailCraft Files")).unwrap();
     for a in s.load_accounts().unwrap() {
@@ -616,12 +642,18 @@ fn a_real_data_files_mail_is_listed_quickly() {
         for f in s.load_folders(&a.id).unwrap() {
             let validity = s.load_folder(&a.id, &f.path).unwrap().validity;
             let t = std::time::Instant::now();
-            bodies += s.cached_bodies(&a.id, &f.path, validity).len();
+            let mut uids = s.cached_bodies(&a.id, &f.path, validity);
             listing += t.elapsed();
+            let dir = s.folder_dir(&a.id, &f.path);
             let t = std::time::Instant::now();
-            names += s.files.list(&s.folder_dir(&a.id, &f.path)).len();
+            let listed = s.files.list(&dir);
             listing_folders += t.elapsed();
-            folders += 1;
+            let n = uids.len();
+            uids.sort_unstable();
+            uids.dedup();
+            assert_eq!(uids.len(), n, "{}: each cached message once", f.path);
+            assert!(listed.iter().all(|(_, p)| p.parent() == Some(dir.as_path())), "{}: only the folder's own files", f.path);
+            (bodies, names, folders) = (bodies + n, names + listed.len(), folders + 1);
         }
         eprintln!("{folders} folders: cached_bodies {bodies} in {listing:?}; folder files {names} in {listing_folders:?}");
     }
@@ -633,12 +665,11 @@ fn a_real_data_files_mail_is_listed_quickly() {
 #[test]
 fn a_folder_is_listed_without_walking_what_is_inside_it() {
     let t = temp("children");
-    let s = Store::open_packed(t.join("app"), t.join("Files")).unwrap();
-    s.save_accounts(&[account("a1", "zoe@studio.example")]).unwrap();
+    let s = packed_store(&t);
     let key = |validity: u32, uid: u32| MessageKey { account: "a1".into(), folder: "INBOX".into(), validity, uid };
     let mut bodies: Vec<(MessageKey, Vec<u8>)> = (1..=2000).map(|uid| (key(7, uid), b"Subject: x\r\n\r\nx".to_vec())).collect();
     bodies.push((key(70, 1), b"Subject: y\r\n\r\ny".to_vec()));
-    s.write_bodies(&bodies).unwrap();
+    s.write_bodies(bodies).unwrap();
     let st = crate::FolderState { validity: 7, ..Default::default() };
     s.save_folder("a1", "INBOX", &st).unwrap();
     let dir = s.folder_dir("a1", "INBOX");
@@ -659,7 +690,7 @@ fn a_folder_is_listed_without_walking_what_is_inside_it() {
         .collect();
     names.sort();
     assert_eq!(names, ["6-x.json", "7.json", "70.json", "8.json", "state.json"]);
-    let crate::Files::Packed(packs) = &s.files.main else { panic!("packed") };
+    let packs = packs(&s);
     let inside = dir.strip_prefix(t.join("app").join("a1")).unwrap().to_str().unwrap().to_string();
     let (_, looked) = packs.children("a1", &inside).unwrap();
     // The five files, the two folders and the key after the last one: not the 2,002 inside.
@@ -676,5 +707,4 @@ fn a_folder_is_listed_without_walking_what_is_inside_it() {
     assert!(s.files.exists(&dir.join("70")) && s.files.exists(&dir.join("7").join("deeper")));
     assert!(!s.files.exists(&dir.join("9")) && !s.files.exists(&dir.join("7").join("de")));
     drop(s);
-    let _ = std::fs::remove_dir_all(&t);
 }

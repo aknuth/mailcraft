@@ -3,6 +3,9 @@
 use super::item::{File, Item};
 use super::*;
 
+pub(super) mod protected;
+pub(super) mod report;
+
 /// What a message's summary takes from its item, read before the item goes into its rebuilt
 /// source (which takes the item apart).
 pub(super) struct Glance {
@@ -79,6 +82,9 @@ fn build(mut it: Item, text: String, fallback_id: &str, depth: usize) -> Result<
     let make = || html.clone().unwrap_or_default();
     let refs = mime::HtmlRefs::new(&make);
     let report = super::report::report_type(&it.headers, &mut it.files);
+    // The attached messages, numbered in turn: one with no id of its own gets the item's with
+    // its number (`<id>.1`, `<id>.2`…), so no two have the same.
+    let mut attached = 0u32;
     for f in std::mem::take(&mut it.files) {
         match f {
             File::Data { name, mime, cid, data } => {
@@ -93,7 +99,8 @@ fn build(mut it: Item, text: String, fallback_id: &str, depth: usize) -> Result<
             File::Message(_) if depth >= MAX_NESTING => log::info!("an attached message deeper than {MAX_NESTING} was left out"),
             File::Message(inner) => {
                 let subject = if inner.subject.trim().is_empty() { "message".to_string() } else { inner.subject.trim().to_string() };
-                let raw = attached_raw(*inner, &format!("{fallback_id}.1"), depth.saturating_add(1))?;
+                attached = attached.saturating_add(1);
+                let raw = attached_raw(*inner, &format!("{fallback_id}.{attached}"), depth.saturating_add(1))?;
                 d.attachments.push(OutAttachment { name: format!("{subject}.eml"), mime: "message/rfc822".into(), data: raw, ..Default::default() });
             }
         }
@@ -133,7 +140,7 @@ fn build(mut it: Item, text: String, fallback_id: &str, depth: usize) -> Result<
 fn extra_headers(it: &Item) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     if !it.thread_index.is_empty() {
-        out.push(("Thread-Index", crate::imap::base64(&it.thread_index)));
+        out.push(("Thread-Index", mailcraft_model::base64::encode(&it.thread_index)));
     }
     let topic = header_text(&it.thread_topic, MAX_TOPIC);
     if !topic.is_empty() {
@@ -166,7 +173,7 @@ pub(super) fn header_text(s: &str, cap: usize) -> String {
         return text.to_string();
     }
     // Words of at most 45 bytes: 60 in base64, 72 with `=?utf-8?B?…?=`.
-    let word = |w: &str| format!("=?utf-8?B?{}?=", crate::imap::base64(w.as_bytes()));
+    let word = |w: &str| format!("=?utf-8?B?{}?=", mailcraft_model::base64::encode(w.as_bytes()));
     let mut words = Vec::new();
     let mut start = 0;
     for (i, c) in text.char_indices() {
@@ -181,7 +188,7 @@ pub(super) fn header_text(s: &str, cap: usize) -> String {
 
 /// Whether a header block has a line named `name` (a folded line's continuation names nothing).
 pub(super) fn has_header(head: &str, name: &str) -> bool {
-    head.lines().filter(|l| !l.starts_with([' ', '\t'])).any(|l| l.split_once(':').is_some_and(|(n, _)| n.trim_end().eq_ignore_ascii_case(name)))
+    mime::field_span(head.as_bytes(), name).is_some()
 }
 
 /// Whether an item's own header (`0x007D`) is one the rebuilt message keeps.
@@ -195,8 +202,9 @@ pub(super) fn usable_headers(original: &str) -> bool {
 /// takes the built one's place in `built` itself: the body (attachments and all) is moved along
 /// in place, not copied into a second message.
 fn with_headers(mut built: Vec<u8>, original: &str, bcc: &[EmailAddress], extra: &[(&str, String)]) -> Vec<u8> {
-    let Some(split) = built.windows(4).position(|w| w == b"\r\n\r\n") else { return built };
-    let head = String::from_utf8_lossy(built.get(..split).unwrap_or_default()).into_owned();
+    let Some(blank) = mime::header_end(&built) else { return built };
+    // The built header, without its last line's end.
+    let head = String::from_utf8_lossy(mime::without_line_end(built.get(..blank.start).unwrap_or_default())).into_owned();
     let mime_header = |line: &str| {
         let l = line.to_ascii_lowercase();
         l.starts_with("content-") || l.starts_with("mime-version:")
@@ -241,7 +249,7 @@ fn with_headers(mut built: Vec<u8>, original: &str, bcc: &[EmailAddress], extra:
         out.push_str("\r\n");
     }
     // The built header and the line end after it go; the blank line ending the header stays.
-    let end = split.saturating_add(2).min(built.len());
+    let end = blank.start;
     // Room made exactly first: splice would grow the buffer to twice its size for a header longer
     // than the built one (most received mail's), and the message waits in its batch in it.
     built.reserve_exact(out.len().saturating_sub(end));
@@ -272,7 +280,7 @@ fn bcc_line(bcc: &[EmailAddress]) -> String {
 /// reading it). The list places it by that time, as Outlook does; the reading pane shows its
 /// `Date:`.
 pub(super) fn summary_of(raw: &[u8], glance: Glance, key: MessageKey, size: u32) -> mailcraft_model::Summary {
-    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").map_or(raw.len(), |i| i + 4);
+    let end = mime::header_end(raw).map_or(raw.len(), |blank| blank.end);
     let mut s = mime::summary_from_header(raw.get(..end).unwrap_or(raw), key, glance.flags, size, glance.date);
     s.has_attachments = glance.has_files;
     s.preview = glance.preview;

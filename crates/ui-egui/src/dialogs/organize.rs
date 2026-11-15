@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod search_folders;
+pub use search_folders::{PresetKind, SEARCH_PRESETS, SearchFolderForm};
+
 pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &mut Vec<Action>) -> bool {
     match d {
         Dialog::Rules => {
@@ -21,34 +24,40 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
             if s.rules.is_empty() {
                 ui.label(RichText::new(tl!("No rules yet.")).color(t.faint));
             }
-            let mut rules = s.rules.clone();
-            let mut changed = false;
+            let lines = rule_lines(ui.ctx(), s);
+            // The rules the find box keeps, in order.
+            let rows: Vec<usize> = (0..s.rules.len())
+                .filter(|&i| needle.is_empty() || lines.found.get(i).is_some_and(|(name, what)| name.contains(&needle) || what.contains(&needle)))
+                .collect();
+            let mut toggled = None;
             let mut remove = None;
-            let mut shown = 0usize;
             // One line a rule (its switch, name, what it does, and its buttons as icons), in a
-            // list that scrolls past a dozen or so.
+            // list that scrolls past a dozen or so; only the lines in view are laid out.
             egui::Frame::new().stroke(egui::Stroke::new(1.0, t.border)).corner_radius(6).show(ui, |ui| {
                 // With the find box, a steady height, so the dialog doesn't jump while typing.
                 let steady = s.rules.len() > 6;
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, !steady]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (i, r) in rules.iter_mut().enumerate() {
-                        let what = describe(s, r);
-                        if !needle.is_empty() && !r.name.to_lowercase().contains(&needle) && !what.to_lowercase().contains(&needle) {
-                            continue;
-                        }
+                ui.spacing_mut().item_spacing.y = 0.0;
+                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, !steady]).show_rows(ui, 32.0, rows.len(), |ui, range| {
+                    for (shown, &i) in rows.iter().enumerate().take(range.end).skip(range.start) {
+                        let (Some(r), Some(what)) = (s.rules.get(i), lines.what.get(i)) else { continue };
                         let (row, hover) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
                         if hover.hovered() {
                             ui.painter().rect_filled(row, 0.0, t.hover_row);
                         } else if shown % 2 == 1 {
                             ui.painter().rect_filled(row, 0.0, t.chrome);
                         }
-                        shown += 1;
+                        // Each rule's own, wherever the list is scrolled to.
                         let mut inner = ui.new_child(
-                            egui::UiBuilder::new().max_rect(row.shrink2(vec2(8.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            egui::UiBuilder::new()
+                                .id_salt(("rule", i))
+                                .max_rect(row.shrink2(vec2(8.0, 0.0)))
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         );
                         let ui = &mut inner;
-                        changed |= ui.checkbox(&mut r.enabled, "").on_hover_text(tl!("On / off")).changed();
+                        let mut on = r.enabled;
+                        if ui.checkbox(&mut on, "").on_hover_text(tl!("On / off")).changed() {
+                            toggled = Some(i);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
                             if widgets::tiny_icon_button(ui, Icon::Delete, "Delete", t).clicked() {
@@ -70,13 +79,13 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
                                 };
                                 job.append(&r.name, 0.0, strong);
                                 let dim = egui::TextFormat { font_id: theme::regular(12.0), color: t.dim, ..Default::default() };
-                                job.append(&what, 10.0, dim);
+                                job.append(what, 10.0, dim);
                                 job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width());
                                 ui.add(egui::Label::new(job).selectable(false)).on_hover_text(format!("{}\n{}", r.name, what));
                             });
                         });
                     }
-                    if shown == 0 && !s.rules.is_empty() {
+                    if rows.is_empty() && !s.rules.is_empty() {
                         ui.add_space(8.0);
                         ui.label(RichText::new(tl!("No rule matches.")).color(t.faint));
                         ui.add_space(8.0);
@@ -85,13 +94,18 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
             });
             if let Some(i) = remove {
                 acts.push(Action::Run("rules.delete", json!({"index": i})));
-            } else if changed {
+            } else if let Some(i) = toggled {
+                // Copied only now, to send with the one switched.
+                let mut rules = s.rules.clone();
+                if let Some(r) = rules.get_mut(i) {
+                    r.enabled = !r.enabled;
+                }
                 acts.push(Action::Run("rules.set", json!({"rules": rules})));
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button(tl!("New rule…")).clicked() {
-                    acts.push(Action::Dialog(Dialog::rule_from("", "")));
+                    acts.push(Action::Dialog(Dialog::rule_from("")));
                 }
                 let any_on = s.rules.iter().any(|r| r.enabled);
                 if ui
@@ -121,30 +135,40 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
                 ui.label(tl!("Name"));
                 ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(300.0));
                 ui.end_row();
-                ui.label(tl!("When mail"));
-                egui::ComboBox::from_id_salt("rule-test").width(300.0).selected_text(f.test.label()).show_ui(ui, |ui| {
-                    for x in RuleTest::ALL {
-                        ui.selectable_value(&mut f.test, x, x.label());
-                    }
-                });
+                let l = ui.label(tl!("When mail"));
+                egui::ComboBox::from_id_salt("rule-test")
+                    .width(300.0)
+                    .selected_text(f.test.label())
+                    .show_ui(ui, |ui| {
+                        for x in RuleTest::ALL {
+                            ui.selectable_value(&mut f.test, x, x.label());
+                        }
+                    })
+                    .response
+                    .labelled_by(l.id);
                 ui.end_row();
                 if f.test.needs_text() {
                     ui.label("");
                     ui.add(egui::TextEdit::singleline(&mut f.text).hint_text(tl!("Text or address")).desired_width(300.0));
                     ui.end_row();
                 }
-                ui.label(tl!("Then"));
-                egui::ComboBox::from_id_salt("rule-do").width(300.0).selected_text(f.action.label()).show_ui(ui, |ui| {
-                    for x in RuleDo::ALL {
-                        if ui.selectable_value(&mut f.action, x, x.label()).changed() {
-                            f.target.clear();
+                let l = ui.label(tl!("Then"));
+                egui::ComboBox::from_id_salt("rule-do")
+                    .width(300.0)
+                    .selected_text(f.action.label())
+                    .show_ui(ui, |ui| {
+                        for x in RuleDo::ALL {
+                            if ui.selectable_value(&mut f.action, x, x.label()).changed() {
+                                f.target.clear();
+                            }
                         }
-                    }
-                });
+                    })
+                    .response
+                    .labelled_by(l.id);
                 ui.end_row();
                 match f.action {
                     RuleDo::MoveTo => {
-                        ui.label(tl!("Folder"));
+                        let l = ui.label(tl!("Folder"));
                         let shown = f
                             .account
                             .as_deref()
@@ -153,28 +177,38 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
                                 format!("{} ({})", crate::i18n::folder(x), s.account(&x.account).map(|a| a.config.email.as_str()).unwrap_or_default())
                             })
                             .unwrap_or_else(|| tl!("Choose…").into());
-                        egui::ComboBox::from_id_salt("rule-folder").width(300.0).selected_text(shown).show_ui(ui, |ui| {
-                            for a in &s.accounts {
-                                ui.label(RichText::new(&a.config.email).small().color(t.faint));
-                                for x in a.folders.iter().filter(|x| x.selectable) {
-                                    let on = f.account.as_deref() == Some(a.config.id.as_str()) && f.target == x.path;
-                                    if ui.selectable_label(on, format!("{}{}", "    ".repeat(x.depth()), crate::i18n::folder(x))).clicked() {
-                                        f.account = Some(a.config.id.clone());
-                                        f.target = x.path.clone();
+                        egui::ComboBox::from_id_salt("rule-folder")
+                            .width(300.0)
+                            .selected_text(shown)
+                            .show_ui(ui, |ui| {
+                                for a in &s.accounts {
+                                    ui.label(RichText::new(&a.config.email).small().color(t.faint));
+                                    for x in a.folders.iter().filter(|x| x.selectable) {
+                                        let on = f.account.as_deref() == Some(a.config.id.as_str()) && f.target == x.path;
+                                        if ui.selectable_label(on, format!("{}{}", "    ".repeat(x.depth()), crate::i18n::folder(x))).clicked() {
+                                            f.account = Some(a.config.id.clone());
+                                            f.target = x.path.clone();
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            })
+                            .response
+                            .labelled_by(l.id);
                         ui.end_row();
                     }
                     RuleDo::Categorize => {
-                        ui.label(tl!("Category"));
+                        let l = ui.label(tl!("Category"));
                         let shown = if f.target.is_empty() { tl!("Choose…").to_string() } else { tl!(&f.target).to_string() };
-                        egui::ComboBox::from_id_salt("rule-cat").width(300.0).selected_text(shown).show_ui(ui, |ui| {
-                            for c in &s.prefs.categories {
-                                ui.selectable_value(&mut f.target, c.name.clone(), &c.name);
-                            }
-                        });
+                        egui::ComboBox::from_id_salt("rule-cat")
+                            .width(300.0)
+                            .selected_text(shown)
+                            .show_ui(ui, |ui| {
+                                for c in &s.prefs.categories {
+                                    ui.selectable_value(&mut f.target, c.name.clone(), &c.name);
+                                }
+                            })
+                            .response
+                            .labelled_by(l.id);
                         ui.end_row();
                     }
                     _ => {}
@@ -223,26 +257,27 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
                     .wrap(),
             );
             ui.add_space(8.0);
-            ui.label(RichText::new(tl!("Show")).color(t.dim).small());
+            let l = ui.label(RichText::new(tl!("Show")).color(t.dim).small());
             let before = f.preset;
             egui::ComboBox::from_id_salt("search-folder-preset")
                 .width(ui.available_width())
-                .selected_text(tl!(SEARCH_PRESETS.get(f.preset).map_or("Custom", |p| p.0)))
+                .selected_text(tl!(f.preset.label()))
                 .show_ui(ui, |ui| {
-                    for (i, (label, _)) in SEARCH_PRESETS.iter().enumerate() {
-                        ui.selectable_value(&mut f.preset, i, tl!(label));
+                    for (label, kind) in SEARCH_PRESETS {
+                        ui.selectable_value(&mut f.preset, kind, tl!(label));
                     }
-                });
+                })
+                .response
+                .labelled_by(l.id);
             if f.preset != before {
                 f.apply_preset(before);
             }
-            let (needs_people, custom) = f.needs();
-            if needs_people {
+            if f.preset == PresetKind::People {
                 ui.add_space(6.0);
                 ui.label(RichText::new(tl!("From these people (addresses or names, separated by commas)")).color(t.dim).small());
                 ui.add(egui::TextEdit::singleline(&mut f.people).hint_text("ana@example.com, Jun").desired_width(f32::INFINITY));
             }
-            if custom {
+            if f.preset == PresetKind::Custom {
                 ui.add_space(6.0);
                 ui.label(RichText::new(tl!("Search for")).color(t.dim).small());
                 ui.add(egui::TextEdit::singleline(&mut f.query).hint_text("from:ana subject:invoice has:attachment").desired_width(f32::INFINITY));
@@ -286,30 +321,40 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
             ui.checkbox(&mut f.pin, tl!("Pin"));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(tl!("Categorize"));
+                let l = ui.label(tl!("Categorize"));
                 let shown = if f.category.is_empty() { tl!("None").to_string() } else { f.category.clone() };
-                egui::ComboBox::from_id_salt("quick-step-category").width(220.0).selected_text(shown).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut f.category, String::new(), tl!("None"));
-                    for c in &s.prefs.categories {
-                        ui.selectable_value(&mut f.category, c.name.clone(), c.name.as_str());
-                    }
-                });
+                egui::ComboBox::from_id_salt("quick-step-category")
+                    .width(220.0)
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut f.category, String::new(), tl!("None"));
+                        for c in &s.prefs.categories {
+                            ui.selectable_value(&mut f.category, c.name.clone(), c.name.as_str());
+                        }
+                    })
+                    .response
+                    .labelled_by(l.id);
             });
             ui.horizontal(|ui| {
-                ui.label(tl!("Then move to"));
-                egui::ComboBox::from_id_salt("quick-step-move").width(220.0).selected_text(QuickStepForm::move_label(&f.move_to)).show_ui(ui, |ui| {
-                    let mut choices = vec![
-                        StepMove::Stay,
-                        StepMove::Role(FolderRole::Archive),
-                        StepMove::Role(FolderRole::Trash),
-                        StepMove::Role(FolderRole::Junk),
-                    ];
-                    choices.extend(f.folders.iter().map(|p| StepMove::Folder(p.clone())));
-                    for c in choices {
-                        let label = QuickStepForm::move_label(&c);
-                        ui.selectable_value(&mut f.move_to, c, label);
-                    }
-                });
+                let l = ui.label(tl!("Then move to"));
+                egui::ComboBox::from_id_salt("quick-step-move")
+                    .width(220.0)
+                    .selected_text(QuickStepForm::move_label(&f.move_to))
+                    .show_ui(ui, |ui| {
+                        let mut choices = vec![
+                            StepMove::Stay,
+                            StepMove::Role(FolderRole::Archive),
+                            StepMove::Role(FolderRole::Trash),
+                            StepMove::Role(FolderRole::Junk),
+                        ];
+                        choices.extend(f.folders.iter().map(|p| StepMove::Folder(p.clone())));
+                        for c in choices {
+                            let label = QuickStepForm::move_label(&c);
+                            ui.selectable_value(&mut f.move_to, c, label);
+                        }
+                    })
+                    .response
+                    .labelled_by(l.id);
             });
             if let Some(e) = &f.error {
                 ui.add_space(4.0);
@@ -390,86 +435,6 @@ impl RuleDo {
             RuleDo::Flag => "Flag",
             RuleDo::Pin => "Pin",
         })
-    }
-}
-
-/// The Search Folders offered, as Outlook's New Search Folder lists them: a name and what it
-/// searches for. "Mail from specific people" asks for them; "Custom" for the search.
-pub const SEARCH_PRESETS: [(&str, &str); 10] = [
-    ("Unread mail", "is:unread"),
-    ("Mail flagged for follow up", "is:flagged"),
-    ("Important mail", "is:important"),
-    ("Categorized mail", "is:categorized"),
-    ("Mail with attachments", "has:attachment"),
-    ("Large mail (over 100 KB)", "larger:100KB"),
-    ("Pinned mail", "is:pinned"),
-    // Not one of Outlook's: what you sent that nobody has answered (two to thirty days old).
-    ("Sent mail waiting for a reply", "is:awaiting"),
-    ("Mail from specific people", "from:"),
-    ("Custom", ""),
-];
-
-pub(super) const PRESET_PEOPLE: usize = 8;
-
-pub(super) const PRESET_CUSTOM: usize = 9;
-
-#[derive(Clone, Debug, Default)]
-pub struct SearchFolderForm {
-    /// The name it had (`None`: a new one).
-    pub original: Option<String>,
-    /// Which of [`SEARCH_PRESETS`].
-    pub preset: usize,
-    pub name: String,
-    /// For "Mail from specific people": addresses or names, separated by commas.
-    pub people: String,
-    /// For "Custom": the search, as typed in the search box.
-    pub query: String,
-    pub error: Option<String>,
-}
-
-impl SearchFolderForm {
-    pub fn new() -> SearchFolderForm {
-        SearchFolderForm { name: tl!("Unread mail").to_string(), ..Default::default() }
-    }
-
-    /// An existing one, to change: its search shown as written.
-    pub fn edit(f: &mailcraft_engine::SearchFolder) -> SearchFolderForm {
-        let preset = SEARCH_PRESETS.iter().position(|p| !p.1.is_empty() && p.1 != "from:" && p.1 == f.query).unwrap_or(PRESET_CUSTOM);
-        SearchFolderForm { original: Some(f.name.clone()), preset, name: f.name.clone(), query: f.query.clone(), ..Default::default() }
-    }
-
-    /// Another kind picked: its name follows, unless one was typed.
-    pub fn apply_preset(&mut self, before: usize) {
-        let was = SEARCH_PRESETS.get(before).map(|p| tl!(p.0).to_string()).unwrap_or_default();
-        if self.name.trim().is_empty() || self.name == was {
-            self.name = SEARCH_PRESETS.get(self.preset).map(|p| tl!(p.0).to_string()).unwrap_or_default();
-        }
-        if self.preset == PRESET_CUSTOM && self.query.trim().is_empty() {
-            self.query = SEARCH_PRESETS.get(before).map(|p| p.1.to_string()).filter(|q| q != "from:").unwrap_or_default();
-        }
-    }
-
-    /// Whether it asks for people, and for a search of its own.
-    pub fn needs(&self) -> (bool, bool) {
-        (self.preset == PRESET_PEOPLE, self.preset == PRESET_CUSTOM)
-    }
-
-    /// What it searches for: `from:ana,"zoe park"` for people.
-    pub fn final_query(&self) -> String {
-        match self.preset {
-            PRESET_PEOPLE => {
-                let people: Vec<String> = self
-                    .people
-                    .split([',', ';'])
-                    .map(|p| p.trim().replace('"', ""))
-                    .filter(|p| !p.is_empty())
-                    .map(|p| if p.contains(char::is_whitespace) { format!("\"{p}\"") } else { p })
-                    .collect();
-                if people.is_empty() { String::new() } else { format!("from:{}", people.join(",")) }
-            }
-            PRESET_CUSTOM => self.query.trim().to_string(),
-            i => SEARCH_PRESETS.get(i).map(|p| p.1.to_string()).unwrap_or_default(),
-        }
     }
 }
 
@@ -587,10 +552,44 @@ pub struct RuleForm {
     /// Run it on the mail already in the Inbox once saved (Outlook's "run this rule now").
     pub run_now: bool,
     pub error: Option<String>,
+    /// The rule as it was when opened: what the editor doesn't show of it (more conditions or
+    /// actions, "any" of them, the account it's for) is kept, and of what it shows only what was
+    /// changed goes in.
+    pub original: Option<Rule>,
+}
+
+/// What the editor shows of a rule: its first condition and its first action.
+fn shown(r: &Rule) -> (RuleTest, String, RuleDo, String) {
+    let (test, text) = match r.conditions.first() {
+        Some(Condition::From(t)) => (RuleTest::From, t.clone()),
+        Some(Condition::To(t)) => (RuleTest::To, t.clone()),
+        Some(Condition::Subject(t)) => (RuleTest::Subject, t.clone()),
+        Some(Condition::AnyText(t)) => (RuleTest::AnyText, t.clone()),
+        Some(Condition::HasAttachment) => (RuleTest::HasAttachment, String::new()),
+        Some(Condition::Bulk) | None => (RuleTest::Bulk, String::new()),
+    };
+    let (action, target) = match r.actions.first() {
+        Some(RuleAction::MoveTo(f)) => (RuleDo::MoveTo, f.clone()),
+        Some(RuleAction::MoveToRole(FolderRole::Trash)) | Some(RuleAction::Delete) => (RuleDo::Delete, String::new()),
+        Some(RuleAction::MoveToRole(_)) => (RuleDo::Archive, String::new()),
+        Some(RuleAction::Categorize(c)) => (RuleDo::Categorize, c.clone()),
+        Some(RuleAction::MarkRead) => (RuleDo::MarkRead, String::new()),
+        Some(RuleAction::Flag) => (RuleDo::Flag, String::new()),
+        Some(RuleAction::Pin) | None => (RuleDo::Pin, String::new()),
+    };
+    (test, text, action, target)
+}
+
+/// `new` in the place of a list's first, or as its only one.
+fn put_first<T>(list: &mut Vec<T>, new: T) {
+    match list.first_mut() {
+        Some(first) => *first = new,
+        None => list.push(new),
+    }
 }
 
 impl RuleForm {
-    pub(super) fn to_rule(&self) -> Result<Rule, String> {
+    pub(crate) fn to_rule(&self) -> Result<Rule, String> {
         if self.name.trim().is_empty() {
             return Err(tl!("Give the rule a name").to_string());
         }
@@ -617,35 +616,39 @@ impl RuleForm {
             RuleDo::Flag => RuleAction::Flag,
             RuleDo::Pin => RuleAction::Pin,
         };
-        Ok(Rule {
-            name: self.name.trim().to_string(),
-            enabled: true,
-            account: if self.action == RuleDo::MoveTo { self.account.clone() } else { None },
-            conditions: vec![condition],
-            match_all: true,
-            actions: vec![action],
-            stop: self.stop,
-        })
+        let Some(original) = &self.original else {
+            return Ok(Rule {
+                name: self.name.trim().to_string(),
+                enabled: true,
+                account: if self.action == RuleDo::MoveTo { self.account.clone() } else { None },
+                conditions: vec![condition],
+                match_all: true,
+                actions: vec![action],
+                stop: self.stop,
+            });
+        };
+        let (test, text, act, target) = shown(original);
+        let mut rule = Rule { name: self.name.trim().to_string(), stop: self.stop, ..original.clone() };
+        if self.test != test || self.text.trim() != text.trim() {
+            put_first(&mut rule.conditions, condition);
+        }
+        let moved_elsewhere = self.action == RuleDo::MoveTo && self.account != original.account;
+        if self.action != act || self.target != target || moved_elsewhere {
+            put_first(&mut rule.actions, action);
+            // The account a move's folder is in is the one it's for; other actions keep theirs.
+            if self.action == RuleDo::MoveTo {
+                rule.account.clone_from(&self.account);
+            } else if act == RuleDo::MoveTo && !rule.actions.iter().any(|a| matches!(a, RuleAction::MoveTo(_))) {
+                // The move's account, which goes with the move: no other action shows one, and a
+                // new rule of this kind has none.
+                rule.account = None;
+            }
+        }
+        Ok(rule)
     }
 
-    pub(super) fn from_rule(index: usize, r: &Rule) -> RuleForm {
-        let (test, text) = match r.conditions.first() {
-            Some(Condition::From(t)) => (RuleTest::From, t.clone()),
-            Some(Condition::To(t)) => (RuleTest::To, t.clone()),
-            Some(Condition::Subject(t)) => (RuleTest::Subject, t.clone()),
-            Some(Condition::AnyText(t)) => (RuleTest::AnyText, t.clone()),
-            Some(Condition::HasAttachment) => (RuleTest::HasAttachment, String::new()),
-            Some(Condition::Bulk) | None => (RuleTest::Bulk, String::new()),
-        };
-        let (action, target) = match r.actions.first() {
-            Some(RuleAction::MoveTo(f)) => (RuleDo::MoveTo, f.clone()),
-            Some(RuleAction::MoveToRole(FolderRole::Trash)) | Some(RuleAction::Delete) => (RuleDo::Delete, String::new()),
-            Some(RuleAction::MoveToRole(_)) => (RuleDo::Archive, String::new()),
-            Some(RuleAction::Categorize(c)) => (RuleDo::Categorize, c.clone()),
-            Some(RuleAction::MarkRead) => (RuleDo::MarkRead, String::new()),
-            Some(RuleAction::Flag) => (RuleDo::Flag, String::new()),
-            Some(RuleAction::Pin) | None => (RuleDo::Pin, String::new()),
-        };
+    pub(crate) fn from_rule(index: usize, r: &Rule) -> RuleForm {
+        let (test, text, action, target) = shown(r);
         RuleForm {
             index: Some(index),
             name: r.name.clone(),
@@ -657,11 +660,45 @@ impl RuleForm {
             stop: r.stop,
             run_now: false,
             error: None,
+            original: Some(r.clone()),
         }
     }
 }
 
-/// One line describing a rule.
+/// What each rule does, in words, and its name and that in lower case for the find box: kept
+/// between frames, and made again only when the rules, the language or the folders change.
+struct RuleLines {
+    rules: Vec<Rule>,
+    key: u64,
+    what: Vec<String>,
+    found: Vec<(String, String)>,
+}
+
+/// The Rules dialog's lines for `s.rules` (see `RuleLines`).
+fn rule_lines(ctx: &egui::Context, s: &Session) -> std::sync::Arc<RuleLines> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The language the lines are in, itself: two languages can word a template alike.
+    crate::i18n::current().code().hash(&mut h);
+    // A move names its folder as the folder pane does, by each folder's delimiter.
+    for f in s.accounts.iter().flat_map(|a| &a.folders) {
+        (&f.path, f.delimiter).hash(&mut h);
+    }
+    let key = h.finish();
+    let id = egui::Id::unique("rules-lines");
+    if let Some(kept) = ctx.data(|d| d.get_temp::<std::sync::Arc<RuleLines>>(id))
+        && kept.key == key
+        && kept.rules == s.rules
+    {
+        return kept;
+    }
+    let what: Vec<String> = s.rules.iter().map(|r| describe(s, r)).collect();
+    let found = s.rules.iter().zip(&what).map(|(r, w)| (r.name.to_lowercase(), w.to_lowercase())).collect();
+    let lines = std::sync::Arc::new(RuleLines { rules: s.rules.clone(), key, what, found });
+    ctx.data_mut(|d| d.insert_temp(id, lines.clone()));
+    lines
+}
+
 /// A folder as the folder pane names it, with the folders it's in: `Inbox › gzamer`.
 pub(super) fn folder_path_label(s: &Session, path: &str) -> String {
     // The folder's own delimiter; "/" (the commonest) for one not synced yet.
@@ -679,6 +716,7 @@ pub(super) fn folder_path_label(s: &Session, path: &str) -> String {
         .join(" › ")
 }
 
+/// One line describing a rule.
 pub(super) fn describe(s: &Session, r: &Rule) -> String {
     let cond = r
         .conditions

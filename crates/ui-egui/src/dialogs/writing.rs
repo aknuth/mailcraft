@@ -43,16 +43,20 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, _s: &Session, t: &Tokens, acts: 
             ui.set_width(440.0);
             title(ui, t, "Check before sending");
             let mut exposed = false;
-            for f in found.iter() {
-                let line = match f {
-                    SendCheck::Lookalike { address, like } => {
-                        tf!("{address} looks like an address at {like}, but isn't one. Is it the right one?", address = address, like = like)
-                    }
-                    SendCheck::Exposed { count } => {
-                        exposed = true;
-                        tf!("{n} people who may not know each other will all see each other's addresses.", n = count)
-                    }
-                };
+            // What was found can't be shown (see `MailApp::run`): that there is something.
+            let unread = found.is_empty().then(|| {
+                tl!("Something about the recipients was found to look at, but it can't be shown. Look them over before sending.").to_string()
+            });
+            let lines = found.iter().map(|f| match f {
+                SendCheck::Lookalike { address, like } => {
+                    tf!("{address} looks like an address at {like}, but isn't one. Is it the right one?", address = address, like = like)
+                }
+                SendCheck::Exposed { count } => {
+                    exposed = true;
+                    tf!("{n} people who may not know each other will all see each other's addresses.", n = count)
+                }
+            });
+            for line in unread.into_iter().chain(lines) {
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), egui::Sense::hover());
                     crate::icons::paint(ui.painter(), r, crate::icons::Icon::Warning, t.warn);
@@ -130,16 +134,47 @@ pub struct NamesForm {
     /// An Exchange Online account needs the user's permission to search its directory (issue #9).
     pub consent: bool,
     pub selected: Option<usize>,
-    /// The field a double-click adds to (`to`, `cc`, `bcc`).
-    pub target: &'static str,
+    /// The field a double-click adds to.
+    pub target: Recipients,
     pub to: String,
     pub cc: String,
     pub bcc: String,
 }
 
-/// Add `a` to a recipient field (`a; b` as Outlook writes them), unless it's there.
+/// A message's recipient fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Recipients {
+    #[default]
+    To,
+    Cc,
+    Bcc,
+}
+
+impl Recipients {
+    /// Its name in the commands' parameters and the widgets' ids: `to`, `cc` or `bcc`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Recipients::To => "to",
+            Recipients::Cc => "cc",
+            Recipients::Bcc => "bcc",
+        }
+    }
+
+    /// This field of the three given (To, Cc and Bcc, in that order).
+    pub fn of<'a>(self, to: &'a mut String, cc: &'a mut String, bcc: &'a mut String) -> &'a mut String {
+        match self {
+            Recipients::To => to,
+            Recipients::Cc => cc,
+            Recipients::Bcc => bcc,
+        }
+    }
+}
+
+/// Add `a` to a recipient field (`a; b` as Outlook writes them), unless it's there: an address
+/// in the field the same as its own, not one it's a part of (`joann@…`) or in a name.
 pub(super) fn add_to(field: &mut String, a: &mailcraft_engine::model::EmailAddress) {
-    if field.to_lowercase().contains(&a.email.to_lowercase()) {
+    let email = a.email.trim().to_lowercase();
+    if email.is_empty() || mailcraft_engine::model::addr::parse_valid(field).iter().any(|x| x.email.to_lowercase() == email) {
         return;
     }
     let f = field.trim().trim_end_matches([';', ',']).trim().to_string();
@@ -177,7 +212,7 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
             }
         }
         ui.add_space(12.0);
-        ui.label(RichText::new(tl!("Address Book")).strong());
+        let book = ui.label(RichText::new(tl!("Address Book")).strong());
         // Everyone (the people written to or heard from, and contacts), every contact, or one
         // address book (each account's Contacts, an organisation's shared ones).
         let accounts = f.books.iter().map(|(_, _, a)| a).collect::<std::collections::BTreeSet<_>>().len();
@@ -199,19 +234,24 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
             }
         }
         let shown = choices.iter().find(|(s, _, _)| *s == f.source).map_or_else(|| tl!("All addresses").to_string(), |(_, l, _)| l.clone());
-        egui::ComboBox::from_id_salt("address-book").width(220.0).selected_text(shown).show_ui(ui, |ui| {
-            for (source, label, tip) in &choices {
-                let mut r = ui.selectable_label(f.source == *source, label);
-                if !tip.is_empty() {
-                    r = r.on_hover_text(*tip);
+        egui::ComboBox::from_id_salt("address-book")
+            .width(220.0)
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                for (source, label, tip) in &choices {
+                    let mut r = ui.selectable_label(f.source == *source, label);
+                    if !tip.is_empty() {
+                        r = r.on_hover_text(*tip);
+                    }
+                    if r.clicked() && f.source != *source {
+                        f.source = source.clone();
+                        f.stale = true;
+                        f.selected = None;
+                    }
                 }
-                if r.clicked() && f.source != *source {
-                    f.source = source.clone();
-                    f.stale = true;
-                    f.selected = None;
-                }
-            }
-        });
+            })
+            .response
+            .labelled_by(book.id);
     });
     // Outlook's "Show this address list first".
     if !f.source.is_empty() && f.source != f.default_source {
@@ -224,7 +264,7 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
         });
     }
     ui.add_space(6.0);
-    let mut add: Option<&'static str> = None;
+    let mut add: Option<Recipients> = None;
     egui::Frame::new().stroke(egui::Stroke::new(1.0, t.border)).corner_radius(4).show(ui, |ui| {
         ui.set_min_size(vec2(ui.available_width(), 230.0));
         egui::Grid::new("names-head").num_columns(2).min_col_width(250.0).show(ui, |ui| {
@@ -232,7 +272,10 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
             ui.label(RichText::new(tl!("Email Address")).color(t.dim).small());
         });
         ui.separator();
-        egui::ScrollArea::vertical().max_height(210.0).auto_shrink([false, false]).show(ui, |ui| {
+        // Only the rows in view are laid out: the list holds up to 2,000 people. A row is as tall
+        // as `horizontal` makes it: its 22 points, or a control's height if that's more.
+        let row_height = ui.spacing().interact_size.y.max(22.0);
+        egui::ScrollArea::vertical().max_height(210.0).auto_shrink([false, false]).show_rows(ui, row_height, f.list.len(), |ui, range| {
             if f.list.is_empty() && !f.stale && !f.searching {
                 let hint = if f.directory && f.source == "directory" && f.query.trim().is_empty() {
                     tl!("Type a name to search your organisation's directory.")
@@ -241,7 +284,7 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
                 };
                 ui.label(RichText::new(hint).color(t.faint));
             }
-            for (i, a) in f.list.iter().enumerate() {
+            for (i, a) in f.list.iter().enumerate().take(range.end).skip(range.start) {
                 let on = f.selected == Some(i);
                 // A row: name and address, left-aligned as in Outlook's list.
                 let r = ui.horizontal(|ui| {
@@ -300,26 +343,16 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
         ui.add(egui::Label::new(RichText::new(tf!("The directory couldn't be searched: {error}", error = e)).color(t.warn).small()).wrap());
     }
     ui.add_space(8.0);
-    for (name, label) in [("to", "To ->"), ("cc", "Cc ->"), ("bcc", "Bcc ->")] {
+    for (field, label) in [(Recipients::To, "To ->"), (Recipients::Cc, "Cc ->"), (Recipients::Bcc, "Bcc ->")] {
         ui.horizontal(|ui| {
             if ui.add_sized(vec2(72.0, 24.0), egui::Button::new(tl!(label))).clicked() {
-                add = Some(name);
+                add = Some(field);
             }
-            let field = match name {
-                "to" => &mut f.to,
-                "cc" => &mut f.cc,
-                _ => &mut f.bcc,
-            };
-            ui.add(egui::TextEdit::singleline(field).desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::singleline(field.of(&mut f.to, &mut f.cc, &mut f.bcc)).desired_width(f32::INFINITY));
         });
     }
     if let (Some(target), Some(a)) = (add, f.selected.and_then(|i| f.list.get(i)).cloned()) {
-        let field = match target {
-            "to" => &mut f.to,
-            "cc" => &mut f.cc,
-            _ => &mut f.bcc,
-        };
-        add_to(field, &a);
+        add_to(target.of(&mut f.to, &mut f.cc, &mut f.bcc), &a);
     }
     let (ok, cancel) = buttons(ui, t, "OK", true);
     if ok {
@@ -327,4 +360,24 @@ pub(super) fn select_names(ui: &mut Ui, f: &mut NamesForm, t: &Tokens, acts: &mu
         return true;
     }
     !cancel
+}
+
+/// Select Names adds someone whose address is part of another's, or of a name, in the field;
+/// not someone already there, whatever the case.
+#[cfg(test)]
+#[test]
+fn an_address_is_added_unless_it_is_there_whole() {
+    let ann = mailcraft_engine::model::EmailAddress::new("Ann", "ann@x.example");
+    let added = |field: &str| {
+        let mut f = field.to_string();
+        add_to(&mut f, &ann);
+        f
+    };
+    assert_eq!(added(""), "Ann <ann@x.example>; ");
+    assert_eq!(added("joann@x.example; "), "joann@x.example; Ann <ann@x.example>; ");
+    assert_eq!(added("\"ann@x.example's desk\" <desk@x.example>"), "\"ann@x.example's desk\" <desk@x.example>; Ann <ann@x.example>; ");
+    assert_eq!(added("bo@x.example, zo"), "bo@x.example, zo; Ann <ann@x.example>; ");
+    for there in ["ann@x.example", "Ann Lee <ANN@x.example>; ", "bo@x.example; Ann@X.example; "] {
+        assert_eq!(added(there), there);
+    }
 }

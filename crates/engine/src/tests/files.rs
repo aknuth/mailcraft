@@ -48,7 +48,7 @@ fn a_mailto_link_starts_a_message_and_attaches_nothing() {
     assert_eq!(draft.bcc, "ned@farm.example");
     assert_eq!(draft.subject, "Seed order");
     assert!(draft.body.starts_with("Dear Lee,\nthanks"), "{:?}", draft.body);
-    assert!(draft.show_cc, "the copy lines are shown when the link fills them");
+    assert!(draft.show_bcc, "the copy lines are shown when the link fills them");
     assert!(draft.attachments.is_empty(), "`attach=` in a link is ignored");
 
     for bad in [json!({ "url": "ftp://farm.example/seeds" }), json!({})] {
@@ -56,7 +56,6 @@ fn a_mailto_link_starts_a_message_and_attaches_nothing() {
     }
     let sending = s.take_jobs().into_iter().filter(|j| matches!(j, Job::Send { .. })).count();
     assert_eq!(sending, 0, "the draft waits for the user");
-    done(s);
 }
 
 #[test]
@@ -83,7 +82,6 @@ fn a_message_file_is_shown() {
     assert!(open_path(&mut s, &path.with_file_name("gone.eml")).is_err());
     assert!(open_path(&mut s, &scratch.0).is_err());
     assert!(s.run("file.open", &json!({ "path": "   " })).is_err());
-    done(s);
 }
 
 #[test]
@@ -135,7 +133,6 @@ fn calendar_and_contacts_files_are_added() {
     assert_eq!(added["kind"], "contacts", "{added}");
     assert_eq!((added["added"].as_u64(), added["skipped"].as_u64()), (Some(1), Some(1)), "{added}");
     assert!(s.people("Ortiz").iter().any(|p| p.card.display() == "Mo Ortiz"));
-    done(s);
 }
 
 /// With no account there's nowhere to put them: said, not crashed.
@@ -177,7 +174,7 @@ fn message_files_go_into_the_folder_open_and_a_msg_is_shown_when_read() {
     });
     assert_eq!(s.take_filed().iter().map(|f| (f.added, f.failed.len())).collect::<Vec<_>>(), [(1, 1)]);
     assert!(s.take_filed().is_empty());
-    assert!(mailcraft_engine_is_message_file("x.MSG") && mailcraft_engine_is_message_file("y.eml") && !mailcraft_engine_is_message_file("z.pdf"));
+    assert!(crate::cmd::is_message_file("x.MSG") && crate::cmd::is_message_file("y.eml") && !crate::cmd::is_message_file("z.pdf"));
 
     // A .msg opened: read elsewhere, then shown.
     let t = TempFolder::new("msg");
@@ -198,6 +195,30 @@ fn message_files_go_into_the_folder_open_and_a_msg_is_shown_when_read() {
     assert!(s.windows.iter().any(|w| w.key == key && w.parsed.as_ref().is_some_and(|p| p.text.contains("Hello."))));
     s.apply(Event::MessageFileRead { path: at.display().to_string(), raw: Err("the file is damaged".into()) });
     assert!(s.opened_file.take().unwrap().is_err());
+}
+
+/// A file opened is told by its first bytes whatever its size: an Outlook message file over
+/// 16 MB without its extension goes to be read as one (it was taken for a plain message), and a
+/// calendar that big is refused as too big (it was read as a message). One that isn't there is
+/// refused at once, even with a `.msg` name.
+#[test]
+fn big_files_opened_are_told_by_their_first_bytes() {
+    let mut s = sample_session("open-big");
+    let t = TempFolder::new("big");
+    let big = |name: &str, head: &[u8]| {
+        let at = t.put(name, head);
+        std::fs::OpenOptions::new().write(true).open(&at).unwrap().set_len(17 << 20).unwrap();
+        at
+    };
+    let outlook = big("figures", &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0]);
+    let r = open_path(&mut s, &outlook);
+    assert_eq!(r.as_ref().ok().map(|r| r["kind"].clone()), Some(json!("reading")), "{r:?}");
+    assert!(s.take_jobs().iter().any(|j| matches!(j, Job::ReadMessageFile { path } if path.ends_with("figures"))));
+    let calendar = big("plans", b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n");
+    let r = open_path(&mut s, &calendar);
+    assert!(matches!(&r, Err(CmdError::Params(m)) if m.ends_with("is too big")), "{r:?}");
+    assert!(open_path(&mut s, &t.0.join("gone.msg")).is_err());
+    assert!(s.take_jobs().is_empty());
 }
 
 /// Issue #56: a message file opens in a message window of its own, as one double-clicked in a
@@ -285,7 +306,6 @@ fn a_message_file_opens_in_a_window_of_its_own_and_leaves_no_trace() {
     }
     assert_eq!((s.windows.len(), s.opened_files.len()), (MAX_WINDOWS, MAX_WINDOWS));
     assert!(s.windows.iter().all(|w| s.opened_file_name(&w.key).is_some()));
-    done(s);
 }
 
 /// The words of laid-out blocks, table cells included.
@@ -294,10 +314,6 @@ fn texts(b: &mailcraft_mime::layout::Block) -> Vec<String> {
         mailcraft_mime::layout::Block::Text(lines) => lines.iter().flatten().map(|sp| sp.text.clone()).collect(),
         mailcraft_mime::layout::Block::Table(t) => t.rows.iter().flatten().flat_map(|c| c.blocks.iter().flat_map(texts)).collect(),
     }
-}
-
-fn mailcraft_engine_is_message_file(path: &str) -> bool {
-    crate::cmd::is_message_file(path)
 }
 
 /// Print and Save as PDF lay a message out as it's read (it came out as lines of text, its
@@ -367,4 +383,70 @@ fn base64_decode(text: &str) -> Vec<u8> {
             [(n >> 16) as u8, (n >> 8) as u8, n as u8].into_iter().take(c.len().saturating_sub(1))
         })
         .collect()
+}
+
+/// Save all attachments of a message with 30 files of 600 KB, and the PDF of one with 40
+/// pictures of its own beside a 12 MB file, timed (a parse per file, or per picture, before).
+/// Run under the heavy lock:
+/// `cargo test -p mailcraft-engine --lib measure_attachments_parsed_once -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn measure_attachments_parsed_once() {
+    use std::fmt::Write as _;
+    const DOT: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    // `n` bytes as base64 lines (any letters will do).
+    let b64 = |n: usize, seed: u8| {
+        let line: String = (0..76u8).map(|i| char::from(b'A' + i.wrapping_add(seed) % 26)).collect();
+        let mut out = String::new();
+        for _ in 0..n / 57 {
+            out.push_str(&line);
+            out.push_str("\r\n");
+        }
+        out
+    };
+    let mut s = sample_session("measure-parse");
+    let scratch = TempFolder::new("measure");
+    let open = |s: &mut Session, name: &str, source: &str| {
+        let path = scratch.put(name, source.as_bytes());
+        let key = open_path(s, &path).unwrap()["key"].as_str().and_then(mailcraft_model::MessageKey::from_id).unwrap();
+        s.reading = s.windows.iter().find(|w| w.key == key).cloned();
+        scratch.0.clone()
+    };
+    let mut files = String::from(
+        "From: a@x.example\r\nTo: b@x.example\r\nSubject: Files\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n",
+    );
+    for i in 0..30u8 {
+        let _ = write!(
+            files,
+            "--b\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=f{i}.bin\r\n\r\n{}",
+            b64(600 << 10, i)
+        );
+    }
+    files.push_str("--b--\r\n");
+    let out = open(&mut s, "files.eml", &files).join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let t = std::time::Instant::now();
+    let r = s.run("attachment.saveAll", &json!({"dir": out.to_string_lossy()})).unwrap();
+    let save_ms = t.elapsed().as_millis();
+    assert_eq!(r["saved"].as_array().map(Vec::len), Some(30));
+    let (mut html, mut parts) = (String::from("<p>"), String::new());
+    for i in 0..40 {
+        let _ = write!(html, "<img src=\"cid:p{i}@x\" width=\"8\" height=\"8\">");
+        let _ = write!(parts, "--b\r\nContent-Type: image/png\r\nContent-ID: <p{i}@x>\r\nContent-Transfer-Encoding: base64\r\n\r\n{DOT}\r\n");
+    }
+    let pictures = format!(
+        "From: a@x.example\r\nTo: b@x.example\r\nSubject: Pictures\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n\
+         --m\r\nContent-Type: multipart/related; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n{html}</p>\r\n{parts}--b--\r\n\
+         --m\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=big.bin\r\n\r\n{}--m--\r\n",
+        b64(12 << 20, 7)
+    );
+    open(&mut s, "pictures.eml", &pictures);
+    let t = std::time::Instant::now();
+    let pdf = s.message_pdf().unwrap();
+    let pdf_ms = t.elapsed().as_millis();
+    let text = String::from_utf8_lossy(&pdf).to_string();
+    let shown = text.split("/XObject <<").nth(1).and_then(|r| r.split(">>").next()).unwrap_or("").matches("/Im").count();
+    assert_eq!(shown, 40, "every picture in the PDF");
+    println!("MEASURE saveAll 30 files: {save_ms} ms; PDF with 40 pictures: {pdf_ms} ms");
+    s.reading = None;
 }

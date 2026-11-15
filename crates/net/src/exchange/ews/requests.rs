@@ -61,33 +61,36 @@ impl Client {
                     Err(e) => return Err(e),
                 },
                 Scheme::Basic => {
-                    let token = b64(format!("{}:{}", self.user, self.password).as_bytes());
+                    let token = base64::encode(format!("{}:{}", self.user, self.password).as_bytes());
                     self.send_on_conn(&base.clone().header("Authorization", &format!("Basic {token}")))?
                 }
                 Scheme::Ntlm(name) if !*self.signed_in.borrow() => {
-                    let first = self.send_on_conn(&base.clone().header("Authorization", &format!("{name} {}", b64(&crate::ntlm::negotiate()))))?;
+                    let first =
+                        self.send_on_conn(&base.clone().header("Authorization", &format!("{name} {}", base64::encode(&crate::ntlm::negotiate()))))?;
                     if first.status != 401 {
                         first
                     } else {
                         let offered = Client::offered(&first);
-                        let token = offered.iter().find_map(|v| v.strip_prefix(name).map(|t| t.trim().to_string())).filter(|t| !t.is_empty());
+                        let token = offered.iter().find_map(|v| scheme_token(v, name).filter(|t| !t.is_empty()));
                         let Some(token) = token else {
                             // NTLM named but not done (a front that takes only Kerberos lists it
                             // anyway): Kerberos, when Negotiate is offered too.
-                            if name == "NTLM" && offered.iter().any(|v| v.eq_ignore_ascii_case("Negotiate")) {
+                            if name == "NTLM" && offered.iter().any(|v| scheme_token(v, "Negotiate").is_some()) {
                                 *self.scheme.borrow_mut() = Scheme::Kerberos;
                                 continue;
                             }
                             return Err(NetError::Auth("the server didn't answer the sign-in".into()));
                         };
-                        let challenge = crate::ntlm::challenge(&unb64(&token).ok_or_else(|| NetError::Protocol("bad NTLM challenge".into()))?)?;
+                        let challenge = crate::ntlm::challenge(&unb64(token).ok_or_else(|| NetError::Protocol("bad NTLM challenge".into()))?)?;
                         let mut client_challenge = [0u8; 8];
                         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut client_challenge)
                             .map_err(|_| NetError::Protocol("no randomness".into()))?;
-                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        let filetime = (now + 11_644_473_600) * 10_000_000;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                        let filetime = u64::try_from(crate::data_files::outlook::filetime(now)).unwrap_or(0);
                         let answer = crate::ntlm::authenticate(&challenge, &self.user, &self.password, filetime, client_challenge);
-                        let resp = self.send_on_conn(&base.clone().header("Authorization", &format!("{name} {}", b64(&answer))))?;
+                        let resp = self.send_on_conn(&base.clone().header("Authorization", &format!("{name} {}", base64::encode(&answer))))?;
                         if resp.status != 401 {
                             *self.signed_in.borrow_mut() = true;
                         }
@@ -101,7 +104,7 @@ impl Client {
             }
             // Not signed in: learn how, once.
             let offered = Client::offered(&resp);
-            let starts = |p: &str| offered.iter().any(|v| v.len() >= p.len() && v.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)));
+            let starts = |p: &str| offered.iter().any(|v| scheme_token(v, p).is_some());
             let next = if starts("NTLM") {
                 Scheme::Ntlm("NTLM")
             } else if starts("Negotiate") {
@@ -130,36 +133,9 @@ impl Client {
         Err(NetError::Auth("the server refused the user name or password".into()))
     }
 
-    /// Run one operation; the answer's elements (a SOAP fault is an error). Something not found
-    /// while the account has public folders is asked for again in the public folder mailboxes
-    /// holding their content (Exchange 2013 and later answer only there).
+    /// Run one operation; the answer's elements (a SOAP fault is an error). It goes to the
+    /// account's own mailbox, or where [`Client::in_folder`] sends it.
     pub fn call(&self, body: &str) -> Result<El> {
-        let doc = self.call_here(body)?;
-        let missing = |doc: &El| messages(doc).iter().any(|m| matches!(m.text_of("ResponseCode"), Some("ErrorFolderNotFound" | "ErrorItemNotFound")));
-        if self.route.borrow().is_some() || self.anchor.borrow().is_some() || !missing(&doc) {
-            return Ok(doc);
-        }
-        for mailbox in self.shared_open.borrow().clone() {
-            if let Ok(there) = self.anchored_to(&mailbox, || self.call_here(body))
-                && !missing(&there)
-            {
-                return Ok(there);
-            }
-        }
-        let guids = self.pf_replicas.borrow().clone();
-        for guid in guids {
-            let Ok(mailbox) = self.public_folder_mailbox(&guid) else { continue };
-            if let Ok(there) = self.routed_to(&mailbox, || self.call_here(body))
-                && !missing(&there)
-            {
-                return Ok(there);
-            }
-        }
-        Ok(doc)
-    }
-
-    /// [`Client::call`] where the request is sent, without looking elsewhere.
-    pub(super) fn call_here(&self, body: &str) -> Result<El> {
         self.call_raw(envelope(body))
     }
 
@@ -184,8 +160,7 @@ impl Client {
 
     /// Run an operation on one thing: its single response message, checked.
     pub(crate) fn call_one(&self, body: &str) -> Result<El> {
-        let doc = self.call(body)?;
-        let m = messages(&doc).first().map(|m| (*m).clone()).ok_or_else(|| NetError::Protocol("an empty answer".into()))?;
+        let m = into_messages(self.call(body)?).into_iter().next().ok_or_else(|| NetError::Protocol("an empty answer".into()))?;
         check_message(&m)?;
         Ok(m)
     }
@@ -200,6 +175,47 @@ impl Client {
     }
 }
 
+/// What a `WWW-Authenticate` value gives for the sign-in scheme `scheme`: its token (`NTLM <token>`,
+/// `""` when it names the scheme alone), the scheme's name taken in any case (RFC 9110 11.1) and
+/// whole (`NTLMfoo` isn't NTLM); `None` for another scheme.
+pub(super) fn scheme_token<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    let v = value.trim();
+    let end = v.find(|c: char| c.is_ascii_whitespace() || c == ',').unwrap_or(v.len());
+    let (name, rest) = v.split_at(end);
+    // A token goes up to the next challenge in the same value, if any.
+    name.eq_ignore_ascii_case(scheme).then(|| rest.split(',').next().unwrap_or("").trim())
+}
+
+/// [`messages`], moved out of the answer rather than copied (a message's source can be most of
+/// it).
+pub(crate) fn into_messages(doc: El) -> Vec<El> {
+    fn body(el: El) -> Option<El> {
+        for k in el.kids {
+            if k.name == "Body" {
+                return Some(k);
+            }
+            if let Some(b) = body(k) {
+                return Some(b);
+            }
+        }
+        None
+    }
+    fn walk(el: El, out: &mut Vec<El>) {
+        for k in el.kids {
+            if k.name == "ResponseMessages" {
+                out.extend(k.kids);
+            } else {
+                walk(k, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(b) = body(doc) {
+        walk(b, &mut out);
+    }
+    out
+}
+
 impl Client {
     /// Sign the connection in with Kerberos (Negotiate) and send `base` on it: the server's
     /// answer to the signed request. A token the server sends back (mutual authentication, or a
@@ -209,12 +225,8 @@ impl Client {
         let (mut n, token) = crate::kerberos::Negotiation::start(&self.user, &self.email, &self.password, &host)?;
         let mut token = token;
         for _ in 0..3 {
-            let resp = self.send_on_conn(&base.clone().header("Authorization", &format!("Negotiate {}", b64(&token))))?;
-            let back = Client::offered(&resp)
-                .iter()
-                .find_map(|v| v.strip_prefix("Negotiate").map(|t| t.trim().to_string()))
-                .filter(|t| !t.is_empty())
-                .and_then(|t| unb64(&t));
+            let resp = self.send_on_conn(&base.clone().header("Authorization", &format!("Negotiate {}", base64::encode(&token))))?;
+            let back = Client::offered(&resp).iter().find_map(|v| scheme_token(v, "Negotiate").filter(|t| !t.is_empty())).and_then(unb64);
             if resp.status != 401 {
                 if let Some(b) = back
                     && let Err(e) = n.step(&b)

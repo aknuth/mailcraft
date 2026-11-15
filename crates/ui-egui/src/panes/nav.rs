@@ -41,15 +41,52 @@ fn folder_key(account: &str, path: &str) -> String {
     format!("folder:{account}/{path}")
 }
 
-/// The folders a folder is inside (`A/B/C` → `A`, `A/B`).
-fn ancestors(f: &Folder) -> Vec<String> {
+/// The folders a folder is inside (`A/B/C` → `A`, `A/B`), as the starts of its own path.
+fn ancestors(f: &Folder) -> impl Iterator<Item = &str> {
     let d = f.delimiter.unwrap_or('/');
-    let parts: Vec<&str> = f.path.split(d).collect();
-    (1..parts.len()).map(|n| parts.get(..n).unwrap_or_default().join(&d.to_string())).collect()
+    f.path.char_indices().filter(move |&(_, c)| c == d).filter_map(|(i, _)| f.path.get(..i))
 }
 
-/// A section's heading that collapses it (Favorites), with its arrow; whether it was clicked.
-fn section_header(ui: &mut Ui, t: &Tokens, label: &str, open: bool) -> bool {
+/// An account's folder tree as the pane shows it this frame: which folders have folders in them
+/// and which of those are collapsed, read from slices of the folders' paths (no string is made
+/// for a folder or its ancestors).
+struct Tree<'a> {
+    /// Every folder some folder is inside.
+    parents: std::collections::HashSet<&'a str>,
+    /// The account's folders collapsed (`Prefs::collapsed`'s `folder:{account}/{path}`).
+    collapsed: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> Tree<'a> {
+    fn new(s: &'a Session, a: &'a mailcraft_engine::AccountState) -> Self {
+        let id = a.config.id.as_str();
+        let collapsed = s
+            .prefs
+            .collapsed
+            .iter()
+            .filter_map(|k| k.strip_prefix("folder:").and_then(|k| k.strip_prefix(id)).and_then(|k| k.strip_prefix('/')))
+            .collect();
+        Tree { parents: a.folders.iter().flat_map(ancestors).collect(), collapsed }
+    }
+
+    /// Whether a folder is inside a collapsed one.
+    fn hidden(&self, f: &Folder) -> bool {
+        !self.collapsed.is_empty() && ancestors(f).any(|up| self.collapsed.contains(up))
+    }
+
+    /// For a folder with folders in it, whether it's collapsed.
+    fn collapse(&self, f: &Folder) -> Option<bool> {
+        self.parents.contains(f.path.as_str()).then(|| self.collapsed.contains(f.path.as_str()))
+    }
+}
+
+/// The folder to open for a file: the one it's in (itself, when it's a folder).
+pub(crate) fn folder_of(file: &std::path::Path) -> std::path::PathBuf {
+    if file.is_dir() { file.to_path_buf() } else { file.parent().unwrap_or(file).to_path_buf() }
+}
+
+/// A section's heading that collapses it (Favorites, Search Folders), with its arrow.
+fn section_header(ui: &mut Ui, t: &Tokens, label: &str, open: bool) -> egui::Response {
     ui.add_space(2.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
     crate::widgets::named(ui, &resp, tl!(label), true, Some(open));
@@ -66,7 +103,7 @@ fn section_header(ui: &mut Ui, t: &Tokens, label: &str, open: bool) -> bool {
         theme::bold(12.0),
         t.faint,
     );
-    resp.clicked()
+    resp
 }
 
 /// What a folder row counts: its unread mail, bold in the accent colour, or (Drafts) the items
@@ -77,19 +114,24 @@ enum Count {
     Items(u32),
 }
 
-/// One row (its label as shown, translated); returns its response.
-#[allow(clippy::too_many_arguments)]
-fn row(
-    ui: &mut Ui,
-    t: &Tokens,
-    icon: Icon,
-    label: &str,
-    count: Count,
-    depth: usize,
+/// What a row is and takes: the one shown, one mail and folders are dropped on, one dragged.
+#[derive(Clone, Copy, Default)]
+struct RowIs {
     selected: bool,
     drop_ok: bool,
     draggable: bool,
-) -> egui::Response {
+}
+
+impl RowIs {
+    /// A row nothing is dropped on or dragged from, shown or not.
+    fn selected(selected: bool) -> RowIs {
+        RowIs { selected, ..RowIs::default() }
+    }
+}
+
+/// One row (its label as shown, translated); returns its response.
+fn row(ui: &mut Ui, t: &Tokens, icon: Icon, label: &str, count: Count, depth: usize, is: RowIs) -> egui::Response {
+    let RowIs { selected, drop_ok, draggable } = is;
     let h = 30.0;
     let unread = if let Count::Unread(n) = count { n } else { 0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), if draggable { Sense::click_and_drag() } else { Sense::click() });
@@ -136,22 +178,28 @@ fn row(
     resp
 }
 
+/// Whether more than one account has mail: one with calendars and contacts only has none to
+/// gather with another's, nor a folder to tell from another's (issue #86).
+fn several_mailboxes(s: &Session) -> bool {
+    s.accounts.iter().filter(|a| !a.config.is_calendar_only()).count() > 1
+}
+
 pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
         // Hidden altogether (View › Favorites), or collapsed to its heading.
         let favorites_open = s.prefs.show_favorites && !s.prefs.collapsed.contains("favorites");
-        if s.prefs.show_favorites && section_header(ui, t, "Favorites", favorites_open) {
+        if s.prefs.show_favorites && section_header(ui, t, "Favorites", favorites_open).clicked() {
             acts.push(Action::Run("view.collapse", json!({"key": "favorites"})));
         }
-        if favorites_open && s.accounts.len() > 1 {
+        if favorites_open && several_mailboxes(s) {
             let unread: u32 = s.accounts.iter().filter_map(|a| a.folder(FolderRole::Inbox)).map(|f| f.unread).sum();
             let sel = s.view == View::Unified { role: FolderRole::Inbox } && s.search.is_none();
-            if row(ui, t, Icon::Inbox, tl!("All Inboxes"), Count::Unread(unread), 0, sel, false, false).clicked() {
+            if row(ui, t, Icon::Inbox, tl!("All Inboxes"), Count::Unread(unread), 0, RowIs::selected(sel)).clicked() {
                 acts.push(Action::Run("folder.unified", json!({"role": "inbox"})));
             }
             let sel = s.view == View::Unified { role: FolderRole::Sent } && s.search.is_none();
-            if row(ui, t, Icon::Sent, tl!("All Sent"), Count::Unread(0), 0, sel, false, false).clicked() {
+            if row(ui, t, Icon::Sent, tl!("All Sent"), Count::Unread(0), 0, RowIs::selected(sel)).clicked() {
                 acts.push(Action::Run("folder.unified", json!({"role": "sent"})));
             }
         }
@@ -163,7 +211,7 @@ pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
         if !s.outbox.is_empty() {
             let sel = s.view == View::Outbox && s.search.is_none();
             let n = u32::try_from(s.outbox.len()).unwrap_or(u32::MAX);
-            if row(ui, t, Icon::Outbox, tl!("Outbox"), Count::Unread(n), 0, sel, false, false)
+            if row(ui, t, Icon::Outbox, tl!("Outbox"), Count::Unread(n), 0, RowIs::selected(sel))
                 .on_hover_text(tl!("Messages waiting to be sent"))
                 .clicked()
             {
@@ -173,7 +221,18 @@ pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
         ui.add_space(8.0);
         // Accounts, and the shared mailboxes they open, each a mailbox of its own in the order
         // the user put them (issue #1).
-        let sections = s.pane_sections();
+        // (An account with calendars and contacts only has no mailbox to show, issue #86.)
+        let sections = s.mail_sections();
+        if sections.is_empty() && !s.accounts.is_empty() {
+            // Nothing but such accounts: what they have is a click away.
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let what = ui.add(egui::Label::new(RichText::new(tl!("Calendars and contacts")).color(t.faint).small()).sense(Sense::click()));
+                if what.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    acts.push(Action::Run("view.module", json!({"name": "calendar"})));
+                }
+            });
+        }
         for (at, sec) in sections.iter().enumerate() {
             let Some(a) = s.account(&sec.account) else { continue };
             if let Some(top) = sec.mailbox.as_ref().and_then(|p| a.folders.iter().find(|f| &f.path == p)) {
@@ -192,13 +251,7 @@ pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
             let chev = m.rect(egui::Rect::from_min_size(rect.min + vec2(6.0, 9.0), vec2(12.0, 12.0)));
             icons::paint(ui.painter(), chev, if open { Icon::ChevronDown } else { m.closed() }, t.dim);
             ui.painter().circle_filled(m.pos(rect.min + vec2(26.0, 15.0)), 4.0, theme::account_color(a.config.color));
-            let label = if a.is_data_file() {
-                a.config.email.clone()
-            } else if a.is_local() && !a.config.is_calendar_only() {
-                tf!("{email} (sample)", email = a.config.email)
-            } else {
-                a.config.email.clone()
-            };
+            let label = if a.is_local() && !a.is_data_file() { tf!("{email} (sample)", email = a.config.email) } else { a.config.email.clone() };
             crate::widgets::named(ui, &resp, &label, true, Some(open));
             let g = crate::widgets::one_line(ui, &label, theme::bold(13.0), t.text, rect.width() - 44.0);
             let resp = if g.elided { resp.on_hover_text(&label) } else { resp };
@@ -206,14 +259,14 @@ pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
             if resp.clicked() {
                 acts.push(Action::Run("view.collapse", json!({"key": key})));
             }
-            let config = a.config.clone();
+            let config = &a.config;
             resp.context_menu(|ui| {
                 if ui.button(tl!("Send / Receive")).clicked() {
                     acts.push(Action::Run("mail.sync", json!({})));
                     ui.close();
                 }
                 // A Microsoft account with a password (refused there) switches to Microsoft sign-in.
-                let switch = mailcraft_engine::model::microsoft_password_account(&config) && s.oauth_available.iter().any(|p| p == "microsoft");
+                let switch = mailcraft_engine::model::microsoft_password_account(config) && s.oauth_available.iter().any(|p| p == "microsoft");
                 if a.config.has_server() && ui.button(if switch { tl!("Sign in with Microsoft…") } else { tl!("Sign in again…") }).clicked() {
                     acts.push(Action::SignInAgain(config.id.clone()));
                     ui.close();
@@ -222,12 +275,11 @@ pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
                 if let Some(file) = s.store.as_ref().map(|store| store.account_path(&config.id)).filter(|p| p.exists())
                     && ui.button(tl!("Open file location")).clicked()
                 {
-                    let dir = if file.is_dir() { file.clone() } else { file.parent().map_or_else(|| file.clone(), std::path::Path::to_path_buf) };
-                    acts.push(Action::OpenFolder(dir));
+                    acts.push(Action::OpenFolder(folder_of(&file)));
                     ui.close();
                 }
                 if !a.is_local() && ui.button(tl!("Account settings…")).clicked() {
-                    acts.push(Action::Dialog(Dialog::edit_account(&config)));
+                    acts.push(Action::Dialog(Dialog::edit_account(config)));
                     ui.close();
                 }
                 if ui.button(tl!("Signature…")).clicked() {
@@ -259,31 +311,19 @@ pub fn show(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
                     ui.close();
                 }
             });
-            // Folders with folders in them collapse; what's inside a collapsed one is hidden.
-            let parents: std::collections::HashSet<String> = a.folders.iter().flat_map(ancestors).collect();
-            let hidden = |f: &Folder| ancestors(f).iter().any(|up| s.prefs.collapsed.contains(&folder_key(&f.account, up)));
             if open {
+                // Folders with folders in them collapse; what's inside a collapsed one is hidden.
+                let tree = Tree::new(s, a);
                 // A data file being imported says how far it is; its folders come as each is done.
                 let importing = crate::app::importing::nav_line(s, t, ui, acts, &a.config.id);
-                if a.config.is_calendar_only() {
-                    // No mail (issue #61): what it has is a click away, not folders on their way.
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        let what =
-                            ui.add(egui::Label::new(RichText::new(tl!("Calendars and contacts")).color(t.faint).small()).sense(Sense::click()));
-                        if what.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                            acts.push(Action::Run("view.module", json!({"name": "calendar"})));
-                        }
-                    });
-                } else if a.folders.is_empty() && !importing {
+                if a.folders.is_empty() && !importing {
                     ui.label(RichText::new(tl!("  Loading folders…")).color(t.faint).small());
                 }
                 for f in a.folders.iter().filter(|f| f.mailbox.is_none()) {
-                    if hidden(f) {
+                    if tree.hidden(f) {
                         continue;
                     }
-                    let collapse = parents.contains(&f.path).then(|| s.prefs.collapsed.contains(&folder_key(&f.account, &f.path)));
-                    folder_row(s, t, ui, acts, f, f.depth() + 1, false, collapse);
+                    folder_row(s, t, ui, acts, f, f.depth() + 1, false, tree.collapse(f));
                 }
                 // The folders its import will bring in, not in yet.
                 crate::app::importing::outline(s, t, ui, &a.config.id, &a.folders);
@@ -301,23 +341,14 @@ fn search_folders(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) 
         return;
     }
     let open = !s.prefs.collapsed.contains("searchFolders");
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     let new = |ui: &mut Ui, acts: &mut Vec<Action>| {
         if ui.button(tl!("New Search Folder…")).clicked() {
             acts.push(Action::Dialog(Dialog::SearchFolder(Box::new(crate::dialogs::SearchFolderForm::new()))));
             ui.close();
         }
     };
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
-    crate::widgets::named(ui, &resp, tl!("Search Folders"), true, Some(open));
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, t.hover_row);
-    }
-    let m = crate::bidi::Mirror::new(rect);
-    let chev = m.rect(egui::Rect::from_min_size(egui::pos2(rect.min.x + 2.0, rect.center().y - 6.0), vec2(12.0, 12.0)));
-    icons::paint(ui.painter(), chev, if open { Icon::ChevronDown } else { m.closed() }, t.faint);
-    let at = m.pos(egui::pos2(rect.min.x + 18.0, rect.center().y));
-    ui.painter().text(at, m.align(egui::Align2::LEFT_CENTER), tl!("Search Folders"), theme::bold(12.0), t.faint);
+    let resp = section_header(ui, t, "Search Folders", open);
     if resp.clicked() {
         acts.push(Action::Run("view.collapse", json!({"key": "searchFolders"})));
     }
@@ -326,7 +357,7 @@ fn search_folders(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) 
         return;
     }
     if s.prefs.search_folders.is_empty() {
-        if row(ui, t, Icon::Plus, tl!("New Search Folder…"), Count::Unread(0), 0, false, false, false).clicked() {
+        if row(ui, t, Icon::Plus, tl!("New Search Folder…"), Count::Unread(0), 0, RowIs::default()).clicked() {
             acts.push(Action::Dialog(Dialog::SearchFolder(Box::new(crate::dialogs::SearchFolderForm::new()))));
         }
         return;
@@ -334,7 +365,7 @@ fn search_folders(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) 
     let showing = s.open_search_folder_name();
     for f in &s.prefs.search_folders {
         let selected = showing == Some(f.name.as_str());
-        let r = row(ui, t, Icon::Search, &f.name, Count::Unread(0), 0, selected, false, false).on_hover_text(&f.query);
+        let r = row(ui, t, Icon::Search, &f.name, Count::Unread(0), 0, RowIs::selected(selected)).on_hover_text(&f.query);
         if r.clicked() {
             acts.push(Action::Run("searchFolder.open", json!({"name": f.name})));
         }
@@ -357,7 +388,6 @@ fn search_folders(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>) 
 /// A shared mailbox an account opens, as a mailbox of its own (issue #1): its top folder `top`
 /// is its heading, its folders are under it as an account's are, and it moves among the
 /// mailboxes as an account does.
-#[allow(clippy::too_many_arguments)]
 fn shared_section(
     s: &Session,
     t: &Tokens,
@@ -376,14 +406,12 @@ fn shared_section(
     if !open {
         return;
     }
-    let parents: std::collections::HashSet<String> = a.folders.iter().flat_map(ancestors).collect();
-    let hidden = |f: &Folder| ancestors(f).iter().any(|up| s.prefs.collapsed.contains(&folder_key(&f.account, up)));
+    let tree = Tree::new(s, a);
     for f in a.folders.iter().filter(|f| f.mailbox == top.mailbox && f.depth() > 0) {
-        if hidden(f) {
+        if tree.hidden(f) {
             continue;
         }
-        let collapse = parents.contains(&f.path).then(|| s.prefs.collapsed.contains(&folder_key(&f.account, &f.path)));
-        folder_row(s, t, ui, acts, f, f.depth(), false, collapse);
+        folder_row(s, t, ui, acts, f, f.depth(), false, tree.collapse(f));
     }
     ui.add_space(6.0);
 }
@@ -438,7 +466,6 @@ fn move_items(ui: &mut Ui, sections: &[mailcraft_engine::PaneSection], at: usize
 
 /// A shared mailbox's heading (its top folder `top`): its name, an arrow that collapses it, and
 /// a menu. Whether it was clicked.
-#[allow(clippy::too_many_arguments)]
 fn shared_header(
     t: &Tokens,
     ui: &mut Ui,
@@ -528,7 +555,6 @@ fn dropped_mail(ui: &Ui, account: &str, folder: &str) -> Action {
 
 /// A folder's row; `collapse` is whether it's collapsed, for one with folders in it (it gets
 /// an arrow).
-#[allow(clippy::too_many_arguments)]
 fn folder_row(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>, f: &Folder, depth: usize, favorite: bool, collapse: Option<bool>) {
     let selected = s.search.is_none() && matches!(&s.view, View::Folder { account, folder } if *account == f.account && *folder == f.path);
     // In Favorites, a shared mailbox's folder says whose it is (its Inbox isn't the account's).
@@ -538,7 +564,7 @@ fn folder_row(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>, f: &
     });
     let name = match s.account(&f.account) {
         _ if favorite && let Some(top) = shared_top => format!("{} · {top}", crate::i18n::folder(f)),
-        Some(a) if favorite && s.accounts.len() > 1 => {
+        Some(a) if favorite && several_mailboxes(s) => {
             format!("{} · {}", crate::i18n::folder(f), a.config.email.split('@').next().unwrap_or_default())
         }
         _ => crate::i18n::folder(f),
@@ -548,7 +574,7 @@ fn folder_row(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>, f: &
     let user_folder = !f.is_fixed();
     // Drafts says how many it holds, as Outlook's (a saved draft is never unread).
     let count = if f.look() == FolderRole::Drafts { Count::Items(f.total) } else { Count::Unread(unread) };
-    let resp = row(ui, t, role_icon(f.look()), &name, count, depth, selected, f.selectable, user_folder && !favorite);
+    let resp = row(ui, t, role_icon(f.look()), &name, count, depth, RowIs { selected, drop_ok: f.selectable, draggable: user_folder && !favorite });
     if let Some(collapsed) = collapse {
         let x = resp.rect.min.x + 10.0 + depth as f32 * 14.0 - 14.0;
         let m = crate::bidi::Mirror::new(resp.rect);
@@ -575,9 +601,8 @@ fn folder_row(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>, f: &
     if user_folder && !favorite && resp.drag_started() {
         resp.dnd_set_drag_payload(DragFolder { account: f.account.clone(), path: f.path.clone() });
     }
-    let path = f.path.clone();
-    let account = f.account.clone();
-    let is_favorite = s.favorites().iter().any(|r| r.account == f.account && r.folder == f.path);
+    // The menu borrows the folder: nothing is copied or looked up unless it's open.
+    let (account, path) = (&f.account, &f.path);
     resp.context_menu(|ui| {
         if ui.button(tl!("Open")).clicked() {
             acts.push(Action::Run("folder.open", json!({"account": account, "folder": path})));
@@ -606,7 +631,7 @@ fn folder_row(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>, f: &
         }
         ui.separator();
         if ui.button(tl!("New folder…")).clicked() {
-            acts.push(Action::Dialog(Dialog::new_folder(&account, Some(&path))));
+            acts.push(Action::Dialog(Dialog::new_folder(account, Some(path))));
             ui.close();
         }
         if user_folder {
@@ -624,6 +649,7 @@ fn folder_row(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Action>, f: &
             }
         }
         ui.separator();
+        let is_favorite = s.favorites().iter().any(|r| r.account == *account && r.folder == *path);
         let label = tl!(if is_favorite { "Remove from Favorites" } else { "Show in Favorites" });
         if ui.button(label).clicked() {
             acts.push(Action::Run("folder.favorite", json!({"account": account, "folder": path, "on": !is_favorite})));

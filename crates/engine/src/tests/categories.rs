@@ -152,8 +152,8 @@ fn rules_files_carry_their_categories_keywords() {
     assert_eq!(third.category("Team").map(|c| c.keyword.as_str()), Some("team"));
 }
 
-/// A long list with many keywords: the dialog's list of those not in the category list is
-/// counted in one pass, at most 100, most used first, any case counted as one.
+/// A long list with many keywords: the dialog's list of those not in the category list holds
+/// at most 100, most used first, any case counted as one.
 #[test]
 fn many_unlisted_keywords_are_counted_and_capped() {
     let mut s = sample_session("cat-many");
@@ -167,9 +167,7 @@ fn many_unlisted_keywords_are_counted_and_capped() {
             m.into()
         })
         .collect();
-    let started = std::time::Instant::now();
     let found = s.unlisted_keywords();
-    eprintln!("{} keywords counted in {:?}", found.len(), started.elapsed());
     assert_eq!(found.len(), 100);
     assert_eq!(found[0], ("Common".to_string(), 20_000), "one keyword whatever its case");
     assert!(!found.iter().any(|(k, _)| k == "$Junk"));
@@ -191,4 +189,32 @@ fn the_server_is_asked_for_categories_by_keyword() {
     s.server_search = Some(crate::ServerSearch { id: 1, query: q.into(), sent: "keyword:$label2".into(), pending: 1, ..Default::default() });
     s.apply(Event::ServerSearched { account: "sample".into(), query: "keyword:$label2".into(), keys: Vec::new(), error: None, done: true });
     assert_eq!(s.server_search.as_ref().map(|ss| ss.pending), Some(0), "the answer counted");
+}
+
+/// Rules that can't come in make no categories: a file whose second rule is broken, or one that
+/// would take the rules past 500, leaves the category list as it was.
+#[test]
+fn a_refused_rules_import_makes_no_categories() {
+    let mut s = sample_session("cat-rules-refused");
+    let before = s.prefs.categories.clone();
+    let file = s.store.as_ref().unwrap().root().join("rules.json");
+    let rule =
+        |n: usize, action: Value| json!({"name": format!("R{n}"), "conditions": [{"if": "from", "value": format!("x{n}@")}], "actions": [action]});
+    let brand_new = json!({"do": "categorize", "value": "Brand New"});
+    let known = json!([{"name": "Brand New", "keyword": "brandnew", "color": 3}]);
+    let import = |s: &mut Session, rules: Value| {
+        std::fs::write(&file, serde_json::to_vec(&json!({"mailcraftRules": 1, "rules": rules, "categories": known})).unwrap()).unwrap();
+        s.run("rules.import", &json!({"path": file.to_string_lossy()}))
+    };
+    // The first rule files mail under a new category; the second is broken.
+    assert!(import(&mut s, json!([rule(1, brand_new.clone()), {"name": 3}])).is_err());
+    assert_eq!(s.prefs.categories, before, "no category made");
+    // 500 rules here already: one more is refused, and its category isn't made.
+    s.rules = (0..500).map(|n| serde_json::from_value(rule(n, json!({"do": "flag"}))).unwrap()).collect();
+    assert!(import(&mut s, json!([rule(900, brand_new.clone())])).is_err());
+    assert_eq!(s.prefs.categories, before, "no category made");
+    // Room for it: the rule comes in with its category.
+    s.rules.clear();
+    import(&mut s, json!([rule(1, brand_new)])).unwrap();
+    assert_eq!(s.category("Brand New").map(|c| c.keyword.as_str()), Some("brandnew"));
 }

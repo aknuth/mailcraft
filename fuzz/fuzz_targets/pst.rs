@@ -12,19 +12,16 @@
 //! right so damage reaches the code behind them.
 #![no_main]
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
+#[path = "pst/harness.rs"]
+mod harness;
 
+use harness::scratch;
 use libfuzzer_sys::fuzz_target;
 use mailcraft_mime as mime;
 use mailcraft_model::pim::{PIM_DOC, Pim, StoredCard, StoredEvent};
 use mailcraft_model::{EmailAddress, Flags, Folder, FolderRole, MessageKey, ical, vcard};
 use mailcraft_net::{pst, pst_export};
 use mailcraft_store::{FolderState, Store};
-
-fn scratch(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("mailcraft-fuzz-{}-{name}", std::process::id()))
-}
 
 /// A data file exported from a small account.
 fn good_file() -> Vec<u8> {
@@ -74,32 +71,16 @@ fn good_file() -> Vec<u8> {
     let path = scratch("good.pst");
     let _ = pst_export::export(&store, "a1", "Riley's mail", &path, &Default::default(), &mut |_| {});
     let data = std::fs::read(&path).unwrap_or_default();
-    for f in ["good.pst", "good Calendar.ics", "good Contacts.vcf"] {
-        let _ = std::fs::remove_file(scratch(f));
-    }
+    let _ = std::fs::remove_file(&path);
     assert!(data.starts_with(b"!BDN"), "the exporter wrote no data file");
     data
 }
 
-static GOOD: OnceLock<Vec<u8>> = OnceLock::new();
-
 fuzz_target!(|data: &[u8]| {
     mailcraft_pst::take_checksums_as_right(true);
-    let file = if data.starts_with(b"!BDN") {
-        data.to_vec()
-    } else {
-        let mut file = GOOD.get_or_init(good_file).clone();
-        for p in data.chunks_exact(5) {
-            let at = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize % file.len();
-            file[at] = p[4];
-        }
-        file
-    };
-    let path = scratch("in.pst");
-    if std::fs::write(&path, &file).is_err() {
-        return;
-    }
+    let Some(path) = harness::write_input(data, good_file, "in.pst") else { return };
     let store = Store::memory();
     let opts = pst::ImportOptions { lanes: 1, ..Default::default() };
     let _ = pst::import_with(&path, &store, "d1", &opts, &mut |_| {});
+    let _ = std::fs::remove_file(&path);
 });

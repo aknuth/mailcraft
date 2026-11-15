@@ -223,15 +223,7 @@ fn ticks_make_the_texts_ahead() {
 fn threads_make_the_texts_aside() {
     let (mut s, t) = unticked();
     let batches: u64 = s.cache.values().map(|st| st.messages.len().div_ceil(512) as u64).sum();
-    let began = Instant::now();
-    s.tick();
-    // Most of them made by the time the ticks come for them.
-    std::thread::sleep(Duration::from_secs(1));
-    while s.texts_ahead_due() {
-        assert!(began.elapsed() < Duration::from_secs(60), "made aside in a minute");
-        std::thread::sleep(Duration::from_millis(1));
-        s.tick();
-    }
+    s.tick_until_texts_made(|_| {});
     let made = s.search_stats();
     assert_eq!(s.texts_handed_out(), batches, "each handed out once");
     assert_eq!(made.summary_texts, 0, "none made on the session's thread");
@@ -460,7 +452,8 @@ fn the_end_of_a_run_starts_a_step() {
 /// comes back as it was (not copied out of the cache, arranged and put into conversations
 /// again), and what the search showed and held is let go of a slice a tick, not in the frame
 /// that clears it (on a real file's 10,941-message folder that frame took 56–91 ms). A message
-/// marked read meanwhile builds it again, with the mark.
+/// marked read meanwhile builds it again, with the mark. How long the clear takes:
+/// [`measure_clearing_a_big_search`].
 #[test]
 fn clearing_a_big_search_shows_the_folder_kept() {
     let (mut s, t) = cold();
@@ -468,11 +461,6 @@ fn clearing_a_big_search_shows_the_folder_kept() {
     let inbox: Vec<MessageKey> = s.list.iter().map(|m| m.key.clone()).collect();
     assert!(inbox.len() >= 10_000, "{}", inbox.len());
     let threadings = s.nav.threadings();
-    let clear = |s: &mut Session| {
-        let began = Instant::now();
-        s.run("search.run", &json!({"query": ""})).unwrap();
-        began.elapsed()
-    };
     for round in 0..2 {
         s.run("search.run", &json!({"query": "is:read", "scope": "all"})).unwrap();
         while !s.search_step(64).done {}
@@ -480,8 +468,7 @@ fn clearing_a_big_search_shows_the_folder_kept() {
         // What the last clear let go of is gone by now.
         assert_eq!(s.letting_go(), 0, "round {round}");
         let structure = s.nav_structure();
-        let took = clear(&mut s);
-        eprintln!("cleared {} found in {took:?}", t.read);
+        s.run("search.run", &json!({"query": ""})).unwrap();
         assert_eq!(s.list.iter().map(|m| m.key.clone()).collect::<Vec<_>>(), inbox, "the Inbox as it was");
         assert_ne!(s.nav_structure(), structure, "its rows are drawn again");
         assert_eq!(s.nav.threadings(), threadings, "its conversations not worked out again");
@@ -496,6 +483,26 @@ fn clearing_a_big_search_shows_the_folder_kept() {
         assert_eq!(s.letting_go(), 0);
         s.run("list.select", &json!({"key": inbox.first().unwrap().to_id()})).unwrap();
         assert_eq!(s.selection.len(), 1, "it's the list shown");
+    }
+}
+
+/// What the frame that clears [`clearing_a_big_search_shows_the_folder_kept`]'s search takes,
+/// three times (`cargo test -p mailcraft-engine --release --lib measure_clearing_a_big_search --
+/// --ignored --nocapture`, under the heavy lock).
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_clearing_a_big_search() {
+    let (mut s, t) = cold();
+    s.run("folder.open", &json!({"account": big::ACCOUNT, "folder": "INBOX"})).unwrap();
+    for _ in 0..3 {
+        s.run("search.run", &json!({"query": "is:read", "scope": "all"})).unwrap();
+        while !s.search_step(64).done {}
+        for _ in 0..41 {
+            s.tick();
+        }
+        let began = Instant::now();
+        s.run("search.run", &json!({"query": ""})).unwrap();
+        println!("MEASURE cleared a search of {} found in {} ms", t.read, began.elapsed().as_millis());
     }
 }
 
@@ -553,7 +560,7 @@ fn a_flag_mid_search_keeps_what_isnt_shown_yet() {
 /// holds in memory (and after the queries). A machine busy with other builds slows every query
 /// alike and can fail it: run it on one at rest.
 #[test]
-#[ignore]
+#[ignore = "a measurement"]
 fn how_long_searches_take() {
     let started = Instant::now();
     let (mut s, t) = unticked();
@@ -620,4 +627,38 @@ fn how_long_searches_take() {
         }
     }
     eprintln!("its index held {} KiB after the queries", s.search_index_bytes(big::ACCOUNT) / 1024);
+}
+
+/// What a Search Folder finding most of the mailbox (`is:read`) takes over a plain search of the
+/// same, waiting (the list put together at its end) and stepped as the window steps it (what's
+/// found streamed into the list), each the median of 7 (`cargo test --release -p
+/// mailcraft-engine --lib a_search_folder_of_most -- --ignored --nocapture`).
+#[test]
+#[ignore = "a measurement"]
+fn a_search_folder_of_most_of_the_mailbox_takes() {
+    let (mut s, t) = cold();
+    s.create_search_folder("Read", "is:read").unwrap();
+    let median = |mut took: Vec<Duration>| {
+        took.sort();
+        took[took.len() / 2]
+    };
+    for background in [false, true] {
+        let by = |s: &mut Session, folder: bool| {
+            s.set_background_search(background);
+            let t = Instant::now();
+            if folder {
+                s.open_search_folder("Read").unwrap();
+            } else {
+                s.run_search("is:read", SearchScope::All);
+            }
+            while !s.search_step(8).done {}
+            t.elapsed()
+        };
+        let plain = median((0..7).map(|_| by(&mut s, false)).collect());
+        assert_eq!(s.list.len(), t.read);
+        let folder = median((0..7).map(|_| by(&mut s, true)).collect());
+        assert_eq!(s.list.len(), t.read);
+        let how = if background { "stepped" } else { "waiting" };
+        println!("MEASURE {} found, {how}: a search {plain:?}, the Search Folder {folder:?}", t.read);
+    }
 }

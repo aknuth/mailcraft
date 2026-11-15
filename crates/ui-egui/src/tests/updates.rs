@@ -21,15 +21,7 @@ struct Asked {
 struct Updating(Rc<RefCell<Asked>>);
 
 impl crate::Services for Updating {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
+    stub_services!(clock, pick_files, save_path);
     fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
         Err("no".into())
     }
@@ -65,18 +57,6 @@ fn ready(admin: bool) -> UpdateState {
     UpdateState::Ready { version: "0.25.0-test.22".into(), asks: if admin { crate::InstallAsks::Administrator } else { crate::InstallAsks::Nothing } }
 }
 
-/// The window asked to close, as its close button does.
-fn close(ctx: &egui::Context, a: &mut MailApp) {
-    let input = RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
-        viewports: std::iter::once((egui::ViewportId::ROOT, egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() }))
-            .collect(),
-        ..Default::default()
-    };
-    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-    out.textures_delta.clear();
-}
-
 /// The frames with the update in each state, for the tour (light and dark, every language).
 pub(crate) fn tour(a: &mut MailApp, ctx: &egui::Context) {
     let asked = updating(a);
@@ -101,7 +81,7 @@ pub(crate) fn tour(a: &mut MailApp, ctx: &egui::Context) {
 /// MailCraft isn't in front.
 #[test]
 fn a_ready_update_is_said_once() {
-    let (mut a, dir) = app("update-ready");
+    let (mut a, _) = app("update-ready");
     let asked = updating(&mut a);
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
@@ -137,14 +117,13 @@ fn a_ready_update_is_said_once() {
     frame(&ctx, &mut a, vec![]);
     close(&ctx, &mut a);
     assert!(a.ui.dialog.is_none() && asked.borrow().restart);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Restart now with a message being written: the save question comes first, and Cancel there
 /// leaves MailCraft as it was (no restart, and the next close asks about the update again).
 #[test]
 fn restart_now_can_still_be_called_off() {
-    let (mut a, dir) = app("update-restart-cancel");
+    let (mut a, _) = app("update-restart-cancel");
     let asked = updating(&mut a);
     asked.borrow_mut().state = ready(false);
     let ctx = egui::Context::default();
@@ -171,7 +150,6 @@ fn restart_now_can_still_be_called_off() {
     frame(&ctx, &mut a, vec![]);
     close(&ctx, &mut a);
     assert!(!asked.borrow().restart, "installed as it closes, not reopened");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Closing with an update ready asks what becomes of it; Close without updating keeps it for
@@ -179,7 +157,7 @@ fn restart_now_can_still_be_called_off() {
 /// follows the download if it finishes meanwhile.
 #[test]
 fn closing_says_what_becomes_of_the_update() {
-    let (mut a, dir) = app("update-close");
+    let (mut a, _) = app("update-close");
     let asked = updating(&mut a);
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
@@ -194,7 +172,7 @@ fn closing_says_what_becomes_of_the_update() {
     a.act(Action::UpdateOnClose(false));
     assert!(asked.borrow().later && a.ui.close_now, "kept for later, and closing");
 
-    let (mut a, dir2) = app("update-close-downloading");
+    let (mut a, _) = app("update-close-downloading");
     let asked = updating(&mut a);
     asked.borrow_mut().state = UpdateState::Downloading { version: "0.25.0".into(), done: 1 << 20, total: 4 << 20 };
     frame(&ctx, &mut a, vec![]);
@@ -215,23 +193,13 @@ fn closing_says_what_becomes_of_the_update() {
     assert!(matches!(&a.ui.dialog, Some(Dialog::UpdateOnClose(_))), "asked again");
     a.act(Action::UpdateOnClose(true));
     assert!(!asked.borrow().later && a.ui.close_now && a.ui.update_answered);
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(dir2);
 }
 
 /// A start that brought the mail over from MailCraft's Flatpak under its id before 0.36.
 struct CarriedOver;
 
 impl crate::Services for CarriedOver {
-    fn clock(&self) -> (i64, i32) {
-        (NOW, 0)
-    }
-    fn pick_files(&mut self) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    fn save_path(&mut self, _: &str) -> Option<std::path::PathBuf> {
-        None
-    }
+    stub_services!(clock, pick_files, save_path);
     fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
         Err("no".into())
     }
@@ -241,19 +209,8 @@ impl crate::Services for CarriedOver {
 }
 
 /// The texts drawn in a frame (AccessKit on) and where each is: `(label, centre)`.
-fn drawn(ctx: &egui::Context, a: &mut MailApp, events: Vec<egui::Event>) -> Vec<(String, egui::Pos2)> {
-    let input = RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), events, ..Default::default() };
-    let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-    out.textures_delta.clear();
-    let tree = out.platform_output.accesskit_update.expect("AccessKit is on");
-    tree.nodes
-        .iter()
-        .filter_map(|(_, n)| {
-            let b = n.bounds()?;
-            let label = n.label().or(n.value())?.to_string();
-            Some((label, egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)))
-        })
-        .collect()
+fn drawn(ctx: &egui::Context, a: &mut MailApp) -> Vec<(String, egui::Pos2)> {
+    named(ctx, a, egui::vec2(1280.0, 800.0)).into_iter().filter_map(|n| Some((n.name()?.to_string(), n.centre()?))).collect()
 }
 
 /// A bar says the mail came over from the old Flatpak and how to remove that one, until it's
@@ -263,14 +220,16 @@ fn the_old_flatpak_is_named_once_its_mail_came_over() {
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     let mut a = MailApp::new(Session::open(None, Clock::new(NOW, 0)), Box::new(NullBackend), Box::new(CarriedOver));
-    drawn(&ctx, &mut a, vec![]);
-    let texts = drawn(&ctx, &mut a, vec![]);
+    // Settled: the bar's button finds its place over the first frames (clicked from the
+    // second's, the press missed it).
+    for _ in 0..3 {
+        drawn(&ctx, &mut a);
+    }
+    let texts = drawn(&ctx, &mut a);
     assert!(texts.iter().any(|(t, _)| t.contains("flatpak uninstall --delete-data ai.storyteller.mailcraft")), "the bar says how to remove it");
     let at = texts.iter().find(|(t, _)| t == "Dismiss").map(|(_, p)| *p).expect("a Dismiss button");
-    let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    drawn(&ctx, &mut a, vec![egui::Event::PointerMoved(at), press(true)]);
-    drawn(&ctx, &mut a, vec![press(false)]);
-    let texts = drawn(&ctx, &mut a, vec![]);
+    click(&ctx, &mut a, at);
+    let texts = drawn(&ctx, &mut a);
     assert_eq!(a.ui.old_flatpak, None);
     assert!(!texts.iter().any(|(t, _)| t.contains("flatpak uninstall")));
     let b = MailApp::new(Session::open(None, Clock::new(NOW, 0)), Box::new(NullBackend), Box::new(NullServices(NOW)));
@@ -282,26 +241,13 @@ fn the_old_flatpak_is_named_once_its_mail_came_over() {
 /// what a close asks. Off, or with no icon to come back from, a close is a close.
 #[test]
 fn closing_the_window_keeps_mailcraft_running_when_asked_to() {
-    let (mut a, dir) = app("keep-running");
+    let (mut a, _) = app("keep-running");
     let asked = updating(&mut a);
     asked.borrow_mut().tray = Some(crate::KeptOnClose::Hidden);
     let ctx = egui::Context::default();
     frame(&ctx, &mut a, vec![]);
     // The window asked to close: what it's told to do then.
-    let closed = |a: &mut MailApp| {
-        let input = RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
-            viewports: std::iter::once((
-                egui::ViewportId::ROOT,
-                egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() },
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        let mut out = ctx.run_ui(input, |ui| a.ui(ui));
-        out.textures_delta.clear();
-        out.viewport_output.remove(&egui::ViewportId::ROOT).map(|v| v.commands).unwrap_or_default()
-    };
+    let closed = |a: &mut MailApp| close(&ctx, a).viewport_output.remove(&egui::ViewportId::ROOT).map(|v| v.commands).unwrap_or_default();
     let hides = |commands: &[egui::ViewportCommand]| {
         commands.contains(&egui::ViewportCommand::CancelClose) && commands.contains(&egui::ViewportCommand::Visible(false))
     };
@@ -333,7 +279,6 @@ fn closing_the_window_keeps_mailcraft_running_when_asked_to() {
     // Where the app can't keep running at all, a close is a close.
     asked.borrow_mut().tray = None;
     assert!(!closed(&mut a).contains(&egui::ViewportCommand::CancelClose));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Ready while something else is asked: that question stays, and the bar says it instead.

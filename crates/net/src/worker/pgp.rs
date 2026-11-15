@@ -7,7 +7,9 @@
 use mailcraft_model::{PgpSignature, PgpWork, Private};
 use mailcraft_pgp as pgp;
 
+use super::credentials::unhex;
 use super::*;
+use crate::hex;
 
 /// The list of the account's keys' fingerprints (JSON), the one in use first.
 const LIST: &str = "pgp";
@@ -23,21 +25,6 @@ fn changing() -> std::sync::MutexGuard<'static, ()> {
 
 fn entry(fingerprint: &str) -> String {
     format!("{LIST}.{}", fingerprint.trim().to_lowercase())
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|p| u8::from_str_radix(p, 16).ok())).collect()
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| i64::try_from(d.as_secs()).unwrap_or(0)).unwrap_or(0)
 }
 
 /// The fingerprints of the account's keys, the one in use first.
@@ -188,68 +175,113 @@ fn keys_now(creds: &dyn Credentials, account: &AccountConfig, imported: Option<S
     }
 }
 
+/// What `work` comes to, on its thread: the event that answers it (`None` for a draft, sealed
+/// before any thread).
+fn work_on(creds: &dyn Credentials, account: &AccountConfig, work: PgpWork) -> Option<Event> {
+    Some(match work {
+        PgpWork::Import { file, passphrase } => match pgp::read_secret_key(&file.0, &passphrase.0) {
+            Ok(key) => {
+                let fp = key.info.fingerprint.clone();
+                keys_now(creds, account, Some(fp), take(creds, account, &key))
+            }
+            Err(e) => keys_now(creds, account, None, Err(e.to_string())),
+        },
+        PgpWork::Use { fingerprint } => keys_now(creds, account, None, use_key(creds, account, &fingerprint)),
+        PgpWork::Forget { fingerprint } => {
+            forget(creds, account, &fingerprint);
+            keys_now(creds, account, None, Ok(()))
+        }
+        PgpWork::Decrypt { key, data, inline, charset, verify_with } => match decrypt(creds, account, &data, inline, &charset, &verify_with) {
+            Ok((entity, signature)) => Event::PgpDecrypted { key, content: Some(Private(entity)), signature, error: None },
+            Err(e) => Event::PgpDecrypted { key, content: None, signature: None, error: Some(e) },
+        },
+        PgpWork::Protect { id, raw, sign, encrypt_to, hide_subject, signer } => {
+            let done = signing_key(creds, account, signer.as_deref()).and_then(|s| protect(&raw.0, &s, sign, &encrypt_to, hide_subject));
+            match done {
+                Ok(r) => Event::Protected { account: account.id.clone(), id, raw: Some(Private(r)), error: None },
+                Err(e) => Event::Protected { account: account.id.clone(), id, raw: None, error: Some(e) },
+            }
+        }
+        PgpWork::SealDraft { .. } => return None,
+    })
+}
+
 impl Pool {
     pub(super) fn pgp(&mut self, account: AccountConfig, work: PgpWork) {
         // A draft is sealed at once (it may be the last thing before MailCraft closes), then saved.
         if let PgpWork::SealDraft { raw, folder, replaces, keep } = work {
-            let sealed = list(self.creds.as_ref(), &account)
-                .first()
-                .ok_or_else(|| "there's no OpenPGP key".to_string())
-                .and_then(|fp| secret(self.creds.as_ref(), &account, fp))
-                .and_then(|s| {
-                    let me = pgp::read_secret_key(&s, "").map_err(|e| e.to_string())?;
-                    protect(&raw.0, &s, false, &[me.public], false)
-                });
-            let raw = match sealed {
-                Ok(s) => s,
-                Err(e) => {
-                    self.sink.emit(Event::Notice {
-                        account: account.id.clone(),
-                        message: format!("the draft couldn't be encrypted, so it's saved as it is: {e}"),
-                    });
-                    raw.0
-                }
-            };
-            let account = account.id;
-            self.submit(if keep { Job::KeepDraft { account, raw, folder, replaces } } else { Job::SaveDraft { account, raw, folder, replaces } });
-            return;
+            return self.seal_pgp_draft(&account, raw, folder, replaces, keep);
         }
-        let creds = self.creds.clone();
-        let sink = self.sink.clone();
-        let spawned = std::thread::Builder::new().name("mail-pgp".into()).spawn(move || {
-            let creds = creds.as_ref();
-            let event = match work {
-                PgpWork::Import { file, passphrase } => match pgp::read_secret_key(&file.0, &passphrase.0) {
-                    Ok(key) => {
-                        let fp = key.info.fingerprint.clone();
-                        keys_now(creds, &account, Some(fp), take(creds, &account, &key))
-                    }
-                    Err(e) => keys_now(creds, &account, None, Err(e.to_string())),
-                },
-                PgpWork::Use { fingerprint } => keys_now(creds, &account, None, use_key(creds, &account, &fingerprint)),
-                PgpWork::Forget { fingerprint } => {
-                    forget(creds, &account, &fingerprint);
-                    keys_now(creds, &account, None, Ok(()))
-                }
-                PgpWork::Decrypt { key, data, inline, charset, verify_with } => match decrypt(creds, &account, &data, inline, &charset, &verify_with)
-                {
-                    Ok((entity, signature)) => Event::PgpDecrypted { key, content: Some(Private(entity)), signature, error: None },
-                    Err(e) => Event::PgpDecrypted { key, content: None, signature: None, error: Some(e) },
-                },
-                PgpWork::Protect { id, raw, sign, encrypt_to, hide_subject, signer } => {
-                    let done = signing_key(creds, &account, signer.as_deref()).and_then(|s| protect(&raw.0, &s, sign, &encrypt_to, hide_subject));
-                    match done {
-                        Ok(r) => Event::Protected { account: account.id.clone(), id, raw: Some(Private(r)), error: None },
-                        Err(e) => Event::Protected { account: account.id.clone(), id, raw: None, error: Some(e) },
-                    }
-                }
-                PgpWork::SealDraft { .. } => return,
-            };
-            sink.emit(event);
+        let (creds, sink) = (self.creds.clone(), self.sink.clone());
+        let unstarted = Unstarted::of(&account.id, &work);
+        let spawned = super::routing::spawn("mail-pgp", move || {
+            if let Some(event) = work_on(creds.as_ref(), &account, work) {
+                sink.emit(event);
+            }
         });
         if let Err(e) = spawned {
             log::warn!("OpenPGP: {e}");
+            if let Some(event) = unstarted.answer(format!("OpenPGP: {e}")) {
+                self.sink.emit(event);
+            }
         }
+    }
+
+    /// A draft encrypted to the account's own key, then saved (or kept, `keep`). Without the key
+    /// it's saved as it is, and the user is told.
+    fn seal_pgp_draft(&mut self, account: &AccountConfig, raw: Private, folder: String, replaces: Option<mailcraft_model::MessageKey>, keep: bool) {
+        let sealed = list(self.creds.as_ref(), account)
+            .first()
+            .ok_or_else(|| "there's no OpenPGP key".to_string())
+            .and_then(|fp| secret(self.creds.as_ref(), account, fp))
+            .and_then(|s| {
+                let me = pgp::read_secret_key(&s, "").map_err(|e| e.to_string())?;
+                protect(&raw.0, &s, false, &[me.public], false)
+            });
+        let raw = match sealed {
+            Ok(s) => s,
+            Err(e) => {
+                self.sink.emit(Event::Notice {
+                    account: account.id.clone(),
+                    message: format!("the draft couldn't be encrypted, so it's saved as it is: {e}"),
+                });
+                raw.0
+            }
+        };
+        let account = account.id.clone();
+        self.submit(if keep { Job::KeepDraft { account, raw, folder, replaces } } else { Job::SaveDraft { account, raw, folder, replaces } });
+    }
+}
+
+/// What a job is answered with, noted before its work goes to its thread: given as its failure
+/// when the thread can't start, so nothing waits for an answer that never comes (a message to
+/// be sent waits for [`Event::Protected`]).
+enum Unstarted {
+    Keys(String),
+    Decrypted(mailcraft_model::MessageKey),
+    Protected(String, u64),
+    /// A draft is sealed before any thread.
+    Nothing,
+}
+
+impl Unstarted {
+    fn of(account: &str, work: &PgpWork) -> Unstarted {
+        match work {
+            PgpWork::Import { .. } | PgpWork::Use { .. } | PgpWork::Forget { .. } => Unstarted::Keys(account.to_string()),
+            PgpWork::Decrypt { key, .. } => Unstarted::Decrypted(key.clone()),
+            PgpWork::Protect { id, .. } => Unstarted::Protected(account.to_string(), *id),
+            PgpWork::SealDraft { .. } => Unstarted::Nothing,
+        }
+    }
+
+    fn answer(self, error: String) -> Option<Event> {
+        Some(match self {
+            // No keys said: the account's stay as they are.
+            Unstarted::Keys(account) => Event::PgpKeys { account, keys: Vec::new(), imported: None, error: Some(error) },
+            Unstarted::Decrypted(key) => Event::PgpDecrypted { key, content: None, signature: None, error: Some(error) },
+            Unstarted::Protected(account, id) => Event::Protected { account, id, raw: None, error: Some(error) },
+            Unstarted::Nothing => return None,
+        })
     }
 }
 

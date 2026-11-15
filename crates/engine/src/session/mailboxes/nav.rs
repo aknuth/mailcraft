@@ -45,6 +45,7 @@ pub(crate) struct ListNav {
     /// them out for each message opened cost a pass over the list every Down.
     kept: OnceLock<(Vec<Thread>, Vec<u32>)>,
     /// How many times the list's conversations were worked out (for tests).
+    #[cfg(test)]
     threadings: AtomicU64,
     /// Summaries copied out of the list ([`Session::selected`]): what's drawn each frame should
     /// copy none (a select-all copied every message, three times a frame).
@@ -168,8 +169,9 @@ impl ListNav {
         self.kept = OnceLock::new();
     }
 
-    /// The list's conversations were worked out once more.
+    /// The list's conversations were worked out once more (counted for tests).
     pub(super) fn threaded(&self) {
+        #[cfg(test)]
         self.threadings.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -245,19 +247,27 @@ impl Session {
     }
 
     /// The selected messages (in list order), copied. What's drawn each frame uses
-    /// [`Session::selected_iter`] or [`Session::first_selected`], which copy nothing.
+    /// [`Session::selected_iter`] or [`Session::first_selected`], which copy nothing; a command
+    /// [`Session::selected_shared`].
     pub fn selected(&self) -> Vec<Summary> {
-        let out: Vec<Summary> = if self.selection.len() < 8 {
+        let out: Vec<Summary> = self.selected_shared().iter().map(|m| Summary::clone(m)).collect();
+        self.nav.clones.fetch_add(u64::try_from(out.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        out
+    }
+
+    /// The selected messages (in list order), shared with the list: no summary copied, so a
+    /// command on all of a big folder's mail doesn't copy each one's addresses and preview
+    /// just to read its key and marks.
+    pub fn selected_shared(&self) -> Vec<SharedSummary> {
+        if self.selection.len() < 8 {
             let mut at: Vec<usize> = self.selection.iter().filter_map(|k| self.index_of(k)).collect();
             at.sort_unstable();
             at.dedup();
-            at.into_iter().filter_map(|i| self.list.get(i)).map(|m| Summary::clone(m)).collect()
+            at.into_iter().filter_map(|i| self.list.get(i)).cloned().collect()
         } else {
             let chosen: HashSet<&MessageKey> = self.selection.iter().collect();
-            self.list.iter().filter(|m| chosen.contains(&m.key)).map(|m| Summary::clone(m)).collect()
-        };
-        self.nav.clones.fetch_add(u64::try_from(out.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
-        out
+            self.list.iter().filter(|m| chosen.contains(&m.key)).cloned().collect()
+        }
     }
 
     /// The selected messages in the list, in the order they were selected, without copying them.

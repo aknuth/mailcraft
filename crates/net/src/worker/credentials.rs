@@ -5,6 +5,9 @@ use std::sync::Mutex;
 
 use mailcraft_model::AccountConfig;
 
+#[cfg(test)]
+mod tests;
+
 /// Where passwords live. The desktop app backs this with the system keychain.
 pub trait Credentials: Send + Sync {
     fn get(&self, account: &AccountConfig) -> Option<String>;
@@ -42,17 +45,15 @@ impl Credentials for MemoryCredentials {
             m.remove(&account.id);
         }
     }
+    // The outgoing server's password: the secret named `smtp`.
     fn get_smtp(&self, account: &AccountConfig) -> Option<String> {
-        self.0.lock().ok().and_then(|m| m.get(&format!("{}|smtp", account.id)).cloned())
+        self.get_secret(account, "smtp")
     }
     fn set_smtp(&self, account: &AccountConfig, password: &str) -> std::result::Result<(), String> {
-        self.0.lock().map_err(|e| e.to_string())?.insert(format!("{}|smtp", account.id), password.to_string());
-        Ok(())
+        self.set_secret(account, "smtp", password)
     }
     fn delete_smtp(&self, account: &AccountConfig) {
-        if let Ok(mut m) = self.0.lock() {
-            m.remove(&format!("{}|smtp", account.id));
-        }
+        self.delete_secret(account, "smtp");
     }
     fn get_secret(&self, account: &AccountConfig, what: &str) -> Option<String> {
         self.0.lock().ok().and_then(|m| m.get(&format!("{}|{what}", account.id)).cloned())
@@ -68,6 +69,24 @@ impl Credentials for MemoryCredentials {
     }
 }
 
+/// The bytes a keychain entry keeps as hex ([`crate::hex`]: a key's secret part, a certificate)
+/// back, either case; `None` for anything else.
+pub(super) fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|p| u8::from_str_radix(p, 16).ok())).collect()
+}
+
+impl super::Sink {
+    /// Says a password (`what`: "the password", "the outgoing server's password"…) couldn't be
+    /// saved in the keychain, and why.
+    pub(super) fn not_kept(&self, account: &str, what: &str, error: &str) {
+        let message = format!("{what} could not be saved in the keychain: {error}");
+        self.emit(mailcraft_model::job::Event::Notice { account: account.to_string(), message });
+    }
+}
+
 impl super::Worker {
     /// Before the account's thread first connects, on that thread: the password just given kept
     /// in the keychain, or the one kept there read. The keychain may ask the user first (macOS
@@ -80,10 +99,7 @@ impl super::Worker {
         let password = match given {
             Some(p) => {
                 if let Err(e) = creds.set(&self.acc, &p) {
-                    self.sink.emit(mailcraft_model::job::Event::Notice {
-                        account: self.acc.id.clone(),
-                        message: format!("the password could not be saved in the keychain: {e}"),
-                    });
+                    self.sink.not_kept(&self.acc.id, "the password", &e);
                 }
                 p
             }
@@ -96,9 +112,7 @@ impl super::Worker {
                 }
             },
         };
-        if let Ok(mut a) = self.auth.lock() {
-            a.secret = password;
-        }
+        super::Auth::held(&self.auth).secret = password;
         if let Some(start) = self.quick_start.take() {
             start();
         }

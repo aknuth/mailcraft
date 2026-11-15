@@ -16,9 +16,11 @@
 //! leave the file within a day of it); for [`TIER_MERGE`] segments of a size (by powers of 4
 //! docs); and past [`MAX_LIVE_SEGMENTS`] segments.
 
+use std::sync::Arc;
+
 use mailcraft_model::search::TOKENIZER_VERSION;
 
-use super::super::format::{LexEntry, LexStream, PosAt, Postings, SegPage, decode_blob, decode_pos_page, decode_post_page, decode_postings};
+use super::super::format::{LexEntry, LexStream, PosAt, Postings, Run, SegPage, decode_blob, decode_postings};
 use super::*;
 
 /// How long (seconds) the words of a removed doc may stay in a segment.
@@ -81,9 +83,9 @@ struct Input {
     /// Its word now.
     word: Option<LexEntry>,
     /// The postings page last read.
-    post: Option<(u32, Vec<u8>)>,
+    post: Option<(u32, Arc<Vec<u8>>)>,
     /// The places page last read.
-    places: Option<(u32, Vec<u8>)>,
+    places: Option<(u32, Arc<Vec<u8>>)>,
 }
 
 impl Input {
@@ -91,7 +93,8 @@ impl Input {
         Input { info, next_page: 0, page: None, word: None, post: None, places: None }
     }
 
-    /// What it holds in memory.
+    /// What it holds in memory (the tests' count of a merge's peak).
+    #[cfg(test)]
     fn held(&self) -> usize {
         let word = self.word.as_ref().map_or(0, |e| e.key.len() + if let Postings::Inline(d) = &e.at { d.len() * 4 } else { 0 });
         let page = self.page.as_ref().map_or(0, LexStream::held);
@@ -128,28 +131,8 @@ impl Input {
             Postings::Inline(docs) => return Ok(docs.clone()),
             &Postings::At { page, offset, len } => (page, offset as usize, len as usize),
         };
-        let mut bytes: Vec<u8> = Vec::with_capacity(len.min(16 << 20));
-        let (mut p, mut from) = (page, offset);
+        let bytes = Run::Postings.read(base, &self.info, (page, offset, len), |p, path| hold(store, &mut self.post, p, path))?;
         let first = Name::SegPost(self.info.id, page).path(base);
-        while bytes.len() < len {
-            let path = Name::SegPost(self.info.id, p).path(base);
-            if p >= self.info.post_pages {
-                return Err(damaged(&path, "postings past the segment"));
-            }
-            if self.post.as_ref().map(|(n, _)| *n) != Some(p) {
-                self.post = None;
-                self.post = Some((p, need_file(store, &path).map_err(|e| missing(&path, e))?));
-            }
-            let raw = self.post.as_ref().map(|(_, r)| r.as_slice()).unwrap_or_default();
-            let data = decode_post_page(raw).map_err(|what| damaged(&path, what))?;
-            let rest = data.get(from..).ok_or_else(|| damaged(&path, "postings past the page"))?;
-            let want = (len - bytes.len()).min(rest.len());
-            if want == 0 {
-                return Err(damaged(&path, "postings past the page"));
-            }
-            bytes.extend_from_slice(rest.get(..want).unwrap_or_default());
-            (p, from) = (p.saturating_add(1), 0);
-        }
         decode_postings(&bytes, e.df, next_doc).map_err(|what| damaged(&first, what))
     }
 
@@ -157,29 +140,21 @@ impl Input {
     fn places(&mut self, store: &Store, base: &Path, at: PosAt) -> Result<Vec<u8>> {
         let first = Name::SegPos(self.info.id, at.page).path(base);
         let len = usize::try_from(at.len).map_err(|_| damaged(&first, "places too long"))?;
-        let mut bytes: Vec<u8> = Vec::with_capacity(len.min(16 << 20));
-        let (mut p, mut from) = (at.page, at.offset as usize);
-        while bytes.len() < len {
-            let path = Name::SegPos(self.info.id, p).path(base);
-            if p >= self.info.pos_pages {
-                return Err(damaged(&path, "places past the segment"));
-            }
-            if self.places.as_ref().map(|(n, _)| *n) != Some(p) {
-                self.places = None;
-                self.places = Some((p, need_file(store, &path).map_err(|e| missing(&path, e))?));
-            }
-            let raw = self.places.as_ref().map(|(_, r)| r.as_slice()).unwrap_or_default();
-            let data = decode_pos_page(raw).map_err(|what| damaged(&path, what))?;
-            let rest = data.get(from..).ok_or_else(|| damaged(&path, "places past the page"))?;
-            let want = (len - bytes.len()).min(rest.len());
-            if want == 0 {
-                return Err(damaged(&path, "places past the page"));
-            }
-            bytes.extend_from_slice(rest.get(..want).unwrap_or_default());
-            (p, from) = (p.saturating_add(1), 0);
-        }
-        Ok(bytes)
+        Run::Places.read(base, &self.info, (at.page, at.offset as usize, len), |p, path| hold(store, &mut self.places, p, path))
     }
+}
+
+/// Page `p` (at `path`) of a segment being merged: the one held, or read in its place.
+fn hold(store: &Store, held: &mut Option<(u32, Arc<Vec<u8>>)>, p: u32, path: &Path) -> Result<Arc<Vec<u8>>> {
+    if let Some((n, page)) = held.as_ref()
+        && *n == p
+    {
+        return Ok(page.clone());
+    }
+    *held = None;
+    let page = Arc::new(need_file(store, path).map_err(|e| missing(path, e))?);
+    *held = Some((p, page.clone()));
+    Ok(page)
 }
 
 /// The writer is held: a file the meta names and isn't there is damage.
@@ -199,18 +174,24 @@ impl Writer {
             return Ok(false);
         }
         let budget = budget.clamp(LEX_PAGE, BACKGROUND_COMMIT);
-        match self.due(now) {
-            Some(Due::Renumber) => self.renumber(store, budget)?,
-            Some(Due::Merge(segs)) => self.merge(store, &segs, budget, now)?,
+        // The doc table looked through once a step: the merge says what it leaves.
+        let dead = self.tombstones();
+        let left = match self.due(now, &dead) {
+            Some(Due::Renumber) => {
+                // Only the live docs are given ids: no removed doc is left.
+                self.renumber(store, budget)?;
+                Vec::new()
+            }
+            Some(Due::Merge(segs)) => self.merge(store, &segs, dead, budget, now)?,
             None => {
-                let since = self.dead_since(&self.meta.segments, &self.tombstones(), now);
+                let since = self.dead_since(&self.meta.segments, &dead, now);
                 if since != self.meta.dead_since {
                     self.write_since(store, since)?;
                 }
                 return Ok(false);
             }
-        }
-        Ok(self.due(now).is_some())
+        };
+        Ok(self.due(now, &left).is_some())
     }
 
     #[cfg(not(test))]
@@ -241,16 +222,16 @@ impl Writer {
         }
     }
 
-    fn due(&self, now: u64) -> Option<Due> {
+    /// What's due, `dead` the [`tombstones`](Writer::tombstones).
+    fn due(&self, now: u64, dead: &[u32]) -> Option<Due> {
         let (next, live) = (self.docs.len() as u64, u64::from(self.live));
         if next > live.saturating_mul(2).saturating_add(u64::from(self.renumber_slack())) {
             return Some(Due::Renumber);
         }
         let segs = &self.meta.segments;
-        let dead = self.tombstones();
         let since = self.meta.dead_since;
         if since != 0 && now.saturating_sub(since) >= TOMBSTONE_AGE {
-            let holding: Vec<usize> = segs.iter().enumerate().filter(|(_, s)| holds(&dead, s)).map(|(i, _)| i).collect();
+            let holding: Vec<usize> = segs.iter().enumerate().filter(|(_, s)| holds(dead, s)).map(|(i, _)| i).collect();
             if !holding.is_empty() {
                 return Some(Due::Merge(smallest(segs, holding, MAX_MERGE)));
             }
@@ -270,27 +251,26 @@ impl Writer {
 
     /// The meta again, a removed doc's words first seen in a segment (or none left) since `since`.
     fn write_since(&mut self, store: &Store, since: u64) -> Result<()> {
-        let mut meta = Meta { gone: Vec::new(), dead_since: since, ..self.meta.clone() };
-        meta.generation = meta.generation.checked_add(1).ok_or_else(|| damaged(&self.base, "no generations left"))?;
-        self.write_meta(store, &meta, &self.meta.gone)?;
+        let meta = Meta { dead_since: since, ..self.next_meta()? };
+        self.switch_to(store, &meta)?;
         self.meta = meta;
         self.stamp = self.stamp.wrapping_add(1);
         Ok(())
     }
 
-    /// Merge these segments into one, the words of removed docs left out.
-    fn merge(&mut self, store: &Store, segs: &[usize], budget: usize, now: u64) -> Result<()> {
+    /// Merge these segments into one, the words of removed docs (`dead`, the
+    /// [`tombstones`](Writer::tombstones)) left out. The tombstones it leaves.
+    fn merge(&mut self, store: &Store, segs: &[usize], dead: Vec<u32>, budget: usize, now: u64) -> Result<Vec<u32>> {
         let next_doc = self.meta.next_doc;
         let base = self.base.clone();
         let mut inputs: Vec<Input> = segs.iter().filter_map(|&i| self.meta.segments.get(i).copied()).map(Input::new).collect();
-        let id = self.meta.next_seg;
-        let mut meta = Meta { gone: Vec::new(), ..self.meta.clone() };
-        meta.generation = meta.generation.checked_add(1).ok_or_else(|| damaged(&base, "no generations left"))?;
-        meta.next_seg = id.checked_add(1).ok_or_else(|| damaged(&base, "no segment ids left"))?;
+        let mut meta = self.next_meta()?;
+        let id = self.take_seg_id(&mut meta)?;
         self.orphans = true;
         let mut b = SegBuilder::default();
         let mut seen = Bits::new(next_doc);
         let mut last: Option<Vec<u8>> = None;
+        #[cfg(test)]
         let mut peak = 0usize;
         loop {
             // The lowest word now, and its docs in every segment that has it.
@@ -316,11 +296,16 @@ impl Writer {
                 };
                 lists.push((docs, places));
             }
+            // What it holds at most, as the tests count it.
+            #[cfg(test)]
             let listed = lists.iter().map(|(d, p)| d.len() * 4 + p.as_ref().map_or(0, Vec::len)).fold(0, usize::saturating_add);
             let live = |d: u32| self.docs.get(d as usize).is_some_and(DocRec::live);
             let merged = merge_lists(&key, lists, live).map_err(|what| damaged(&base, what))?;
-            let held = inputs.iter().map(Input::held).fold(b.held(), usize::saturating_add);
-            peak = peak.max(held.saturating_add(listed).saturating_add(merged.docs.len() * 4 + merged.places.len()));
+            #[cfg(test)]
+            {
+                let held = inputs.iter().map(Input::held).fold(b.held(), usize::saturating_add);
+                peak = peak.max(held.saturating_add(listed).saturating_add(merged.docs.len() * 4 + merged.places.len()));
+            }
             if !merged.docs.is_empty() {
                 for &d in &merged.docs {
                     seen.set(d);
@@ -347,7 +332,6 @@ impl Writer {
             self.seg_files(id, seg, &mut files);
             self.write_batches(store, files)?;
         }
-        let dead = self.tombstones();
         let (purged, kept): (Vec<u32>, Vec<u32>) = dead.into_iter().partition(|&d| !within(&left, d));
         let mut files = Vec::new();
         let mut pages: BTreeSet<usize> = purged.iter().map(|&d| (d / DOCS_PER_PAGE) as usize).collect();
@@ -372,12 +356,7 @@ impl Writer {
         }
         self.write_batches(store, files)?;
         meta.dead_since = self.dead_since(&meta.segments, &kept, now);
-        #[cfg(test)]
-        if self.stop_before_meta {
-            return Err(io_err(&self.base)(other("stopped before the meta")));
-        }
-        let gone: Vec<Name> = self.meta.gone.iter().chain(&meta.gone).copied().collect();
-        self.write_meta(store, &meta, &gone)?;
+        self.switch_to(store, &meta)?;
         for d in purged {
             if let Some(r) = self.docs.get_mut(d as usize) {
                 r.bits |= PURGED;
@@ -390,9 +369,7 @@ impl Writer {
         {
             self.merge_peak = peak;
         }
-        #[cfg(not(test))]
-        let _ = peak;
-        Ok(())
+        Ok(kept)
     }
 
     fn write_pages(&self, store: &Store, id: u32, pages: Vec<SegPage>) -> Result<()> {
@@ -416,18 +393,18 @@ impl Writer {
             doc_pages: Vec::new(),
             text_pages: Vec::new(),
             segments: Vec::new(),
-            gone: Vec::new(),
             dead: 0,
             dead_since: 0,
-            ..self.meta.clone()
+            ..self.next_meta()?
         };
-        meta.generation = meta.generation.checked_add(1).ok_or_else(|| damaged(&self.base, "no generations left"))?;
         let generation = meta.generation;
         self.orphans = true;
         let mut docs: Vec<DocRec> = Vec::with_capacity(self.live as usize);
         let mut files: Vec<(PathBuf, Prepared)> = Vec::new();
+        // What `files` keeps, in bytes.
+        let mut pending = 0usize;
         let mut page: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut page_bytes = 0usize;
+        let mut packer = TextPacker::default();
         let mut read: Option<(u32, Vec<(u32, Vec<u8>)>)> = None;
         let mut words = BTreeMap::new();
         let (mut word_bytes, mut word_docs) = (0usize, 0u32);
@@ -439,21 +416,20 @@ impl Writer {
                     read.take();
                     read = Some((d.text, self.read_text_page(store, d.text)?));
                 }
-                let path =
-                    Name::Text { generation: self.meta.text_pages.get(d.text as usize).map_or(0, |t| t.generation), page: d.text }.path(&self.base);
                 let recs = read.as_ref().map(|(_, r)| r.as_slice()).unwrap_or_default();
                 let old = u32::try_from(old).unwrap_or(u32::MAX);
                 let blob = recs.binary_search_by_key(&old, |(doc, _)| *doc).ok().and_then(|i| recs.get(i)).map(|(_, b)| b);
-                let blob = blob.ok_or_else(|| damaged(&path, "a doc's text isn't in its page"))?;
-                let text = decode_blob(blob).map_err(|what| damaged(&path, what))?;
+                let blob = blob.ok_or_else(|| damaged(&self.text_path(d.text), "a doc's text isn't in its page"))?;
+                let text = decode_blob(blob).map_err(|what| damaged(&self.text_path(d.text), what))?;
                 word_bytes = word_bytes.saturating_add(add_words(&mut words, new, &text.text, &text.names));
                 word_docs = word_docs.saturating_add(1);
-                if !page.is_empty() && (page_bytes.saturating_add(blob.len() + 8) > TEXT_PAGE || page.len() >= usize::from(u16::MAX)) {
+                if packer.full(blob.len()) {
                     self.close_text_page(&mut meta, std::mem::take(&mut page), &mut files);
-                    page_bytes = 0;
+                    pending = pending.saturating_add(files.last().map_or(0, |(_, p)| p.kept_len()));
+                    packer = TextPacker::default();
                 }
                 rec.text = u32::try_from(meta.text_pages.len()).map_err(|_| damaged(&self.base, "too many text pages"))?;
-                page_bytes = page_bytes.saturating_add(blob.len() + 8);
+                packer.put(blob.len());
                 page.push((new, blob.clone()));
             }
             docs.push(rec);
@@ -461,8 +437,9 @@ impl Writer {
                 self.write_segment(store, &mut meta, std::mem::take(&mut words), word_docs)?;
                 (word_bytes, word_docs) = (0, 0);
             }
-            if files.iter().map(|(_, p)| p.kept_len()).fold(0, usize::saturating_add) >= budget {
+            if pending >= budget {
                 self.write_batches(store, std::mem::take(&mut files))?;
+                pending = 0;
             }
         }
         if !page.is_empty() {
@@ -477,10 +454,7 @@ impl Writer {
         self.write_batches(store, files)?;
         let n = u32::try_from(docs.len()).map_err(|_| damaged(&self.base, "no doc ids left"))?;
         (meta.next_doc, meta.live) = (n, n);
-        #[cfg(test)]
-        if self.stop_before_meta {
-            return Err(io_err(&self.base)(other("stopped before the meta")));
-        }
+        // Every file of the generation before goes: the meta switched to names none of them.
         let gone: Vec<Name> = self.meta.uses().into_iter().chain(self.meta.gone.iter().copied()).collect();
         self.write_meta(store, &meta, &gone)?;
         self.by_key = by_key(&docs);

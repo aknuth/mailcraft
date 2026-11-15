@@ -1,3 +1,55 @@
+use super::*;
+
+mod find;
+mod kept;
+mod meeting;
+mod notes;
+mod occurring;
+mod showing;
+mod tasks;
+mod zones;
+
+/// Found in the audit: a uid or a text with a control character was written raw, which RFC
+/// 5545 doesn't allow; a server (Radicale) stored the uid without it, and the one kept here was
+/// never found there. What's written leaves them out (HTAB stays), a server's copy has the uid
+/// without them, and it's looked for there so ([`stored_uid`]). An event's uid is kept as it
+/// came all the same, and a file or a message has it so: an organizer who looks for their
+/// meeting by the uid they wrote finds it in the answer.
+#[test]
+fn a_control_character_is_not_written_and_a_uid_is_echoed_as_it_came() {
+    let e = CalEvent {
+        uid: "probe\u{1}two".into(),
+        summary: "Hi\u{1}\tthere\u{7f}".into(),
+        start: 1_800_000_000,
+        end: 1_800_003_600,
+        ..Default::default()
+    };
+    let text = write_for_server(std::slice::from_ref(&e), 0);
+    assert!(!text.contains(|c: char| c.is_ascii_control() && !matches!(c, '\t' | '\r' | '\n')), "{text:?}");
+    let back = parse(&text, 0).events;
+    assert_eq!((back[0].uid.as_str(), back[0].summary.as_str()), ("probetwo", "Hi\tthere"));
+    // An invitation that brings one: kept as it came, and the answer has it byte for byte (a
+    // long one too, folded); the server's copy has it as a line may hold it, and is found by that.
+    for odd in ["probe\u{1}two\u{1b}".to_string(), format!("{}\u{1}\u{7f}{}", "a".repeat(80), "é".repeat(40))] {
+        let invitation = text.replace("UID:probetwo", &format!("UID:{odd}"));
+        let kept = parse(&invitation, 0).events.remove(0);
+        assert_eq!(kept.uid, odd);
+        let reply = write(std::slice::from_ref(&kept), Some("REPLY"), 0);
+        assert_eq!(parse(&reply, 0).events[0].uid, odd, "{reply:?}");
+        assert!(reply.replace("\r\n ", "").contains(&format!("\r\nUID:{odd}\r\n")), "{reply:?}");
+        let stored = write_for_server(std::slice::from_ref(&kept), 0);
+        assert!(!stored.contains(|c: char| c.is_ascii_control() && !matches!(c, '\t' | '\r' | '\n')), "{stored:?}");
+        assert!(parse(&stored, 0).events.iter().any(|x| x.uid == stored_uid(&kept.uid)), "{stored}");
+    }
+    assert_eq!((stored_uid(" a\u{0}b \u{7f}"), stored_uid("x\ty")), ("ab".to_string(), "x\ty".to_string()));
+    // A line kept as written that would end the event once its control is left out: left out.
+    let odd = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:o\r\nDTSTART:20261102T090000Z\r\nEND:VEVENT\u{1}\r\nX-AFTER:kept\r\nSUMMARY:Odd\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let o = parse(odd, 0).events.remove(0);
+    let back = parse(&write_for_server(std::slice::from_ref(&o), 0), 0).events;
+    assert_eq!(back.len(), 1);
+    assert_eq!((back[0].summary.as_str(), back[0].extra.contains(&"X-AFTER:kept".to_string())), ("Odd", true));
+}
+
 /// Issue #1: a Google invitation as Exchange makes it text reads as it does in Outlook: each
 /// `words<address>` is a link named by its words, an address alone on its line is a link of
 /// its own, phone links stay text, and nothing else changes.
@@ -118,14 +170,6 @@ fn an_events_links_and_the_one_that_joins_it() {
     assert!(links_in("https://").is_empty() && links_in("http://x").is_empty());
 }
 
-use super::*;
-
-mod find;
-mod meeting;
-mod showing;
-mod tasks;
-mod zones;
-
 fn at(y: i64, m: u32, d: u32, h: i64, mi: i64) -> i64 {
     days_from_civil(y, m, d) * 86_400 + h * 3600 + mi * 60
 }
@@ -180,19 +224,25 @@ fn reads_an_invitation() {
     assert_eq!(parse(&winter, 0).events[0].start, at(2026, 12, 15, 13, 0));
 }
 
-/// A big calendar expands in one pass: the moved occurrences are gathered once, not looked
-/// for again for every event.
-#[test]
-fn a_big_calendar_expands_quickly() {
+/// Thirty thousand events, and a daily series with one occurrence moved.
+fn big_calendar() -> Vec<CalEvent> {
     let day = 86_400;
     let mut events: Vec<CalEvent> = (0..30_000)
         .map(|n| CalEvent { uid: format!("e{n}"), summary: format!("{n}"), start: n * 3600, end: n * 3600 + 1800, ..Default::default() })
         .collect();
     events.push(CalEvent { uid: "s".into(), start: 0, end: 600, rrule: Some("FREQ=DAILY".into()), ..Default::default() });
     events.push(CalEvent { uid: "s".into(), recurrence_id: Some(2 * day), start: 2 * day + 60, end: 2 * day + 660, ..Default::default() });
-    let took = std::time::Instant::now();
-    let got = occurrences(&events, 0, 4 * day);
-    assert!(took.elapsed() < std::time::Duration::from_secs(5), "{:?}", took.elapsed());
+    events
+}
+
+/// A big calendar expands in one pass: the moved occurrences are gathered once, not looked
+/// for again for every event. The events looked at are counted, held in proportion to the
+/// calendar whatever the machine's load.
+#[test]
+fn a_big_calendar_expands_quickly() {
+    let day = 86_400;
+    let events = big_calendar();
+    let got = crate::work::linear(events.len(), || occurrences(&events, 0, 4 * day));
     let series: Vec<i64> = got.iter().filter(|o| events[o.event].uid == "s").map(|o| o.start).collect();
     assert_eq!(series, [0, day, 2 * day + 60, 3 * day]);
     assert_eq!(got.len(), 96 + 4);
@@ -243,6 +293,71 @@ fn reminders_from_and_to_alarms() {
     set_reminder(&mut ev, Some(45));
     let back = parse(&write(&[ev], None, 1_800_000_000), 0).events;
     assert_eq!(back.first().and_then(reminder_minutes), Some(45));
+}
+
+/// An event's alarms are the ones reading takes for its own: however their `BEGIN` and `END` are
+/// written, with their lines read whole (a quoted parameter may hold a colon), and not one
+/// nested in another component the event holds.
+#[test]
+fn alarms_are_found_as_reading_finds_them() {
+    let with = |lines: &[&str]| CalEvent { start: 1_800_000_000, extra: lines.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+    let spaced = ["X-KEEP:1", "BEGIN: valarm", "TRIGGER:-PT20M", "end:valarm"];
+    assert_eq!(reminder_minutes(&with(&spaced)), Some(20));
+    let mut e = with(&spaced);
+    set_reminder(&mut e, None);
+    assert_eq!(e.extra, ["X-KEEP:1"]);
+    let mut e = with(&spaced);
+    acknowledge(&mut e, 1_800_000_000);
+    assert_eq!(acknowledged(&e), Some(1_800_000_000));
+    // A colon in a quoted parameter.
+    assert_eq!(reminder_minutes(&with(&["BEGIN:VALARM", "TRIGGER;X-NOTE=\"a:b\":-PT15M", "END:VALARM"])), Some(15));
+    assert_eq!(acknowledged(&with(&["BEGIN:VALARM", "ACKNOWLEDGED;X-BY=\"app:1\":20261101T000000Z", "END:VALARM"])), Some(at(2026, 11, 1, 0, 0)));
+    // An alarm in another component isn't the event's.
+    let nested = ["BEGIN:X-PART", "BEGIN:VALARM", "TRIGGER:-PT5M", "END:VALARM", "END:X-PART"];
+    assert_eq!(reminder_minutes(&with(&nested)), None);
+    let mut e = with(&nested);
+    set_reminder(&mut e, Some(10));
+    assert_eq!(e.extra.get(..5), Some(&with(&nested).extra[..]), "kept: {:?}", e.extra);
+    assert_eq!(reminder_minutes(&e), Some(10));
+    // A snooze alarm goes on acknowledging, its acknowledgement replaced; one left open stays.
+    let mut e = with(&[
+        "BEGIN:VALARM",
+        "TRIGGER:-PT5M",
+        "ACKNOWLEDGED:20261101T000000Z",
+        "END:VALARM",
+        "BEGIN:VALARM",
+        "RELATED-TO;RELTYPE=snooze:x",
+        "END:VALARM",
+        "BEGIN:VALARM",
+        "TRIGGER:-PT1M",
+    ]);
+    acknowledge(&mut e, at(2026, 11, 2, 0, 0));
+    assert_eq!(e.extra, ["BEGIN:VALARM", "TRIGGER:-PT5M", "ACKNOWLEDGED:20261102T000000Z", "END:VALARM", "BEGIN:VALARM", "TRIGGER:-PT1M"]);
+}
+
+/// An event from a damaged cache, starting at the end of time, is written without overflowing.
+#[test]
+fn an_event_at_the_end_of_time_is_written() {
+    for (all_day, tzid) in [(true, ""), (false, ""), (false, "Europe/Berlin"), (false, "Nowhere/Made-up")] {
+        for start in [i64::MAX - 10, i64::MIN + 10] {
+            let e = CalEvent { uid: "far".into(), start, end: 0, all_day, tzid: tzid.into(), ..Default::default() };
+            let text = write(std::slice::from_ref(&e), None, 0) + &write_for_server(&[e], 0);
+            assert!(text.contains("UID:far") && text.contains("DTEND"), "{text}");
+        }
+    }
+}
+
+/// A component begun with spaces round its name (`BEGIN: valarm`, which reading takes) is written
+/// back as servers take it.
+#[test]
+fn a_component_s_beginning_is_written_plainly() {
+    let cal = parse(
+        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:sp\r\nDTSTART:20261103T090000Z\r\nBEGIN: valarm \r\nTRIGGER:-PT5M\r\nEND:valarm\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        0,
+    );
+    let text = write_for_server(&cal.events, 0);
+    assert!(text.contains("\r\nBEGIN:valarm\r\nTRIGGER:-PT5M\r\nEND:valarm\r\n"), "{text}");
+    assert_eq!(parse(&text, 0).events.first().and_then(reminder_minutes), Some(5));
 }
 
 #[test]
@@ -305,7 +420,7 @@ fn recurrences() {
     let e = mk("FREQ=DAILY", mon);
     assert_eq!(starts(&e, mon + 10 * 86_400).len(), 10);
     // An endless secondly rule stops at the cap of occurrences.
-    assert_eq!(starts(&mk("FREQ=SECONDLY", mon), i64::MAX).len(), MAX_OCCURRENCES * 10);
+    assert_eq!(starts(&mk("FREQ=SECONDLY", mon), i64::MAX).len(), MAX_STARTS);
     assert!(starts(&mk("FREQ=DAILY;BYMONTH=13", mon), mon + 400 * 86_400).len() <= 400);
     // RFC 5545's own: every other week on Tuesday and Sunday from Tuesday 5 August 1997, weeks
     // starting on Sunday, then on Monday (the day when none is said).
@@ -460,4 +575,40 @@ fn a_calendar_is_read_to_its_limit_at_a_character_s_start() {
     text.push_str("\r\nBEGIN:VEVENT\r\nUID:b\r\nDTSTART:20261103T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
     let uids: Vec<String> = parse(&text, 0).events.into_iter().map(|e| e.uid).collect();
     assert_eq!(uids, ["a"]);
+}
+
+/// Notes full of addresses that aren't kept (no dot in the host), or of closing brackets after
+/// one, are read in one pass: each address not kept had both schemes searched for again over the
+/// rest of the text, and each bracket had the link's brackets counted again.
+/// The bytes looked through are counted, held in proportion to the notes.
+#[test]
+fn notes_full_of_addresses_are_read_at_once() {
+    let (notes, brackets) = notes_full_of_addresses();
+    assert_eq!(crate::work::linear(notes.len(), || links_in(&notes)), ["https://studio.example/plan"]);
+    assert_eq!(crate::work::linear(brackets.len(), || links_in(&brackets)), ["https://studio.example/x"]);
+}
+
+/// Notes of addresses that aren't kept, then one that is; and a link followed by closing
+/// brackets.
+fn notes_full_of_addresses() -> (String, String) {
+    let mut notes = "https://a ".repeat(100_000);
+    notes.push_str("then https://studio.example/plan");
+    (notes, format!("See https://studio.example/x{}", ")".repeat(200_000)))
+}
+
+/// How long a big calendar and those notes take: `cargo test --release -p mailcraft-model --lib
+/// how_long_big_calendars_take -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: run in release"]
+fn how_long_big_calendars_take() {
+    let took = |what: &str, f: &dyn Fn()| {
+        let started = std::time::Instant::now();
+        f();
+        println!("MEASURE {what}: {} ms", started.elapsed().as_millis());
+    };
+    let events = big_calendar();
+    took("30,000 events expanded", &|| drop(occurrences(&events, 0, 4 * 86_400)));
+    let (notes, brackets) = notes_full_of_addresses();
+    took("100,000 addresses not kept", &|| drop(links_in(&notes)));
+    took("200,000 closing brackets", &|| drop(links_in(&brackets)));
 }

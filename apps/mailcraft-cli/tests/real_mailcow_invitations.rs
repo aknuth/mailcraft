@@ -27,13 +27,8 @@ const MARK: &str = "Mailcow meeting";
 
 /// Take out what an earlier run left in ann's and bob's calendars and Inboxes.
 fn clean(m: &Mailcow) {
+    m.clean_calendars(&[0, 1], MARK);
     for n in [0, 1] {
-        let cal = format!("{}personal/", m.dav_home(n));
-        for (href, data) in m.calendar(n, &cal) {
-            if data.contains(&format!("SUMMARY:{MARK}")) {
-                m.dav(n, "DELETE", &format!("{}{href}", m.web), None, "");
-            }
-        }
         let mut imap = m.imap_as(n);
         for folder in ["INBOX", "Trash"] {
             imap.cmd(&format!("SELECT {folder}"));
@@ -57,11 +52,10 @@ fn wait_subjects(m: &Mailcow, n: usize, folder: &str, what: &str, ok: impl Fn(&[
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a Mailcow on this computer in MAILCRAFT_REAL_MAILCOW"]
 fn real_mailcow_invitations_between_two_users() {
     let Some(m) = Mailcow::from_env() else { return };
     clean(&m);
-    let (ann_email, _) = m.user(0);
     let (bob_email, _) = m.user(1);
     let web = format!("{}/", m.web);
     let target = m.web.trim_start_matches("http://").to_string();
@@ -236,6 +230,5 @@ fn real_mailcow_invitations_between_two_users() {
         m.calendar(1, &format!("{}personal/", m.dav_home(1))).into_iter().filter(|(_, d)| d.contains(&uid2)).map(|x| x.1).collect();
     assert_eq!(in_sogo.len(), 1, "{in_sogo:?}");
     assert!(in_sogo[0].contains("PARTSTAT=TENTATIVE"), "{}", in_sogo[0]);
-    let _ = ann_email;
     clean(&m);
 }

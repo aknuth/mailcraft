@@ -1,4 +1,5 @@
 use super::*;
+use crate::fakes::measure::peak_working_set;
 
 #[test]
 fn answers_are_read_carefully() {
@@ -15,6 +16,8 @@ fn answers_are_read_carefully() {
     );
     let ms = messages(&doc);
     assert_eq!(ms.len(), 2);
+    assert_eq!(format!("{:?}", into_messages(doc.clone())), format!("{ms:?}"), "the same messages, moved out");
+    assert!(into_messages(parse("<a><Body><b/></Body></a>")).is_empty() && into_messages(El::default()).is_empty());
     assert!(check_message(ms[0]).is_ok());
     assert!(matches!(check_message(ms[1]), Err(NetError::No(m)) if m.contains("not found")));
     let it = ms[0].find("Message").unwrap();
@@ -46,21 +49,129 @@ fn answers_are_read_carefully() {
     assert_eq!(esc("a<b&\"c\u{1}"), "a&lt;b&amp;&quot;c");
 }
 
+/// Audit #112: a big message's source downloaded (60 MB, 80 MB of base64 in the answer), from a
+/// server whose answer is made before the clock starts: how long it takes and how far the
+/// process's peak memory grows, the source byte for byte. Run alone, in release:
+/// `cargo test --release -p mailcraft-net --lib a_big_source_downloads -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn a_big_source_downloads() {
+    use std::io::{BufRead, Read, Write};
+    let line = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit 0123\r\n";
+    let raw: Vec<u8> = line.iter().copied().cycle().take(60 << 20).collect();
+    // The answer made a piece at a time, so making it doesn't set the peak.
+    let (head, tail) = (
+        "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"s\"><s:Body><m:GetItemResponse xmlns:m=\"m\" xmlns:t=\"t\"><m:ResponseMessages>\
+         <m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message><t:ItemId Id=\"I1\"/>\
+         <t:MimeContent CharacterSet=\"UTF-8\">",
+        "</t:MimeContent></t:Message></m:Items></m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse></s:Body></s:Envelope>",
+    );
+    let len = head.len() + raw.len().div_ceil(3) * 4 + tail.len();
+    let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {len}\r\n\r\n{head}").into_bytes();
+    answer.reserve(len);
+    for piece in raw.chunks(3 << 20) {
+        answer.extend_from_slice(base64::encode(piece).as_bytes());
+    }
+    answer.extend_from_slice(tail.as_bytes());
+    let answer = std::sync::Arc::new(answer);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/EWS/Exchange.asmx", l.local_addr().unwrap().port());
+    let served = answer.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            loop {
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if h == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut req = vec![0; len];
+                r.read_exact(&mut req).unwrap();
+                s.write_all(&served).unwrap();
+            }
+        }
+    });
+    let c = Client::new(&url, "u", "p", "riley@contoso.example").unwrap();
+    let mut times = Vec::new();
+    let mut growth = None;
+    for round in 0..12 {
+        let before = peak_working_set();
+        let t = std::time::Instant::now();
+        let got = c.download("I1").unwrap();
+        times.push(t.elapsed().as_millis());
+        if round == 0 {
+            growth = before.zip(peak_working_set()).map(|(b, a)| a.saturating_sub(b) >> 20);
+        }
+        assert!(got == raw, "the source byte for byte");
+    }
+    let mut sorted = times.clone();
+    sorted.sort_unstable();
+    let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+    let fastest = sorted.first().copied().unwrap_or(0);
+    println!(
+        "MEASURE ews download 60 MB source: fastest {fastest} ms, median {median} ms, ms per round {times:?}, peak working set grew {growth:?} MB on the first"
+    );
+}
+
 #[test]
 fn autodiscover_answers() {
     let ok = "<Autodiscover><Response><Account><AccountType>email</AccountType><Action>settings</Action>\
                   <Protocol><Type>EXCH</Type><EwsUrl>https://mail.corp.local/EWS/Exchange.asmx</EwsUrl></Protocol>\
                   <Protocol><Type>EXPR</Type><EwsUrl>https://mail.contoso.example/EWS/Exchange.asmx</EwsUrl></Protocol></Account></Response></Autodiscover>";
-    assert_eq!(autodiscover_answer(ok).0.as_deref(), Some("https://mail.contoso.example/EWS/Exchange.asmx"), "the outside address first");
+    assert_eq!(autodiscover_answer(ok, false).0.as_deref(), Some("https://mail.contoso.example/EWS/Exchange.asmx"), "the outside address first");
     let redirect = "<Autodiscover><Response><Account><Action>redirectAddr</Action><RedirectAddr>riley@corp.example</RedirectAddr></Account></Response></Autodiscover>";
-    assert_eq!(autodiscover_answer(redirect).1.as_deref(), Some("riley@corp.example"));
-    assert_eq!(autodiscover_answer("<x/>"), (None, None));
+    assert_eq!(autodiscover_answer(redirect, false).1.as_deref(), Some("riley@corp.example"));
+    assert_eq!(autodiscover_answer("<x/>", false), (None, None));
     let plain = "<Autodiscover><Response><Account><Protocol><Type>EXPR</Type><EwsUrl>http://mail.contoso.example/EWS</EwsUrl></Protocol></Account></Response></Autodiscover>";
-    assert_eq!(autodiscover_answer(plain).0, None, "never plain http");
+    for here in [false, true] {
+        assert_eq!(autodiscover_answer(plain, here).0, None, "never plain http");
+    }
+    // But to this computer, under any of its names, when the server asked is on this computer
+    // too (the user's own, or a test's): an answer from the network never names one.
+    let at = |url: &str| {
+        format!("<Autodiscover><Response><Account><Protocol><Type>EXPR</Type><EwsUrl>{url}</EwsUrl></Protocol></Account></Response></Autodiscover>")
+    };
+    for here in ["http://127.0.0.1:8080/EWS/Exchange.asmx", "http://localhost/EWS/Exchange.asmx", "http://[::1]:99/EWS/Exchange.asmx"] {
+        assert_eq!(autodiscover_answer(&at(here), true).0.as_deref(), Some(here));
+        assert_eq!(autodiscover_answer(&at(here), false).0, None, "{here} from the network");
+    }
+    for not in ["http://127.0.0.1.evil.example/EWS", "ftp://mail.contoso.example/EWS", "https://"] {
+        assert_eq!(autodiscover_answer(&at(not), true).0, None, "{not}");
+        assert_eq!(autodiscover_answer(&at(not), false).0, None, "{not}");
+    }
+    // Which server was asked is read from its address, as the client reads it.
+    for (asked, here) in [
+        ("http://127.0.0.1:8080/autodiscover/autodiscover.xml", true),
+        ("https://localhost/autodiscover/autodiscover.xml", true),
+        ("http://[::1]:99/autodiscover/autodiscover.xml", true),
+        ("https://autodiscover.contoso.example/autodiscover/autodiscover.xml", false),
+        ("https://127.0.0.1.evil.example/autodiscover/autodiscover.xml", false),
+        ("https://localhost.evil.example/autodiscover/autodiscover.xml", false),
+        ("", false),
+    ] {
+        assert_eq!(discover::asked_here(asked), here, "{asked}");
+    }
     assert_eq!(autodiscover_urls("riley@Contoso.example")[0], "https://autodiscover.contoso.example/autodiscover/autodiscover.xml");
     assert!(autodiscover_urls("riley@bad/host").is_empty());
     // A public folder's content mailbox: PR_REPLICA_LIST as Exchange sends it.
     assert_eq!(replica_guid("MWVjMmEyMzYtZWQ5My00Zjg4LWI5YzYtMzNlNjNmYTRhYTQ0AA==").as_deref(), Some("1ec2a236-ed93-4f88-b9c6-33e63fa4aa44"));
+    // Its tag, asked for as always and known however an answer writes it.
+    assert_eq!(replica_list(), "<t:ExtendedFieldURI PropertyTag=\"26264\" PropertyType=\"Binary\"/>");
+    for (tag, is) in
+        [("0x6698", true), ("0X6698", true), ("26264", true), (" 26264 ", true), ("0x6699", false), ("6698", false), ("0x", false), ("", false)]
+    {
+        assert_eq!(is_replica_tag(tag), is, "{tag:?}");
+    }
     assert_eq!(replica_guid("bm90IGEgZ3VpZA=="), None);
     assert_eq!(replica_guid("%%%"), None);
     let pf =
@@ -101,4 +212,17 @@ fn a_message_text_first_from_its_item() {
     assert_eq!((files[1].1, files[1].2), ("message/rfc822", 4096));
     let none = parse("<s:Envelope><s:Body><t:Message><t:Body BodyType=\"Text\">hi</t:Body></t:Message></s:Body></s:Envelope>");
     assert!(text_first::text_first(&none).is_none(), "no files: the whole of it is as quick");
+}
+
+/// A sign-in scheme is known by its whole name in any case, and its token read after it.
+#[test]
+fn sign_in_schemes_by_their_whole_name_in_any_case() {
+    assert_eq!(scheme_token("ntlm TlRMTVNTUA==", "NTLM"), Some("TlRMTVNTUA=="));
+    assert_eq!(scheme_token("  NTLM  ", "NTLM"), Some(""));
+    assert_eq!(scheme_token("NEGOTIATE YII=", "Negotiate"), Some("YII="));
+    assert_eq!(scheme_token("Negotiate, NTLM", "Negotiate"), Some(""));
+    assert_eq!(scheme_token("Basic realm=\"x\"", "Basic"), Some("realm=\"x\""));
+    for (value, scheme) in [("NTLMfoo abc", "NTLM"), ("Negotiate", "NTLM"), ("", "NTLM"), ("Bas", "Basic")] {
+        assert_eq!(scheme_token(value, scheme), None, "{value:?}");
+    }
 }

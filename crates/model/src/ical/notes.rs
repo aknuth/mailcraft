@@ -1,5 +1,7 @@
 //! An event's notes as they read: links under their words, addresses as links (Exchange's and Google's invitations).
 
+use crate::work::scanned;
+
 /// Most web addresses taken from an event's notes.
 pub(super) const MAX_LINKS: usize = 20;
 
@@ -11,16 +13,28 @@ pub fn links_in(text: &str) -> Vec<String> {
     let lower = text.to_ascii_lowercase();
     let mut at = 0;
     while out.len() < MAX_LINKS {
-        let next = [lower.get(at..).and_then(|r| r.find("https://")), lower.get(at..).and_then(|r| r.find("http://"))].into_iter().flatten().min();
-        let Some(rel) = next else { break };
-        let start = at + rel;
+        // Each `http` found once, left to right: a link where `://` or `s://` follows. (Both
+        // schemes searched for from each went over the rest of the text again for every address
+        // not kept.)
+        let Some(start) = lower.get(at..).and_then(|r| scanned(r, r.find("http"))).map(|i| at + i) else { break };
+        let scheme = lower.get(start + 4..).unwrap_or("");
+        if !scheme.starts_with("://") && !scheme.starts_with("s://") {
+            at = start + 4;
+            continue;
+        }
         let rest = text.get(start..).unwrap_or("");
-        let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '[' | ']' | '{' | '}' | '|')).unwrap_or(rest.len());
+        let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '[' | ']' | '{' | '}' | '|'));
+        let len = scanned(rest, end).unwrap_or(rest.len());
         let mut link = rest.get(..len).unwrap_or("");
-        // Closing punctuation, and a closing bracket the link didn't open.
+        // Closing punctuation, and closing brackets the link didn't open (its brackets counted
+        // once: counted again for each one, a run of them was quadratic).
+        let opened = count_of(link, '(');
+        let mut closed = count_of(link, ')');
         loop {
+            crate::work::steps(1);
             let trimmed = link.trim_end_matches(['.', ',', ';', ':', '!', '?']);
-            let trimmed = if trimmed.ends_with(')') && trimmed.matches('(').count() < trimmed.matches(')').count() {
+            let trimmed = if trimmed.ends_with(')') && opened < closed {
+                closed -= 1;
                 trimmed.get(..trimmed.len() - 1).unwrap_or(trimmed)
             } else {
                 trimmed
@@ -37,6 +51,12 @@ pub fn links_in(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// How many `c` are in `s`, the bytes looked through counted.
+fn count_of(s: &str, c: char) -> usize {
+    crate::work::steps(s.len());
+    s.matches(c).count()
 }
 
 /// A piece of an event's notes as they're shown ([`note_lines`]).
@@ -114,24 +134,36 @@ pub(super) fn note_line(line: &str) -> Vec<NotePart> {
     out
 }
 
-/// The first `<scheme:…>` in a line: the text before it, the address, the text after.
+/// The first `<scheme:…>` in a line: the text before it, the address, the text after. Read in
+/// time the line's length: each `<` was looked at alone, its `>` searched for and what was
+/// before it lower-cased over the rest of the line, and a line of 100,000 brackets took half a
+/// minute (a debug build), each frame its event was open.
 pub(super) fn bracketed_link(line: &str) -> Option<(&str, &str, &str)> {
+    const SCHEMES: [&str; 4] = ["https://", "http://", "mailto:", "tel:"];
     let mut from = 0;
+    // The `>` after the last `<` looked at: every `<` before it ends there too.
+    let mut close = 0;
     loop {
-        let open = from + line.get(from..)?.find('<')?;
-        let inner = line.get(open + 1..)?;
-        let close = inner.find('>');
-        let url = close.and_then(|c| inner.get(..c)).unwrap_or("");
-        let lower = url.to_ascii_lowercase();
-        let scheme = ["https://", "http://", "mailto:", "tel:"].iter().any(|s| lower.starts_with(s));
-        if let Some(c) = close
-            && scheme
-            && url.len() > 7
-            && !url.contains(char::is_whitespace)
-        {
-            return Some((line.get(..open)?, url, inner.get(c + 1..)?));
+        let rest = line.get(from..)?;
+        let open = from + scanned(rest, rest.find('<'))?;
+        if close <= open {
+            // None after this `<` is none after any later one either.
+            let after = line.get(open + 1..)?;
+            close = open + 1 + scanned(after, after.find('>'))?;
         }
-        from = open + 1;
+        let url = line.get(open + 1..close)?;
+        let scheme = SCHEMES.iter().any(|s| url.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s)));
+        if scheme && url.len() > 7 {
+            let space = url.char_indices().find(|(_, c)| c.is_whitespace());
+            crate::work::steps(space.map_or(url.len(), |(at, _)| at + 1));
+            match space {
+                None => return Some((line.get(..open)?, url, line.get(close + 1..)?)),
+                // Every `<` before the space ends at the same `>`, past it: none of them is one.
+                Some((at, c)) => from = open + 1 + at + c.len_utf8(),
+            }
+        } else {
+            from = open + 1;
+        }
     }
 }
 
@@ -158,7 +190,7 @@ pub(super) fn push_text(out: &mut Vec<NotePart>, s: &str) {
 pub(super) fn bare_links(text: &str, out: &mut Vec<NotePart>) {
     let mut rest = text;
     for link in links_in(text) {
-        let Some(at) = rest.find(&link) else { continue };
+        let Some(at) = scanned(rest, rest.find(&link)) else { continue };
         push_text(out, rest.get(..at).unwrap_or(""));
         out.push(NotePart::Link { label: link.clone(), url: link.clone() });
         rest = rest.get(at + link.len()..).unwrap_or("");
@@ -171,10 +203,10 @@ pub(super) fn bare_links(text: &str, out: &mut Vec<NotePart>) {
 /// [`super::is_meeting_link_in`].
 pub fn is_meeting_link(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else { return false };
+    let Some(rest) = super::meeting::web_rest(&lower) else { return false };
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
     let host = host.split(':').next().unwrap_or(host);
-    let on = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    let on = |domain: &str| crate::lookalike::is_under(host, domain);
     (on("teams.microsoft.com") && (path.starts_with("l/meetup-join") || path.starts_with("meet/")))
         || (on("teams.live.com") && path.starts_with("meet"))
         || (on("zoom.us") && (path.starts_with("j/") || path.starts_with("w/") || path.starts_with("my/")))

@@ -3,7 +3,13 @@
 use super::*;
 
 mod table;
-use table::{Room, column_widths, room_margin};
+use table::{Room, Rows, column_widths, room_margin};
+
+/// How deep tables are drawn inside one another, and measured inside the one measured (the
+/// pictures of a long message's parts not laid out are looked for as deep).
+pub(super) const MAX_NESTED: usize = 16;
+/// Columns of a table sized and measured at most (those past it share what's left).
+const MAX_COLUMNS: usize = 64;
 
 /// The messages shown otherwise than the setting for all mail (File › Options, View › Plain
 /// text) says: one message formatted though all mail is read as plain text, or the other way,
@@ -172,7 +178,7 @@ pub(super) fn rich_body(s: &Session, st: &mut UiState, ui: &mut Ui, key: &Messag
     {
         return;
     }
-    let mut body = Body { s, key, p, allowed, shown: &mut shown, acts, cells: None };
+    let mut body = Body { s, key, p, allowed, shown: &mut shown, acts, cells: None, held: None };
     if long_text::many_lines(p) {
         // Thousands of lines: laid out by what's in view.
         long_text::rich(&mut body, st, ui, ui.scope_id().with(("long-text", key.to_id())), width, theme::surface_rgb(&t));
@@ -183,12 +189,12 @@ pub(super) fn rich_body(s: &Session, st: &mut UiState, ui: &mut Ui, key: &Messag
     }
     // Pictures without a description have no place in the text: show them after it.
     if allowed {
-        let rest: Vec<&String> = p.images.iter().filter(|u| !shown.contains(u)).collect();
+        let rest: Vec<&String> = p.images.iter().filter(|u| !body.shown.contains(u)).collect();
         if !rest.is_empty() {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 for src in rest {
-                    picture(s, st, ui, key, p, src, allowed, width, None);
+                    body.picture(st, ui, src, width, None);
                 }
             });
         }
@@ -206,18 +212,21 @@ pub(super) struct Body<'a> {
     pub(super) acts: &'a mut Vec<Action>,
     /// Blocks of text drawn as text boxes, to change (the original under a reply).
     pub(super) cells: Option<&'a mut dyn CellEdit>,
+    /// What the table being drawn that's in no other holds (`None` between such tables): the
+    /// tables inside it keep their measures by it.
+    pub(super) held: Option<table::Held>,
 }
 
 /// Draws a block of text as a text box to change it (`false`: drawn as text after all).
 pub(super) trait CellEdit {
     /// `page`: the colour it's on (its cell's), for its colours to read.
-    fn edit(&mut self, ui: &mut Ui, lines: &[Vec<mime::Span>], page: [u8; 3], acts: &mut Vec<Action>) -> bool;
+    fn edit(&mut self, ui: &mut Ui, lines: &mime::RichText, page: [u8; 3], acts: &mut Vec<Action>) -> bool;
 }
 
 /// Narrower than this, a table's columns go one under the other.
 pub(super) const MIN_COLUMN: f32 = 140.0;
 
-pub(super) fn span_font(sp: &mime::Span) -> egui::FontId {
+pub(crate) fn span_font(sp: &mime::Span) -> egui::FontId {
     let font = span_font_at_full_size(sp);
     match sp.rise {
         mime::Rise::Normal => font,
@@ -302,8 +311,7 @@ impl Body<'_> {
                     });
                     continue;
                 }
-                let line_w: f32 =
-                    line.iter().map(|sp| ui.fonts_mut(|f| f.layout_no_wrap(sp.text.clone(), span_font(sp), Color32::WHITE).size().x)).sum();
+                let line_w = line_width(ui, line);
                 if line.iter().all(|sp| sp.image.is_none()) && line_w < width {
                     let space = if align == Align::Center { (width - line_w) / 2.0 } else { width - line_w };
                     ui.horizontal(|ui| {
@@ -332,7 +340,7 @@ impl Body<'_> {
         let t = st.tokens;
         if let Some(src) = &sp.image {
             self.shown.push(src.clone());
-            if !picture(self.s, st, ui, self.key, self.p, src, self.allowed, width, sp.image_size) {
+            if !self.picture(st, ui, src, width, sp.image_size) {
                 let alt = held_back_words(&sp.text);
                 match held_back_box(sp.image_size, width) {
                     Some(size) => {
@@ -370,9 +378,20 @@ impl Body<'_> {
         }
         match &sp.link {
             Some(link) => {
-                // Hovered, a link says where it will open (cleaned, when links are).
-                let shown = if self.s.prefs.clean_links { mime::clean_link(link) } else { link.clone() };
-                let r = text_selection::run(st, ui, rt.color(fg), Some(fg)).on_hover_text(shown);
+                // Hovered, a link says where it will open (cleaned, when links are): written only
+                // when it's shown, or a screen reader is told it (not for every link every frame).
+                let clean = self.s.prefs.clean_links;
+                let shown = || if clean { mime::clean_link(link) } else { link.clone() };
+                let r = text_selection::run(st, ui, rt.color(fg), Some(fg));
+                let r = if r.ctx.has_accesskit_node(r.id) {
+                    r.on_hover_text(shown())
+                } else {
+                    // As `on_hover_text` draws it.
+                    r.on_hover_ui(|ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.add(egui::Label::new(shown()));
+                    })
+                };
                 if r.clicked() {
                     self.acts.push(Action::OpenUrl(link.clone()));
                 }
@@ -384,7 +403,6 @@ impl Body<'_> {
     }
 
     /// Laid-out parts `width` wide.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn blocks(
         &mut self,
         st: &mut UiState,
@@ -413,12 +431,15 @@ impl Body<'_> {
                         self.lines(st, ui, lines, width, page, main_align(align));
                     }
                 }
-                Block::Table(table) if depth < 16 => {
+                Block::Table(table) if depth < MAX_NESTED => {
                     // What its columns hold (measured once): their widths, and its own when it
                     // sets none and is as wide as what it holds (a `<table>`, a button).
                     let (s, key, p, allowed) = (self.s, self.key, self.p, self.allowed);
                     let ctx = ui.ctx().clone();
-                    let measures = table::measured_with(ui, key, table, allowed, &mut |sp| {
+                    // In no other table: all it holds is hashed here, once for those inside too.
+                    let outer = self.held.is_none();
+                    let held = self.held.take().unwrap_or_else(|| table::Held::of(ui, table));
+                    let measures = table::measured_with(ui, key, Some(&held), table, allowed, &mut |sp| {
                         let Some(src) = &sp.image else { return table::PictureWidth::Alt };
                         match picture_texture(s, st, &ctx, key, p, src, allowed) {
                             Pic::Ready(tex) => {
@@ -428,6 +449,7 @@ impl Body<'_> {
                             Pic::Missing => table::PictureWidth::Alt,
                         }
                     });
+                    self.held = Some(held);
                     let tw = match table.width {
                         Some(Width::Px(px)) => (px as f32).min(width),
                         Some(Width::Percent(pc)) => width * f32::from(pc) / 100.0,
@@ -461,9 +483,10 @@ impl Body<'_> {
                                 let slot = ui.painter().add(egui::Shape::Noop);
                                 ui.spacing_mut().item_spacing = vec2(spacing, spacing);
                                 let columns = column_widths(&table.rows);
-                                let inner = (tw - 2.0 * spacing).max(1.0);
+                                let width = (tw - 2.0 * spacing).max(1.0);
+                                let rows = Rows { columns: &columns, content: &measures.columns, width, page, room, depth };
                                 for row in &table.rows {
-                                    self.row(st, ui, row, &columns, &measures.columns, inner, page, room, depth);
+                                    self.row(st, ui, row, rows);
                                 }
                                 slot
                             });
@@ -474,6 +497,9 @@ impl Body<'_> {
                             }
                         });
                     });
+                    if outer {
+                        self.held = None;
+                    }
                 }
                 Block::Table(_) => {}
             }
@@ -531,34 +557,23 @@ impl Body<'_> {
         let h = draw(self, st, ui, top, false);
         top + h
     }
-}
 
-/// Draw one picture of an HTML message, `width` the room it's in, at the size the message sets
-/// (`size`); `false` when it can't be shown (yet).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn picture(
-    s: &Session,
-    st: &mut UiState,
-    ui: &mut Ui,
-    key: &MessageKey,
-    p: &mime::Parsed,
-    src: &str,
-    allowed: bool,
-    width: f32,
-    size: Option<mime::ImageSize>,
-) -> bool {
-    let tex = match picture_texture(s, st, ui.ctx(), key, p, src, allowed) {
-        Pic::Ready(tex) => tex,
-        Pic::Loading => {
-            ui.spinner();
-            return true;
+    /// Draw one picture of the message, `width` the room it's in, at the size the message sets
+    /// (`size`); `false` when it can't be shown (yet).
+    pub(super) fn picture(&self, st: &mut UiState, ui: &mut Ui, src: &str, width: f32, size: Option<mime::ImageSize>) -> bool {
+        let tex = match picture_texture(self.s, st, ui.ctx(), self.key, self.p, src, self.allowed) {
+            Pic::Ready(tex) => tex,
+            Pic::Loading => {
+                ui.spinner();
+                return true;
+            }
+            Pic::Missing => return false,
+        };
+        if let Some(at) = shown_size(tex.size_vec2(), size, width) {
+            ui.add(egui::Image::new(&tex).fit_to_exact_size(at).maintain_aspect_ratio(false));
         }
-        Pic::Missing => return false,
-    };
-    if let Some(at) = shown_size(tex.size_vec2(), size, width) {
-        ui.add(egui::Image::new(&tex).fit_to_exact_size(at).maintain_aspect_ratio(false));
+        true
     }
-    true
 }
 
 /// The room a picture that can't be shown (held back, or lost) takes: the size it says, no wider
@@ -633,11 +648,46 @@ pub(super) fn natural_width(ui: &Ui, blocks: &[mime::layout::Block]) -> Option<f
             if line.iter().any(|sp| sp.image.is_some()) {
                 return None;
             }
-            let w: f32 = line.iter().map(|sp| ui.fonts_mut(|f| f.layout_no_wrap(sp.text.clone(), span_font(sp), Color32::WHITE).size().x)).sum();
-            widest = widest.max(w);
+            widest = widest.max(line_width(ui, line));
         }
     }
     Some(widest)
+}
+
+/// Line widths kept, by what each line says and in what fonts.
+#[derive(Clone, Default)]
+struct LineWidths(std::collections::HashMap<u64, f32>);
+
+/// More line widths than this kept, they're let go and measured again as they're drawn.
+const LINE_WIDTHS: usize = 8_192;
+
+/// How wide a line of formatted text is unwrapped: its spans' words in their fonts, measured the
+/// first time and kept by what they are (a newsletter's centred lines were each laid out twice a
+/// frame, to measure and to draw, a sixth of its frame).
+pub(crate) fn line_width(ui: &Ui, line: &[mime::Span]) -> f32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The fonts themselves: installed again (another language's, one come for Chinese), the
+    // same words are another width.
+    (ui.ctx().pixels_per_point().to_bits(), table::fonts_stamp(ui)).hash(&mut h);
+    for sp in line {
+        // What its font is made of (span_font).
+        (&sp.text, sp.heading, sp.code, sp.bold, sp.size, sp.rise == mime::Rise::Normal).hash(&mut h);
+    }
+    let key = h.finish();
+    let store = egui::Id::unique("mailcraft-line-widths");
+    if let Some(w) = ui.ctx().data_mut(|d| d.get_temp_mut_or_default::<LineWidths>(store).0.get(&key).copied()) {
+        return w;
+    }
+    let w: f32 = line.iter().map(|sp| ui.fonts_mut(|f| f.layout_no_wrap(sp.text.clone(), span_font(sp), Color32::WHITE).size().x)).sum();
+    ui.ctx().data_mut(|d| {
+        let kept = d.get_temp_mut_or_default::<LineWidths>(store);
+        if kept.0.len() >= LINE_WIDTHS {
+            kept.0.clear();
+        }
+        kept.0.insert(key, w);
+    });
+    w
 }
 
 /// Right-click on right-to-left text (selectable too): copy the line, or the whole message, as
@@ -666,8 +716,15 @@ pub(super) enum Pic {
     Missing,
 }
 
-/// Most web pictures kept decoded.
-const WEB_PICTURES: usize = 200;
+/// Most web pictures kept decoded (those shown least recently go first, never one shown in this
+/// frame; past them, one more is kept until it's no longer shown).
+pub(crate) const WEB_PICTURES: usize = 200;
+
+/// Whether a picture's address is on the web (`http://` or `https://`, in any case), read where
+/// it starts (the address isn't copied to be lowered, for each picture every frame).
+pub(crate) fn on_the_web(src: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| src.get(..scheme.len()).is_some_and(|s| s.eq_ignore_ascii_case(scheme)))
+}
 
 /// A picture of an HTML message: one inside it (`cid:`) always, one on the web once allowed.
 pub(super) fn picture_texture(
@@ -679,9 +736,12 @@ pub(super) fn picture_texture(
     src: &str,
     allowed: bool,
 ) -> Pic {
+    // One of the signature drawn in the message being written (issue #90).
+    if let Some(own) = super::signature_card::own_picture(ctx, src) {
+        return Pic::Ready(own);
+    }
     // One sent with the message: by `cid:`, or by the name or address it was sent under.
-    let lower = src.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    if !on_the_web(src) {
         let Some(index) = mime::picture_attachment(p, src) else { return Pic::Missing };
         // At a size to read it at (an attachment's card has a small thumbnail: a picture wider
         // than that came out that wide, issue #10), taken out with the message's others.
@@ -697,23 +757,11 @@ pub(super) fn picture_texture(
     match s.pictures.get(src) {
         Some(mailcraft_engine::Picture::Ready(bytes)) => {
             let now = st.pictures.frame();
-            if let Some((t, used)) = st.web_pictures.get_mut(src) {
-                *used = now;
-                return t.clone().map_or(Pic::Missing, Pic::Ready);
+            if let Some(t) = st.web_pictures.get(src, now) {
+                return t.map_or(Pic::Missing, Pic::Ready);
             }
             let t = decode(ctx, &format!("web-{src}"), bytes, 1200);
-            // Those shown least recently go (never one shown in this frame: a message with more
-            // than that many pictures decoded all of them again every frame). Past that many
-            // shown at once it's kept anyway, and let go once no longer shown.
-            while st.web_pictures.len() >= WEB_PICTURES {
-                let Some(oldest) =
-                    st.web_pictures.iter().filter(|(_, (_, used))| *used < now).min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone())
-                else {
-                    break;
-                };
-                st.web_pictures.remove(&oldest);
-            }
-            st.web_pictures.insert(src.to_string(), (t.clone(), now));
+            st.web_pictures.keep_anyway(src.to_string(), t.clone(), now);
             t.map_or(Pic::Missing, Pic::Ready)
         }
         Some(mailcraft_engine::Picture::Loading) => Pic::Loading,

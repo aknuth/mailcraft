@@ -72,6 +72,7 @@
 	Edit rule	규칙 편집
 	Email address	이메일 주소
 	Enter the password for {email}.	{email}의 암호를 입력하세요.
+	Enter the password for {email}, which signs in as {user}.	{email}의 암호를 입력하세요. 로그인할 때는 {user}을(를) 사용합니다.
 	Favorites	즐겨찾기
 	Feb	2월
 	File	파일
@@ -408,7 +409,7 @@
 	Mark messages as read when opened	메시지를 열면 읽음으로 표시
 	Microsoft 365 (IMAP)	Microsoft 365 (IMAP)
 	No senders yet.	아직 보낸 사람이 없습니다.
-	Not available: the sample mailbox has no server.	사용할 수 없음: 예제 사서함에는 서버가 없습니다.
+	Not available: this mailbox has no server.	사용할 수 없음: 이 사서함에는 서버가 없습니다.
 	Not available: {error}	사용할 수 없음: {error}
 	On	켜짐
 	On from {from}	{from}부터 켜짐
@@ -840,7 +841,8 @@
 	Formatted	서식 있음
 	HTML code	HTML 코드
 	From a file…	파일에서…
-	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written; while you write, a message shows its text.	다른 곳에서 만든 서명의 HTML을 붙여 넣거나, 웹 페이지로 저장한 서명(Outlook의 .htm)을 여세요. 작성된 그대로 보내지며, 메시지를 쓰는 동안에는 그 텍스트가 표시됩니다.
+	Paste the HTML of a signature made elsewhere, or open one saved as a web page (Outlook's .htm). It's sent as written, and shown so while you write.	다른 곳에서 만든 서명의 HTML을 붙여 넣거나, 웹 페이지로 저장한 서명(Outlook의 .htm)을 여세요. 작성된 그대로 보내지며, 메시지를 쓰는 동안에도 그대로 표시됩니다.
+	Your signature as it will be sent. To change it, pick Signature above the message.	보내지는 그대로의 서명입니다. 바꾸려면 메시지 위의 서명을 선택하세요.
 	{name} can't be read as a signature	{name}을(를) 서명으로 읽을 수 없습니다
 	All contacts	모든 연락처
 	Always open with this address book	항상 이 주소록으로 열기
@@ -932,6 +934,9 @@
 	Name on mail from it	이 주소로 보내는 메일의 이름
 	Replies go to	회신 받을 주소
 	(the account's own)	(계정의 서명)
+	Write new mail from this address	새 메일을 이 주소에서 쓰기
+	A new message starts from this address, not from {email}. Pick another in From as ever.	새 메시지는 {email}이(가) 아니라 이 주소에서 시작합니다. 보낸 사람에서 언제든 다른 주소를 고를 수 있습니다.
+	{address} (new mail)	{address} (새 메일)
 	Add…	추가…
 	Its folders show under this account. You need access to it on the Exchange server; the ones you have full access to open by themselves.	폴더가 이 계정 아래에 표시됩니다. Exchange 서버에서 액세스 권한이 필요하며, 모든 권한이 있는 사서함은 자동으로 열립니다.
 	Mailboxes you have full access to open by themselves.	모든 권한이 있는 사서함은 자동으로 열립니다.
@@ -1106,6 +1111,7 @@ month	May	5월
 	Check before sending	보내기 전에 확인
 	{address} looks like an address at {like}, but isn't one. Is it the right one?	{address}은(는) {like}의 주소처럼 보이지만 아닙니다. 맞는 주소인가요?
 	{n} people who may not know each other will all see each other's addresses.	서로 모를 수도 있는 {n}명이 모두 서로의 주소를 보게 됩니다.
+	Something about the recipients was found to look at, but it can't be shown. Look them over before sending.	받는 사람에서 확인할 점이 발견되었지만 표시할 수 없습니다. 보내기 전에 받는 사람을 확인하세요.
 	Put everyone in Bcc	모두 숨은 참조에 넣기
 	Each of them gets the message without seeing who else did; you're in To	각자 다른 받는 사람을 보지 못한 채 메시지를 받습니다. 받는 사람에는 내가 들어갑니다
 	Open links without their tracking	추적 없이 링크 열기
@@ -1445,6 +1451,7 @@ month	May	5월
 	Calendar and contacts couldn't be read: changes to them won't be saved	일정과 연락처를 읽을 수 없습니다. 변경 내용은 저장되지 않습니다
 	Your rules couldn't be read: changes to them won't be saved	규칙을 읽을 수 없습니다. 변경 내용은 저장되지 않습니다
 	Snoozed mail couldn't be read: changes to it won't be saved	다시 알림으로 미룬 메일을 읽을 수 없습니다. 변경 내용은 저장되지 않습니다
+	What replies waiting in the Outbox answer couldn't be read: that mail may not be marked as answered	보낼 편지함에서 대기 중인 답장이 어떤 메일에 대한 것인지 읽을 수 없습니다. 해당 메일이 회신함으로 표시되지 않을 수 있습니다
 	Checking your data file	데이터 파일을 확인하는 중
 	Opening your mail…	메일을 여는 중…
 	{file} wasn't closed properly last time. MailCraft is checking it; a large file can take a minute or two.	{file}이(가) 지난번에 제대로 닫히지 않았습니다. MailCraft에서 확인하고 있습니다. 큰 파일은 1~2분 정도 걸릴 수 있습니다.
@@ -1462,6 +1469,8 @@ month	May	5월
 	Some results may be missing: still indexing	일부 결과가 빠졌을 수 있습니다: 아직 색인 작성 중
 	Some long messages were searched only in part	일부 긴 메시지는 일부만 검색되었습니다
 	Couldn't read the date “{value}”	날짜 "{value}"을(를) 읽을 수 없습니다
+	Couldn't read “{value}”	"{value}"을(를) 읽을 수 없습니다
+	Part of a long search was left out	긴 검색의 일부가 제외되었습니다
 	Received after	받은 날짜 이후
 	Received before	받은 날짜 이전
 	About {h} h {m} min left	약 {h}시간 {m}분 남음
@@ -1708,3 +1717,7 @@ month	May	5월
 	Nothing to do	할 일이 없습니다
 	Nothing in the next 7 days	앞으로 7일 동안 일정이 없습니다
 	Show the calendar, what's coming up and your tasks beside the mail	메일 옆에 일정, 다가오는 약속, 작업을 표시합니다
+	Read / Unread (Ctrl+Q / Ctrl+U)	읽음 / 읽지 않음(Ctrl+Q / Ctrl+U)
+	{name} couldn't be downloaded: {error}	{name}을(를) 다운로드할 수 없습니다: {error}
+	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	창에서 문제가 생겨 하던 작업을 중단했습니다. MailCraft는 계속 사용할 수 있으며, 문제가 생긴 위치는 로그에 있습니다.
+	Font size	글꼴 크기

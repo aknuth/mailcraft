@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::{CACHE, CommitTimes, OpenProgress, Prepared, Result, StoreError, io_err, write_atomic};
+use crate::{CACHE, CommitTimes, OpenProgress, Prepared, Result, StoreError, io_err, lock, write_atomic};
 
 mod beside;
 mod commit;
@@ -34,6 +34,7 @@ mod filling;
 mod handles;
 mod health;
 mod kept;
+mod names;
 mod open;
 mod owner;
 mod shrink;
@@ -177,7 +178,7 @@ impl Packs {
     /// Data files for the store at `root`, kept in `dir`, none of them opened yet.
     pub(crate) fn new(root: &Path, dir: &Path) -> Result<Packs> {
         fs::create_dir_all(dir).map_err(io_err(dir))?;
-        let names = fs::read(root.join(NAMES)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let names = names::read(root, dir)?;
         Ok(Packs {
             root: root.to_path_buf(),
             dir: dir.to_path_buf(),
@@ -222,35 +223,19 @@ impl Packs {
         }
     }
 
-    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// The data file of an account, when it has one (or is named already).
     pub(crate) fn file(&self, account: &str) -> Option<PathBuf> {
-        Packs::lock(&self.names).get(account).map(|n| self.dir.join(n))
+        lock(&self.names).get(account).map(|n| self.dir.join(n))
     }
 
     /// The name of an account's data file, chosen the first time: its address, as Outlook names
     /// a `.pst` (an opened data file keeps that file's name).
     fn name(&self, account: &str) -> String {
-        if let Some(n) = Packs::lock(&self.names).get(account) {
+        if let Some(n) = lock(&self.names).get(account) {
             return n.clone();
         }
-        let email = fs::read(self.root.join("accounts.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Vec<mailcraft_model::AccountConfig>>(&b).ok())
-            .and_then(|list| list.into_iter().find(|a| crate::safe_segment(&a.id) == account).map(|a| a.email));
-        let stem = email.as_deref().map(str::trim).filter(|e| !e.is_empty()).unwrap_or(account);
-        let stem = stem.strip_suffix(".pst").or_else(|| stem.strip_suffix(".ost")).or_else(|| stem.strip_suffix(".mailcraft")).unwrap_or(stem);
-        let stem: String = stem
-            .chars()
-            .map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '_' } else { c })
-            .take(80)
-            .collect();
-        let stem = stem.trim_matches(|c: char| c == '.' || c.is_whitespace());
-        let stem = if stem.is_empty() { account } else { stem };
-        let mut names = Packs::lock(&self.names);
+        let stem = names::stem(&self.root, account);
+        let mut names = lock(&self.names);
         let taken = |n: &str| names.values().any(|v| v.eq_ignore_ascii_case(n)) || self.dir.join(n).exists();
         let mut name = format!("{stem}.{EXTENSION}");
         let mut i = 2;
@@ -259,20 +244,17 @@ impl Packs {
             i += 1;
         }
         names.insert(account.to_string(), name.clone());
-        if let Ok(json) = serde_json::to_vec_pretty(&*names) {
-            let _ = write_atomic(&self.root.join(NAMES), &json);
-        }
+        names::save(&self.root, &names);
         name
     }
 
+    /// The file at `key`, read back. The reads here tell a database error as [`other`], not
+    /// [`disk`]: the drive's own error mustn't pass for the file missing or damaged (`NotFound`,
+    /// `InvalidData`), which `load_body` takes as not kept.
     fn get(&self, account: &str, key: &str) -> io::Result<Option<Vec<u8>>> {
         let Some(db) = self.db(account, false)? else { return Ok(None) };
         let tx = db.begin_read().map_err(other)?;
-        let table = match tx.open_table(FILES) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(other(e)),
-        };
+        let Some(table) = files_of(&tx).map_err(other)? else { return Ok(None) };
         read_file(&tx, &table, key)
     }
 
@@ -280,22 +262,15 @@ impl Packs {
     fn has(&self, account: &str, key: &str) -> io::Result<bool> {
         let Some(db) = self.db(account, false)? else { return Ok(false) };
         let tx = db.begin_read().map_err(other)?;
-        match tx.open_table(FILES) {
-            Ok(t) => Ok(t.get(key).map_err(other)?.is_some()),
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
-            Err(e) => Err(other(e)),
-        }
+        let Some(table) = files_of(&tx).map_err(other)? else { return Ok(false) };
+        Ok(table.get(key).map_err(other)?.is_some())
     }
 
     /// Whether any file is under `prefix` (a folder), from the first key alone.
     fn has_under(&self, account: &str, prefix: &str) -> io::Result<bool> {
         let Some(db) = self.db(account, false)? else { return Ok(false) };
         let tx = db.begin_read().map_err(other)?;
-        let table = match tx.open_table(FILES) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-            Err(e) => return Err(other(e)),
-        };
+        let Some(table) = files_of(&tx).map_err(other)? else { return Ok(false) };
         let start = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
         let first = table.range(start.as_str()..).map_err(other)?.next();
         match first {
@@ -312,11 +287,7 @@ impl Packs {
     fn children(&self, account: &str, prefix: &str) -> io::Result<(Vec<String>, usize)> {
         let Some(db) = self.db(account, false)? else { return Ok((Vec::new(), 0)) };
         let tx = db.begin_read().map_err(other)?;
-        let table = match tx.open_table(FILES) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
-            Err(e) => return Err(other(e)),
-        };
+        let Some(table) = files_of(&tx).map_err(other)? else { return Ok((Vec::new(), 0)) };
         let start = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
         let (mut out, mut looked) = (Vec::new(), 0usize);
         let mut from = start.clone();
@@ -343,11 +314,7 @@ impl Packs {
     fn keys(&self, account: &str, prefix: &str) -> io::Result<Vec<(String, u64)>> {
         let Some(db) = self.db(account, false)? else { return Ok(Vec::new()) };
         let tx = db.begin_read().map_err(other)?;
-        let table = match tx.open_table(FILES) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(other(e)),
-        };
+        let Some(table) = files_of(&tx).map_err(other)? else { return Ok(Vec::new()) };
         let start = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
         let mut out = Vec::new();
         for item in table.range(start.as_str()..).map_err(other)? {
@@ -384,6 +351,44 @@ impl Packs {
                 Ok(())
             })
             .map_err(|source| StoreError::Io { path: a.clone(), source })?;
+        }
+        Ok(())
+    }
+
+    /// Files read one at a time by `read` (`None`: gone, so skipped) and written as they come,
+    /// one transaction per data file: no more than one of them is held twice at once, and a
+    /// failure, reading or writing, writes none of a data file's.
+    pub(crate) fn write_each(&self, paths: &[PathBuf], read: &mut dyn FnMut(&Path) -> Result<Option<Vec<u8>>>) -> Result<()> {
+        let mut by_account: std::collections::BTreeMap<String, Vec<(&Path, String)>> = std::collections::BTreeMap::new();
+        for p in paths {
+            match self.place(p) {
+                Place::In(a, k) => by_account.entry(a).or_default().push((p.as_path(), k)),
+                Place::Account(_) | Place::Disk => {
+                    if let Some(bytes) = read(p)? {
+                        write_atomic(p, &bytes)?;
+                    }
+                }
+            }
+        }
+        for (a, files) in by_account {
+            let mut unread = None;
+            let done = self.change(&a, |t| {
+                for (p, k) in &files {
+                    match read(p) {
+                        Ok(Some(bytes)) => t.put(k.as_str(), &bytes)?,
+                        Ok(None) => {}
+                        Err(e) => {
+                            unread = Some(e);
+                            return Err(io::Error::other("a file couldn't be read"));
+                        }
+                    }
+                }
+                Ok(())
+            });
+            if let Some(e) = unread {
+                return Err(e);
+            }
+            done.map_err(|source| StoreError::Io { path: a.clone(), source })?;
         }
         Ok(())
     }
@@ -431,7 +436,7 @@ impl Packs {
                     }
                     // A recompress may have passed where it went: it goes back for it.
                     match raw_to {
-                        Some(to) => pull_back(tx, &t.files, &to, Packs::lock(&self.recompressing).contains(&a)),
+                        Some(to) => pull_back(tx, &t.files, &to, lock(&self.recompressing).contains(&a)),
                         None => Ok(()),
                     }
                 })
@@ -458,25 +463,26 @@ impl Packs {
     /// `.pst`: closed and no longer anyone's, so it can be opened again (File › Open & Export) and
     /// the same address added again gets a file of its own beside it. Returns the file.
     pub(crate) fn let_go(&self, account: &str) -> Option<PathBuf> {
-        let (_, name) = self.close_and_forget(account);
-        Packs::lock(&self.fresh).remove(account);
-        self.seals.forget(account);
-        if let Ok(json) = serde_json::to_vec_pretty(&*Packs::lock(&self.names)) {
-            let _ = write_atomic(&self.root.join(NAMES), &json);
-        }
+        let (_, name) = self.forget_account(account);
         name.map(|n| self.dir.join(n)).filter(|f| f.exists())
+    }
+
+    /// `account`'s data file closed and no longer its ([`Packs::close_and_forget`]), with nothing
+    /// left waiting to say how it's kept or to seal it, and the names saved without it. Whether it
+    /// was open, and its name.
+    fn forget_account(&self, account: &str) -> (bool, Option<String>) {
+        let forgotten = self.close_and_forget(account);
+        lock(&self.fresh).remove(account);
+        self.seals.forget(account);
+        names::save(&self.root, &lock(&self.names));
+        forgotten
     }
 
     pub(crate) fn remove_dir_all(&self, p: &Path) -> io::Result<()> {
         match self.place(p) {
             // The account goes: its data file with it.
             Place::Account(a) => {
-                let (had, name) = self.close_and_forget(&a);
-                Packs::lock(&self.fresh).remove(&a);
-                self.seals.forget(&a);
-                if let Ok(json) = serde_json::to_vec_pretty(&*Packs::lock(&self.names)) {
-                    let _ = write_atomic(&self.root.join(NAMES), &json);
-                }
+                let (had, name) = self.forget_account(&a);
                 let legacy = fs::remove_dir_all(p).is_ok();
                 match name.map(|n| fs::remove_file(self.dir.join(n))) {
                     Some(r) => r.or(Ok(())),
@@ -635,6 +641,15 @@ const BATCH: usize = 32 << 20;
 /// (a big one takes minutes).
 const COPY_CHUNK: usize = 8 << 20;
 
+/// Whether reading a file failed because something else has it open: Windows' sharing and lock
+/// violations (`ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION`). Elsewhere nothing keeps a file
+/// from being read so, and the same numbers are other errors (`EPIPE`, `EDOM`): never.
+fn held_elsewhere(e: &io::Error) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    cfg!(windows) && matches!(e.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION))
+}
+
 /// Every file in the data file at `path` (its path inside the account, its bytes), handed to
 /// `each` in batches. It's read from a copy at `tmp`, so the original is never changed (opening a
 /// database may write to it) and one another MailCraft has open can still be read. `stop` is
@@ -654,21 +669,13 @@ pub(crate) fn read_data_file(
     }
     if let Err(e) = copy_until(path, tmp, stop) {
         let _ = fs::remove_file(tmp);
-        return Err(match e.raw_os_error() {
-            // Windows' sharing and lock violations: something else has it open.
-            Some(32 | 33) => in_use(),
-            _ => io_err(e),
-        });
+        return Err(if held_elsewhere(&e) { in_use() } else { io_err(e) });
     }
     let read = (|| -> Result<usize> {
         let not_ours = |e: &dyn std::fmt::Display| io_err(io::Error::new(io::ErrorKind::InvalidData, format!("not a MailCraft data file ({e})")));
         let db = Database::builder().set_cache_size(CACHE).open(tmp).map_err(|e| not_ours(&e))?;
         let tx = db.begin_read().map_err(|e| not_ours(&e))?;
-        let table = match tx.open_table(FILES) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-            Err(e) => return Err(not_ours(&e)),
-        };
+        let Some(table) = files_of(&tx).map_err(|e| not_ours(&e))? else { return Ok(0) };
         let (mut batch, mut size, mut n) = (Vec::new(), 0usize, 0usize);
         for item in table.iter().map_err(|e| not_ours(&e))? {
             let (k, _) = item.map_err(|e| not_ours(&e))?;

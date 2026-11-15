@@ -5,6 +5,7 @@ use std::borrow::Cow;
 
 use super::*;
 use crate::tnef::{TnefBody, is_tnef, read_tnef};
+use mailcraft_model::{file_name, work};
 
 pub(crate) mod fields;
 mod index_text;
@@ -83,6 +84,23 @@ pub(super) fn attached<'a>(m: &'a Message<'_>) -> (Vec<Attached<'a>>, TnefBody) 
     (out, body)
 }
 
+/// The body the first `winmail.dat` with one carries, as [`attached`] gives it, without the
+/// message's other files read.
+pub(super) fn tnef_body(m: &Message<'_>) -> TnefBody {
+    let mut body = TnefBody::None;
+    for p in files_of(m.root()) {
+        if !is_tnef(&mime_of(p).unwrap_or_default(), p.attachment_name()) {
+            continue;
+        }
+        if let Some(t) = read_tnef(&contents(p)).filter(|t| !t.attachments.is_empty() || !t.body.is_empty())
+            && body.is_empty()
+        {
+            body = t.body;
+        }
+    }
+    body
+}
+
 /// Whether a message carries a file: the paperclip, "Has files" and `has:attachment` agree
 /// with search's count ([`index_doc`]), and with a data file's import ([`draft_carries_files`]),
 /// by sharing [`carries_file`].
@@ -140,22 +158,22 @@ impl Refs {
                 r.cids.insert(percent_decoded(cid));
             }
         }
-        for attr in ["src", "href", "background"] {
-            let mut from = 0;
-            while let Some(at) = lower.get(from..).and_then(|s| s.find(attr)).map(|i| i + from) {
-                from = at + attr.len();
-                if at > 0 && !lower.as_bytes().get(at - 1).is_some_and(|b| b.is_ascii_whitespace()) {
-                    continue;
-                }
-                let Some(value) = lower.get(from..).and_then(|s| s.trim_start().strip_prefix('=')).map(str::trim_start) else { continue };
-                let value = match value.chars().next() {
-                    Some(q @ ('"' | '\'')) => value.get(1..).and_then(|v| v.split(q).next()).unwrap_or_default(),
-                    _ => value.split(|c: char| c.is_ascii_whitespace() || c == '>').next().unwrap_or_default(),
-                };
+        // Every `src`, `href` and `background` of a tag, read as every other pass reads a tag's
+        // attributes ([`crate::html::attributes`]): not a name in another's quoted value
+        // (`alt="… src=plan.pdf"` took a file of that name for shown), nor in the text.
+        let mut from = 0;
+        while let Some(at) = lower.get(from..).and_then(|s| work::scanned(s, s.find('<'))).map(|i| i + from) {
+            let Some(end) = crate::html::tag_end(lower.as_bytes(), at + 1) else { break };
+            from = end + 1;
+            let tag = lower.get(at..=end).unwrap_or_default();
+            for a in crate::html::attributes(tag).1.into_iter().filter(|a| matches!(a.name.as_str(), "src" | "href" | "background")) {
+                let value = tag.get(a.value).unwrap_or_default();
                 let path = percent_decoded(value.split(['?', '#']).next().unwrap_or(value).trim());
                 if !path.is_empty() && r.paths.len() < MAX_REFS {
-                    if !last_segment(&path).is_empty() {
-                        r.files.insert(last_segment(&path).to_string());
+                    // The same last part as the reading pane's (`picture_attachment`), so that
+                    // they find the same picture.
+                    if !file_name(&path).is_empty() {
+                        r.files.insert(file_name(&path).to_string());
                     }
                     r.paths.insert(path);
                 }
@@ -165,29 +183,10 @@ impl Refs {
     }
 }
 
-/// A path's last segment (`chart.png` of `http://studio.example/a/chart.png`).
-fn last_segment(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
-}
-
-/// `%xx` escapes decoded.
-fn percent_decoded(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        match (c, b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+/// `%xx` escapes decoded (RFC 3986), as the reading pane decodes a picture's address
+/// ([`picture_attachment`]).
+pub(crate) fn percent_decoded(s: &str) -> String {
+    mailcraft_model::mailto::percent_decode(s)
 }
 
 impl<'a> HtmlRefs<'a> {
@@ -213,7 +212,7 @@ impl<'a> HtmlRefs<'a> {
         let cid = cid.map(|c| c.trim().trim_matches(['<', '>']).to_ascii_lowercase()).filter(|c| !c.is_empty());
         let location = location.map(|l| l.trim().trim_matches(['<', '>', '"']).to_ascii_lowercase()).filter(|l| !l.is_empty());
         cid.is_some_and(|c| r.cids.contains(&c) || r.files.contains(&c))
-            || location.is_some_and(|l| r.paths.contains(&l) || r.files.contains(last_segment(&l)) || r.cids.contains(&l))
+            || location.is_some_and(|l| r.paths.contains(&l) || r.files.contains(file_name(&l)) || r.cids.contains(&l))
     }
 }
 
@@ -384,14 +383,8 @@ const QUOTED_PICTURE_MAX: usize = 25 << 20;
 /// "[picture]"): each one in the message (by `cid:`, by its `Content-Location` or name, or written
 /// into the HTML as `data:`) given by `cid:`, with its bytes for the reply to send; one on the web
 /// kept by its address, as Outlook keeps it (never loaded here); tracking pictures left out.
-/// Also the indexes of the attachments the quote shows.
-pub fn quoted_pictures(p: &mut Parsed, raw: &[u8]) -> (Vec<InlinePicture>, Vec<usize>) {
-    let (out, used, _) = quoted_pictures_given(p, raw);
-    (out, used)
-}
-
-/// [`quoted_pictures`], with each picture's address in the message and the `cid:` it was given
-/// (for [`quote_html`]).
+/// Also the indexes of the attachments the quote shows, and each picture's address in the
+/// message with the `cid:` it was given (for [`quote_html`]).
 pub fn quoted_pictures_given(p: &mut Parsed, raw: &[u8]) -> (Vec<InlinePicture>, Vec<usize>, Vec<(String, String)>) {
     let mut out: Vec<InlinePicture> = Vec::new();
     let mut used: Vec<usize> = Vec::new();
@@ -408,13 +401,18 @@ pub fn quoted_pictures_given(p: &mut Parsed, raw: &[u8]) -> (Vec<InlinePicture>,
         })
         .collect();
     let trackers = p.trackers.pictures.clone();
+    // The pictures in the message, read from one parse (each was the whole message parsed and
+    // every file in it decoded again: 40 ms for 30 pictures of 200 KB).
+    let wanted: Vec<usize> =
+        found.iter().filter_map(|(_, at)| p.attachments.get((*at)?)).filter(|a| a.size <= QUOTED_PICTURE_MAX).map(|a| a.index).collect();
+    let datas: std::collections::HashMap<usize, Vec<u8>> = attachments_data(raw, &wanted, usize::MAX, usize::MAX).into_iter().collect();
     let mut given: Vec<(String, String)> = Vec::new();
     for (src, at) in found {
         if given.iter().any(|(s, _)| *s == src) || out.len() >= QUOTED_PICTURES {
             continue;
         }
         let picture = match at.and_then(|i| p.attachments.get(i)) {
-            Some(a) if a.size <= QUOTED_PICTURE_MAX => attachment_data(raw, a.index).map(|data| {
+            Some(a) if a.size <= QUOTED_PICTURE_MAX => datas.get(&a.index).cloned().map(|data| {
                 let cid = a
                     .content_id
                     .clone()
@@ -423,7 +421,7 @@ pub fn quoted_pictures_given(p: &mut Parsed, raw: &[u8]) -> (Vec<InlinePicture>,
                 InlinePicture { cid, name: a.name.clone(), mime: a.mime.clone(), data }
             }),
             Some(_) => None,
-            None => data_url(&src).map(|(mime, data)| {
+            None => data_url(&src, QUOTED_PICTURE_MAX).map(|(mime, data)| {
                 let n = out.len() + 1;
                 let ext = Some(crate::files::ext_for_mime(&mime)).filter(|e| !e.is_empty()).unwrap_or(".png");
                 InlinePicture {
@@ -457,19 +455,21 @@ pub fn quoted_pictures_given(p: &mut Parsed, raw: &[u8]) -> (Vec<InlinePicture>,
     (out, used, given)
 }
 
-/// A picture written into HTML as `data:image/…;base64,…`: its type and bytes.
-fn data_url(src: &str) -> Option<(String, Vec<u8>)> {
-    let rest = src.trim().get(..11).filter(|p| p.eq_ignore_ascii_case("data:image/")).and_then(|_| src.trim().get(5..))?;
+/// A picture written into HTML as `data:image/…;base64,…` (PNG, JPEG, GIF, WebP or BMP) of at
+/// most `max` bytes: its type (`image/jpg` as `image/jpeg`) and bytes. The one reader of them, for
+/// a reply's quoted pictures and a signature's.
+pub(crate) fn data_url(src: &str, max: usize) -> Option<(String, Vec<u8>)> {
+    let src = src.trim();
+    let rest = src.get(..11).filter(|p| p.eq_ignore_ascii_case("data:image/")).and_then(|_| src.get(5..))?;
     let (kind, b64) = rest.split_once(',')?;
-    let mime = kind.strip_suffix(";base64").or_else(|| kind.strip_suffix(";BASE64"))?.to_ascii_lowercase();
-    if !["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/bmp"].contains(&mime.as_str())
-        || b64.len() > QUOTED_PICTURE_MAX / 3 * 4 + 8
-    {
+    let kind = kind.to_ascii_lowercase();
+    let mime = kind.strip_suffix(";base64")?;
+    if !["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/bmp"].contains(&mime) || b64.len() > max / 3 * 4 + 8 {
         return None;
     }
     let clean: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let data = encodify::base64::LENIENT.decode(&clean).ok().filter(|d| !d.is_empty())?;
-    Some((if mime == "image/jpg" { "image/jpeg".into() } else { mime }, data))
+    let data = encodify::base64::LENIENT.decode(&clean).ok().filter(|d| !d.is_empty() && d.len() <= max)?;
+    Some((if mime == "image/jpg" { "image/jpeg" } else { mime }.to_string(), data))
 }
 
 /// The bytes of attachment `index`.
@@ -477,17 +477,10 @@ pub fn attachment_data(raw: &[u8], index: usize) -> Option<Vec<u8>> {
     attachments_data(raw, &[index], usize::MAX, usize::MAX).pop().map(|(_, d)| d)
 }
 
-/// [`attachment_data`] for a big file: a file's bytes are decoded once and handed over, not
-/// copied again, so the message and the file are held once each, not the file twice.
-pub fn attachment_data_moved(raw: &[u8], index: usize) -> Option<Vec<u8>> {
-    let mut out = None;
-    attachments_moved(raw, &[index], &mut |_, data| out = Some(data));
-    out
-}
-
-/// [`attachment_data_moved`] for several files from one parse: `each` is handed each of `wanted`
-/// the message has (each once, in no set order), one at a time, so a message with 30 big files
-/// is parsed once, not 30 times, and holds no file twice.
+/// [`attachment_data`] for big files, from one parse: `each` is handed each of `wanted` the
+/// message has (each once, in no set order), one at a time, its bytes decoded once and handed
+/// over, not copied again, so a message with 30 big files is parsed once, not 30 times, and
+/// holds no file twice.
 pub fn attachments_moved(raw: &[u8], wanted: &[usize], each: &mut dyn FnMut(usize, Vec<u8>)) {
     let mut wanted = wanted.to_vec();
     wanted.sort_unstable();
@@ -519,17 +512,32 @@ pub fn attachment_text(raw: &[u8], index: usize) -> Option<String> {
 /// (`text/plain; charset=windows-1252`), so the copy is read as the original was; without it, a
 /// file in Latin-1 went out as bare `text/plain` and was read as UTF-8.
 pub fn attachment_out(raw: &[u8], index: usize) -> Option<crate::OutAttachment> {
-    let m = MessageParser::default().parse(raw)?;
-    let a = attached(&m).0.into_iter().find(|a| a.info.index == index)?;
-    let sent = a.part.and_then(sent_bytes);
-    let charset =
-        a.part.filter(|_| sent.is_some() && a.info.mime.starts_with("text/")).and_then(|p| charset_token(p.content_type()?.attribute("charset")?));
-    let mime = match charset {
-        Some(c) => format!("{}; charset={c}", a.info.mime),
-        None => a.info.mime.clone(),
-    };
-    let data = sent.unwrap_or_else(|| a.data.into_owned());
-    Some(crate::OutAttachment { name: a.info.name, mime, data, ..Default::default() })
+    attachments_out(raw, &[index]).pop().map(|(_, out)| out)
+}
+
+/// [`attachment_out`] for several files from one parse (a draft reopened, a message forwarded:
+/// each of its files was the whole message parsed and all its files decoded again). Each of
+/// `wanted` the message has, once, in the message's order.
+pub fn attachments_out(raw: &[u8], wanted: &[usize]) -> Vec<(usize, crate::OutAttachment)> {
+    let Some(m) = MessageParser::default().parse(raw) else { return Vec::new() };
+    let mut out: Vec<(usize, crate::OutAttachment)> = Vec::new();
+    for a in attached(&m).0.into_iter().filter(|a| wanted.contains(&a.info.index)) {
+        if out.iter().any(|(i, _)| *i == a.info.index) {
+            continue;
+        }
+        let sent = a.part.and_then(sent_bytes);
+        let charset = a
+            .part
+            .filter(|_| sent.is_some() && a.info.mime.starts_with("text/"))
+            .and_then(|p| charset_token(p.content_type()?.attribute("charset")?));
+        let mime = match charset {
+            Some(c) => format!("{}; charset={c}", a.info.mime),
+            None => a.info.mime.clone(),
+        };
+        let data = sent.unwrap_or_else(|| a.data.into_owned());
+        out.push((a.info.index, crate::OutAttachment { name: a.info.name, mime, data, ..Default::default() }));
+    }
+    out
 }
 
 /// A charset's name as it can go into a `Content-Type`: a token (RFC 2045 §5.1) of at most 64

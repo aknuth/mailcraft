@@ -37,9 +37,65 @@ pub(super) fn picture_format(height: f32) -> TextFormat {
     TextFormat { font_id: theme::regular(14.5), line_height: Some(height + 4.0), color: Color32::TRANSPARENT, ..Default::default() }
 }
 
-/// The text laid out with its styles; `shift` moves a paragraph right (alignment); `own`: the
-/// pictures' own sizes.
-pub(super) fn job(text: &str, st: &Styles, plain: bool, t: &Tokens, wrap: f32, shift: &[f32], own: &HashMap<String, egui::Vec2>) -> LayoutJob {
+/// A part of the text with something drawn in its place (a signature's HTML code, laid out as
+/// it's sent, issue #90). The text stays in the message as it is, so what's sent and every
+/// place in the text are what they were: its letters are laid out too small to see, and its
+/// last line is as tall as what's drawn, with that much room before it (the cursor after it is
+/// that tall, at its right, as after a picture).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Card {
+    /// The characters it stands for.
+    pub range: std::ops::Range<usize>,
+    /// What's one thing with it (a signature's `-- ` line and its text): the cursor doesn't
+    /// stop in it, and Backspace after it or Delete before it takes all of it.
+    pub whole: std::ops::Range<usize>,
+    /// How big what's drawn is.
+    pub size: egui::Vec2,
+}
+
+impl Card {
+    /// Where the cursor is before it: the end of the line above, else its start.
+    pub(super) fn before(&self, text: &str) -> usize {
+        let above = self.whole.start.checked_sub(1).filter(|at| text.chars().nth(*at) == Some('\n'));
+        above.unwrap_or(self.whole.start)
+    }
+
+    /// The character its last line starts at: the line that keeps the room.
+    pub(super) fn last_line(&self, text: &str) -> usize {
+        let breaks = text.chars().enumerate().take(self.range.end).skip(self.range.start);
+        breaks.filter(|(_, ch)| *ch == '\n').map(|(i, _)| i + 1).last().unwrap_or(self.range.start)
+    }
+}
+
+/// Letters that take (next to) no room and aren't seen: a [`Card`]'s text. `height`: its line's.
+fn hidden_format(height: f32) -> TextFormat {
+    TextFormat { font_id: theme::regular(1.0), line_height: Some(height), color: Color32::TRANSPARENT, ..Default::default() }
+}
+
+/// What the message's text is laid out with: its styles, whether it's plain text, the colours,
+/// the width it wraps at, its pictures' own sizes and a part of it drawn as something else.
+#[derive(Clone, Copy)]
+pub(super) struct Lay<'a> {
+    pub(super) st: &'a Styles,
+    pub(super) plain: bool,
+    pub(super) t: &'a Tokens,
+    pub(super) wrap: f32,
+    pub(super) own: &'a HashMap<String, egui::Vec2>,
+    pub(super) card: Option<&'a Card>,
+}
+
+/// The text laid out as `lay` says; `shift` moves a paragraph right (alignment).
+pub(super) fn job(text: &str, lay: Lay<'_>, shift: &[f32]) -> LayoutJob {
+    let Lay { st, plain, t, wrap, own, card } = lay;
+    let card = card.filter(|_| !plain).map(|c| (c, c.last_line(text)));
+    // A card's letter at `at`: how tall its line is, and the room before it (its last line's start).
+    let hidden = |at: usize| {
+        card.filter(|(c, _)| c.range.contains(&at)).map(|(c, last)| {
+            let room = if wrap.is_finite() { c.size.x.min((wrap - 40.0).max(0.0)) } else { c.size.x };
+            (if at >= last { c.size.y + 4.0 } else { 0.5 }, if at == last { room } else { 0.0 })
+        })
+    };
+    let edge = |at: usize| card.is_some_and(|(c, _)| at == c.range.start || at == c.range.end);
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap;
     // Where a paragraph goes is decided here (`layout_aligned`), against the editor's width;
@@ -49,7 +105,11 @@ pub(super) fn job(text: &str, st: &Styles, plain: bool, t: &Tokens, wrap: f32, s
     let mut i = 0usize;
     for (n, line) in text.split('\n').enumerate() {
         if n > 0 {
-            let f = if plain { plain_fmt.clone() } else { format(&st.style(i.saturating_sub(1)), t) };
+            let f = match hidden(i) {
+                Some((height, _)) => hidden_format(height),
+                None if plain => plain_fmt.clone(),
+                None => format(&st.style(i.saturating_sub(1)), t),
+            };
             job.append("\n", 0.0, f);
             i += 1;
         }
@@ -62,11 +122,18 @@ pub(super) fn job(text: &str, st: &Styles, plain: bool, t: &Tokens, wrap: f32, s
             let cur = st.chars.get(i + k).copied();
             let next = st.chars.get(i + k + 1).copied();
             let pic = chars.get(k).is_some_and(|(_, ch)| *ch == PICTURE) || chars.get(k + 1).is_some_and(|(_, ch)| *ch == PICTURE);
-            if k + 1 == chars.len() || cur != next || pic {
+            if k + 1 == chars.len() || cur != next || pic || edge(i + k + 1) {
                 let from = chars.get(run_start).map_or(line.len(), |(b, _)| *b);
                 let to = chars.get(k + 1).map_or(line.len(), |(b, _)| *b);
                 let piece = line.get(from..to).unwrap_or("");
                 let style = st.style(i + run_start);
+                // A card's letters: unseen, the room for what's drawn before its last line.
+                if let Some((height, room)) = hidden(i + run_start) {
+                    job.append(piece, lead + room, hidden_format(height));
+                    lead = 0.0;
+                    run_start = k + 1;
+                    continue;
+                }
                 let size = (!plain && piece.starts_with(PICTURE))
                     .then(|| style.picture.as_ref().map(|cid| super::pictures::shown(own.get(cid).copied(), style.picture_width, wrap)))
                     .flatten();
@@ -132,18 +199,52 @@ pub(super) fn indent_empty_rows(g: Arc<Galley>, st: &Styles, plain: bool) -> Arc
 }
 
 /// Lay the text out; centred and right-aligned paragraphs that fit on one line are moved over.
-pub(super) fn layout(ui: &Ui, text: &str, st: &Styles, plain: bool, t: &Tokens, wrap: f32, own: &HashMap<String, egui::Vec2>) -> Arc<Galley> {
-    indent_empty_rows(layout_aligned(ui, text, st, plain, t, wrap, own), st, plain)
+/// (Afresh, for the tests: the editor keeps what it laid out with [`layout_kept`].)
+#[cfg(test)]
+pub(super) fn layout(ui: &Ui, text: &str, lay: Lay<'_>) -> Arc<Galley> {
+    let first = ui.painter().layout_job(job(text, lay, &[]));
+    indent_empty_rows(aligned(ui, first, text, lay), lay.st, lay.plain)
 }
 
-pub(super) fn layout_aligned(ui: &Ui, text: &str, st: &Styles, plain: bool, t: &Tokens, wrap: f32, own: &HashMap<String, egui::Vec2>) -> Arc<Galley> {
-    let first = ui.painter().layout_job(job(text, st, plain, t, wrap, &[], own));
-    // A right-to-left paragraph left as it was sits against the right edge.
-    let lines: Vec<&str> = text.split('\n').collect();
-    let align_of = |n: usize, a: Align| {
-        if a == Align::Left && lines.get(n).is_some_and(|l| crate::bidi::has_rtl(l) && crate::bidi::paragraph_rtl(l)) { Align::Right } else { a }
-    };
-    let rtl_of = |n: usize| lines.get(n).is_some_and(|l| crate::bidi::has_rtl(l) && crate::bidi::paragraph_rtl(l));
+/// The text laid out last, given again while it would be laid out the same: egui gives back the
+/// same first layout (it keeps a layout while it's used, and lays out afresh when the fonts
+/// change), with the same paragraphs and width. Aligned paragraphs (laid out twice), right-to-left
+/// ones and empty list items were moved on every frame.
+#[derive(Default)]
+pub(super) struct Laid {
+    first: Option<Arc<Galley>>,
+    paras: Vec<rich::Para>,
+    plain: bool,
+    wrap: f32,
+    out: Option<Arc<Galley>>,
+}
+
+/// The text laid out, its centred and right-aligned paragraphs that fit on one line moved over;
+/// given again from `laid` when it's the same.
+pub(super) fn layout_kept(laid: &mut Laid, ui: &Ui, text: &str, lay: Lay<'_>) -> Arc<Galley> {
+    let Lay { st, plain, wrap, .. } = lay;
+    let first = ui.painter().layout_job(job(text, lay, &[]));
+    if let (Some(was), Some(out)) = (&laid.first, &laid.out)
+        && Arc::ptr_eq(was, &first)
+        && laid.paras == st.paras
+        && laid.plain == plain
+        && laid.wrap.to_bits() == wrap.to_bits()
+    {
+        return out.clone();
+    }
+    let out = indent_empty_rows(aligned(ui, first.clone(), text, lay), st, plain);
+    *laid = Laid { first: Some(first), paras: st.paras.clone(), plain, wrap, out: Some(out.clone()) };
+    out
+}
+
+/// `first` (the text laid out) with its centred and right-aligned paragraphs moved over.
+fn aligned(ui: &Ui, first: Arc<Galley>, text: &str, lay: Lay<'_>) -> Arc<Galley> {
+    let Lay { st, plain, wrap, .. } = lay;
+    // A right-to-left paragraph left as it was sits against the right edge. (Each paragraph is
+    // looked at once: it was again for each of its rows, and twice to align it.)
+    let rtl: Vec<bool> = text.split('\n').map(|l| crate::bidi::has_rtl(l) && crate::bidi::paragraph_rtl(l)).collect();
+    let rtl_of = |n: usize| rtl.get(n).copied().unwrap_or(false);
+    let align_of = |n: usize, a: Align| if a == Align::Left && rtl_of(n) { Align::Right } else { a };
     if plain {
         // Plain text has no alignment of its own: right-to-left paragraphs still start on the right.
         return rtl_rows_right(first, rtl_of, wrap, 1);
@@ -173,7 +274,7 @@ pub(super) fn layout_aligned(ui: &Ui, text: &str, st: &Styles, plain: bool, t: &
             }
         }
     }
-    let shifted = ui.painter().layout_job(job(text, st, plain, t, wrap, &shift, own));
+    let shifted = ui.painter().layout_job(job(text, lay, &shift));
     // A right-to-left paragraph left as it was and wrapped: each of its rows against the right edge.
     rtl_rows_right(shifted, |n| st.para(n).align == Align::Left && rtl_of(n), wrap, 2)
 }

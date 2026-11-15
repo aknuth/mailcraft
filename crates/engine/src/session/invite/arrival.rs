@@ -8,7 +8,7 @@
 //! on this computer, and moves to the server's calendar once there is one. Nothing is lost
 //! either way: held invitations are kept with the calendar (`pim.json`), not just in memory.
 
-use mailcraft_model::pim::{HeldInvite, LOCAL, StoredEvent, is_server_calendar};
+use mailcraft_model::pim::{HeldInvite, LOCAL, is_server_calendar};
 
 use super::*;
 
@@ -68,7 +68,7 @@ impl Session {
     /// them: past that, one goes to the calendar on this computer at once (it moves to the
     /// server's later), so the calendar's file stays small. Whether anything changed.
     pub(crate) fn take_invitation(&mut self, key: &MessageKey) -> bool {
-        let Some((ics, sender)) = self.message_ics(key) else { return false };
+        let Some((ics, sender)) = self.message_ics(key, None) else { return false };
         let account = key.account.clone();
         let invitation = || matches!(ical::parse_in(&ics, self.clock.local_zone()).method.as_deref(), Some("REQUEST" | "CANCEL"));
         if self.calendars_pending(&account) && ics.len() <= MAX_HELD_ICS && invitation() {
@@ -102,7 +102,7 @@ impl Session {
             return;
         }
         let (due, kept): (Vec<HeldInvite>, Vec<HeldInvite>) =
-            std::mem::take(&mut p.held).into_iter().partition(|h| all || now - h.since >= HOLD_SECS);
+            std::mem::take(&mut p.held).into_iter().partition(|h| all || now.saturating_sub(h.since) >= HOLD_SECS);
         p.held = kept;
         if due.is_empty() {
             return;
@@ -140,7 +140,8 @@ impl Session {
     /// this computer (called from [`Session::tick`]; cheap when nothing waits).
     pub(crate) fn held_invitations_due(&mut self) {
         let now = self.clock.now;
-        let due: Vec<String> = self.pim.iter().filter(|(_, p)| p.held.iter().any(|h| now - h.since >= HOLD_SECS)).map(|(a, _)| a.clone()).collect();
+        let due: Vec<String> =
+            self.pim.iter().filter(|(_, p)| p.held.iter().any(|h| now.saturating_sub(h.since) >= HOLD_SECS)).map(|(a, _)| a.clone()).collect();
         for a in due {
             self.release_held(&a, false);
         }
@@ -159,7 +160,7 @@ impl Session {
                     .iter()
                     .filter(|e| &e.event.uid == uid && e.calendar == LOCAL)
                     .flat_map(|e| e.event.attendees.iter())
-                    .find(|a| mine.contains(&a.email.to_ascii_lowercase()))
+                    .find(|a| is_mine(&a.email, &mine))
                     .map(|a| a.partstat.clone())
                     .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("NEEDS-ACTION"))?;
                 Some((uid.clone(), answer))
@@ -192,7 +193,7 @@ impl Session {
                                 .event
                                 .attendees
                                 .iter()
-                                .filter(|a| mine.contains(&a.email.to_ascii_lowercase()))
+                                .filter(|a| is_mine(&a.email, &mine))
                                 .all(|a| a.partstat.is_empty() || a.partstat.eq_ignore_ascii_case("NEEDS-ACTION"));
                             if unanswered {
                                 set_answer(&mut e.event, &mine, &me, stat);
@@ -247,7 +248,7 @@ impl Session {
         let Some(uid) = cal.events.first().map(|e| e.uid.clone()).filter(|u| !u.trim().is_empty()) else { return false };
         let mine = self.my_addresses();
         // The user's own meeting (a copy to themselves): theirs already.
-        if cal.events.iter().any(|e| e.organizer.as_ref().is_some_and(|o| mine.contains(&without_mailto(&o.email).to_ascii_lowercase()))) {
+        if cal.events.iter().any(|e| e.organizer.as_ref().is_some_and(|o| is_mine(&o.email, &mine))) {
             return false;
         }
         if self.invite_problem(&cal, sender).is_some() {
@@ -263,11 +264,11 @@ impl Session {
                 let mut remote = false;
                 for mut e in events {
                     set_answer(&mut e, &mine, &me, "NEEDS-ACTION");
-                    e.attendees.iter_mut().filter(|a| mine.contains(&a.email.to_ascii_lowercase())).for_each(|a| a.rsvp = true);
+                    e.attendees.iter_mut().filter(|a| is_mine(&a.email, &mine)).for_each(|a| a.rsvp = true);
                     remote |= put_occurrence(p, &calendar, e);
                 }
                 // The user's copy now: a colleague's of the same meeting isn't shown beside it.
-                let theirs: Vec<String> = p.calendars.iter().filter(|c| c.foreign).map(|c| c.id.clone()).collect();
+                let theirs = p.theirs();
                 p.events.retain(|e| !(e.event.uid == uid && theirs.contains(&e.calendar)));
                 self.placed_here(account, &calendar, &uid);
                 self.after_pim_change(account, remote);
@@ -294,7 +295,7 @@ impl Session {
                         .events
                         .iter()
                         .find(|s| s.event.uid == uid && (s.event.recurrence_id == e.recurrence_id || s.event.recurrence_id.is_none()))
-                        .and_then(|s| s.event.attendees.iter().find(|a| mine.contains(&a.email.to_ascii_lowercase())).map(|a| a.partstat.clone()))
+                        .and_then(|s| s.event.attendees.iter().find(|a| is_mine(&a.email, &mine)).map(|a| a.partstat.clone()))
                         .filter(|_| !unanswered)
                         .unwrap_or_else(|| "NEEDS-ACTION".into());
                     set_answer(&mut e, &mine, &me, &kept);
@@ -309,15 +310,7 @@ impl Session {
                 let mut remote = false;
                 if unanswered {
                     // Never answered: gone, as if it hadn't come.
-                    if cancelled.iter().any(Option::is_none) {
-                        let gone: Vec<StoredEvent> = p.events.iter().filter(|e| e.event.uid == uid).cloned().collect();
-                        remote |= delete_items(p, &gone);
-                        p.events.retain(|e| e.event.uid != uid);
-                    } else {
-                        for at in cancelled.into_iter().flatten() {
-                            remote |= drop_occurrence(p, &uid, at);
-                        }
-                    }
+                    remote |= cancel_parts(p, &uid, &cancelled);
                 } else {
                     // Answered: marked cancelled, on the server too, as other calendars show it; the
                     // calendar here leaves cancelled meetings out, so its time is free.

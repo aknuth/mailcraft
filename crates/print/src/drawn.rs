@@ -2,6 +2,10 @@
 //! under the header in strips, a page's worth at a time, each strip ending where a row is one
 //! colour all across (between lines of text, not through them) when there's one near the end.
 
+use std::fmt::Write as _;
+
+use super::{MARGIN, MAX_PAGES, PAGE_H, Placed, add, compress};
+
 /// A body drawn as pictures, in place of the text.
 pub struct Drawn<'a> {
     /// Its size in CSS pixels.
@@ -58,6 +62,76 @@ pub(crate) fn rgb_on_white(w: u32, rows: u32, rgba: &[u8]) -> Vec<u8> {
     // Pixels missing (a short buffer): white.
     out.resize(n.saturating_mul(3), 255);
     out
+}
+
+/// The drawn body placed from `y` down, a page's room at a time (each strip painted then, and
+/// ended between lines where it can be), above `bottom`; `true` when it didn't all fit in
+/// [`MAX_PAGES`].
+pub(crate) fn place(d: Drawn<'_>, width: f32, bottom: f32, pages: &mut Vec<Vec<Placed>>, strips: &mut Vec<Vec<Strip>>, y: &mut f32) -> bool {
+    if !(d.width.is_finite() && d.height.is_finite()) || d.width < 1.0 || d.height <= 0.0 {
+        return false;
+    }
+    // Points per CSS pixel: the page's width across the text's.
+    let k = width / d.width;
+    let mut top = 0.0f32;
+    while top < d.height - 0.5 {
+        let room = *y - bottom;
+        if room < 36.0 {
+            if pages.len() >= MAX_PAGES {
+                return true;
+            }
+            pages.push(Vec::new());
+            *y = PAGE_H - MARGIN;
+            continue;
+        }
+        let want = (room / k).min(d.height - top);
+        let Some((px_w, px_h, rgba)) = (d.paint)(top, want) else { return false };
+        if px_w == 0 || px_h == 0 {
+            return false;
+        }
+        let last = top + want >= d.height - 0.5;
+        let keep = if last { px_h } else { rows_to_keep(px_w, px_h, &rgba) }.max(1);
+        let used = want * keep as f32 / px_h as f32;
+        let h = used * k;
+        *y -= h;
+        strips.resize_with(pages.len(), Vec::new);
+        if let Some(on) = strips.last_mut() {
+            on.push(Strip { x: MARGIN, y: *y, w: width, h, px_w, px_h: keep, data: compress(&rgb_on_white(px_w, keep, &rgba)) });
+        }
+        top += used;
+        if !last {
+            *y = bottom; // the page is full: the next strip starts a new one
+        }
+    }
+    false
+}
+
+/// A page's strips drawn (its content stream's start).
+pub(crate) fn draw_strips(strips: Option<&Vec<Strip>>) -> String {
+    let mut c = String::new();
+    for (j, st) in strips.into_iter().flatten().enumerate() {
+        let _ = writeln!(c, "q {:.2} 0 0 {:.2} {:.2} {:.2} cm /St{} Do Q", st.w, st.h, st.x, st.y, j + 1);
+    }
+    c
+}
+
+/// A page's strips as picture objects: their entries in the page's `/XObject` dictionary.
+pub(crate) fn strip_objects(strips: Option<&mut Vec<Strip>>, objects: &mut Vec<Vec<u8>>) -> String {
+    let mut names = String::new();
+    for (j, st) in strips.into_iter().flatten().enumerate() {
+        let data = std::mem::take(&mut st.data);
+        let mut s = format!(
+            "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n",
+            st.px_w,
+            st.px_h,
+            data.len()
+        )
+        .into_bytes();
+        s.extend_from_slice(&data);
+        s.extend_from_slice(b"\nendstream");
+        let _ = write!(names, "/St{} {} 0 R ", j + 1, add(objects, s));
+    }
+    names
 }
 
 #[cfg(test)]

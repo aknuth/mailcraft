@@ -3,12 +3,14 @@
 use super::*;
 
 mod across;
+mod big_moves;
 mod deferred;
 mod echo;
 mod follow_up;
 mod marks;
 mod moving;
 mod nav;
+mod one_undo;
 mod search;
 mod search_big;
 mod store_errors;
@@ -24,7 +26,6 @@ fn sample_inbox_lists_newest_first_with_groups() {
     assert!(rows.contains(&Row::Header("Yesterday")));
     let inbox = s.account(sample::SAMPLE_ACCOUNT).unwrap().folder(FolderRole::Inbox).unwrap();
     assert_eq!((inbox.unread, inbox.total), (3, 7));
-    done(s);
 }
 
 #[test]
@@ -80,7 +81,6 @@ fn open_marks_read_and_shows_text_and_attachments() {
     // Saved on purpose, any name is the user's call.
     s.run("attachment.save", &json!({"index": 0, "path": exe.to_string_lossy()})).unwrap();
     assert!(exe.exists());
-    done(s);
 }
 
 #[test]
@@ -114,7 +114,6 @@ fn delete_archive_move_and_permanent_delete() {
     assert!(s.run("mail.move", &json!({"folder": "Nowhere"})).is_err());
     s.run("folder.open", &json!({"account": "sample", "folder": "Projects/Short film"})).unwrap();
     assert_eq!(s.list.len(), 3);
-    done(s);
 }
 
 /// Issue #1: a message's whole conversation showed above it in the reading pane though the
@@ -135,7 +134,6 @@ fn the_conversation_shows_above_a_message_only_when_grouped() {
     assert_eq!(s.reading.as_ref().unwrap().thread.len(), 2);
     s.run("view.conversations", &json!({"on": false})).unwrap();
     assert!(s.reading.as_ref().unwrap().thread.is_empty());
-    done(s);
 }
 
 #[test]
@@ -191,7 +189,6 @@ fn folders_create_rename_move_delete_and_favorites() {
     let s2 = Session::open(Some(Store::open(&root).unwrap()), mailcraft_model::dates::Clock::new(NOW, 0));
     assert!(s2.folder(a, "Customers").is_some());
     assert!(s2.folder(a, "Clients").is_none());
-    done(s);
 }
 
 #[test]
@@ -216,7 +213,6 @@ fn remote_folder_changes_are_queued_as_jobs() {
     assert!(matches!(s.take_jobs().as_slice(), [Job::Apply { op: Op::RenameFolder { to, .. }, .. }] if to == "INBOX.Trash.Plans"));
     s.run("folder.delete", &json!({"folder": "INBOX.Trash.Plans"})).unwrap();
     assert!(matches!(s.take_jobs().as_slice(), [Job::Apply { op: Op::DeleteFolder { path }, .. }] if path == "INBOX.Trash.Plans"));
-    let _ = std::fs::remove_dir_all(s.store.as_ref().unwrap().root());
 }
 
 #[test]
@@ -253,7 +249,6 @@ hi
         s.run("message.popOut", &json!({})).unwrap();
     }
     assert_eq!(s.windows.len(), keys.len().min(crate::session::MAX_WINDOWS));
-    done(s);
 }
 
 /// A message waiting in the reading pane and in a window of its own is parsed once when it
@@ -277,7 +272,6 @@ fn a_message_shown_twice_is_parsed_once() {
     assert!(s.compose.as_ref().is_some_and(|c| c.subject.contains("Twice")));
     assert!(Arc::ptr_eq(s.reading.as_ref().unwrap().parsed.as_ref().unwrap(), &pane), "the one shown is left as it was");
     assert_eq!(*pane, *window);
-    done(s);
 }
 
 #[test]
@@ -302,7 +296,7 @@ fn mailbox_settings_commands() {
     assert!(s.run("account.mailbox", &json!({"account": "sample"})).unwrap()["cached"].as_u64().unwrap() > 0);
     assert!(s.run("account.setVacation", &json!({"account": "sample", "text": "x"})).is_err(), "no server");
     assert!(s.run("account.update", &json!({"account": "sample", "imapHost": "x"})).is_err());
-    done(s);
+    drop(s);
 
     // A server account: replies, quota and settings go through jobs and events.
     let mut s = Session::open(Some(temp("mailbox-remote")), mailcraft_model::dates::Clock::new(NOW, 0));
@@ -339,17 +333,12 @@ fn mailbox_settings_commands() {
     s.run("account.update", &json!({"account": id, "jmap": null})).unwrap();
     assert!(s.account(&id).unwrap().config.jmap.is_none());
     assert!(s.run("account.update", &json!({"account": id, "imapHost": "bad host"})).is_err());
-    done(s);
 }
 
 #[test]
 fn web_pictures_load_only_when_asked() {
-    let store = temp("pictures");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let inbox =
-        mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![inbox] });
+    let (mut s, id) = server_account("pictures", json!({"email": "zoe@example.org", "password": "pw"}), &[("INBOX", FolderRole::Inbox)]);
+    let store = s.store.clone().unwrap();
     let key = |uid| mailcraft_model::MessageKey { account: id.clone(), folder: "INBOX".into(), validity: 1, uid };
     let msgs = vec![
         mailcraft_model::Summary { key: key(1), subject: "News".into(), date: NOW, ..Default::default() },
@@ -424,17 +413,12 @@ fn web_pictures_load_only_when_asked() {
     assert!(!s.pictures_load_alone(), "in Junk");
     s.run("view.autoPictures", &json!({"on": false})).unwrap();
     assert!(!s.pictures_allowed(), "off again: it asks");
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 #[test]
 fn only_mail_that_arrives_later_is_announced() {
-    let store = temp("notify");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let inbox =
-        mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![inbox] });
+    let (mut s, id) = server_account("notify", json!({"email": "zoe@example.org", "password": "pw"}), &[("INBOX", FolderRole::Inbox)]);
+    let store = s.store.clone().unwrap();
     let m = |uid: u32, seen: bool, age: i64| mailcraft_model::Summary {
         key: mailcraft_model::MessageKey { account: id.clone(), folder: "INBOX".into(), validity: 9, uid },
         subject: format!("m{uid}"),
@@ -472,7 +456,6 @@ fn only_mail_that_arrives_later_is_announced() {
     save(vec![m(6, false, 1), m(5, false, 10)]);
     s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
     assert!(s.take_new_mail().is_empty());
-    let _ = std::fs::remove_dir_all(store.root());
 }
 
 /// A new account whose Inbox was empty at its first sync: nothing said the Inbox changed, so
@@ -480,12 +463,8 @@ fn only_mail_that_arrives_later_is_announced() {
 /// calendar). Synced in full, the empty Inbox is marked.
 #[test]
 fn the_first_message_of_an_empty_inbox_is_new() {
-    let store = temp("notify-empty");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let inbox =
-        mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![inbox] });
+    let (mut s, id) = server_account("notify-empty", json!({"email": "zoe@example.org", "password": "pw"}), &[("INBOX", FolderRole::Inbox)]);
+    let store = s.store.clone().unwrap();
     s.apply(Event::Status { account: id.clone(), status: SyncStatus::Online { at: NOW } });
     let m = mailcraft_model::Summary {
         key: mailcraft_model::MessageKey { account: id.clone(), folder: "INBOX".into(), validity: 9, uid: 1 },
@@ -498,7 +477,33 @@ fn the_first_message_of_an_empty_inbox_is_new() {
         .unwrap();
     s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
     assert_eq!(s.take_new_mail().into_iter().map(|m| m.subject).collect::<Vec<_>>(), ["first"]);
-    let _ = std::fs::remove_dir_all(store.root());
+}
+
+/// A server that numbers an Inbox again (a new UIDVALIDITY: the cache is dropped and synced
+/// again) brings the same mail under new numbers: none of it arrived, whatever its number, and
+/// what comes after it did.
+#[test]
+fn an_inbox_numbered_again_brings_no_new_mail() {
+    let (mut s, id) = server_account("notify-renumbered", json!({"email": "zoe@example.org", "password": "pw"}), &[("INBOX", FolderRole::Inbox)]);
+    let store = s.store.clone().unwrap();
+    let state = |validity: u32, uids: std::ops::RangeInclusive<u32>| {
+        let messages = uids
+            .map(|uid| {
+                let key = mailcraft_model::MessageKey { account: id.clone(), folder: "INBOX".into(), validity, uid };
+                mailcraft_model::Summary { key, subject: format!("{validity}/{uid}"), date: NOW, ..Default::default() }.into()
+            })
+            .collect();
+        mailcraft_store::FolderState { validity, uid_next: 0, highest_modseq: 0, messages, window: 0 }
+    };
+    store.save_folder(&id, "INBOX", &state(9, 1..=3)).unwrap();
+    s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
+    assert!(s.take_new_mail().is_empty(), "the first look is the backlog");
+    store.save_folder(&id, "INBOX", &state(10, 1..=20)).unwrap();
+    s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
+    assert!(s.take_new_mail().is_empty(), "numbered again, nothing arrived");
+    store.save_folder(&id, "INBOX", &state(10, 1..=21)).unwrap();
+    s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
+    assert_eq!(s.take_new_mail().into_iter().map(|m| m.subject).collect::<Vec<_>>(), ["10/21"]);
 }
 
 #[test]
@@ -514,7 +519,6 @@ fn recipients_are_suggested_from_mail_seen() {
     // Your own address isn't.
     assert_eq!(s.run("contacts.suggest", &json!({"query": "riley"})).unwrap().as_array().unwrap().len(), 0);
     assert!(s.run("contacts.suggest", &json!({})).is_err());
-    done(s);
 }
 
 /// A folder made in the Inbox shows under it, as Outlook shows one.
@@ -618,41 +622,43 @@ fn received_mail_is_listed_when_it_came() {
 }
 
 /// A big folder (tens of thousands of messages, as a 60 GB data file brings): selecting all and
-/// marking them read, then deleting them, takes moments, not minutes (per message, a delete read
-/// its whole folder again, and lookups went through whole lists: 8,000 took 65 s).
+/// marking them read, then deleting them, changes every one of them, in the list and on disk. How
+/// long it takes is measured apart, [`measure_a_big_folder_changed_all_at_once`]: moments, not
+/// minutes (per message, a delete read its whole folder again, and lookups went through whole
+/// lists: 8,000 took 65 s).
 #[test]
-fn a_big_folder_changes_all_at_once_quickly() {
-    let store = temp("big-folder-ops");
-    sample::seed_if_empty(&store, NOW).unwrap();
-    let n = 20_000u32;
-    let mut st = store.load_folder("sample", "Projects").unwrap();
-    st.validity = 7;
-    st.messages = (1..=n)
-        .map(|uid| mailcraft_model::Summary {
-            key: mailcraft_model::MessageKey { account: "sample".into(), folder: "Projects".into(), validity: 7, uid },
-            subject: format!("Report {uid}"),
-            date: NOW - i64::from(uid) * 60,
-            ..Default::default()
-        })
-        .map(Into::into)
-        .collect();
-    store.save_folder("sample", "Projects", &st).unwrap();
-    let mut s = Session::open(Some(store), mailcraft_model::dates::Clock::new(NOW, 0));
-    s.run("folder.open", &json!({"account": "sample", "folder": "Projects"})).unwrap();
-    assert_eq!(s.list.len(), n as usize);
+fn a_big_folder_changes_all_at_once() {
+    let mut s = big_folder("big-folder-ops");
+    s.run("list.selectAll", &json!({})).unwrap();
+    s.run("mail.markRead", &json!({})).unwrap();
+    assert!(s.list.iter().all(|m| m.flags.seen));
+    assert!(s.store.as_ref().unwrap().load_folder("sample", "Projects").unwrap().messages.iter().all(|m| m.flags.seen));
+    s.run("list.selectAll", &json!({})).unwrap();
+    s.run("mail.delete", &json!({})).unwrap();
+    assert!(s.list.is_empty(), "{}", s.list.len());
+}
+
+/// What [`a_big_folder_changes_all_at_once`] takes (`cargo test -p mailcraft-engine --release
+/// measure_a_big_folder_changed_all_at_once -- --ignored --nocapture`).
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_a_big_folder_changed_all_at_once() {
+    let mut s = big_folder("big-folder-ops-measured");
     let began = std::time::Instant::now();
     s.run("list.selectAll", &json!({})).unwrap();
     s.run("mail.markRead", &json!({})).unwrap();
-    let took = began.elapsed();
-    assert!(s.list.iter().all(|m| m.flags.seen));
-    assert!(s.store.as_ref().unwrap().load_folder("sample", "Projects").unwrap().messages.iter().all(|m| m.flags.seen));
-    assert!(took < std::time::Duration::from_secs(15), "marking {n} read took {took:?}");
+    let marked = began.elapsed();
     let began = std::time::Instant::now();
     s.run("list.selectAll", &json!({})).unwrap();
     s.run("mail.delete", &json!({})).unwrap();
-    let took = began.elapsed();
-    assert!(s.list.is_empty(), "{}", s.list.len());
-    assert!(took < std::time::Duration::from_secs(15), "deleting {n} took {took:?}");
+    let deleted = began.elapsed();
+    assert!(s.list.is_empty());
+    println!("MEASURE a folder of 20000: all marked read in {} ms, all deleted in {} ms", marked.as_millis(), deleted.as_millis());
+}
+
+/// The sample, on disk, with its Projects made a folder of 20,000 messages, open.
+fn big_folder(name: &str) -> Session {
+    big_projects(&temp(name), 20_000)
 }
 
 /// Issue #4: closing loses what online-only accounts hold in memory only (unsent mail, changes
@@ -682,7 +688,6 @@ fn closing_counts_whats_lost_and_a_missing_password_is_asked_for() {
     s.ask_password.clear();
     needs(&mut s);
     assert!(s.ask_password.is_empty(), "once while MailCraft runs");
-    done(s);
 }
 
 /// Issue #46: dates and times as the user writes them, day first and on a 12-hour clock, with the
@@ -704,5 +709,4 @@ fn dates_are_written_as_chosen() {
     assert_eq!(s.prefs.date_style.order, mailcraft_model::dates::DateOrder::DayMonthYear);
     assert!(s.prefs.date_style.full_in_list && !s.clock.style.hours12);
     assert!(matches!(s.run("view.dateFormat", &json!({"order": "ydm"})), Err(CmdError::Params(_))));
-    done(s);
 }

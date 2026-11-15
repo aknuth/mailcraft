@@ -30,7 +30,7 @@ use serde_json::json;
 /// it when an address is typed: the encrypted ports first. Then the calendar and contacts
 /// found from Mailcow's own address, as `/.well-known/caldav` leads to SOGo.
 #[test]
-#[ignore]
+#[ignore = "needs a Mailcow on this computer in MAILCRAFT_REAL_MAILCOW"]
 fn real_mailcow_account_setup() {
     let Some(m) = Mailcow::from_env() else { return };
     let (email, _) = m.user(0);
@@ -90,7 +90,7 @@ fn real_mailcow_account_setup() {
 /// Inbox shared through SOGo, bob (who may change it) and carol (who may only read it) see the
 /// same; carol's change is refused, not taken and forgotten.
 #[test]
-#[ignore]
+#[ignore = "needs a Mailcow on this computer in MAILCRAFT_REAL_MAILCOW"]
 fn real_mailcow_categories_with_sogo() {
     let Some(m) = Mailcow::from_env() else { return };
     let tag = std::process::id();
@@ -107,8 +107,8 @@ fn real_mailcow_categories_with_sogo() {
     let mut imap = m.imap_as(0);
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let uid = loop {
-        if let Some(x) = imap.messages("INBOX").into_iter().find(|x| x.2 == subject) {
-            break x.0;
+        if let Some(x) = imap.messages("INBOX").into_iter().find(|x| x.subject == subject) {
+            break x.uid;
         }
         assert!(std::time::Instant::now() < end, "not delivered");
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -172,9 +172,9 @@ fn real_mailcow_categories_with_sogo() {
     assert!((200..300).contains(&r.status), "{}", r.text());
     sogo.post("Mail/0/folderINBOX/addOrRemoveLabel", &json!({"operation": "add", "msgUIDs": [uid], "flags": "\\Flagged"}));
     sogo.post("Mail/0/folderINBOX/moveMessages", &json!({"uids": [uid], "folder": "/0/folderArchive"}));
-    let archived = imap.messages("Archive").into_iter().find(|x| x.2 == subject).expect("moved by SOGo");
-    eprintln!("in Archive: {:?}", archived.1);
-    sogo.post("Mail/0/folderArchive/moveMessages", &json!({"uids": [archived.0], "folder": "/0/folderINBOX"}));
+    let archived = imap.messages("Archive").into_iter().find(|x| x.subject == subject).expect("moved by SOGo");
+    eprintln!("in Archive: {:?}", archived.flags);
+    sogo.post("Mail/0/folderArchive/moveMessages", &json!({"uids": [archived.uid], "folder": "/0/folderINBOX"}));
     let back = imap.flags("INBOX", &subject);
     eprintln!("back in the Inbox: {back:?}");
     for k in ["r=c3=bcckfrage", "$label2", "$label6", "projekt", "\\Seen", "\\Flagged"] {
@@ -185,7 +185,7 @@ fn real_mailcow_categories_with_sogo() {
     });
     assert_eq!(names(&mut app), ["Work", "Review", "Rückfrage", "projekt"]);
     // SOGo takes one off: gone here too.
-    let now_uid = imap.messages("INBOX").into_iter().find(|x| x.2 == subject).map(|x| x.0).unwrap();
+    let now_uid = imap.messages("INBOX").into_iter().find(|x| x.subject == subject).map(|x| x.uid).unwrap();
     sogo.label("folderINBOX", &[now_uid], "projekt", false);
     app.pool.submit(mailcraft_engine::model::Job::SyncFolder { account: id.clone(), folder: "INBOX".into() });
     app.pump(60, "projekt taken off", |s, _| s.folder_state(&id, "INBOX").messages.iter().any(|x| x.subject == subject && !x.flags.has("projekt")));

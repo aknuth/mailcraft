@@ -65,13 +65,10 @@ impl MailApp {
             _ => builder,
         };
         let (session, st, services) = (&mut self.session, &mut self.ui, &mut self.services);
-        let close = ctx.show_viewport_immediate(id, builder, |ui, _| {
-            let mut place = st.places.get("compose").copied();
-            after_open(ui, place);
-            WindowPlace::note(&mut place, ui);
-            if let Some(p) = place {
-                st.places.insert("compose".into(), p);
-            }
+        // Under the frame's guard: a panic in this window's own pass is said once it's over.
+        let mut caught = None;
+        let mut draw = |ui: &mut egui::Ui| {
+            track_place(&mut st.places, "compose", ui);
             let mut mine_acts: Vec<Action> = Vec::new();
             let mut closing = ui.input(|i| i.viewport().close_requested());
             // Something written: ask first, as Outlook does.
@@ -101,7 +98,9 @@ impl MailApp {
             }
             acts.extend(mine_acts);
             closing
-        });
+        };
+        let close = ctx.show_viewport_immediate(id, builder, |ui, _| super::frame::guarded_window(&mut caught, || draw(ui)));
+        self.window_drawn(ctx, caught);
         if close {
             forget_open(ctx, id);
             acts.push(Action::Run("compose.close", json!({"save": false})));
@@ -162,6 +161,8 @@ impl MailApp {
                 }
             }
         }
+        // Under the frame's guard: a panic in a window's own pass is said once they're drawn.
+        let mut caught = None;
         for w in self.session.windows.clone() {
             let key = w.key.clone();
             let subject =
@@ -177,16 +178,11 @@ impl MailApp {
                 _ => builder,
             };
             let (session, st) = (&mut self.session, &mut self.ui);
-            let close = ctx.show_viewport_immediate(id, builder, |ui, _| {
+            let mut draw = |ui: &mut egui::Ui| {
                 // Reading here is the user being back, as much as in the main window.
                 st.compact.note_input(ui);
-                let mut place = st.places.get("message").copied();
-                after_open(ui, place);
                 raise_once(ui.ctx(), id);
-                WindowPlace::note(&mut place, ui);
-                if let Some(p) = place {
-                    st.places.insert("message".into(), p);
-                }
+                track_place(&mut st.places, "message", ui);
                 let mut mine: Vec<Action> = Vec::new();
                 let closing = ui.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape));
                 egui::Panel::top(egui::Id::unique(("message-window-bar", key.to_id())))
@@ -214,12 +210,14 @@ impl MailApp {
                     a => a,
                 }));
                 closing && !leave
-            });
+            };
+            let close = ctx.show_viewport_immediate(id, builder, |ui, _| super::frame::guarded_window(&mut caught, || draw(ui)));
             if close {
                 forget_open(ctx, id);
                 acts.push(Action::Run("message.closeWindow", json!({"key": key.to_id()})));
             }
         }
+        self.window_drawn(ctx, caught);
     }
 }
 
@@ -245,6 +243,42 @@ pub(crate) const SYSTEM_BAR: egui::Vec2 = egui::vec2(48.0, 48.0);
 
 /// The smallest a window is made to fit its monitor (the main window's minimum size).
 pub(crate) const FIT_MIN: egui::Vec2 = egui::vec2(760.0, 480.0);
+
+/// The monitors as the system lists them, in physical pixels: every one, and the primary one
+/// where the system says which (not on Wayland, nor in the browser).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Monitors {
+    pub all: Vec<egui::Rect>,
+    pub primary: Option<egui::Rect>,
+}
+
+fn monitors_id() -> egui::Id {
+    egui::Id::unique("system-monitors")
+}
+
+/// Tell every window where the monitors are (the app asks the system every so often), for a
+/// window opening where none is any more ([`WindowPlace::rescue`]).
+pub fn set_monitors(ctx: &egui::Context, monitors: Option<Monitors>) {
+    ctx.data_mut(|d| d.insert_temp(monitors_id(), monitors.map(std::sync::Arc::new)));
+}
+
+/// What [`set_monitors`] said last.
+fn monitors(ctx: &egui::Context) -> Option<std::sync::Arc<Monitors>> {
+    ctx.data(|d| d.get_temp::<Option<std::sync::Arc<Monitors>>>(monitors_id())).flatten()
+}
+
+/// How much of a window's top edge must be on one monitor for the pointer to drag it back.
+const GRIP: egui::Vec2 = egui::vec2(96.0, 16.0);
+
+/// Whether a [`GRIP`] of `window`'s top edge is on one of `monitors` (all in one unit).
+pub(crate) fn reachable(window: egui::Rect, monitors: &[egui::Rect]) -> bool {
+    let top = egui::Rect::from_min_size(window.min, egui::vec2(window.width(), window.height().min(GRIP.y)));
+    let need = GRIP.min(top.size());
+    monitors.iter().any(|m| {
+        let on = top.intersect(*m);
+        on.is_positive() && on.width() >= need.x && on.height() >= need.y
+    })
+}
 
 /// Light or dark as chosen in MailCraft (none: as the system is), for the title bars the system
 /// draws on its windows: they followed the system alone, a dark bar on a light MailCraft (issue
@@ -294,26 +328,37 @@ impl WindowPlace {
             return;
         }
         if let (Some(outer), Some(inner)) = (v.outer_rect, v.inner_rect) {
-            let monitor = v.monitor_size.filter(|m| m.is_finite() && m.x > 0.0 && m.y > 0.0).map(|m| [m.x, m.y]);
+            let monitor = monitor_of(&v).map(|m| [m.x, m.y]);
             *place = Some(WindowPlace { x: outer.min.x, y: outer.min.y, w: inner.width(), h: inner.height(), maximized: false, monitor });
         }
     }
 
     /// Where to move a restored window, once its monitor is known (the other Craft apps' fix): a
-    /// window whose monitor differs from the one it was saved on (an external monitor unplugged)
-    /// may sit where no monitor is any more, so it's centred on the primary one, whose top-left
-    /// corner is the origin. A maximized window fills whichever monitor the system picks.
-    pub fn rescue(self, info: &egui::ViewportInfo) -> Option<egui::Pos2> {
+    /// window whose monitor differs from the one it was saved on (an external monitor unplugged),
+    /// or that the system's `monitors` say no monitor holds enough of to be dragged by, is
+    /// centred on the primary monitor (whose top-left corner is the origin where the system
+    /// doesn't say where it is). Sizes alone can't tell: a monitor unplugged can leave one of
+    /// the same size (WordCraft found). A maximized window fills whichever monitor the system
+    /// picks.
+    pub fn rescue(self, info: &egui::ViewportInfo, monitors: Option<&Monitors>) -> Option<egui::Pos2> {
         if self.maximized {
             return None;
         }
-        let saved = egui::Vec2::from(self.monitor?);
-        let now = info.monitor_size.filter(|s| s.is_finite() && s.x > 0.0 && s.y > 0.0)?;
-        if (now - saved).length() <= 1.0 {
+        let now = monitor_of(info)?;
+        let other = self.monitor.is_some_and(|saved| (now - egui::Vec2::from(saved)).length() > 1.0);
+        // In the monitors' physical pixels.
+        let ppp = info.native_pixels_per_point.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(1.0);
+        let lost = match (monitors.filter(|m| !m.all.is_empty()), info.outer_rect.filter(|r| r.is_finite())) {
+            (Some(m), Some(outer)) => !reachable(egui::Rect::from_min_max(outer.min * ppp, outer.max * ppp), &m.all),
+            _ => false,
+        };
+        if !other && !lost {
             return None;
         }
-        let free = now - egui::vec2(self.w, self.h);
-        Some(egui::pos2((free.x / 2.0).max(0.0), (free.y / 2.0).max(0.0)))
+        let primary = monitors.and_then(|m| m.primary).map(|r| egui::Rect::from_min_max(r.min / ppp, r.max / ppp));
+        let area = primary.unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, now));
+        let free = area.size() - egui::vec2(self.w, self.h);
+        Some(area.min + (free / 2.0).max(egui::Vec2::ZERO))
     }
 
     /// Once the monitor is known, a smaller size and a centred position for a window that doesn't
@@ -325,7 +370,7 @@ impl WindowPlace {
         if info.maximized == Some(true) || info.fullscreen == Some(true) || info.minimized == Some(true) {
             return None;
         }
-        let monitor = info.monitor_size.filter(|s| s.is_finite() && s.x > 0.0 && s.y > 0.0)?;
+        let monitor = monitor_of(info)?;
         let inner = info.inner_rect.filter(|r| r.is_finite())?;
         let outer = info.outer_rect.filter(|r| r.is_finite()).unwrap_or(inner);
         let frame = (outer.size() - inner.size()).max(egui::Vec2::ZERO);
@@ -376,11 +421,11 @@ pub fn after_open(ui: &Ui, place: Option<WindowPlace>) {
     // A window with no place (the system put it) is checked too.
     let pending = pending.unwrap_or_else(|| Some(place.unwrap_or_default()));
     let info = ui.input(|i| i.viewport().clone());
-    let known = info.monitor_size.is_some_and(|m| m.is_finite() && m.x > 0.0 && m.y > 0.0);
+    let known = monitor_of(&info).is_some();
     let pending = match pending {
         Some(p) if known => {
             let restored = place.is_some();
-            if let Some(pos) = p.rescue(&info) {
+            if let Some(pos) = p.rescue(&info, monitors(ctx).as_deref()) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             } else if !p.maximized
                 && let Some((pos, size)) = WindowPlace::fit(&info, restored)
@@ -393,6 +438,29 @@ pub fn after_open(ui: &Ui, place: Option<WindowPlace>) {
         other => other,
     };
     ctx.data_mut(|d| d.insert_temp(id, pending));
+}
+
+/// What every window does at the top of each of its frames: [`after_open`] from where windows of
+/// its `kind` ("main", "message", "compose", "source") were last, then where it is now noted
+/// there for the next one.
+pub(crate) fn track_place(places: &mut std::collections::BTreeMap<String, WindowPlace>, kind: &str, ui: &Ui) {
+    let mut place = places.get(kind).copied();
+    after_open(ui, place);
+    WindowPlace::note(&mut place, ui);
+    if let Some(p) = place {
+        // The kind's key made only the once, not at every frame.
+        match places.get_mut(kind) {
+            Some(kept) => *kept = p,
+            None => {
+                places.insert(kind.to_string(), p);
+            }
+        }
+    }
+}
+
+/// The size of the monitor a window is on, when the system has told a sensible one.
+fn monitor_of(info: &egui::ViewportInfo) -> Option<egui::Vec2> {
+    info.monitor_size.filter(|m| m.is_finite() && m.x > 0.0 && m.y > 0.0)
 }
 
 /// True until [`after_open`] has run for this viewport. Saved geometry goes into the builder
@@ -432,26 +500,15 @@ pub(crate) fn window_toolbar(ui: &mut Ui, s: &Session, st: &UiState, key: &Messa
         opened_file_toolbar(ui, s, st, key, acts);
         return;
     }
+    widgets::fitted_toolbar(ui, egui::Id::unique(("message-toolbar-fit", ui.ctx().viewport_id())), |ui| toolbar_row(ui, s, st, key, acts));
+}
+
+/// The row of a message window's toolbar (what [`window_toolbar`] fits to the window).
+fn toolbar_row(ui: &mut Ui, s: &Session, st: &UiState, key: &MessageKey, acts: &mut Vec<Action>) {
+    let t = &st.tokens;
     let close = || Action::Run("message.closeWindow", json!({"key": key.to_id()}));
     let flagged = s.summary(key).is_some_and(|m| m.flags.flagged);
     let unread = s.summary(key).is_some_and(|m| !m.flags.seen);
-    widgets::fitted_toolbar(ui, egui::Id::unique(("message-toolbar-fit", ui.ctx().viewport_id())), |ui| {
-        toolbar_row(ui, s, st, key, flagged, unread, close, acts)
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn toolbar_row(
-    ui: &mut Ui,
-    s: &Session,
-    st: &UiState,
-    key: &MessageKey,
-    flagged: bool,
-    unread: bool,
-    close: impl Fn() -> Action,
-    acts: &mut Vec<Action>,
-) {
-    let t = &st.tokens;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (id, icon, label) in
@@ -493,26 +550,32 @@ fn toolbar_row(
             acts.push(Action::Open(key.clone()));
             acts.push(Action::Print);
         }
-        // More, as the reading pane's ⋯: what's done to this message alone, staying open.
-        let more = widgets::more_pill(ui, "More actions", t);
-        egui::Popup::menu(&more).show(|ui| {
-            if ui.button(tl!("View message source")).clicked() {
-                acts.push(Action::Run("message.source", json!({"key": key.to_id()})));
-                ui.close();
-            }
-            if let Some(p) = s.windows.iter().find(|w| &w.key == key).and_then(|w| w.parsed.as_ref()) {
-                reading::plain_text_check(s, st, ui, key, p, acts);
-            }
-        });
-        // Drawn inside the page (the browser), the window has no title bar to close it from.
-        if ui.ctx().embed_viewports() {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::tool_button(ui, Icon::Close, "Close", t, true).clicked() {
-                    acts.push(close());
-                }
-            });
+        more_and_close(ui, s, st, key, acts);
+    });
+}
+
+/// The end of a message window's toolbar: More, as the reading pane's ⋯ (what's done to this
+/// message alone, staying open), and Close where the window has no title bar to close it from
+/// (drawn inside the page, the browser's).
+fn more_and_close(ui: &mut Ui, s: &Session, st: &UiState, key: &MessageKey, acts: &mut Vec<Action>) {
+    let t = &st.tokens;
+    let more = widgets::more_pill(ui, "More actions", t);
+    egui::Popup::menu(&more).show(|ui| {
+        if ui.button(tl!("View message source")).clicked() {
+            acts.push(Action::Run("message.source", json!({"key": key.to_id()})));
+            ui.close();
+        }
+        if let Some(p) = s.windows.iter().find(|w| &w.key == key).and_then(|w| w.parsed.as_ref()) {
+            reading::plain_text_check(s, st, ui, key, p, acts);
         }
     });
+    if ui.ctx().embed_viewports() {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if widgets::tool_button(ui, Icon::Close, "Close", t, true).clicked() {
+                acts.push(Action::Run("message.closeWindow", json!({"key": key.to_id()})));
+            }
+        });
+    }
 }
 
 /// The toolbar of an opened message file's window (issue #56): what looks at it or keeps a copy
@@ -535,22 +598,6 @@ fn opened_file_toolbar(ui: &mut Ui, s: &Session, st: &UiState, key: &MessageKey,
                 ui.close();
             }
         });
-        let more = widgets::more_pill(ui, "More actions", t);
-        egui::Popup::menu(&more).show(|ui| {
-            if ui.button(tl!("View message source")).clicked() {
-                acts.push(Action::Run("message.source", json!({"key": key.to_id()})));
-                ui.close();
-            }
-            if let Some(p) = s.windows.iter().find(|w| &w.key == key).and_then(|w| w.parsed.as_ref()) {
-                reading::plain_text_check(s, st, ui, key, p, acts);
-            }
-        });
-        if ui.ctx().embed_viewports() {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if widgets::tool_button(ui, Icon::Close, "Close", t, true).clicked() {
-                    acts.push(Action::Run("message.closeWindow", json!({"key": key.to_id()})));
-                }
-            });
-        }
+        more_and_close(ui, s, st, key, acts);
     });
 }

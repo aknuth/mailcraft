@@ -15,13 +15,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use desktop::launch::{self, Launch};
+use desktop::start::Made;
 use desktop::{Desktop, PoolBackend};
 use mailcraft_engine::Session;
 use mailcraft_engine::model::dates::Clock;
 use mailcraft_engine::model::{Event, Job};
 use mailcraft_engine::store::{OpenProgress, Store, location};
 use mailcraft_net::worker::{Credentials, Pool};
-use mailcraft_ui_egui::{Backend, BootCard, MailApp, Services, VideoFrame};
+use mailcraft_ui_egui::{Backend, BootCard, FramePart, MailApp, Services, VideoFrame};
 use secrets::Keychain;
 
 mod appearance;
@@ -46,16 +48,20 @@ mod xdnd;
 
 /// The system's UI font, if installed (never bundled).
 fn system_fonts() -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let candidates: &[(&str, &str)] = if cfg!(target_os = "windows") {
-        &[("C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf")]
-    } else if cfg!(target_os = "macos") {
-        &[("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf")]
+    let candidates: Vec<(PathBuf, PathBuf)> = if cfg!(target_os = "windows") {
+        let fonts = desktop::windows_fonts_dir();
+        vec![(fonts.join("segoeui.ttf"), fonts.join("segoeuib.ttf"))]
     } else {
-        &[
-            ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
-            ("/usr/share/fonts/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf"),
-            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-        ]
+        let places: &[(&str, &str)] = if cfg!(target_os = "macos") {
+            &[("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf")]
+        } else {
+            &[
+                ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+                ("/usr/share/fonts/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Bold.ttf"),
+                ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+            ]
+        };
+        places.iter().map(|(r, b)| (PathBuf::from(r), PathBuf::from(b))).collect()
     };
     for (r, b) in candidates {
         if let Ok(reg) = std::fs::read(r) {
@@ -111,10 +117,12 @@ impl mailcraft_ui_egui::ClipboardRead for SystemClipboard {
     }
 }
 
-/// The window icon: the committed app icon (`cargo xtask icons`), or egui's default if it can't be decoded.
+/// The committed app icon (`cargo xtask icons`), at 64 pixels.
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/64x64/apps/io.github.zidan44.MailCraft.png");
+
+/// The window icon: the app icon, or egui's default if it can't be decoded.
 fn app_icon() -> egui::IconData {
-    const PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/64x64/apps/io.github.zidan44.MailCraft.png");
-    match image::load_from_memory_with_format(PNG, image::ImageFormat::Png) {
+    match image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png) {
         Ok(img) => {
             let img = img.into_rgba8();
             egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
@@ -126,11 +134,10 @@ fn app_icon() -> egui::IconData {
 /// Hand a file to the system's drag and drop (Windows and macOS; elsewhere egui has no way to).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn drag_out(frame: &eframe::Frame, path: PathBuf) {
-    const PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/64x64/apps/io.github.zidan44.MailCraft.png");
     let options = drag::Options { skip_animatation_on_cancel_or_failure: false, mode: drag::DragMode::Copy };
     // The drag crate is native code; a failure there must not take the app down.
     let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drag::start_drag(frame, drag::DragItem::Files(vec![path]), drag::Image::Raw(PNG.to_vec()), |_, _| {}, options)
+        drag::start_drag(frame, drag::DragItem::Files(vec![path]), drag::Image::Raw(APP_ICON_PNG.to_vec()), |_, _| {}, options)
     }));
     match started {
         Ok(Ok(())) => {}
@@ -184,6 +191,8 @@ struct App {
     updater: Option<self_update::Updater>,
     /// When the settings were last looked at ([`App::keep_state`]).
     looked: std::time::Instant,
+    /// When the system was last asked where the monitors are ([`App::look_at_monitors`]).
+    monitors_looked: Option<std::time::Instant>,
     /// MailCraft's icon in the notification area, while it's kept running there.
     tray: desktop::tray::Tray,
 }
@@ -191,7 +200,26 @@ struct App {
 /// How often changed settings are written while MailCraft runs.
 const KEEP_STATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often the system is asked where the monitors are.
+const MONITORS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl App {
+    /// Tell MailCraft's windows where the monitors are, asking the system every few seconds (a
+    /// monitor plugged in or out shows soon enough): a window restored where none is any more is
+    /// brought back on screen (`WindowPlace::rescue`).
+    fn look_at_monitors(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.monitors_looked.is_some_and(|at| at.elapsed() < MONITORS_EVERY) {
+            return;
+        }
+        self.monitors_looked = Some(std::time::Instant::now());
+        let rect = |(x, y): (i32, i32), (w, h): (u32, u32)| egui::Rect::from_min_size(egui::pos2(x as f32, y as f32), egui::vec2(w as f32, h as f32));
+        let monitors = frame.winit_window().map(|w| mailcraft_ui_egui::Monitors {
+            all: w.available_monitors().map(|m| rect((m.position().x, m.position().y), (m.size().width, m.size().height))).collect(),
+            primary: w.primary_monitor().map(|m| rect((m.position().x, m.position().y), (m.size().width, m.size().height))),
+        });
+        mailcraft_ui_egui::set_monitors(ctx, monitors);
+    }
+
     /// Write the settings when they've changed: a reminder dismissed or a sender blocked isn't
     /// lost if MailCraft is ended without closing (a crash, a power cut, a forced quit).
     fn keep_state(&mut self, ctx: Option<&egui::Context>, force: bool) {
@@ -213,10 +241,28 @@ impl App {
     }
 }
 
+// Each part of a frame runs under the guard: a panic in it is said and MailCraft goes on, rather
+// than ending with the messages being written (`MailApp::frame_part_ended`).
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.app.frame_part_starts(FramePart::Logic);
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.logic_unguarded(ctx, frame)));
+        self.app.frame_part_ended(ctx, FramePart::Logic, ran);
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.app.frame_part_starts(FramePart::Ui);
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ui_unguarded(ui, frame)));
+        self.app.frame_part_ended(ui.ctx(), FramePart::Ui, ran);
+    }
+    fn on_exit(&mut self) {
+        self.exiting();
+    }
+}
+
+impl App {
     // Every frame, the window minimized or hidden too (when eframe runs no `ui`): started again,
     // this window comes forward instead of a second one, and opens what that launch handed over.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic_unguarded(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // The GPU device is gone: what's being written is kept as drafts and MailCraft closes, as
         // nothing can be drawn any more.
         if self.lost.as_ref().is_some_and(graphics::LostWatch::lost) {
@@ -240,7 +286,7 @@ impl eframe::App for App {
         #[cfg(target_os = "macos")]
         MailApp::quit_instead_of_close(ctx, apple_events::quit);
     }
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui_unguarded(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Nothing is drawn with a lost device (egui-wgpu would panic making its buffers).
         if self.app.ui.graphics_lost {
             return;
@@ -251,13 +297,14 @@ impl eframe::App for App {
         {
             graphics::log_errors(&device);
         }
+        self.look_at_monitors(ui.ctx(), frame);
         self.app.ui(ui);
         self.keep_state(Some(ui.ctx()), false);
         if let Some(path) = self.app.take_drag_out() {
             drag_out(frame, path);
         }
     }
-    fn on_exit(&mut self) {
+    fn exiting(&mut self) {
         if let Some(server) = &self.instance {
             server.close();
         }
@@ -315,44 +362,25 @@ fn main() -> eframe::Result {
         say_out(args::USAGE);
         return Ok(());
     }
-    let cmd_args = args.clone();
-    // `mailto:` links and mail files: MailCraft as the system's mail app, or Open with (`args.rs`).
-    let handed = opened.unwrap_or_else(|| args::handed(&args));
-    let sample = args.iter().any(|a| a == "--sample");
     // Text pasted from Outlook, Word or a web page keeps its look.
     // A logo copied with it from older Word or Outlook, a file of Office's own, comes along too.
     mailcraft_ui_egui::set_clipboard_html(|| read_clipboard(|c| c.get().html().ok()).filter(|h| !h.trim().is_empty()).map(desktop::office_pictures));
-    // Each account is a data file in Documents\MailCraft Files (as Outlook keeps .pst files in
-    // Outlook Files); the account list and the app's state stay in the app folder. The data files'
-    // folder can be moved (File › Options) when it's the usual one: a move asked for is carried
-    // out now, before anything opens them.
-    let chosen = sample || args.iter().any(|a| a == "--data") || std::env::var_os("MAILCRAFT_DATA").is_some_and(|d| !d.is_empty());
-    // Portable (issue #4): `portable.txt` beside the app keeps everything in MailCraftData there.
-    let portable = if chosen { portable::Portable::default() } else { portable::current().clone() };
-    let base = (!chosen && portable.dir.is_none()).then(location::base_root).flatten();
-    let data = args
-        .iter()
-        .position(|a| a == "--data")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .or_else(|| portable.dir.clone())
-        .or_else(mailcraft_engine::store::default_root);
-    let root = data.map(|d| if sample { d.join("sample") } else { d });
+    let launch = Launch::resolve(args, opened);
     // MailCraft's Flatpak under its id before 0.36 kept its mail in that id's sandbox: brought
     // across before anything is made in this one's.
-    if !chosen
-        && portable.dir.is_none()
-        && let Some(r) = root.as_deref()
+    if !launch.chosen
+        && launch.portable.dir.is_none()
+        && let Some(r) = launch.root.as_deref()
     {
         self_update::renamed::carry_over_flatpak(r);
     }
     // One MailCraft per data folder: started again, it brings the running one forward and leaves,
     // before it moves, logs or opens anything there (`single_instance.rs`).
-    let instance = match root.as_deref().map(|r| single_instance::claim(r, &handed)) {
+    let instance = match launch.root.as_deref().map(|r| single_instance::claim(r, &launch.handed)) {
         Some(single_instance::Claim::Shown) => {
-            say(if !handed.is_empty() {
+            say(if !launch.handed.is_empty() {
                 "MailCraft is already running: what it was started with opens there"
-            } else if args.iter().any(|a| a == "--cmd") {
+            } else if launch.has("--cmd") {
                 "MailCraft is already running: its window is brought forward (--cmd is run only by the first)"
             } else {
                 "MailCraft is already running: its window is brought forward"
@@ -362,135 +390,49 @@ fn main() -> eframe::Result {
         Some(single_instance::Claim::Primary(server)) => Some(server),
         _ => None,
     };
-    let mut moved = match base.as_deref().map(location::apply_pending_move) {
+    // A move of the data files' folder asked for (File › Options) is carried out now, before
+    // anything opens them.
+    let mut moved = match launch.base.as_deref().map(location::apply_pending_move) {
         Some(Ok(Some(to))) => Some(Ok(to)),
         Some(Err(e)) => Some(Err(e)),
         _ => None,
     };
-    // The sample mailbox stays a folder of files; anything else keeps its data files beside it
-    // (`--data`) or in Documents.
-    let files =
-        (!sample).then(|| root.as_ref().map(|r| base.as_deref().map_or_else(|| r.join(location::FILES_FOLDER), location::files_dir))).flatten();
-    // Diagnostics go to `mailcraft.log` in the data folder.
-    let echo = cfg!(debug_assertions) || args.iter().any(|a| a == "--log");
-    if let Some(path) = logfile::start(root.as_deref(), echo) {
-        log::info!("{} started; log at {}", args::version_line(), path.display());
-    }
-    logfile::log_panics();
-    // What MailCraft's id before 0.36 left on this computer (`self_update/renamed.rs`).
-    if !sample && let Err(e) = std::thread::Builder::new().name("renamed".into()).spawn(self_update::renamed::tidy) {
-        log::warn!("renamed: not tidied: {e}");
-    }
-    if let Some(dir) = &portable.dir {
-        log::info!("portable: everything is kept in {}", dir.display());
-    }
-    if let Some(why) = &portable.unwritable {
-        log::warn!("{why}");
-        say(why);
-    }
+    let files = launch.files();
+    start_logging(&launch);
 
     let (now, offset) = Desktop::default().clock();
-    let store = root.as_ref().and_then(|r| {
-        let opened = match &files {
-            // Nothing opened here: the data files open behind the window (`desktop/boot.rs`). The
-            // folder layout is held alone: a second window on it (where the single-instance check
-            // can't keep one out) runs without the cache rather than writing over the first's.
-            Some(f) => Store::packed(r, f).or_else(|e| {
-                moved = Some(Err(e.to_string()));
-                Store::open_alone(r)
-            }),
-            None => Store::open_alone(r),
-        };
-        match opened {
-            Ok(s) => Some(s),
-            Err(e) => {
-                say(&format!("the mail cache can't be opened ({e}); running without one"));
-                None
-            }
-        }
-    });
-    if sample
+    let store = launch.open_store(files.as_deref(), &mut moved);
+    if launch.sample
         && let Some(s) = &store
         && let Err(e) = mailcraft_engine::sample::seed_if_empty_at(s, now, i64::from(offset))
     {
         say(&format!("the sample mailbox couldn't be created: {e}"));
     }
-    // A release build's commit, so File › About can tell its test build from a later one.
     let build_sha = option_env!("MAILCRAFT_BUILD_SHA").filter(|s| !s.trim().is_empty()).map(str::to_string);
-    let made = (Clock::new(now, offset), portable.dir.is_some(), build_sha.clone());
+    let made = Made { clock: Clock::new(now, offset), portable: launch.portable.dir.is_some(), build_sha: build_sha.clone() };
     // The data files open on a thread of their own, and the session is made there from them,
     // while the window shows how that goes (a file not closed properly is checked: minutes).
-    let opening = {
+    let (progress, opened) = {
         let made = made.clone();
-        desktop::boot::open(store, root.clone(), moved, move |store| desktop::start::session(store, made))
+        desktop::boot::open(store, launch.root.clone(), moved, move |store| desktop::start::session(store, made))
     };
-    let state_path = root.as_ref().map(|r| r.join("ui.json"));
+    let state_path = launch.state_path();
     // Test builds update themselves (`self_update.rs`); not the sample mailbox's run, unless it's
     // trying the updater out.
-    let updater = root.clone().filter(|_| !sample || self_update::trying_out()).and_then(|r| self_update::Updater::start(r, build_sha));
+    let updater = launch.root.clone().filter(|_| !launch.sample || self_update::trying_out()).and_then(|r| self_update::Updater::start(r, build_sha));
 
+    // The settings, read once: the window opens with them, and MailCraft once it's in it.
     let saved_ui = state_path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-    // The main window opens where it was, at the size it was, maximized if it was.
-    let main_place: Option<mailcraft_ui_egui::WindowPlace> =
-        saved_ui.as_ref().and_then(|v| v.get("windows")?.get("main").cloned()).and_then(|m| serde_json::from_value(m).ok());
-    // Until MailCraft is in it, the window is in the language and the light or dark chosen.
-    let dark = if args.iter().any(|a| a == "--light") {
-        Some(false)
-    } else if args.iter().any(|a| a == "--dark") {
-        Some(true)
-    } else {
-        saved_ui.as_ref().and_then(|v| v.get("dark")?.as_bool())
-    };
-    let card = BootCard::new(saved_ui.as_ref().and_then(|v| v.get("language")?.as_str()).unwrap_or(mailcraft_ui_egui::i18n::AUTO), dark);
-    // In the colour and bar MailCraft will have once it's in the window.
-    let prefs = saved_ui.as_ref().and_then(|v| v.get("prefs"));
-    let card = card.in_colours(
-        prefs.and_then(|p| p.get("accent")?.as_str()).unwrap_or_default(),
-        prefs.and_then(|p| p.get("plainTopBar")?.as_bool()).unwrap_or(false),
-    );
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(if sample { "MailCraft – Sample mailbox" } else { "MailCraft" })
-            // Matches the desktop entry (StartupWMClass) and icon name in packaging/linux.
-            .with_app_id(mailcraft_ui_egui::APP_ID)
-            .with_inner_size([1320.0, 820.0])
-            .with_min_inner_size([760.0, 480.0])
-            .with_icon(Arc::new(app_icon())),
-        ..Default::default()
-    };
-    let mut options = match main_place {
-        Some(p) => eframe::NativeOptions { viewport: p.apply(options.viewport), ..options },
-        None => options,
-    };
-    // Windows: MailCraft's top bar is the window's title bar, in its colour, as Outlook's (issue
-    // #22), unless File › Options asked for the system's. Read here, before the window opens.
-    let own_title_bar = cfg!(windows) && !saved_ui.as_ref().and_then(|v| v.get("prefs")?.get("systemTitleBar")?.as_bool()).unwrap_or(false);
-    options.viewport = options.viewport.with_decorations(!own_title_bar);
-    graphics::configure(&mut options);
-    // Cut, Copy and Paste keys are MailCraft's, in every window: Ctrl+V attaches files copied
-    // in a file manager that puts no text with them (Explorer, PCManFM; issue #10). Not in a
-    // Wayland window, where egui-winit reads the clipboard without waiting on the event loop.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let own_keys = display::choose_from_env() == display::Choice::X11 || std::env::var_os("WAYLAND_DISPLAY").is_none();
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
-    let own_keys = true;
-    if own_keys {
-        options.clipboard_shortcuts = false;
-        options.viewport_hooks = Some(Arc::new(ClipboardKeys { pages: mailcraft_ui_egui::alt_code_pages() }));
-    }
-    // Linux and the BSDs: through XWayland on a Wayland desktop, so attachments drag in and out.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if display::choose_from_env() == display::Choice::X11 {
-        options.event_loop_builder = Some(Box::new(|b| {
-            use winit::platform::x11::EventLoopBuilderExtX11;
-            b.with_x11();
-        }));
-    }
+    let theme = launch::theme_asked(&launch.args);
+    // Linux and the BSDs: whether the window opens on X11 (`display.rs`), chosen once (a stale
+    // `DISPLAY` is logged as it's chosen).
+    let x11 = cfg!(all(unix, not(target_os = "macos"))) && display::choose_from_env() == display::Choice::X11;
+    let (options, card) = launch::window(launch.sample, saved_ui.as_ref(), theme, x11);
+    let started =
+        Started { launch, opening: Opening { progress, opened, card, made }, state_path, instance, updater, looks: Looks { saved_ui, theme, x11 } };
     // A window that can't open says why, rather than the app leaving without a word (or
     // staying in the background); a panic on the way is caught for that too.
-    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(options, sample, (opening, card, made), base, state_path, (cmd_args, handed), instance, updater)
-    }));
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(options, started)));
     let failed = match ran {
         Ok(Ok(())) => {
             log::logger().flush();
@@ -512,6 +454,29 @@ fn main() -> eframe::Result {
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
     std::process::exit(1)
+}
+
+/// Diagnostics to `mailcraft.log` in the data folder, panics logged; then what this start should
+/// note there.
+fn start_logging(launch: &Launch) {
+    let echo = cfg!(debug_assertions) || launch.has("--log");
+    if let Some(path) = logfile::start(launch.root.as_deref(), echo) {
+        log::info!("{} started; log at {}", args::version_line(), path.display());
+    }
+    logfile::log_panics();
+    // What MailCraft's id before 0.36 left on this computer (`self_update/renamed.rs`).
+    if !launch.sample
+        && let Err(e) = std::thread::Builder::new().name("renamed".into()).spawn(self_update::renamed::tidy)
+    {
+        log::warn!("renamed: not tidied: {e}");
+    }
+    if let Some(dir) = &launch.portable.dir {
+        log::info!("portable: everything is kept in {}", dir.display());
+    }
+    if let Some(why) = &launch.portable.unwritable {
+        log::warn!("{why}");
+        say(why);
+    }
 }
 
 /// How long a clipboard read may wait on the app that copied (Linux and the BSDs).
@@ -575,21 +540,41 @@ fn cant_open(why: &str) -> String {
 
 /// The data files opening (`desktop/boot.rs`), what the window shows meanwhile, and what the
 /// session is made with if they couldn't be.
-type Opening = ((Arc<OpenProgress>, std::sync::mpsc::Receiver<desktop::boot::Opened>), BootCard, desktop::start::Made);
+struct Opening {
+    progress: Arc<OpenProgress>,
+    opened: std::sync::mpsc::Receiver<desktop::boot::Opened>,
+    card: BootCard,
+    made: Made,
+}
+
+/// What was decided of the window's look before it opened, for MailCraft once it's in it.
+struct Looks {
+    /// The settings (`ui.json`) as they were read for the window.
+    saved_ui: Option<serde_json::Value>,
+    /// `--light` (false) or `--dark` (true), over the settings.
+    theme: Option<bool>,
+    /// The window is on X11 (`display.rs`; Linux and the BSDs).
+    x11: bool,
+}
+
+/// What the window runs with, besides its options.
+struct Started {
+    launch: Launch,
+    opening: Opening,
+    /// Where the window's settings are written (`ui.json`).
+    state_path: Option<PathBuf>,
+    /// Answering later launches on the same data folder.
+    instance: Option<single_instance::Server>,
+    updater: Option<self_update::Updater>,
+    looks: Looks,
+}
 
 /// Open the window and run the app until it closes: the boot card while the data files open,
 /// then MailCraft.
-#[allow(clippy::too_many_arguments)]
-fn run(
-    options: eframe::NativeOptions,
-    sample: bool,
-    ((progress, opened), card, made): Opening,
-    base: Option<PathBuf>,
-    state_path: Option<PathBuf>,
-    (cmd_args, handed): (Vec<String>, Vec<String>),
-    instance: Option<single_instance::Server>,
-    updater: Option<self_update::Updater>,
-) -> eframe::Result {
+fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
+    let Started { launch, opening: Opening { progress, opened, card, made }, state_path, instance, updater, looks: Looks { saved_ui, theme, x11 } } =
+        started;
+    let Launch { args: cmd_args, handed, sample, base, .. } = launch;
     // The guard stays here, outside the closure, so the handlers live as long as the loop.
     #[cfg(target_os = "macos")]
     let (_finder_guard, finder) = apple_events::listen();
@@ -621,9 +606,8 @@ fn run(
                 server.connect(&cc.egui_ctx);
             }
             // A Wayland window can't bring itself forward: it asks for attention instead.
-            let native_wayland = cfg!(all(unix, not(target_os = "macos")))
-                && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
-                && display::choose_from_env() != display::Choice::X11;
+            let native_wayland =
+                cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) && !x11;
             #[cfg(target_os = "macos")]
             {
                 apple_events::repaint_on_arrival(&finder, &cc.egui_ctx);
@@ -644,7 +628,7 @@ fn run(
                 // The store opened with: the plain cache when folders from before couldn't come
                 // into data files, none if opening failed altogether.
                 let desktop_data = store.as_ref().and_then(Store::data_files_dir);
-                let app_portable = made.1;
+                let app_portable = made.portable;
                 let session = made_session.unwrap_or_else(|| desktop::start::session(None, made));
                 let backend: Box<dyn Backend> = match store {
                     Some(store) => {
@@ -682,13 +666,12 @@ fn run(
                     app.session.print_fonts = Some((r.clone(), bold.clone()));
                 }
                 app.install_fonts(ctx, regular, bold);
-                if let Some(v) = state_path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()) {
-                    app.restore_state(&v);
+                // The settings the window opened with (nothing writes them until MailCraft runs).
+                if let Some(v) = &saved_ui {
+                    app.restore_state(v);
                 }
-                if args.iter().any(|a| a == "--light") {
-                    app.ui.dark = Some(false);
-                } else if args.iter().any(|a| a == "--dark") {
-                    app.ui.dark = Some(true);
+                if theme.is_some() {
+                    app.ui.dark = theme;
                 }
                 desktop::start::commands(&mut app, &args);
                 for h in &handed {
@@ -709,6 +692,7 @@ fn run(
                     native_wayland,
                     updater,
                     looked: std::time::Instant::now(),
+                    monitors_looked: None,
                     tray: desktop::tray::Tray::new(native_wayland),
                 }
             });
@@ -767,9 +751,17 @@ mod tests {
         assert!(m.contains("mailcraft.log") && !m.contains("  "), "{m}");
     }
 
+    /// The system's thumbnailer (as when ffmpeg isn't installed) makes a video's frame through
+    /// the desktop's services: the window's first ask is answered at once, the frame comes later.
+    /// It needs ffmpeg to make the clip and a thumbnailer on the system; without either it says
+    /// so and checks nothing (`desktop/video_frames.rs` checks the rest with a stand-in tool).
+    /// Found in audit (#233): it checked nothing of what its name says, and passed with no frame
+    /// when the system had no thumbnailer.
     #[test]
     fn video_thumbnails_are_made_off_the_ui_thread() {
-        let Some(ffmpeg) = video::find_tool("ffmpeg", &[]) else { return };
+        let skipped = |why: &str| eprintln!("video_thumbnails_are_made_off_the_ui_thread: SKIPPED, {why}");
+        let Some(ffmpeg) = video::find_tool("ffmpeg", &[]) else { return skipped("no ffmpeg to make the clip") };
+        let Some(system) = video::system() else { return skipped("no system thumbnailer") };
         let dir = std::env::temp_dir().join(format!("mailcraft-desktop-video-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let clip = dir.join("clip.mp4");
@@ -778,20 +770,21 @@ mod tests {
             .arg(&clip)
             .status();
         if !made.is_ok_and(|s| s.success()) {
-            return;
+            return skipped("ffmpeg made no clip");
         }
-        // The system's thumbnailer, as when ffmpeg isn't installed.
-        let mut d = Desktop { frame_source: Some(video::system()), ..Default::default() };
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
+        let mut d = Desktop { frames: desktop::video_frames::VideoFrames::with_source(Some(system)), ..Default::default() };
+        let asked = std::time::Instant::now();
+        assert_eq!(d.video_frame(&clip), VideoFrame::Pending, "the first ask waits for nothing");
+        assert!(asked.elapsed() < std::time::Duration::from_secs(5), "the window waited {:?}", asked.elapsed());
+        // Longer than the tool is given: a frame that never comes is the tool's to give up on.
+        let end = std::time::Instant::now() + video::TIMEOUT.saturating_mul(2);
+        let frame = loop {
             match d.video_frame(&clip) {
                 VideoFrame::Pending if std::time::Instant::now() < end => std::thread::sleep(std::time::Duration::from_millis(50)),
-                f => {
-                    assert!(matches!(f, VideoFrame::Ready(_)) || video::system().is_none(), "{f:?}");
-                    break;
-                }
+                f => break f,
             }
-        }
+        };
+        assert!(matches!(&frame, VideoFrame::Ready(png) if png.starts_with(b"\x89PNG")), "{frame:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

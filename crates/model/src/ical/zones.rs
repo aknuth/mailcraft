@@ -186,21 +186,52 @@ impl FileZones {
     /// A DATE or DATE-TIME property as (Unix seconds, all day, the zone it was in). A local time
     /// is in its `TZID`, else in `fallback` (an exception's event's zone), else the viewer's.
     pub(super) fn time(&self, l: &Line, fallback: &str) -> Option<(i64, bool, String)> {
-        let (t, all_day, utc) = date_time(&l.value)?;
-        if all_day || l.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE")) {
+        LineTimes::of(self, l, fallback).read(&l.value)
+    }
+
+    /// The first `max` of a list's values (`EXDATE`, `RDATE`; a period by its start) that read as
+    /// [`FileZones::time`] reads one, the line's zone found once: per value, the whole line was
+    /// copied and its zone looked up (and a file's copied) again.
+    pub(super) fn times(&self, l: &Line, fallback: &str, max: usize) -> Vec<i64> {
+        let mut times = LineTimes::of(self, l, fallback);
+        l.value
+            .split(',')
+            .inspect(|v| crate::work::steps(v.len() + 1))
+            .filter_map(|v| times.read(v.split('/').next().unwrap_or(v)).map(|(t, _, _)| t))
+            .take(max)
+            .collect()
+    }
+}
+
+/// How one property's values are read: as dates, or in its zone (found once one needs it).
+struct LineTimes<'a> {
+    zones: &'a FileZones,
+    date_only: bool,
+    id: &'a str,
+    zone: Option<Option<EventZone>>,
+}
+
+impl<'a> LineTimes<'a> {
+    fn of(zones: &'a FileZones, l: &'a Line, fallback: &'a str) -> LineTimes<'a> {
+        let date_only = l.param("VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE"));
+        let id = l.param("TZID").map(|z| z.trim_matches('"').trim()).filter(|z| !z.is_empty()).unwrap_or(fallback);
+        LineTimes { zones, date_only, id, zone: None }
+    }
+
+    fn read(&mut self, value: &str) -> Option<(i64, bool, String)> {
+        let (t, all_day, utc) = date_time(value)?;
+        if all_day || self.date_only {
             return Some((t - t.rem_euclid(86_400), true, String::new()));
         }
         if utc {
             return Some((t, false, String::new()));
         }
-        let id = l.param("TZID").map(|z| z.trim_matches('"').trim()).filter(|z| !z.is_empty()).unwrap_or(fallback);
-        if !id.is_empty()
-            && let Some(z) = self.resolve(id)
-        {
+        let (zones, id) = (self.zones, self.id);
+        if let Some(z) = self.zone.get_or_insert_with(|| if id.is_empty() { None } else { zones.resolve(id) }) {
             return Some((z.to_utc(t), false, id.to_string()));
         }
         // Floating, or a zone nobody defines: the viewer's.
-        Some((self.local.to_utc(t), false, self.local.name().unwrap_or_default().to_string()))
+        Some((zones.local.to_utc(t), false, zones.local.name().unwrap_or_default().to_string()))
     }
 }
 
@@ -211,8 +242,8 @@ pub(super) fn nth_weekday(year: i64, month: u32, nth: i32, weekday: u32) -> Opti
         return None;
     }
     let first = days_from_civil(year, month, 1);
-    let next = if month == 12 { days_from_civil(year + 1, 1, 1) } else { days_from_civil(year, month + 1, 1) };
-    let wd = |d: i64| (d + 3).rem_euclid(7) as u32;
+    let next = first.saturating_add(crate::dates::month_len(year, month));
+    let wd = crate::dates::weekday_index;
     if nth > 0 {
         let offset = (i64::from(weekday) - i64::from(wd(first))).rem_euclid(7);
         let d = first + offset + 7 * i64::from(nth - 1);
@@ -263,30 +294,46 @@ pub(super) fn tzid_param(id: &str) -> String {
     if id.contains([':', ';', ',']) { format!("\"{id}\"") } else { id }
 }
 
-/// A `VTIMEZONE` for a zone of the database, as its clocks change in `year`: yearly rules when
-/// they change twice (summer time), else the offsets as they are.
-pub(super) fn zone_definition(id: &str, zone: Zone, year: i64) -> Vec<String> {
-    let year = year.clamp(1971, 9998);
+/// How a zone's offset (`offset`: seconds east of UTC at an instant) changes in `year` (1971 to
+/// 9998), up to four times: each change's first second with the new offset, the offset before
+/// and the offset after. Looked for a day at a time, each found to the second.
+fn changes_in_year(offset: impl Fn(i64) -> i64, year: i64) -> Vec<(i64, i64, i64)> {
     let (from, to) = (days_from_civil(year, 1, 1) * 86_400, days_from_civil(year + 1, 1, 1) * 86_400);
-    // Each change: (the instant, the offset before, the offset after).
-    let mut changes: Vec<(i64, i64, i64)> = Vec::new();
-    let mut before = zone.offset_at(from);
+    let mut changes = Vec::new();
+    let mut before = offset(from);
     let mut t = from;
     while t < to && changes.len() < 4 {
         let next = t + 86_400;
-        let after = zone.offset_at(next);
+        let after = offset(next);
         if after != before {
-            // The first second with the new offset.
             let (mut lo, mut hi) = (t, next);
             while hi - lo > 1 {
                 let mid = lo + (hi - lo) / 2;
-                if zone.offset_at(mid) == after { hi = mid } else { lo = mid }
+                if offset(mid) == after { hi = mid } else { lo = mid }
             }
             changes.push((hi, before, after));
             before = after;
         }
         t = next;
     }
+    changes
+}
+
+/// The day a change happens on, by the clock before it (`local`): its month, which of the
+/// month's weekdays it is (1 to 4; `None`, the last) and that weekday (0 Monday).
+fn change_day(local: i64) -> (u32, Option<i64>, u32) {
+    let day = local.div_euclid(86_400);
+    let (y, m, d) = civil_from_days(day);
+    let nth = (i64::from(d) + 7 <= crate::dates::month_len(y, m)).then(|| (i64::from(d) - 1) / 7 + 1);
+    (m, nth, crate::dates::weekday_index(day))
+}
+
+/// A `VTIMEZONE` for a zone of the database, as its clocks change in `year`: yearly rules when
+/// they change twice (summer time), else the offsets as they are.
+pub(super) fn zone_definition(id: &str, zone: Zone, year: i64) -> Vec<String> {
+    let year = year.clamp(1971, 9998);
+    let from = days_from_civil(year, 1, 1) * 86_400;
+    let changes = changes_in_year(|t| zone.offset_at(t), year);
     let mut out = vec!["BEGIN:VTIMEZONE".to_string(), format!("TZID:{}", id.replace(['\r', '\n'], ""))];
     let part = |out: &mut Vec<String>, dst: bool, from: i64, to: i64, start: String, rule: Option<String>| {
         let kind = if dst { "DAYLIGHT" } else { "STANDARD" };
@@ -301,14 +348,11 @@ pub(super) fn zone_definition(id: &str, zone: Zone, year: i64) -> Vec<String> {
         for (at, from, to) in &changes {
             // The local time it happens at, on the clock before the change.
             let local = at + from;
-            let day = local.div_euclid(86_400);
-            let (_, m, d) = civil_from_days(day);
-            let month_len = month_day(year, m, -1).map_or(31, |last| last - days_from_civil(year, m, 1) + 1);
-            let nth: i32 = if i64::from(d) + 7 > month_len { -1 } else { i32::try_from((d - 1) / 7 + 1).unwrap_or(1) };
-            let wd = (day + 3).rem_euclid(7) as u32;
+            let (m, nth, wd) = change_day(local);
+            let nth = nth.and_then(|n| i32::try_from(n).ok()).unwrap_or(-1);
             let code = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"].get(wd as usize).copied().unwrap_or("SU");
             // The rule's first year, as calendars write it.
-            let first = nth_weekday(1970, m, nth, wd).unwrap_or(day);
+            let first = nth_weekday(1970, m, nth, wd).unwrap_or(local.div_euclid(86_400));
             let start = local_stamp(first * 86_400 + local.rem_euclid(86_400));
             part(&mut out, zone.is_dst(*at), *from, *to, start, Some(format!("RRULE:FREQ=YEARLY;BYMONTH={m};BYDAY={nth}{code}")));
         }
@@ -351,33 +395,13 @@ pub struct ZoneRule {
 pub fn zone_rule(e: &CalEvent, year: i64) -> Option<ZoneRule> {
     let zone = zone_of(e)?;
     let offset = |t: i64| zone.local(t).saturating_sub(t);
-    let year = year.clamp(1971, 9998);
-    let (from, to) = (days_from_civil(year, 1, 1) * 86_400, days_from_civil(year + 1, 1, 1) * 86_400);
-    let mut changes: Vec<(i64, i64, i64)> = Vec::new();
-    let mut before = offset(from);
-    let mut t = from;
-    while t < to && changes.len() < 4 {
-        let next = t + 86_400;
-        let after = offset(next);
-        if after != before {
-            let (mut lo, mut hi) = (t, next);
-            while hi - lo > 1 {
-                let mid = lo + (hi - lo) / 2;
-                if offset(mid) == after { hi = mid } else { lo = mid }
-            }
-            changes.push((hi, before, after));
-            before = after;
-        }
-        t = next;
-    }
+    let changes = changes_in_year(offset, year.clamp(1971, 9998));
     let change = |(at, from, _): (i64, i64, i64)| {
         let local = at.saturating_add(from);
-        let day = local.div_euclid(86_400);
-        let (y, m, d) = civil_from_days(day);
-        let month_len = month_day(y, m, -1).map_or(31, |last| last - days_from_civil(y, m, 1) + 1);
-        let nth = if i64::from(d) + 7 > month_len { 5 } else { (d - 1) / 7 + 1 };
-        let weekday = u32::try_from((day + 4).rem_euclid(7)).unwrap_or(0);
-        ZoneChange { month: m, nth, weekday, time: local.rem_euclid(86_400) }
+        let (month, nth, monday_first) = change_day(local);
+        // Outlook's: the last is the fifth, and weeks start on Sunday.
+        let nth = nth.and_then(|n| u32::try_from(n).ok()).unwrap_or(5);
+        ZoneChange { month, nth, weekday: (monday_first + 1) % 7, time: local.rem_euclid(86_400) }
     };
     match changes[..] {
         [a, b] => {

@@ -23,7 +23,7 @@ pub(super) const MAX_FOLDERS: usize = 100_000;
 /// Items handed out, at most.
 const MAX_ITEMS: u64 = 10_000_000;
 /// Items read of one folder, at most.
-pub(super) const MAX_ROWS: usize = 1_000_000;
+pub(in crate::data_files) const MAX_ROWS: usize = 1_000_000;
 /// PidTagMessageSize: an item's size as the file gives it.
 const MESSAGE_SIZE: u16 = 0x0E08;
 
@@ -67,15 +67,22 @@ pub(super) struct Plan {
     pub(super) sent: Option<u32>,
 }
 
-/// The folders a plan has taken, against the file going round in circles or on for ever.
-#[derive(Default)]
-pub(super) struct Guard {
+/// The folders a plan has taken, against the file going round in circles or on for ever: none
+/// as deep as `depth` below the top (the import's [`MAX_DEPTH`]).
+pub(in crate::data_files) struct Guard {
     seen: HashSet<u32>,
+    depth: usize,
+}
+
+impl Default for Guard {
+    fn default() -> Guard {
+        Guard::to_depth(MAX_DEPTH)
+    }
 }
 
 /// Why a folder isn't read.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Refused {
+pub(in crate::data_files) enum Refused {
     /// Seen already: a folder listed twice, or under itself.
     Again,
     TooDeep,
@@ -84,9 +91,14 @@ pub(super) enum Refused {
 }
 
 impl Guard {
+    /// A guard taking folders less than `depth` below the top.
+    pub(in crate::data_files) fn to_depth(depth: usize) -> Guard {
+        Guard { seen: HashSet::new(), depth }
+    }
+
     /// Whether the folder at `node`, `depth` below the top, is read.
-    pub(super) fn admit(&mut self, node: u32, depth: usize) -> Result<(), Refused> {
-        if depth >= MAX_DEPTH {
+    pub(in crate::data_files) fn admit(&mut self, node: u32, depth: usize) -> Result<(), Refused> {
+        if depth >= self.depth {
             return Err(Refused::TooDeep);
         }
         if self.seen.len() >= MAX_FOLDERS {
@@ -101,20 +113,15 @@ impl Plan {
     /// their bytes, and the file's record key. A file changed where its items aren't (Outlook
     /// writing its header) has the same; one with an item more or less, another.
     pub(super) fn fingerprint(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut add = |bytes: &[u8]| {
-            for b in bytes {
-                h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
-            }
-        };
-        add(self.record_key.as_bytes());
+        let mut h = mailcraft_model::hash::Fnv::new();
+        h.add(self.record_key.as_bytes());
         for f in self.folders.iter().filter(|f| f.kind != Kind::LeftOut) {
-            add(&f.node.to_le_bytes());
-            add(&[u8::from(f.kind == Kind::Mail)]);
-            add(&f.rows.to_le_bytes());
-            add(&f.bytes.to_le_bytes());
+            h.add(&f.node.to_le_bytes());
+            h.add(&[u8::from(f.kind == Kind::Mail)]);
+            h.add(&f.rows.to_le_bytes());
+            h.add(&f.bytes.to_le_bytes());
         }
-        h
+        h.value()
     }
 
     fn lose(&mut self, reason: SkipReason) {
@@ -165,7 +172,6 @@ struct Special {
 
 /// Plan the folders under `folder`: they go under `parent` (`.0`), and are thrown away (`.1`)
 /// when it's Deleted Items or under it.
-#[allow(clippy::too_many_arguments)]
 fn visit(
     store: &PstStore,
     folder: &PstFolder,
@@ -197,7 +203,7 @@ fn visit(
                 return;
             }
         }
-        let Looked { sub, rows, bytes, kind, name } = match look(store, node, plan.folders.len(), ctx) {
+        let Looked { sub, rows, bytes, kind, name } = match ctx.fault_looking(plan.folders.len()).and_then(|()| look(store, node)) {
             Ok(l) => l,
             Err(e) => {
                 log::info!("a folder could not be read: {e}");
@@ -227,15 +233,8 @@ fn visit(
     }
 }
 
-/// The folder at `node` (the plan's `index`th) opened, with what it is and holds.
-fn look(store: &PstStore, node: u32, index: usize, ctx: &Ctx<'_>) -> io::Result<Looked> {
-    #[cfg(test)]
-    if let Some(super::lanes::tests::Fault::PlanAt(n)) = ctx.opts.fault
-        && index == n
-    {
-        return Err(io::Error::other("a test's plan fault"));
-    }
-    let _ = (index, ctx);
+/// The folder at `node` opened, with what it is and holds.
+fn look(store: &PstStore, node: u32) -> io::Result<Looked> {
     let sub = store.open_folder(node)?;
     let (rows, bytes) = sub.contents_table().map_or((0, 0), |t| sizes(t).fold((0u64, 0u64), |(n, b), (_, s)| (n + 1, b.saturating_add(s))));
     let kind = classify(&sub.properties().get(0x3613).and_then(text_of).unwrap_or_default());
@@ -428,14 +427,7 @@ fn folder(store: &PstStore, index: usize, f: &PlanFolder, feed: &mut Feed, ctx: 
                         }
                         return false;
                     }
-                    #[cfg(test)]
-                    let size = match ctx.opts.fault {
-                        // The walk fails; the Sent Items folder read after it doesn't.
-                        Some(super::lanes::tests::Fault::PlannerAfter(n)) if feed.handed == n && sent.is_none() => panic!("a test's planner fault"),
-                        // The file says every item is tiny.
-                        Some(super::lanes::tests::Fault::Understate) => 1,
-                        _ => size,
-                    };
+                    let size = ctx.fault_handing(feed.handed, sent.is_some(), size);
                     feed.handed += 1;
                     if !feed.job(node, size, (index, f, row), sent, &stopped) {
                         return false;

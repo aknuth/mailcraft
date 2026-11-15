@@ -6,6 +6,8 @@
 //! messages' sources nor another test's.
 
 use super::*;
+use crate::data_files::scratch::scratch;
+use crate::fakes::measure::peak_working_set as peak;
 
 /// Each file's size: more than the import keeps (100 MB).
 const BIG: usize = 120 << 20;
@@ -16,38 +18,9 @@ const DIR_VAR: &str = "MC_EXPORT_BIG_DIR";
 /// held with their batch, as before, came to 411 MB.
 const MAX_GROWTH: u64 = 350 << 20;
 
-/// A big file's byte at `at`, the `n`th file's: not one repeated block, which a writer might
-/// keep once.
-fn byte(n: usize, at: usize) -> u8 {
-    let x = (at as u64).wrapping_add(n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (x >> 56) as u8
-}
-
 /// Whether this system says what a process's peak working set is ([`peak`]): elsewhere the
 /// memory bound isn't checked, only the file.
 const MEASURED: bool = cfg!(any(windows, target_os = "linux"));
-
-/// A folder taken away when the test ends, passed or not: it holds about 1 GB.
-struct Scratch(std::path::PathBuf);
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// This process's peak working set, in bytes (Windows' count, asked of PowerShell; Linux's
-/// `VmHWM`); `None` where neither is there.
-fn peak() -> Option<u64> {
-    if cfg!(windows) {
-        let script = format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id());
-        let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().ok()?;
-        return String::from_utf8_lossy(&out.stdout).trim().parse().ok();
-    }
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kb = status.lines().find_map(|l| l.strip_prefix("VmHWM:"))?.trim().trim_end_matches("kB").trim().parse::<u64>().ok()?;
-    Some(kb << 10)
-}
 
 /// The export, alone in its process: started by [`big_files_are_written_with_bounded_memory`].
 #[test]
@@ -66,22 +39,11 @@ fn export_big_files_alone() {
 
 /// How many of the big files are in the data file at `path`, each checked byte for byte.
 fn files_in(path: &Path) -> usize {
-    let pst = PstFile::open(path).unwrap();
-    let store = PstStore::read(Rc::new(pst)).unwrap();
-    let any: Rc<PstStore> = store.clone();
-    let top = any.open_folder(any.ipm_subtree().unwrap()).unwrap();
-    let table = top.hierarchy_table().unwrap().clone();
-    let inbox = table
-        .rows_matrix()
-        .filter_map(|row| any.open_folder(row.id()).ok())
-        .find(|f| f.properties().display_name().is_ok_and(|n| n == "Inbox"))
-        .unwrap();
+    let any = read_file(path);
     let mut seen = 0;
-    for row in inbox.contents_table().unwrap().rows_matrix() {
+    for m in messages_in(&any, &folder_at(&any, &["Inbox"])) {
         use mailcraft_pst::{Attachment, AttachmentData};
-        let entry = row.id();
-        let m = Message::read(store.clone(), entry).unwrap();
-        let subject = m.properties().get(0x0037).and_then(crate::pst::text_of).unwrap_or_default();
+        let subject = subject_of(&m);
         let n: usize = subject.trim_start_matches("Footage ").parse().unwrap();
         let rows: Vec<_> = m.attachment_table().unwrap().rows_matrix().map(|r| r.id()).collect();
         assert_eq!(rows.len(), 1);
@@ -89,7 +51,7 @@ fn files_in(path: &Path) -> usize {
         let Some(AttachmentData::Binary(b)) = a.data() else { panic!("{subject}: no file") };
         let data = b.buffer();
         assert_eq!(data.len(), BIG);
-        assert!(data.iter().enumerate().all(|(at, x)| *x == byte(n, at)), "{subject}: the file isn't as it was");
+        assert!(data.iter().enumerate().all(|(at, x)| *x == big_byte(n, at)), "{subject}: the file isn't as it was");
         seen += 1;
     }
     seen
@@ -97,14 +59,12 @@ fn files_in(path: &Path) -> usize {
 
 #[test]
 fn big_files_are_written_with_bounded_memory() {
-    let scratch = Scratch(std::env::temp_dir().join(format!("mailcraft-pst-export-big-{}", std::process::id())));
-    let dir = scratch.0.clone();
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    // About 1 GB, taken away when the test ends, passed or not.
+    let dir = scratch("pst-export-big");
     let store = Store::open(dir.join("cache")).unwrap();
     let mut messages = Vec::new();
     for n in 1..=2u32 {
-        let data: Vec<u8> = (0..BIG).map(|at| byte(n as usize, at)).collect();
+        let data = big_file(n as usize, BIG);
         let d = mime::Draft {
             to: vec![EmailAddress::new("Ana", "ana@studio.example")],
             subject: format!("Footage {n}"),
@@ -157,7 +117,4 @@ fn big_files_are_written_with_bounded_memory() {
     let imported = crate::pst::import(&path, &back, "b1", &mut |_| {}).unwrap();
     assert_eq!(imported.messages, 2, "{imported:?}");
     assert_eq!(imported.skips.get(&mailcraft_model::job::SkipReason::AttachmentTooBig), Some(&2), "{imported:?}");
-    drop(back);
-    drop(scratch);
-    assert!(!dir.exists());
 }

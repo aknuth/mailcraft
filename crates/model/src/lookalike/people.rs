@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::EmailAddress;
 
-use super::{SenderWarning, domain_of, plain, related};
+use super::{SenderWarning, domain_of, draw_alike, plain, related};
 
 /// Words that make a name a role or a service rather than a person ("Help Desk", "Sales Team").
 const GENERIC: &[&str] = &[
@@ -203,7 +203,7 @@ fn wide_or_styled(c: char) -> char {
 /// A name's key as it's looked up: [`name_key`] with letters drawn alike made one (`l`, `i` and
 /// `1`; `rn` and `m`), as domains are compared, so `Wh1tfield` is `Whitfield`.
 fn drawn_key(name: &str) -> Option<String> {
-    name_key(name).map(|k| k.replace("rn", "m").replace("vv", "w").replace('i', "l"))
+    name_key(name).map(|k| draw_alike(&k))
 }
 
 /// The people the user deals with, by name and by address.
@@ -245,12 +245,6 @@ impl KnownPeople {
     /// Whether `email` is an address of someone known.
     pub fn knows_address(&self, email: &str) -> bool {
         self.addresses.contains(&email.trim().to_lowercase())
-    }
-
-    /// The addresses the person named `name` is known by (none for a name that doesn't say who
-    /// someone is).
-    pub fn addresses_of(&self, name: &str) -> Option<&BTreeSet<String>> {
-        self.by_name.get(&drawn_key(name)?).map(|(_, a)| a)
     }
 
     /// `from` wears the name of someone known on an address that person isn't known by. Not

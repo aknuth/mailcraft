@@ -6,13 +6,10 @@ use super::*;
 
 /// How long a key is valid, in words.
 fn validity(s: &Session, k: &mailcraft_engine::pgp::KeyInfo) -> String {
-    let day = |at: i64| {
-        crate::i18n::date(&mailcraft_engine::model::dates::day_text(at.saturating_add(i64::from(s.clock.offset)).div_euclid(86_400), &s.clock))
-    };
     match (k.revoked, k.expires) {
-        (Some(at), _) => tf!("Withdrawn on {date}", date = day(at)),
-        (None, Some(at)) if at <= s.clock.now => tf!("It ran out on {date}", date = day(at)),
-        (None, Some(at)) => tf!("Valid until {date}", date = day(at)),
+        (Some(at), _) => tf!("Withdrawn on {date}", date = day_shown(s, at)),
+        (None, Some(at)) if at <= s.clock.now => tf!("It ran out on {date}", date = day_shown(s, at)),
+        (None, Some(at)) => tf!("Valid until {date}", date = day_shown(s, at)),
         (None, None) => tl!("No end date").to_string(),
     }
 }
@@ -27,7 +24,8 @@ pub(super) fn pgp(s: &Session, t: &Tokens, ui: &mut Ui, a: &AccountState, acts: 
             setting_row(ui, t, true, name(t, tl!("OpenPGP keys work in the desktop app")), None, |_| {});
             return;
         }
-        match s.pgp_key(&id) {
+        let key = s.pgp_key(&id);
+        match &key {
             None => setting_row(
                 ui,
                 t,
@@ -41,14 +39,14 @@ pub(super) fn pgp(s: &Session, t: &Tokens, ui: &mut Ui, a: &AccountState, acts: 
                 },
             ),
             Some(k) => {
-                let who = k.emails.first().cloned().unwrap_or_else(|| k.name.clone());
+                let who = whose(&k.emails, &k.name);
                 let bad = k.revoked.is_some() || k.expires.is_some_and(|at| at <= s.clock.now);
-                let about = RichText::new(format!("{} · {} · {}", k.spaced(), k.algorithm, validity(s, &k))).size(12.0).color(if bad {
+                let about = RichText::new(format!("{} · {} · {}", k.spaced(), k.algorithm, validity(s, k))).size(12.0).color(if bad {
                     t.danger
                 } else {
                     t.faint
                 });
-                setting_row(ui, t, true, name(t, &who), Some(about), |ui| {
+                setting_row(ui, t, true, name(t, who), Some(about), |ui| {
                     if ui
                         .button(RichText::new(tl!("Remove")).color(t.danger))
                         .on_hover_text(tl!("Forget this key: its secret part goes from the keychain too"))
@@ -67,7 +65,7 @@ pub(super) fn pgp(s: &Session, t: &Tokens, ui: &mut Ui, a: &AccountState, acts: 
             }
         }
         for k in s.pgp_older_keys(&id) {
-            let who = k.emails.first().cloned().unwrap_or_else(|| k.name.clone());
+            let who = whose(&k.emails, &k.name);
             // One of another of the account's addresses signs mail from it (issue #81).
             let signs = s.signed_by_key(&id, &k.fingerprint);
             let about = if signs.is_empty() {
@@ -78,7 +76,7 @@ pub(super) fn pgp(s: &Session, t: &Tokens, ui: &mut Ui, a: &AccountState, acts: 
             // Each by its own key (as the certificates' rows: the same address names both).
             let usable = k.problems(s.clock.now).is_empty();
             ui.push_id(("older-key", &k.fingerprint), |ui| {
-                setting_row(ui, t, false, name(t, &who), Some(note(t, &about)), |ui| {
+                setting_row(ui, t, false, name(t, who), Some(note(t, &about)), |ui| {
                     if ui
                         .button(RichText::new(tl!("Remove")).color(t.danger))
                         .on_hover_text(tl!("Forget this key: mail encrypted to it can't be read any more"))
@@ -99,7 +97,7 @@ pub(super) fn pgp(s: &Session, t: &Tokens, ui: &mut Ui, a: &AccountState, acts: 
             });
         }
         let settings = s.pgp_settings(&id);
-        if s.pgp_key(&id).is_some() {
+        if key.is_some() {
             setting_row(
                 ui,
                 t,

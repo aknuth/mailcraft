@@ -4,8 +4,15 @@ use super::*;
 
 /// Said when a sent message's copy has nowhere to go.
 const NO_SENT: &str = "sent, but no copy was saved: the server has no Sent Items folder, and one couldn't be made";
+/// Said, with why, when a sent message's copy couldn't be saved.
+const NOT_SAVED: &str = "sent, but no copy was saved in Sent Items";
 
 impl Worker {
+    /// Say a sent message's copy couldn't be kept in Sent Items, and why.
+    fn sent_copy_not_kept(&self, error: String) {
+        self.sink.emit(Event::SentCopyNotKept { account: self.id(), error });
+    }
+
     /// The account's second connection: sends mail and reads or changes the automatic replies,
     /// whatever the main connection is doing. It connects when there's something to do, and lets
     /// go of an idle connection after a while.
@@ -31,9 +38,7 @@ impl Worker {
             let Some(job) = waiting.remove(next) else { continue };
             self.fresh_token();
             match job {
-                Job::Send { account, id, raw, from, recipients, sent_folder } => {
-                    self.send_quick(Job::Send { account, id, raw, from, recipients, sent_folder });
-                }
+                j @ Job::Send { .. } => self.send_quick(j),
                 j @ (Job::GetVacation { .. } | Job::SetVacation { .. }) => self.handle(j),
                 // The whole of a message whose text the main connection gave first; or one opened
                 // while the main connection was busy, its text first when that's quicker.
@@ -75,7 +80,7 @@ impl Worker {
             Ok(()) => {
                 log::info!("{}: message {id} sent to {} recipient(s)", self.acc.id, recipients.len());
                 self.sink.emit(Event::Sent { account: self.id(), id: *id });
-                self.file_sent_quick(raw, sent_folder.clone());
+                self.file_sent_quick(*id, raw, sent_folder.clone());
             }
             Err(e) if e.is_retryable() => {
                 log::info!("{}: sending on the second connection: {e}; left to the main one", self.acc.id);
@@ -97,7 +102,7 @@ impl Worker {
 
     /// Gmail files sent mail itself.
     fn files_itself(&self) -> bool {
-        self.acc.smtp.host.ends_with("gmail.com") || self.acc.smtp.host.ends_with("googlemail.com")
+        mailcraft_model::files_sent_mail_itself(&self.acc.smtp.host)
     }
 
     /// The folder a sent message's copy goes in: the one it was sent with, else the account's
@@ -202,7 +207,7 @@ impl Worker {
     /// A sent message's copy: Exchange, Graph and JMAP file it themselves; IMAP servers get one
     /// (not Gmail, which files its own). Then the main connection reads Sent Items, now and, where
     /// the server files it a moment later, again then.
-    pub(super) fn file_sent_quick(&mut self, raw: &[u8], sent_folder: Option<String>) {
+    pub(super) fn file_sent_quick(&mut self, id: u64, raw: &[u8], sent_folder: Option<String>) {
         // What the main connection has listed since this one started.
         if let Ok(listed) = self.store.load_folders(&self.acc.id)
             && !listed.is_empty()
@@ -212,31 +217,10 @@ impl Worker {
         let folder = if self.acc.is_api() || self.files_itself() {
             sent_folder.or_else(|| self.folders.iter().find(|f| f.role == FolderRole::Sent).map(|f| f.path.clone()))
         } else {
-            let mut made = false;
-            let r = (|| -> Result<Option<String>> {
-                let Some(folder) = self.sent_folder(sent_folder)? else { return Ok(None) };
-                if self.conn.is_none() {
-                    self.connect()?;
-                }
-                let (folder, made_now) = self.file_in(&folder, FolderRole::Sent, "\\Seen", raw)?;
-                made = made_now;
-                Ok(Some(folder))
-            })();
-            match r {
-                Ok(Some(f)) => {
-                    log::info!("{}: sent copy saved in {f}", self.acc.id);
-                    if made {
-                        self.relist();
-                    }
-                    Some(f)
-                }
-                Ok(None) => {
-                    self.notice(NO_SENT.to_string());
-                    None
-                }
-                Err(e) => {
+            match self.save_sent_copy(id, raw, sent_folder) {
+                Ok(f) => f,
+                Err(_) => {
                     self.conn = None;
-                    self.notice(format!("sent, but no copy was saved in Sent Items: {e}"));
                     return;
                 }
             }
@@ -246,10 +230,18 @@ impl Worker {
         let job = Job::SyncFolder { account: self.id(), folder: folder.clone() };
         let _ = main.send(job.clone());
         if self.acc.is_api() {
-            // Graph and Exchange file the copy a moment after taking the message.
+            // Graph and Exchange file the copy a moment after taking the message. Not past this
+            // connection's end: it would keep a stopped account's main thread waiting for it.
+            let alive = Arc::downgrade(&self.alive);
             let _ = std::thread::Builder::new().name("sent-later".into()).spawn(move || {
                 for wait in [SENT_SOON, SENT_LATER.saturating_sub(SENT_SOON)] {
-                    std::thread::sleep(wait);
+                    let until = Instant::now() + wait;
+                    while let Some(left) = until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()) {
+                        if alive.upgrade().is_none() {
+                            return;
+                        }
+                        std::thread::sleep(left.min(SENT_LATER_SLICE));
+                    }
                     if main.send(job.clone()).is_err() {
                         return;
                     }
@@ -307,10 +299,10 @@ impl Worker {
                 })?;
                 (u.to_string(), pw)
             }
-            None => (if self.acc.username.is_empty() { self.acc.email.clone() } else { self.acc.username.clone() }, self.secret()?),
+            None => (self.acc.login_name().to_string(), self.secret()?),
         };
-        let sent =
-            smtp::send_trusting(&self.acc.smtp, &user, &secret, self.acc.oauth.is_some(), from, recipients, raw, &self.acc.trusted_certificates);
+        let sign_in = smtp::SignIn { user: &user, password: &secret, oauth: self.acc.oauth.is_some() };
+        let sent = smtp::send_trusting(&self.acc.smtp, sign_in, from, recipients, raw, &self.acc.trusted_certificates);
         sent.map_err(|e| match e {
             // Say whether the sign-in covered sending: Microsoft lists what it granted.
             NetError::Auth(m) if self.acc.oauth.as_deref() == Some("microsoft") => {
@@ -342,9 +334,10 @@ impl Worker {
                     attempts: 1,
                     error: Some(e.to_string()),
                     not_before: 0,
+                    refused: false,
                 };
                 match self.store.outbox_add(&self.acc.id, &item, raw) {
-                    Ok(()) => self.sink.emit(Event::Queued { account: self.id(), id, error: e.to_string() }),
+                    Ok(()) => self.sink.emit(Event::Queued { account: self.id(), id, error: e.to_string(), kind: e.failure() }),
                     Err(se) => {
                         self.sink.emit(Event::SendFailed { account: self.id(), id, error: format!("{e} (and the Outbox couldn't keep it: {se})") })
                     }
@@ -360,31 +353,51 @@ impl Worker {
     /// Send what waits in the Outbox, oldest first. Stops at the first failure that may clear
     /// up later (still offline); a message refused for good stays, marked with the error.
     pub(super) fn flush_outbox(&mut self) {
+        self.store.outbox_sweep(&self.acc.id);
         for mut item in self.store.outbox(&self.acc.id) {
-            // Held back (Delay Delivery) until its time; then dated when it goes.
-            if item.not_before > now() {
+            // Sent, or refused for good, already: the Outbox couldn't be told.
+            if self.outbox_done.contains(&item.id) {
+                continue;
+            }
+            // Refused for good: waits for the user to edit or delete it. Held back (Delay
+            // Delivery) until its time; then dated when it goes.
+            if item.refused || item.not_before > now() {
                 continue;
             }
             let Some(raw) = self.store.outbox_raw(&self.acc.id, item.id) else { continue };
             let raw = if item.not_before > 0 { mailcraft_mime::with_date(&raw, now()) } else { raw };
-            if item.error.as_deref().is_some_and(|e| e.starts_with("refused:")) {
-                // Refused for good: waits for the user to edit or delete it.
-                continue;
-            }
             let sent = self.deliver(&raw, &item.from, &item.recipients, item.sent_folder.as_deref());
             match sent {
                 Ok(()) => {
-                    self.store.outbox_remove(&self.acc.id, item.id);
+                    // Left in the Outbox, it would go again.
+                    let kept = self.store.outbox_remove(&self.acc.id, item.id).err();
+                    if kept.is_some() {
+                        self.outbox_done.insert(item.id);
+                    }
                     let folder = item.sent_folder.take();
                     self.after_sent(item.id, &raw, folder);
+                    if let Some(e) = kept {
+                        log::error!("{}: message {} sent, but it couldn't be taken out of the Outbox: {e}", self.acc.id, item.id);
+                        let message = format!(
+                            "a message was sent, but it couldn't be taken out of the Outbox ({e}): it isn't sent again while MailCraft runs; delete it there"
+                        );
+                        self.sink.emit(Event::Notice { account: self.id(), message });
+                    }
                 }
                 Err(e) => {
                     let retry = e.is_retryable();
                     item.attempts = item.attempts.saturating_add(1);
-                    item.error = Some(if retry { e.to_string() } else { format!("refused: {e}") });
-                    let _ = self.store.outbox_update(&self.acc.id, &item);
+                    item.error = Some(e.to_string());
+                    item.refused = !retry;
+                    if let Err(se) = self.store.outbox_update(&self.acc.id, &item) {
+                        log::warn!("{}: message {}: why it wasn't sent couldn't be kept in the Outbox: {se}", self.acc.id, item.id);
+                        // Refused for good: not tried again for nothing.
+                        if !retry {
+                            self.outbox_done.insert(item.id);
+                        }
+                    }
                     if retry {
-                        self.sink.emit(Event::Queued { account: self.id(), id: item.id, error: e.to_string() });
+                        self.sink.emit(Event::Queued { account: self.id(), id: item.id, error: e.to_string(), kind: e.failure() });
                         return;
                     }
                     self.sink.emit(Event::SendFailed { account: self.id(), id: item.id, error: e.to_string() });
@@ -415,32 +428,44 @@ impl Worker {
         if self.files_itself() {
             return;
         }
-        let mut made = false;
-        let r = (|| -> Result<Option<String>> {
+        if let Ok(Some(folder)) = self.save_sent_copy(id, raw, sent_folder) {
+            self.sync_filed(&folder);
+        }
+    }
+
+    /// Keep message `id`'s sent copy: in Sent Items on an IMAP server (one made when there's
+    /// none, and the folders listed again), on this computer for POP. Connects when it isn't.
+    /// Where it went; when it went nowhere, or failed to, that's said.
+    fn save_sent_copy(&mut self, id: u64, raw: &[u8], sent_folder: Option<String>) -> Result<Option<String>> {
+        let r = (|| -> Result<Option<(String, bool)>> {
             if self.conn.is_none() {
                 self.connect()?;
             }
             // POP: Sent Items is on this computer.
             if let Some(Conn::Pop) = self.conn.as_ref() {
-                let folder = sent_folder.clone().unwrap_or_else(|| "Sent Items".into());
+                let folder = sent_folder.unwrap_or_else(|| "Sent Items".into());
                 let flags = mailcraft_model::Flags { seen: true, ..Default::default() };
-                return crate::pop::file_locally(&self.store, &self.acc.id, &folder, raw, flags, now()).map(|_| Some(folder));
+                return crate::pop::file_locally(&self.store, &self.acc.id, &folder, raw, flags, now()).map(|_| Some((folder, false)));
             }
-            let Some(folder) = self.sent_folder(sent_folder.clone())? else { return Ok(None) };
-            let (folder, made_now) = self.file_in(&folder, FolderRole::Sent, "\\Seen", raw)?;
-            made = made_now;
-            Ok(Some(folder))
+            let Some(folder) = self.sent_folder(sent_folder)? else { return Ok(None) };
+            self.file_in(&folder, FolderRole::Sent, "\\Seen", raw).map(Some)
         })();
         match r {
-            Ok(Some(folder)) => {
+            Ok(Some((folder, made))) => {
                 log::info!("{}: message {id}'s sent copy saved in {folder}", self.acc.id);
                 if made {
                     self.relist();
                 }
-                self.sync_filed(&folder);
+                Ok(Some(folder))
             }
-            Ok(None) => self.notice(NO_SENT.to_string()),
-            Err(e) => self.notice(format!("sent, but no copy was saved in Sent Items: {e}")),
+            Ok(None) => {
+                self.sent_copy_not_kept(NO_SENT.to_string());
+                Ok(None)
+            }
+            Err(e) => {
+                self.sent_copy_not_kept(format!("{NOT_SAVED}: {e}"));
+                Err(e)
+            }
         }
     }
 }

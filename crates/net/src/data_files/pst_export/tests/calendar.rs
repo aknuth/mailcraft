@@ -2,18 +2,12 @@
 //! read back by MailCraft's import, field by field and occurrence by occurrence.
 
 use super::*;
+use crate::data_files::scratch::scratch;
 use mailcraft_model::dates::days_from_civil;
 use mailcraft_model::ical::{self, Attendee, CalEvent, Privacy, ShowAs};
 use mailcraft_model::pim::{Pim, StoredEvent};
 use mailcraft_model::zone::Zone;
 use mailcraft_pst::write;
-
-fn scratch(label: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-cal-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 /// Local wall-clock `y-m-d h:mi` in `zone`, as an instant.
 fn at(zone: &str, y: i64, m: u32, d: u32, h: i64, mi: i64) -> i64 {
@@ -163,7 +157,7 @@ fn occurrences(events: &[CalEvent]) -> Vec<(String, i64, i64, String)> {
 #[test]
 fn the_calendar_round_trips_inside_a_data_file() {
     use mailcraft_pst::PropertyValue as V;
-    let dir = scratch("round-trip");
+    let dir = scratch("pst-export-cal-round-trip");
     let store = Store::open(dir.join("cache")).unwrap();
     let events = calendar();
     let pim = Pim { events: events.iter().map(|e| StoredEvent { event: e.clone(), ..Default::default() }).collect(), ..Default::default() };
@@ -237,7 +231,6 @@ fn the_calendar_round_trips_inside_a_data_file() {
     // Exported again into the same file: nothing goes in twice.
     let again = export(&store, "a1", "Calendar", &file, NONE, &mut |_| {}).unwrap();
     assert_eq!((again.events, again.occurrences, again.pim_already), (0, 0, 10), "{again:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A meeting's request carries the meeting's own properties as its appointment has them: the
@@ -246,7 +239,7 @@ fn the_calendar_round_trips_inside_a_data_file() {
 #[test]
 fn meeting_mail_carries_its_meeting() {
     use mailcraft_pst::PropertyValue as V;
-    let dir = scratch("meeting-mail");
+    let dir = scratch("pst-export-cal-meeting-mail");
     let store = Store::open(dir.join("cache")).unwrap();
     let mut invite = CalEvent {
         uid: "review@studio.example".into(),
@@ -347,7 +340,6 @@ fn meeting_mail_carries_its_meeting() {
     let cal = ical::parse(&mime::attachment_text(&raw, part.index).unwrap(), 0);
     assert_eq!(cal.method.as_deref(), Some("REQUEST"));
     assert_eq!(cal.events.len(), 2);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 use crate::data_files::pst_export::calendar::{self as cal, Owner};
@@ -535,29 +527,29 @@ fn hours_and_added_dates_go_in_as_their_occurrences() {
 
 /// The pattern the export writes for `e` (none when it goes in one occurrence at a time).
 fn written(e: &CalEvent) -> Option<Vec<u8>> {
-    crate::data_files::pst_export::calendar::series(e, &[], &Default::default(), false)?.into_iter().find_map(|(k, v)| match (k, v) {
-        (crate::data_files::pst_export::pim::Key::Lid(_, 0x8216), crate::data_files::pst_export::pim::Value::Bin(b)) => Some(b),
+    cal::series(e, &[], &Default::default(), false)?.into_iter().find_map(|(k, v)| match (k, v) {
+        (Key::Lid(_, 0x8216), Value::Bin(b)) => Some(b),
         _ => None,
     })
 }
 
 /// A rule of a kind Outlook's pattern says, as RFC 5545 writes it.
-fn rule_strategy() -> impl proptest::strategy::Strategy<Value = (String, bool)> {
+fn rule_strategy() -> impl proptest::strategy::Strategy<Value = String> {
     use proptest::prelude::*;
     let days = proptest::sample::subsequence(vec!["SU", "MO", "TU", "WE", "TH", "FR", "SA"], 1..=7).prop_map(|d| d.join(","));
     let nth = prop_oneof![Just(-1i32), 1..=4i32];
     let weekday = proptest::sample::select(vec!["SU", "MO", "TU", "WE", "TH", "FR", "SA"]);
     let end = prop_oneof![Just(String::new()), (1u32..40).prop_map(|n| format!(";COUNT={n}")), (1i64..700).prop_map(|d| format!(";UNTIL=+{d}"))];
     let kind = prop_oneof![
-        (1u32..5).prop_map(|i| (format!("FREQ=DAILY;INTERVAL={i}"), true)),
+        (1u32..5).prop_map(|i| format!("FREQ=DAILY;INTERVAL={i}")),
         (1u32..4, days, proptest::sample::select(vec!["", ";WKST=MO", ";WKST=SU"]))
-            .prop_map(|(i, d, w)| (format!("FREQ=WEEKLY;INTERVAL={i};BYDAY={d}{w}"), true)),
-        (1u32..4, prop_oneof![Just(-1i32), 1..=28i32]).prop_map(|(i, d)| (format!("FREQ=MONTHLY;INTERVAL={i};BYMONTHDAY={d}"), false)),
-        (1u32..4, nth.clone(), weekday.clone()).prop_map(|(i, n, w)| (format!("FREQ=MONTHLY;INTERVAL={i};BYDAY={n}{w}"), false)),
-        (1u32..3).prop_map(|i| (format!("FREQ=YEARLY;INTERVAL={i}"), false)),
-        (1u32..3, nth, weekday).prop_map(|(i, n, w)| (format!("FREQ=YEARLY;INTERVAL={i};BYMONTH=M;BYDAY={n}{w}"), false)),
+            .prop_map(|(i, d, w)| format!("FREQ=WEEKLY;INTERVAL={i};BYDAY={d}{w}")),
+        (1u32..4, prop_oneof![Just(-1i32), 1..=28i32]).prop_map(|(i, d)| format!("FREQ=MONTHLY;INTERVAL={i};BYMONTHDAY={d}")),
+        (1u32..4, nth.clone(), weekday.clone()).prop_map(|(i, n, w)| format!("FREQ=MONTHLY;INTERVAL={i};BYDAY={n}{w}")),
+        (1u32..3).prop_map(|i| format!("FREQ=YEARLY;INTERVAL={i}")),
+        (1u32..3, nth, weekday).prop_map(|(i, n, w)| format!("FREQ=YEARLY;INTERVAL={i};BYMONTH=M;BYDAY={n}{w}")),
     ];
-    (kind, end).prop_map(|((k, by_day), e)| (format!("{k}{e}"), by_day))
+    (kind, end).prop_map(|(k, e)| format!("{k}{e}"))
 }
 
 proptest::proptest! {
@@ -567,7 +559,7 @@ proptest::proptest! {
     /// (`pst_pim::recur`), the series has the same occurrences over three years.
     #[test]
     fn a_rule_written_and_read_back_keeps_its_occurrences(
-        (rule, _) in rule_strategy(),
+        rule in rule_strategy(),
         day in 0i64..1000,
         minute in 0i64..(24 * 4),
         zone in proptest::sample::select(vec!["", "America/New_York", "Europe/Berlin", "Australia/Sydney", "Asia/Kolkata"]),

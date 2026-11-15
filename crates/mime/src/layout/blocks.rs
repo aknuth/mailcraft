@@ -171,12 +171,13 @@ fn parted(n: &Node, pending: &str) -> bool {
 }
 
 pub(super) fn blocks(kids: &[Kid], ctx: &mut Ctx, depth: usize) -> Vec<Block> {
+    mailcraft_model::work::steps(kids.len());
     // Boxes side by side (`inline-block`, floated) straight in a cell or the body, with no box
     // around them: columns as they are in any box (issue #47: a newsletter's three
     // `inline-block` notes under its products stacked one under another).
     let boxes = kids.iter().filter(|k| matches!(k, Kid::El(n) if !n.hidden())).count();
     if boxes >= 2 && depth < MAX_DEPTH {
-        let around = Node { tag: "div".into(), attrs: Vec::new(), kids: kids.iter().map(copy).collect() };
+        let around = Node { tag: "div".into(), attrs: Vec::new(), kids: kids.iter().map(copy).collect(), styles: Default::default() };
         if around.columns().is_some() {
             return blocks(&[Kid::El(around)], ctx, depth);
         }
@@ -185,9 +186,11 @@ pub(super) fn blocks(kids: &[Kid], ctx: &mut Ctx, depth: usize) -> Vec<Block> {
     let mut pending = String::new();
     let flush = |pending: &mut String, out: &mut Vec<Block>, ctx: &Ctx| {
         if pending.chars().any(|c| !c.is_whitespace()) || pending.contains("<img") {
+            // With the sizes the text was marked with as it was written ([`super::ready`]).
+            let rich = |html: &str| crate::html::html_to_rich_within(html, crate::HTML_MAX, false);
             let rich = match &ctx.color {
-                Some(c) => crate::html_to_rich(&format!("{}<div style=\"color:{c}\">{}</div>", ctx.css, pending)),
-                None => crate::html_to_rich(&format!("{}{}", ctx.css, pending)),
+                Some(c) => rich(&format!("{}<div style=\"color:{c}\">{}</div>", ctx.css, pending)),
+                None => rich(&format!("{}{}", ctx.css, pending)),
             };
             if !rich.is_empty() {
                 out.push(Block::Text(rich));
@@ -657,16 +660,15 @@ pub(super) fn has_columns(b: &[Block]) -> bool {
 
 /// The pictures behind boxes in a layout (to be shown, or held back, like the message's others).
 pub fn background_pictures(b: &[Block]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut add = |src: &Option<String>, out: &mut Vec<String>| {
+    fn add(src: &Option<String>, out: &mut Vec<String>) {
         if let Some(s) = src
             && !out.contains(s)
             && out.len() < 200
         {
             out.push(s.clone());
         }
-    };
-    pub(super) fn walk(b: &[Block], out: &mut Vec<String>, add: &mut dyn FnMut(&Option<String>, &mut Vec<String>), depth: usize) {
+    }
+    fn walk(b: &[Block], out: &mut Vec<String>, depth: usize) {
         if depth > MAX_DEPTH * 2 {
             return;
         }
@@ -675,14 +677,15 @@ pub fn background_pictures(b: &[Block]) -> Vec<String> {
                 add(&t.background_image, out);
                 for c in t.rows.iter().flatten() {
                     add(&c.background_image, out);
-                    walk(&c.blocks, out, add, depth + 1);
+                    walk(&c.blocks, out, depth + 1);
                     for o in &c.overlays {
-                        walk(&o.blocks, out, add, depth + 1);
+                        walk(&o.blocks, out, depth + 1);
                     }
                 }
             }
         }
     }
-    walk(b, &mut out, &mut add, 0);
+    let mut out = Vec::new();
+    walk(b, &mut out, 0);
     out
 }

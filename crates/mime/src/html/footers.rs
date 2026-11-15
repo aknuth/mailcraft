@@ -7,6 +7,8 @@
 
 use std::borrow::Cow;
 
+use mailcraft_model::work::scanned;
+
 /// Tables open one in another that are followed, at most; their footers past it are rows where
 /// they're written.
 const MAX_TABLES: usize = 256;
@@ -44,7 +46,7 @@ pub(crate) fn footers_last(html: &str) -> Cow<'_, str> {
     // Each table's first footer, and where it goes (its end tag).
     let mut moves: Vec<((usize, usize), usize)> = Vec::new();
     let mut i = 0;
-    while let Some(at) = b.get(i..).and_then(|r| r.iter().position(|&c| c == b'<')).map(|o| i + o) {
+    while let Some(at) = b.get(i..).and_then(|r| scanned(r, r.iter().position(|&c| c == b'<'))).map(|o| i + o) {
         let rest = b.get(at..).unwrap_or_default();
         if rest.starts_with(b"<!--") {
             i = find(b, at + 4, b"-->").map_or(b.len(), |e| e + 3);
@@ -158,36 +160,22 @@ pub(crate) fn footers_last(html: &str) -> Cow<'_, str> {
     String::from_utf8(out).map_or(Cow::Borrowed(html), Cow::Owned)
 }
 
-/// Where the tag whose name ends at `from` ends, past its `>`: a `>` in a quoted value is the
-/// value's (found in review: `title="a>b"` ended the tag there, and the rest of it was taken for
-/// markup). One left open runs to the end, as a browser reads it.
+/// Where the tag whose name ends at `from` ends, past its `>` ([`crate::html::tag_end`]). One
+/// left open runs to the end, as a browser reads it.
 fn tag_end(b: &[u8], from: usize) -> usize {
-    let mut i = from;
-    let mut after_equals = false;
-    while let Some(&c) = b.get(i) {
-        match c {
-            b'>' => return i + 1,
-            b'"' | b'\'' if after_equals => {
-                i = b.get(i + 1..).and_then(|r| r.iter().position(|&q| q == c)).map_or(b.len(), |o| i + 1 + o);
-                after_equals = false;
-            }
-            b'=' => after_equals = true,
-            c if c.is_ascii_whitespace() => {}
-            _ => after_equals = false,
-        }
-        i += 1;
-    }
-    b.len()
+    crate::html::tag_end(b, from).map_or(b.len(), |e| e + 1)
 }
 
 /// Where `what` is in `b` from `from`.
 fn find(b: &[u8], from: usize, what: &[u8]) -> Option<usize> {
-    b.get(from..)?.windows(what.len()).position(|w| w == what).map(|o| from + o)
+    let rest = b.get(from..)?;
+    scanned(rest, rest.windows(what.len()).position(|w| w == what)).map(|o| from + o)
 }
 
 /// [`find`], whatever the letters' case.
 fn find_ignoring_case(b: &[u8], from: usize, what: &[u8]) -> Option<usize> {
-    b.get(from..)?.windows(what.len()).position(|w| w.eq_ignore_ascii_case(what)).map(|o| from + o)
+    let rest = b.get(from..)?;
+    scanned(rest, rest.windows(what.len()).position(|w| w.eq_ignore_ascii_case(what))).map(|o| from + o)
 }
 
 #[cfg(test)]

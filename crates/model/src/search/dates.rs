@@ -13,7 +13,7 @@
 //! The days are the user's: [`Query::resolve`] places them in the local zone (each on the offset
 //! in force that day), from the clock the caller passes, as the model never reads the time.
 
-use crate::dates::{Clock, civil_from_days, days_from_civil};
+use crate::dates::{Clock, civil_from_days, days_from_civil, month_len};
 
 use super::{Query, Term};
 
@@ -117,9 +117,26 @@ pub fn is_day(value: &str) -> bool {
 /// `date: friday`) is words that happen to follow the field's name.
 pub(super) fn looks_like_date(value: &str) -> bool {
     let v = unquote(value);
-    let named: String = v.chars().filter(|c| !matches!(c, ' ' | '-' | '_')).collect();
-    v.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '<' | '>' | '=' | '.'))
-        || ["today", "yesterday", "thisweek", "lastweek", "thismonth", "lastmonth", "thisyear", "lastyear"].iter().any(|n| named.starts_with(n))
+    let named = squashed(&v);
+    v.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '<' | '>' | '=' | '.')) || RELATIVE.iter().any(|(n, _)| named.starts_with(n))
+}
+
+/// The periods named from today, as [`squashed`].
+const RELATIVE: [(&str, Relative); 8] = [
+    ("today", Relative::Today),
+    ("yesterday", Relative::Yesterday),
+    ("thisweek", Relative::ThisWeek),
+    ("lastweek", Relative::LastWeek),
+    ("thismonth", Relative::ThisMonth),
+    ("lastmonth", Relative::LastMonth),
+    ("thisyear", Relative::ThisYear),
+    ("lastyear", Relative::LastYear),
+];
+
+/// A value as a name from today is read: lower-cased, without spaces, `-` or `_`
+/// (`"Last week"`, `last-week` and `last_week` are `lastweek`).
+fn squashed(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, ' ' | '-' | '_')).collect::<String>().to_ascii_lowercase()
 }
 
 fn unquote(value: &str) -> String {
@@ -130,20 +147,9 @@ fn unquote(value: &str) -> String {
 
 /// A period as written: a year, month or day, or one named from today.
 fn point(s: &str) -> Option<DatePoint> {
-    let named: String = s.chars().filter(|c| !matches!(c, ' ' | '-' | '_')).collect::<String>().to_ascii_lowercase();
-    let rel = match named.as_str() {
-        "today" => Some(Relative::Today),
-        "yesterday" => Some(Relative::Yesterday),
-        "thisweek" => Some(Relative::ThisWeek),
-        "lastweek" => Some(Relative::LastWeek),
-        "thismonth" => Some(Relative::ThisMonth),
-        "lastmonth" => Some(Relative::LastMonth),
-        "thisyear" => Some(Relative::ThisYear),
-        "lastyear" => Some(Relative::LastYear),
-        _ => None,
-    };
-    if let Some(r) = rel {
-        return Some(DatePoint::Rel(r));
+    let named = squashed(s);
+    if let Some((_, r)) = RELATIVE.iter().find(|(n, _)| *n == named) {
+        return Some(DatePoint::Rel(*r));
     }
     let s = s.trim();
     // `20240315`, as the calendar's search reads it too.
@@ -175,8 +181,8 @@ fn month(s: &str) -> Option<u32> {
 
 fn day(y: &str, m: &str, d: &str) -> Option<DatePoint> {
     let (y, m, d) = (year(y)?, month(m)?, number(d, 2)?);
-    // A day its month has: 2023-02-29 comes back as March the 1st.
-    (d >= 1 && civil_from_days(days_from_civil(y, m, d)) == (y, m, d)).then_some(DatePoint::Day { y, m, d })
+    // A day its month has: not 2023-02-29.
+    (1..=month_len(y, m)).contains(&i64::from(d)).then_some(DatePoint::Day { y, m, d })
 }
 
 fn next_month(y: i64, m: u32) -> (i64, u32) {
@@ -204,8 +210,7 @@ impl DatePoint {
             DatePoint::Year { y } => year(y),
             DatePoint::Rel(r) => {
                 let today = clock.local(clock.now).div_euclid(DAY);
-                // 1970-01-01 was a Thursday: Monday is 0.
-                let monday = today.saturating_sub(today.saturating_add(3).rem_euclid(7));
+                let monday = today.saturating_sub(i64::from(crate::dates::weekday_index(today)));
                 let (y, m, _) = civil_from_days(today);
                 match r {
                     Relative::Today => (today, today.saturating_add(1)),

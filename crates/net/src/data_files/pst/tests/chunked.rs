@@ -6,24 +6,15 @@ use std::path::{Path, PathBuf};
 
 use super::super::chunked::{ChunkReader, PAGE, Shared, Source};
 use super::super::open::open_read;
+use crate::data_files::scratch::scratch;
+use crate::fakes::random::{Rng, noise};
 
 /// A file of `len` bytes that don't repeat in any short run.
-fn file_of(name: &str, len: usize) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-chunked-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn file_of(name: &str, len: usize) -> PathBuf {
+    let dir = scratch(&format!("pst-chunked-{name}"));
     let path = dir.join("data.bin");
-    let mut x = 0x2545_f491_4f6c_dd1du64;
-    let bytes: Vec<u8> = (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect();
-    std::fs::write(&path, bytes).unwrap();
-    (dir, path)
+    std::fs::write(&path, noise(len, 0x2545_f491_4f6c_dd1d)).unwrap();
+    path
 }
 
 fn source(path: &Path, chunk_kb: usize) -> Shared {
@@ -35,18 +26,13 @@ fn source(path: &Path, chunk_kb: usize) -> Shared {
 #[test]
 fn the_reader_reads_what_the_file_holds() {
     let len = 1024 * 1024 + 7;
-    let (dir, path) = file_of("same", len);
+    let path = file_of("same", len);
     for chunk_kb in [0, 4] {
         let shared = source(&path, chunk_kb);
         let mut ours = ChunkReader::new(&shared);
         let mut plain = std::fs::File::open(&path).unwrap();
-        let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ chunk_kb as u64;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
+        let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15u64 ^ chunk_kb as u64);
+        let mut next = || rng.next_u64();
         for step in 0..10_000 {
             let r = next();
             match r % 5 {
@@ -95,14 +81,13 @@ fn the_reader_reads_what_the_file_holds() {
         let (held, _) = shared.borrow().held();
         assert!(held <= 64 * if chunk_kb == 0 { 64 * 1024 } else { chunk_kb * 1024 }, "{held}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Reads at and past the end give nothing; seeks before the start, or past what a position holds,
 /// are errors and leave the position where it was.
 #[test]
 fn the_end_and_before_the_start() {
-    let (dir, path) = file_of("ends", 10_000);
+    let path = file_of("ends", 10_000);
     let shared = source(&path, 0);
     let mut r = ChunkReader::new(&shared);
     let mut buf = [0; 64];
@@ -118,7 +103,6 @@ fn the_end_and_before_the_start() {
     r.seek(SeekFrom::Start(3)).unwrap();
     assert!(r.seek(SeekFrom::Current(-4)).is_err());
     assert_eq!(r.stream_position().unwrap(), 3);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Pages read here and there are read exactly, once each however often they're asked for (as
@@ -126,7 +110,7 @@ fn the_end_and_before_the_start() {
 /// and a second handle starts with what the first read.
 #[test]
 fn ranges_are_read_once_and_ahead_only_in_order() {
-    let (dir, path) = file_of("ahead", 8 * 1024 * 1024);
+    let path = file_of("ahead", 8 * 1024 * 1024);
     let shared = source(&path, 0);
     let mut r = ChunkReader::new(&shared);
     let mut page = [0; PAGE];
@@ -158,14 +142,13 @@ fn ranges_are_read_once_and_ahead_only_in_order() {
     again.seek(SeekFrom::Start(0x4400)).unwrap();
     again.read_exact(&mut page).unwrap();
     assert_eq!(shared.borrow().bytes_read, read);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An attachment's blocks close together in no order: read by the chunk, not one by one; a block
 /// far from the last is read exactly, and so are pages, near or not.
 #[test]
 fn blocks_near_the_last_read_their_chunk() {
-    let (dir, path) = file_of("near", 16 * 1024 * 1024);
+    let path = file_of("near", 16 * 1024 * 1024);
     let shared = source(&path, 0);
     let mut r = ChunkReader::new(&shared);
     let mut plain = std::fs::File::open(&path).unwrap();
@@ -194,5 +177,4 @@ fn blocks_near_the_last_read_their_chunk() {
     r.seek(SeekFrom::Start(13 * 1024 * 1024)).unwrap();
     r.read_exact(&mut page).unwrap();
     assert_eq!(shared.borrow().bytes_read - bytes, 8192 + PAGE as u64);
-    let _ = std::fs::remove_dir_all(&dir);
 }

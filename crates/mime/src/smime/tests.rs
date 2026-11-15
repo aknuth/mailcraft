@@ -107,7 +107,7 @@ MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer
     let sealed = encrypted_message(&outer, &[7; 300], false);
     assert_eq!(protection(&sealed), Protection::Encrypted(vec![7; 300]));
     let back = with_entity(&sealed, &entity);
-    let parsed = crate::parse(&back).unwrap_or_else(|| crate::parse(b"x").unwrap_or_default());
+    let parsed = crate::parse(&back).expect("the message parses");
     assert_eq!(parsed.subject, "Proof");
     assert_eq!(parsed.text.trim(), "Approved \u{2713}");
     assert!(is_smime_part("application/pkcs7-signature", "x") && is_smime_part("application/octet-stream", "smime.p7m"));
@@ -155,7 +155,8 @@ fn a_message_to_sign_is_safe_to_sign() {
         seven_bit: true,
         ..Default::default()
     };
-    let raw = crate::build(&d, &mailcraft_model::EmailAddress::new("Riley", "riley@studio.example"), 1_800_000_000, "<a@b>").unwrap_or_default();
+    let raw =
+        crate::build(&d, &mailcraft_model::EmailAddress::new("Riley", "riley@studio.example"), 1_800_000_000, "<a@b>").expect("the message builds");
     let (_, entity) = entity_of(&raw);
     let bad: Vec<String> = entity
         .split(|b| *b == b'\n')
@@ -165,7 +166,7 @@ fn a_message_to_sign_is_safe_to_sign() {
     assert!(bad.is_empty(), "{bad:?}");
     assert!(safe_to_sign(&entity));
     // And it reads back: the attached message whole.
-    let parsed = crate::parse(&with_entity(&raw, &entity)).unwrap_or_default();
+    let parsed = crate::parse(&with_entity(&raw, &entity)).expect("the message parses");
     assert!(parsed.text.starts_with("Ol\u{e1}"));
     assert_eq!(parsed.attachments.len(), 1);
 }
@@ -254,7 +255,7 @@ MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThe plan.\r\
     let sent = encrypted_message(out_outer.as_bytes(), &[1, 2, 3], false);
     let (back, was) = with_entity_protected(&sent, &protected);
     assert!(was);
-    let p = crate::parse(&back).unwrap_or_default();
+    let p = crate::parse(&back).expect("the message parses");
     assert_eq!(p.subject, "Caf\u{e9} plans");
     assert_eq!(p.text.trim(), "The plan.", "the Legacy Display part isn't shown");
     // Signed only: everything stays outside as it was, and inside too.
@@ -265,8 +266,36 @@ MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nThe plan.\r\
     let forged = b"From: Boss <boss@posteo.example>\r\nContent-Type: text/plain\r\n\r\nPay me.\r\n";
     let (back, was) = with_entity_protected(raw.as_bytes(), forged);
     assert!(!was);
-    assert_eq!(crate::parse(&back).unwrap_or_default().from.email, "riley@studio.example");
+    assert_eq!(crate::parse(&back).expect("the message parses").from.email, "riley@studio.example");
     assert!(String::from_utf8_lossy(&quoted_printable("a\u{e9}= ")).contains("a=C3=A9=3D=20"));
+}
+
+/// `hp=` and `hp-legacy-display=` are read in any case, the boundary as written: the Legacy
+/// Display part under a boundary in capitals is still taken out.
+#[test]
+fn header_protection_parameters_are_read_as_written() {
+    let entity = b"Subject: Inner\r\nContent-Type: multipart/mixed;\r\n boundary=\"=_HpAbC\"; HP=Cipher\r\n\r\n\
+--=_HpAbC\r\nContent-Type: text/plain; HP-Legacy-Display=\"1\"\r\n\r\nSubject: Inner\r\n\r\n\
+--=_HpAbC\r\nContent-Type: text/plain\r\n\r\nBody\r\n--=_HpAbC--\r\n";
+    let (back, protected) = with_entity_protected(b"From: a@b.example\r\nSubject: [...]\r\n\r\nx\r\n", entity);
+    assert!(protected);
+    let p = crate::parse(&back).expect("the message parses");
+    assert_eq!(p.subject, "Inner");
+    assert_eq!(p.text.trim(), "Body", "the Legacy Display part isn't shown");
+    assert_eq!(parameter(b"Content-Type: multipart/mixed; Boundary=\"=_HpAbC\"", "boundary").as_deref(), Some("=_HpAbC"));
+}
+
+/// Any field's value reads as its text, not the Subject's alone: unfolded, encoded words
+/// decoded, trimmed, 8-bit bytes read as the reading pane reads them.
+#[test]
+fn a_fields_value_is_its_text() {
+    assert_eq!(field_value(b"Subject: =?utf-8?q?Caf=C3=A9_plans?="), "Caf\u{e9} plans");
+    assert_eq!(field_value(b"Comments: =?utf-8?q?caf=C3=A9?="), "caf\u{e9}");
+    assert_eq!(field_value(b"Keywords:  plans,\r\n secret "), "plans, secret");
+    assert_eq!(field_value(b"Subject: Re: =?utf-8?b?8J+YgA==?=\r\n =?utf-8?q?_more?="), "Re: \u{1f600} more");
+    assert_eq!(field_value(b"Subject: caf\xE9"), "caf\u{e9}");
+    assert_eq!(field_value(b"Subject:"), "");
+    assert_eq!(field_value(b"no colon"), "");
 }
 
 #[test]
@@ -297,7 +326,7 @@ fn junk_never_panics() {
 /// under the time a full parse of it takes. Timed, so in release only:
 /// `cargo test -p mailcraft-mime --release -- --ignored a_big_plain_message`.
 #[test]
-#[ignore]
+#[ignore = "a measurement"]
 fn a_big_plain_message_is_not_parsed_to_say_it_is_unprotected() {
     let mut raw = b"From: a@b.example\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n".to_vec();
     for i in 0..50 {

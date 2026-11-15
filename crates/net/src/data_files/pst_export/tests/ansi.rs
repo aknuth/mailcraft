@@ -2,10 +2,8 @@
 //! in beside what it had, their strings 8-bit, and the import reads them all back.
 
 use super::*;
-use mailcraft_pst::{
-    PstFile, PstStore,
-    write::{self, BatchMessage},
-};
+use crate::data_files::scratch::scratch;
+use mailcraft_pst::write::{self, BatchMessage};
 
 fn mail(store: &Store, folder: &str, uid: u32, subject: &str) -> mailcraft_model::Summary {
     let d = mime::Draft { subject: subject.into(), body: format!("{subject}, the body."), ..Default::default() };
@@ -19,19 +17,9 @@ fn mail(store: &Store, folder: &str, uid: u32, subject: &str) -> mailcraft_model
 /// says.
 fn subjects(path: &Path) -> Vec<(Vec<u8>, i32)> {
     use mailcraft_pst::PropertyValue as V;
-    let any: Rc<PstStore> = PstStore::read(Rc::new(PstFile::open(path).unwrap())).unwrap();
-    let top = any.open_folder(any.ipm_subtree().unwrap()).unwrap();
-    let inbox = top
-        .hierarchy_table()
-        .unwrap()
-        .rows_matrix()
-        .filter_map(|row| any.open_folder(row.id()).ok())
-        .find(|f| f.properties().display_name().is_ok_and(|n| n == "Inbox"))
-        .unwrap();
+    let any = read_file(path);
     let mut out = Vec::new();
-    for row in inbox.contents_table().unwrap().rows_matrix() {
-        let entry = row.id();
-        let m = Message::read(any.clone(), entry).unwrap();
+    for m in messages_in(&any, &folder_at(&any, &["Inbox"])) {
         let page = match m.properties().get(0x3FFD) {
             Some(V::Integer32(page)) => *page,
             _ => 0,
@@ -47,27 +35,13 @@ fn subjects(path: &Path) -> Vec<(Vec<u8>, i32)> {
 
 #[test]
 fn an_account_goes_into_an_ansi_data_file_and_back() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-ansi-file-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-ansi-file");
     let file = dir.join("Old.pst");
     // The file's own mail, one message of which the account has too.
     write::create_empty(&file, mailcraft_pst::Format::Ansi).unwrap();
-    let theirs = |subject, message_id| NewMessage {
-        subject,
-        sender_name: "Ana",
-        sender_email: "ana@example.com",
-        recipients: &[],
-        body: "Kept as it was.",
-        html_body: None,
-        message_id,
-        delivery_time: 133_485_408_000_000_000,
-        message_class: "IPM.Note",
-        properties: &[],
-    };
     let batch = [
-        BatchMessage { message: theirs("Theirs", "<theirs@example.com>"), attachments: &[] },
-        BatchMessage { message: theirs("Both", "<m1@example.com>"), attachments: &[] },
+        BatchMessage { message: plain_message("Theirs", "<theirs@example.com>"), attachments: &[] },
+        BatchMessage { message: plain_message("Both", "<m1@example.com>"), attachments: &[] },
     ];
     write::append(&file, &["Inbox"], &batch).unwrap();
 
@@ -119,14 +93,13 @@ fn an_account_goes_into_an_ansi_data_file_and_back() {
     // Added to again, nothing goes in twice.
     let again = export(&store, "a1", "Riley's mail", &file, NONE, &mut |_| {}).unwrap();
     assert_eq!((again.messages, again.already, again.pim_already), (0, 4, 10));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The top folders of an ANSI file: each one's name as written and how many messages it holds.
 fn top(path: &Path) -> Vec<(Vec<u8>, usize)> {
     use mailcraft_pst::PropertyValue as V;
-    let any: Rc<PstStore> = PstStore::read(Rc::new(PstFile::open(path).unwrap())).unwrap();
-    let top = any.open_folder(any.ipm_subtree().unwrap()).unwrap();
+    let any = read_file(path);
+    let top = folder_at(&any, &[]);
     let mut out: Vec<(Vec<u8>, usize)> = top
         .hierarchy_table()
         .unwrap()
@@ -148,9 +121,7 @@ fn top(path: &Path) -> Vec<(Vec<u8>, usize)> {
 /// adding to the same folder, and two that it would write alike stay apart.
 #[test]
 fn folders_windows_1252_cant_name_stay_one_each() {
-    let dir = std::env::temp_dir().join(format!("mailcraft-pst-export-ansi-names-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("pst-export-ansi-names");
     let file = dir.join("Old.pst");
     write::create_empty(&file, mailcraft_pst::Format::Ansi).unwrap();
     let store = Store::open(dir.join("cache")).unwrap();
@@ -188,5 +159,4 @@ fn folders_windows_1252_cant_name_stay_one_each() {
         found.retain(|(name, _)| !matches!(name.as_slice(), b"Calendar" | b"Contacts" | b"Notes" | b"Tasks"));
         assert_eq!(found, want, "round {round}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }

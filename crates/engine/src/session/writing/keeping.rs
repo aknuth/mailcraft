@@ -255,31 +255,8 @@ impl Session {
 
     /// A message as a draft's source, the Drafts folder it goes in, and its Message-ID.
     pub(crate) fn draft_bytes(&mut self, c: &Compose) -> Result<(Vec<u8>, String, String), CmdError> {
-        // Drafts may hold unfinished addresses: keep only the valid ones.
-        let lenient = addr::parse_valid;
-        let (body, html, inline) = c.bodies_with(&c.signature_code);
-        let d = mime::Draft {
-            reply_to: lenient(&c.reply_to),
-            to: lenient(&c.to),
-            cc: lenient(&c.cc),
-            bcc: lenient(&c.bcc),
-            subject: c.subject.clone(),
-            body,
-            in_reply_to: c.in_reply_to.clone(),
-            references: c.references.clone(),
-            attachments: c.attachments.clone(),
-            html,
-            inline,
-            importance: c.importance,
-            read_receipt: c.read_receipt,
-            seven_bit: false,
-            keep_bcc: true,
-            source: match (&c.source, c.mode) {
-                (Some(k), Some(ReplyMode::Forward)) => format!("forward {}", k.to_id()),
-                (Some(k), Some(_)) => format!("reply {}", k.to_id()),
-                _ => String::new(),
-            },
-        };
+        // Drafts may hold unfinished addresses: only the valid ones are kept.
+        let d = self.draft_of(c, true)?;
         // A server account without one gets Drafts made where it's filed, as Outlook makes it.
         let account = self.account(&c.account);
         let folder = match account.and_then(|a| a.folder(FolderRole::Drafts)) {
@@ -302,21 +279,10 @@ impl Session {
     pub(crate) fn file_locally(&mut self, account: &str, folder: &str, raw: &[u8], seen: bool) -> Result<MessageKey, CmdError> {
         let store = self.store.clone().ok_or_else(|| CmdError::Failed("there is nowhere to keep it".into()))?;
         let failed = |e: mailcraft_store::StoreError| CmdError::Failed(format!("The message couldn't be kept in {folder}: {e}"));
-        let mut st = store.load_folder(account, folder).map_err(failed)?;
-        if st.validity == 0 {
-            st.validity = 1;
-        }
-        let mut next = st.free_uid(account, folder).map_err(failed)?;
-        let uid = mailcraft_store::FolderState::take_uid(&mut next, account, folder).map_err(failed)?;
-        st.uid_next = next;
-        let key = MessageKey { account: account.to_string(), folder: folder.to_string(), validity: st.validity, uid };
         let flags = mailcraft_model::Flags { seen, draft: !seen, ..Default::default() };
-        let size = u32::try_from(raw.len()).unwrap_or(u32::MAX);
-        let s = mime::summary_from_full(raw, key.clone(), flags, size, self.clock.now);
-        store.write_body(&key, raw).map_err(failed)?;
-        st.messages.push(s.into());
-        sort_newest_first(&mut st.messages);
-        store.save_folder(account, folder, &st).map_err(failed)?;
+        let mut filing = Filing::new(&store, account, folder).map_err(failed)?;
+        let key = Self::file_raw(&mut filing, raw.to_vec(), flags, self.clock.now).map_err(failed)?;
+        filing.finish().map_err(failed)?;
         self.reload_folder(account, folder);
         self.recount_local(account, Some(&[folder.to_string()]));
         self.refresh_list();

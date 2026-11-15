@@ -1,6 +1,7 @@
 //! Links in the message editor: Insert link, and addresses as they're shown and written.
 
 use super::*;
+use mailcraft_engine::model::mailto::{self, percent_encode};
 
 /// Outlook's Insert Hyperlink, with what mail needs: a web page or file, or an email address.
 #[derive(Clone, Debug, Default)]
@@ -21,20 +22,15 @@ pub(super) struct LinkForm {
 impl LinkForm {
     /// The dialog for the selection: its text, and the link already on it.
     pub(super) fn open(c: &Compose, sel: Range<usize>) -> LinkForm {
-        let chosen: String = c.body.chars().skip(sel.start).take(sel.end.saturating_sub(sel.start)).collect();
+        let chosen: String = chars_in(&c.body, sel.clone()).collect();
         let existing = c.styles.style(sel.start).link.filter(|_| !c.body.is_empty());
         let multi = chosen.contains('\n');
         let mut f = LinkForm { text: if multi { String::new() } else { chosen }, sel, editing: existing.is_some(), multi, ..Default::default() };
-        match existing {
-            Some(url) if url.to_ascii_lowercase().starts_with("mailto:") => {
-                f.email = true;
-                let rest = url.get(7..).unwrap_or_default();
-                let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
-                f.to = percent_decode(to);
-                f.subject = query.split('&').find_map(|kv| kv.strip_prefix("subject=")).map(percent_decode).unwrap_or_default();
+        if let Some(url) = existing {
+            match mailto::parse(&url) {
+                Some(m) => (f.email, f.to, f.subject) = (true, m.to, m.subject),
+                None => f.address = url,
             }
-            Some(url) => f.address = url,
-            None => {}
         }
         f
     }
@@ -66,41 +62,6 @@ impl LinkForm {
             format!("https://{a}")
         })
     }
-}
-
-/// `%XX` escapes in a mailto address or subject, as text.
-pub(super) fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        let hex = |k: usize| b.get(k).and_then(|h| (*h as char).to_digit(16));
-        match (c, hex(i + 1), hex(i + 2)) {
-            (b'%', Some(h), Some(l)) => {
-                out.push(u8::try_from(h * 16 + l).unwrap_or(b'?'));
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// A subject as a mailto may carry it (RFC 6068): everything but letters, digits and `-._~`
-/// escaped.
-pub(super) fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 /// Insert link, as Outlook's Insert Hyperlink keeps what mail needs: what the text says, and a
@@ -171,7 +132,7 @@ pub(crate) fn link_dialog(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Comp
             let sel = f.sel.clone();
             let n = c.body.chars().count();
             let sel = sel.start.min(n)..sel.end.min(n);
-            let current: String = c.body.chars().skip(sel.start).take(sel.end - sel.start).collect();
+            let current: String = chars_in(&c.body, sel.clone()).collect();
             let shown = if f.text.trim().is_empty() {
                 url.strip_prefix("mailto:").map_or(url.as_str(), |a| a.split('?').next().unwrap_or(a)).to_string()
             } else {

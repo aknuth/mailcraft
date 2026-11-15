@@ -31,14 +31,18 @@ fn a_draft_opens_again_as_it_was_saved() {
         });
     }
     s.run("compose.saveDraft", &json!({})).unwrap();
-    s.run("compose.close", &json!({"save": false})).unwrap_or_default();
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
     let key = draft_key(&mut s, "Re: Invoice");
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
     let c = s.compose.clone().expect("being written again");
     assert_eq!(c.draft.as_ref(), Some(&key), "its copy, to replace");
-    assert!(c.to.contains("morgan@mill.example") && c.bcc.contains("boss@studio.example") && c.show_cc, "{} / {}", c.to, c.bcc);
+    assert!(c.to.contains("morgan@mill.example") && c.bcc.contains("boss@studio.example") && c.show_bcc, "{} / {}", c.to, c.bcc);
+    // Kept as it was named before (`show_cc`, for the Bcc row), it's read still.
+    let mut kept = serde_json::to_value(&c).unwrap();
+    let shown = kept.as_object_mut().and_then(|o| o.remove("show_bcc")).expect("written as show_bcc");
+    kept["show_cc"] = shown;
+    assert!(serde_json::from_value::<crate::Compose>(kept).unwrap().show_bcc);
     assert_eq!((c.subject.as_str(), c.importance), ("Re: Invoice", 1));
     assert!(c.body.starts_with("All **paid**.") && c.styles.style(0).bold, "{}", c.body);
     assert!(c.body.contains("Subject: Invoice"), "who sent the original, in the text: {}", c.body);
@@ -72,14 +76,13 @@ fn a_draft_opens_again_as_it_was_saved() {
     s.run("mail.forward", &json!({})).unwrap();
     s.run("compose.update", &json!({"to": "ann@x.example"})).unwrap();
     s.run("compose.saveDraft", &json!({})).unwrap();
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
     let key = draft_key(&mut s, "Fwd: Invoice");
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
     let c = s.compose.as_ref().unwrap();
     assert_eq!((c.source.as_ref(), c.mode), (Some(&mill), Some(mailcraft_mime::ReplyMode::Forward)));
     assert!(s.run("draft.edit", &json!({"key": "nonsense"})).is_err());
-    done(s);
 }
 
 /// A signature written as HTML code (a card in two columns) comes back as it went in: the same
@@ -97,7 +100,7 @@ fn a_draft_keeps_its_signature_code() {
     s.run("compose.update", &json!({"to": "ann@x.example", "subject": "Card draft", "body": format!("Hello Ann,{}", written.body)})).unwrap();
     let before = s.compose.as_ref().unwrap().bodies_with(&written.signature_code).1.unwrap_or_default();
     s.run("compose.saveDraft", &json!({})).unwrap();
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
     let key = draft_key(&mut s, "Card draft");
     s.run("list.open", &json!({"key": key.to_id()})).unwrap();
     s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
@@ -110,23 +113,18 @@ fn a_draft_keeps_its_signature_code() {
     assert_eq!(html.matches("<table").count(), before.matches("<table").count(), "{html}");
     assert_eq!(html.matches("cid:signature1.").count(), 1, "its photo once: {html}");
     assert_eq!(pictures.iter().filter(|p| p.cid.starts_with("signature1.")).count(), 1);
-    done(s);
 }
 
 /// Saved to a server, a draft's copy gets its place there: saved again, it replaces that copy
 /// (found by its Message-ID once listed) instead of adding another, as Outlook keeps one.
 #[test]
 fn a_draft_saved_twice_to_a_server_replaces_its_copy() {
-    let store = temp("draft-server");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    s.apply(Event::Folders {
-        account: id.clone(),
-        folders: vec![
-            mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() },
-            mailcraft_model::Folder { account: id.clone(), path: "Drafts".into(), role: FolderRole::Drafts, selectable: true, ..Default::default() },
-        ],
-    });
+    let (mut s, id) = server_account(
+        "draft-server",
+        json!({"email": "zoe@example.org", "password": "pw"}),
+        &[("INBOX", FolderRole::Inbox), ("Drafts", FolderRole::Drafts)],
+    );
+    let store = s.store.clone().unwrap();
     s.take_jobs();
     s.run("mail.new", &json!({"account": id})).unwrap();
     s.run("compose.update", &json!({"to": "ann@example.org", "subject": "Plans", "body": "First"})).unwrap();
@@ -169,7 +167,6 @@ fn a_draft_saved_twice_to_a_server_replaces_its_copy() {
     s.apply(Event::Sent { account: id.clone(), id: compose });
     assert!(!s.list.iter().any(|m| m.key == key), "gone from Drafts");
     assert_eq!(s.more_on_server(), None, "nothing more on the server");
-    done(s);
 }
 
 /// The mark on MailCraft's own copy of a draft on an IMAP server (gap 7) stays in that copy: a
@@ -177,16 +174,11 @@ fn a_draft_saved_twice_to_a_server_replaces_its_copy() {
 /// sent, both built anew from what the draft says.
 #[test]
 fn the_mark_on_a_drafts_copy_goes_nowhere_else() {
-    let store = temp("draft-mark");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    s.apply(Event::Folders {
-        account: id.clone(),
-        folders: vec![
-            mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() },
-            mailcraft_model::Folder { account: id.clone(), path: "Drafts".into(), role: FolderRole::Drafts, selectable: true, ..Default::default() },
-        ],
-    });
+    let (mut s, id) = server_account(
+        "draft-mark",
+        json!({"email": "zoe@example.org", "password": "pw"}),
+        &[("INBOX", FolderRole::Inbox), ("Drafts", FolderRole::Drafts)],
+    );
     s.take_jobs();
     let mark = "0123456789abcdef0123456789abcdef";
     let raw = format!(
@@ -194,12 +186,9 @@ fn the_mark_on_a_drafts_copy_goes_nowhere_else() {
         mailcraft_mime::COPY_HEADER
     );
     let key = mailcraft_model::MessageKey { account: id.clone(), folder: "Drafts".into(), validity: 7, uid: 1 };
-    let mut drafts = store.load_folder(&id, "Drafts").unwrap();
-    drafts.validity = 7;
     let flags = mailcraft_model::Flags { draft: true, ..Default::default() };
-    drafts.messages.push(mailcraft_mime::summary_from_full(raw.as_bytes(), key.clone(), flags, 0, NOW).into());
-    store.save_folder(&id, "Drafts", &drafts).unwrap();
-    store.write_body(&key, raw.as_bytes()).unwrap();
+    let summary = mailcraft_mime::summary_from_full(raw.as_bytes(), key.clone(), flags, 0, NOW);
+    file_in(&mut s, summary, Some(raw.as_bytes()));
     s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
     s.run("compose.update", &json!({"body": "Second"})).unwrap();
     s.run("compose.saveDraft", &json!({})).unwrap();
@@ -214,7 +203,6 @@ fn the_mark_on_a_drafts_copy_goes_nowhere_else() {
         assert!(raw.contains("Second"), "{what}: {raw}");
         assert!(!raw.contains(mailcraft_mime::COPY_HEADER) && !raw.contains(mark), "{what}: {raw}");
     }
-    done(s);
 }
 
 /// Another message read while one is being written in the reading pane: the one being written
@@ -241,7 +229,7 @@ fn reading_another_message_keeps_the_one_written_inline_in_drafts() {
     s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
     assert!(s.compose.as_ref().is_some_and(|c| c.to.contains("zoe@studio.example")), "carried on from Drafts");
     assert!(s.compose.as_ref().is_some_and(|c| c.body.starts_with("Please review.")), "the body kept in Drafts");
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
 
     // Nothing written: no draft.
     s.run("folder.open", &json!({"account": "sample", "folder": "INBOX"})).unwrap();
@@ -285,19 +273,14 @@ fn reading_another_message_keeps_the_one_written_inline_in_drafts() {
 /// done; a message closed meanwhile is held until then too.
 #[test]
 fn a_draft_saved_twice_on_the_way_stays_one_draft() {
-    let store = temp("draft-twice");
-    let mut s = Session::open(Some(store), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    let drafts =
-        mailcraft_model::Folder { account: id.clone(), path: "Drafts".into(), role: FolderRole::Drafts, selectable: true, ..Default::default() };
-    s.apply(Event::Folders { account: id.clone(), folders: vec![drafts] });
+    let (mut s, id) = server_account("draft-twice", json!({"email": "zoe@example.org", "password": "pw"}), &[("Drafts", FolderRole::Drafts)]);
     s.take_jobs();
     let saved = |s: &mut Session| {
         let raw = s.take_jobs().into_iter().find_map(|j| match j {
             Job::SaveDraft { raw, .. } | Job::KeepDraft { raw, .. } => Some(raw),
             _ => None,
         });
-        mailcraft_model::thread::written_message_id(&raw.expect("a draft saved"))
+        mailcraft_mime::written_message_id(&raw.expect("a draft saved"))
     };
     s.run("mail.new", &json!({"account": id})).unwrap();
     s.run("compose.update", &json!({"to": "ann@example.org", "subject": "Plans", "body": "One"})).unwrap();
@@ -324,7 +307,6 @@ fn a_draft_saved_twice_on_the_way_stays_one_draft() {
     s.apply(Event::DraftSaved { account: id.clone(), message_id: first, error: Some("disk full".into()) });
     assert!(s.saving.is_empty());
     assert!(s.composes.iter().any(|c| c.window && c.body.starts_with("One two three four")), "open again to go on with");
-    done(s);
 }
 
 /// Issue #53: a server account's message closed with Close › keep in Drafts, or made way for in
@@ -333,36 +315,25 @@ fn a_draft_saved_twice_on_the_way_stays_one_draft() {
 /// why, instead of being lost. Held, it's still kept as a draft if MailCraft closes.
 #[test]
 fn a_message_is_held_until_its_draft_is_kept() {
-    let store = temp("draft-held");
-    let mut s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
-    let id = s.run("account.add", &json!({"email": "zoe@example.org", "password": "pw"})).unwrap()["account"].as_str().unwrap().to_string();
-    s.apply(Event::Folders {
-        account: id.clone(),
-        folders: vec![
-            mailcraft_model::Folder { account: id.clone(), path: "INBOX".into(), role: FolderRole::Inbox, selectable: true, ..Default::default() },
-            mailcraft_model::Folder { account: id.clone(), path: "Drafts".into(), role: FolderRole::Drafts, selectable: true, ..Default::default() },
-        ],
-    });
+    let (mut s, id) = server_account(
+        "draft-held",
+        json!({"email": "zoe@example.org", "password": "pw"}),
+        &[("INBOX", FolderRole::Inbox), ("Drafts", FolderRole::Drafts)],
+    );
     // Two messages to read.
-    let mut inbox = store.load_folder(&id, "INBOX").unwrap();
-    inbox.validity = 3;
     let mut keys = Vec::new();
     for uid in 1..=2u32 {
         let key = mailcraft_model::MessageKey { account: id.clone(), folder: "INBOX".into(), validity: 3, uid };
         let raw = format!(
             "From: Ann <ann@example.org>\r\nTo: zoe@example.org\r\nSubject: Plans {uid}\r\nMessage-ID: <p{uid}@example.org>\r\n\r\nShall we?\r\n"
         );
-        store.write_body(&key, raw.as_bytes()).unwrap();
-        inbox.messages.push(mailcraft_mime::summary_from_full(raw.as_bytes(), key.clone(), mailcraft_model::Flags::default(), 0, NOW).into());
-        keys.push(key);
+        keys.push(file_whole(&mut s, key, raw.as_bytes()));
     }
-    store.save_folder(&id, "INBOX", &inbox).unwrap();
-    s.apply(Event::FolderChanged { account: id.clone(), folder: "INBOX".into() });
     s.run("folder.open", &json!({"account": id, "folder": "INBOX"})).unwrap();
     s.take_jobs();
     let saved_id = |s: &mut Session| {
         let raw = s.take_jobs().into_iter().find_map(|j| if let Job::SaveDraft { raw, .. } = j { Some(raw) } else { None });
-        mailcraft_model::thread::written_message_id(&raw.expect("a draft saved"))
+        mailcraft_mime::written_message_id(&raw.expect("a draft saved"))
     };
     let write = |s: &mut Session, body: &str| {
         s.run("mail.new", &json!({"account": id})).unwrap();
@@ -376,7 +347,7 @@ fn a_message_is_held_until_its_draft_is_kept() {
     assert!(s.notices.last().is_none_or(|n| n.text != "Draft saved"), "not yet");
     s.apply(Event::DraftSaved { account: id.clone(), message_id: open_id, error: None });
     assert!(s.notices.last().is_some_and(|n| n.text == "Draft saved"));
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
 
     // Saved with Save, then MailCraft closed (or the graphics lost) before the server answered:
     // kept as the same draft, its Message-ID and the copy it replaces, not a second one (found in
@@ -388,9 +359,9 @@ fn a_message_is_held_until_its_draft_is_kept() {
     assert_eq!(s.keep_drafts(), 1);
     let kept = s.take_jobs().into_iter().find_map(|j| if let Job::KeepDraft { raw, replaces, .. } = j { Some((raw, replaces)) } else { None });
     let (kept, kept_replaces) = kept.expect("kept");
-    assert_eq!(mailcraft_model::thread::written_message_id(&kept), mailcraft_model::thread::written_message_id(&sent));
+    assert_eq!(mailcraft_mime::written_message_id(&kept), mailcraft_mime::written_message_id(&sent));
     assert_eq!(kept_replaces, replaces);
-    s.compose = None;
+    s.run("compose.discard", &json!({})).unwrap();
 
     // Closed, kept in Drafts: held until the server has it, then gone.
     write(&mut s, "First");
@@ -423,7 +394,7 @@ fn a_message_is_held_until_its_draft_is_kept() {
     s.run("list.open", &json!({"key": keys[1].to_id()})).unwrap();
     let on_its_way = s.take_jobs().into_iter().find_map(|j| if let Job::SaveDraft { raw, replaces, .. } = j { Some((raw, replaces)) } else { None });
     let on_its_way = on_its_way.expect("a draft saved");
-    let third = mailcraft_model::thread::written_message_id(&on_its_way.0);
+    let third = mailcraft_mime::written_message_id(&on_its_way.0);
     assert!(s.compose.is_none() && s.saving.len() == 1);
     assert_eq!(s.keep_drafts(), 1);
     assert!(s.saving.is_empty(), "kept: let go of");
@@ -454,7 +425,6 @@ fn a_message_is_held_until_its_draft_is_kept() {
     s.run("account.remove", &json!({"account": id})).unwrap();
     assert!(s.saving.is_empty());
     assert_eq!(s.keep_held(), 0);
-    done(s);
 }
 
 /// Issue #52: a message whose reply was left in Drafts is known to have one (the list marks it
@@ -488,7 +458,6 @@ fn a_message_answered_by_a_draft_is_known() {
     s.run("list.select", &json!({"key": key.to_id()})).unwrap();
     s.run("mail.delete", &json!({})).unwrap();
     assert!(!answered(&s), "the draft deleted");
-    done(s);
 }
 
 /// Gap 8: a message whose forward was left in Drafts is marked `[Draft]` as one whose reply
@@ -578,7 +547,6 @@ fn a_message_forwarded_by_a_draft_is_known() {
     s.run("list.select", &json!({"key": draft.to_id()})).unwrap();
     s.run("mail.delete", &json!({})).unwrap();
     assert_eq!(others(&mut s), vec![replied.key.clone()], "the forward deleted; the reply still marks");
-    done(s);
 }
 
 /// How many drafts are in Drafts.
@@ -645,7 +613,6 @@ fn every_change_to_a_reply_is_something_written() {
     let mid = s.compose.as_ref().unwrap().draft_id.clone();
     s.apply(Event::DraftSaved { account: id, message_id: mid, error: Some("disk full".into()) });
     assert!(s.compose_written(), "not saved after all");
-    done(s);
 }
 
 /// A name with a comma in it (`"Park, Zoe"`, as a reply writes it) stays one recipient in the
@@ -661,5 +628,79 @@ fn a_draft_keeps_a_name_with_a_comma() {
     let m = s.list.iter().find(|m| m.subject == "Comma").unwrap();
     let to: Vec<(&str, &str)> = m.to.iter().map(|a| (a.name.as_str(), a.email.as_str())).collect();
     assert_eq!(to, [("Park, Zoe", "zoe@studio.example"), ("sales@corp.example, Team", "team@studio.example")]);
-    done(s);
+}
+
+/// A draft saved elsewhere names the message it answers by its In-Reply-To alone: found however
+/// the list keeps that message's Message-ID (brackets, a space), compared as threading compares
+/// them (each side trimmed its own way, they didn't meet).
+#[test]
+fn a_draft_finds_what_it_answers_however_its_id_is_kept() {
+    let mut s = sample_session("draft-answers-id");
+    let key = mailcraft_model::MessageKey { uid: 9811, ..next_key(&s, "sample", "INBOX") };
+    let kept = mailcraft_model::Summary {
+        key: key.clone(),
+        message_id: " <plan 7@studio.test> ".into(),
+        subject: "Plan".into(),
+        date: NOW,
+        ..Default::default()
+    };
+    file_in(&mut s, kept, None);
+    let raw = b"From: Riley <riley@studio.example>\r\nTo: ann@x.example\r\nSubject: Re: Plan\r\nMessage-ID: <d7@studio.example>\r\nIn-Reply-To: <plan7@studio.test>\r\n\r\nOn it.\r\n";
+    let at = mailcraft_model::MessageKey { uid: 9812, ..next_key(&s, "sample", "Drafts") };
+    let draft = file_whole(&mut s, at, raw);
+    s.run("draft.edit", &json!({"key": draft.to_id()})).unwrap();
+    let c = s.compose.as_ref().unwrap();
+    assert_eq!((c.source.as_ref(), c.mode), (Some(&key), Some(mailcraft_mime::ReplyMode::Reply)));
+}
+
+/// What opening a draft saved elsewhere takes (no word of the message it answers but its
+/// In-Reply-To), the message it answers in a folder of 50,000 whose list is read already, behind
+/// others of 20,000 that aren't (`cargo test -p mailcraft-engine --release
+/// measure_a_draft_finding_what_it_answers -- --ignored --nocapture`).
+#[test]
+#[ignore = "a measurement: run in release"]
+fn measure_a_draft_finding_what_it_answers() {
+    let store = temp("measure-draft-answers");
+    sample::seed_if_empty(&store, NOW).unwrap();
+    let fill = |folder: &str, n: u32| {
+        let mut st = store.load_folder("sample", folder).unwrap_or_default();
+        st.validity = 7;
+        st.messages = (1..=n)
+            .map(|uid| mailcraft_model::Summary {
+                key: mailcraft_model::MessageKey { account: "sample".into(), folder: folder.into(), validity: 7, uid },
+                message_id: format!("m{uid:08}.{}@studio.example", folder.len()),
+                date: NOW - i64::from(uid) * 60,
+                ..Default::default()
+            })
+            .map(Into::into)
+            .collect();
+        store.save_folder("sample", folder, &st).unwrap();
+    };
+    let s = Session::open(Some(store.clone()), mailcraft_model::dates::Clock::new(NOW, 0));
+    let folders: Vec<String> = s.accounts[0].folders.iter().map(|f| f.path.clone()).filter(|f| f != "Drafts").collect();
+    for f in &folders {
+        fill(f, 20_000);
+    }
+    let last = folders.last().unwrap().clone();
+    fill(&last, 50_000);
+    let mut s = Session::open(Some(store), mailcraft_model::dates::Clock::new(NOW, 0));
+    s.run("folder.open", &json!({"account": "sample", "folder": last})).unwrap();
+    let raw = format!(
+        "From: Riley <riley@studio.example>\r\nTo: ann@x.example\r\nSubject: Re: Report\r\nMessage-ID: <d1@studio.example>\r\nIn-Reply-To: <m00049999.{}@studio.example>\r\n\r\nOn it.\r\n",
+        last.len()
+    );
+    let at = mailcraft_model::MessageKey { uid: 9801, ..next_key(&s, "sample", "Drafts") };
+    let key = file_whole(&mut s, at, raw.as_bytes());
+    let runs = 5u32;
+    let began = std::time::Instant::now();
+    for _ in 0..runs {
+        s.run("draft.edit", &json!({"key": key.to_id()})).unwrap();
+        assert_eq!(s.compose.as_ref().and_then(|c| c.source.as_ref()).map(|k| k.uid), Some(49_999));
+        s.run("compose.discard", &json!({})).unwrap();
+    }
+    println!(
+        "MEASURE a draft opened, finding what it answers among {} folders: {} ms",
+        folders.len(),
+        began.elapsed().as_millis() / u128::from(runs)
+    );
 }
