@@ -12,7 +12,7 @@ use crate::css::hex;
 use crate::html::escaped;
 use crate::{RichText, Span};
 
-pub mod reply;
+pub mod markup;
 
 /// Where a picture sits in the text.
 pub const PICTURE: char = '\u{FFFC}';

@@ -11,9 +11,9 @@ use super::*;
 pub(crate) struct Launch {
     /// The options, as `--cmd`, `--light`, `--dark` and `--log` are read from them.
     pub(crate) args: Vec<String>,
-    /// `mailto:` links and mail files to open: MailCraft as the system's mail app, or Open with
-    /// (`args.rs`).
-    pub(crate) handed: Vec<String>,
+    /// `mailto:` links and mail files to open: MailCraft as the system's mail app, or Open with;
+    /// and files to send, after `--attach` (`args.rs`).
+    pub(crate) handed: args::Handed,
     /// The sample mailbox (`--sample`).
     pub(crate) sample: bool,
     /// The data folder was chosen at start: `--data`, `--sample` or `MAILCRAFT_DATA`.
@@ -28,7 +28,8 @@ pub(crate) struct Launch {
 }
 
 impl Launch {
-    /// The launch for `args` (the options; `opened`: what follows `--open`, `args.rs`).
+    /// The launch for `args` (the options, and the files to send after `--attach`; `opened`: what
+    /// follows `--open`, `args.rs`).
     pub(crate) fn resolve(args: Vec<String>, opened: Option<Vec<String>>) -> Launch {
         let env_data = std::env::var_os("MAILCRAFT_DATA").is_some_and(|d| !d.is_empty());
         Launch::resolve_with(args, opened, env_data, portable::current)
@@ -37,7 +38,9 @@ impl Launch {
     /// [`Launch::resolve`], `env_data` telling whether `MAILCRAFT_DATA` names a folder, and
     /// `portable` looking for a portable copy's marker.
     fn resolve_with(args: Vec<String>, opened: Option<Vec<String>>, env_data: bool, portable: fn() -> &'static portable::Portable) -> Launch {
-        let handed = opened.unwrap_or_else(|| args::handed(&args));
+        let (args, attach) = args::attaching(args);
+        let open = opened.unwrap_or_else(|| args::handed(&args));
+        let handed = args::Handed::new(open, attach);
         let sample = args.iter().any(|a| a == "--sample");
         // Each account is a data file in Documents\MailCraft Files (as Outlook keeps .pst files
         // in Outlook Files); the account list and the app's state stay in the app folder. The
@@ -54,6 +57,14 @@ impl Launch {
             .or_else(mailcraft_engine::store::default_root);
         let root = data.map(|d| if sample { d.join("sample") } else { d });
         Launch { args, handed, sample, chosen, portable, base, root }
+    }
+
+    /// Whether MailCraft starts with its window put away (issue #116): kept running in the
+    /// notification area and set to start there (`saved_ui`'s settings), and started with
+    /// nothing to open (a link, a file or files to send bring the window up).
+    pub(crate) fn starts_away(&self, saved_ui: Option<&Value>) -> bool {
+        let pref = |k: &str| saved_ui.and_then(|v| v.get("prefs")?.get(k)?.as_bool()).unwrap_or(false);
+        pref("closeToTray") && pref("startInTray") && self.handed.is_empty()
     }
 
     /// Whether `option` was given.
@@ -208,12 +219,33 @@ mod tests {
         assert_eq!(launch(&["--data"], None, false).root, mailcraft_engine::store::default_root());
     }
 
+    /// Issue #116: MailCraft starts put away when it's kept running in the notification area
+    /// and set to start there, and was started with nothing to open.
+    #[test]
+    fn a_launch_starts_away_when_set_to() {
+        let ui = |keep: bool, start: bool| serde_json::json!({"prefs": {"closeToTray": keep, "startInTray": start}});
+        assert!(launch(&[], None, false).starts_away(Some(&ui(true, true))));
+        assert!(!launch(&[], None, false).starts_away(Some(&ui(false, true))), "not kept running");
+        assert!(!launch(&[], None, false).starts_away(Some(&ui(true, false))), "not set to");
+        assert!(!launch(&[], None, false).starts_away(None), "no settings yet");
+        assert!(!launch(&["mailto:a@x.example"], None, false).starts_away(Some(&ui(true, true))), "a link to open");
+        assert!(!launch(&["--attach", "/u/a.pdf"], None, false).starts_away(Some(&ui(true, true))), "files to send");
+    }
+
     /// What's handed over comes from `--open` when MailCraft was started by the system,
-    /// otherwise from the arguments that aren't options.
+    /// otherwise from the arguments that aren't options; files to send from after `--attach`,
+    /// whose options before it are read and nothing after it (issue #96).
     #[test]
     fn a_launch_hands_over_its_links() {
-        assert_eq!(launch(&[], Some(&["mailto:a@x.example"]), false).handed, ["mailto:a@x.example"]);
-        assert_eq!(launch(&["--sample", "mailto:b@x.example"], None, false).handed, ["mailto:b@x.example"]);
+        let open = |a: &[&str]| args::Handed::opening(a.iter().map(|s| s.to_string()).collect());
+        assert_eq!(launch(&[], Some(&["mailto:a@x.example"]), false).handed, open(&["mailto:a@x.example"]));
+        assert_eq!(launch(&["--sample", "mailto:b@x.example"], None, false).handed, open(&["mailto:b@x.example"]));
+        let sending = launch(&["--sample", "--attach", "/u/a.pdf", "--data"], None, false);
+        assert!(sending.sample && sending.chosen && sending.handed.open.is_empty(), "the options before it");
+        assert_eq!(sending.handed.attach.len(), 1, "one message");
+        assert_eq!(sending.handed.attach[0].len(), 2, "`--data` after it is a file");
+        assert!(!sending.has("--data") && sending.root.as_deref().is_some_and(|r| r.ends_with("sample")), "not an option");
+        assert!(launch(&["--sample", "--attach"], None, false).handed.is_empty());
         assert_eq!(theme_asked(&["--dark".into(), "--light".into()]), Some(false));
         assert_eq!(theme_asked(&["--dark".into()]), Some(true));
         assert_eq!(theme_asked(&["--sample".into()]), None);

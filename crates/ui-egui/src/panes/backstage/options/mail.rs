@@ -20,6 +20,7 @@ pub(super) fn reading(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Actio
             (tl!("Group messages by conversation"), None, s.prefs.conversations, "view.conversations"),
             (tl!("Show a line of each message in the list"), None, s.prefs.show_preview, "view.preview"),
             (tl!("Compact list"), None, s.prefs.compact, "view.compact"),
+            (tl!("Single-line list"), Some(tl!("One line a message: the sender, the subject and the time")), s.prefs.single_line, "view.singleLine"),
             (
                 tl!("Classic ribbon"),
                 Some(tl!("Big buttons with their names under them, in named groups")),
@@ -73,6 +74,17 @@ pub(super) fn reading(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Actio
         for (label, on, cmd) in windows {
             switch_row(ui, t, false, Switch { label, about: None, on, cmd }, acts);
         }
+        // Issue #115: Ctrl+Enter sends at once only when that's chosen.
+        setting(ui, t, false, tl!("Ctrl+Enter in a message"), None, |ui| {
+            use mailcraft_engine::CtrlEnter;
+            let ways = [CtrlEnter::Ask, CtrlEnter::Send, CtrlEnter::Nothing];
+            let now = ways.iter().position(|w| *w == s.prefs.ctrl_enter).unwrap_or(0);
+            if let Some(i) = widgets::segmented(ui, t, "ctrl-enter", &[tl!("Ask first"), tl!("Send"), tl!("Do nothing")], now)
+                && let Some(w) = ways.get(i)
+            {
+                acts.push(Action::Run("options.ctrlEnter", json!({"does": w})));
+            }
+        });
         // Every message as plain text, as Outlook's own setting for all mail: here, out of the
         // way, and View › Plain text; one message's More actions (⋯) and Show formatted switch
         // that message alone.
@@ -149,14 +161,24 @@ pub(super) fn checking(s: &Session, t: &Tokens, ui: &mut Ui, acts: &mut Vec<Acti
             setting(ui, t, i == 0, &c.email, None, |ui| {
                 let now = c.check_every.unwrap_or(0);
                 let word = |m: u32| if m == 0 { tl!("Automatically").to_string() } else { tf!("Every {n} minutes", n = m) };
+                // Only when asked (issue #104): Send / Receive on the account.
+                let shown = if c.check_by_hand { tl!("Only when I ask").to_string() } else { word(now) };
                 egui::ComboBox::from_id_salt(("check-every", c.id.as_str()))
                     .width(170.0)
-                    .selected_text(word(now))
+                    .selected_text(shown)
                     .show_ui(ui, |ui| {
                         for m in [0u32, 5, 10, 15, 30, 60] {
-                            if ui.selectable_label(m == now, word(m)).clicked() && m != now {
+                            if ui.selectable_label(m == now && !c.check_by_hand, word(m)).clicked() && (m != now || c.check_by_hand) {
                                 acts.push(Action::Run("account.checkEvery", json!({"account": c.id, "minutes": m})));
                             }
+                        }
+                        if ui
+                            .selectable_label(c.check_by_hand, tl!("Only when I ask"))
+                            .on_hover_text(tl!("Send / Receive on the account looks; Send / Receive for all leaves it out"))
+                            .clicked()
+                            && !c.check_by_hand
+                        {
+                            acts.push(Action::Run("account.checkEvery", json!({"account": c.id, "byHand": true})));
                         }
                     })
                     .response

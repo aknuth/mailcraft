@@ -45,6 +45,7 @@
 	Close	閉じる
 	Code	コード
 	Compact	コンパクト
+	Single line	1 行
 	Connect	接続
 	Connecting…	接続しています…
 	Conversations	スレッド
@@ -260,6 +261,13 @@
 	Select a message first.	先にメッセージを選択してください。
 	Send	送信
 	Send (Ctrl+Enter)	送信 (Ctrl+Enter)
+	Send this message?	このメッセージを送信しますか?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter を押すと、作成中のメッセージが送信されます。
+	Don't ask again	今後は確認しない
+	Don't send	送信しない
+	Ctrl+Enter in a message	メッセージでの Ctrl+Enter
+	Ask first	先に確認する
+	Do nothing	何もしない
 	Send / Receive	送受信
 	Send / Receive all folders (F9)	すべてのフォルダーを送受信 (F9)
 	Send anyway	このまま送信
@@ -275,6 +283,11 @@
 	Settings found: {source}	設定が見つかりました: {source}
 	Show a desktop notification when new mail arrives	新しいメールが届いたらデスクトップ通知を表示する
 	Keep MailCraft running when its window is closed	ウィンドウを閉じても MailCraft を実行したままにする
+	Start MailCraft in the notification area	MailCraft を通知領域で起動する
+	Start MailCraft minimized	MailCraft を最小化して起動する
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	ウィンドウを閉じたときと同じく、ウィンドウをしまったままメールを確認して通知します。リンクやファイルを開くために起動したときはウィンドウを開きます。
+	Show the unread mail on its icon	アイコンに未読メールを表示する
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	受信トレイの未読メッセージの数を、通知領域の MailCraft アイコンの隅に表示します
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	通知領域に残り、メールを確認して新着を知らせます。「ファイル」ページ、またはアイコンのメニューの「終了」で閉じます。
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	ウィンドウは最小化され、MailCraft はメールの確認と新着の通知を続けます。「ファイル」ページの「終了」で閉じます。
 	Open MailCraft	MailCraft を開く
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	このアカウントの名前、サーバー、サインイン、署名を変更します。
 	Checking with the server…	サーバーに確認しています…
 	Compact list	コンパクトな一覧
+	Single-line list	1 行の一覧
+	One line a message: the sender, the subject and the time	メッセージごとに 1 行: 差出人、件名、時刻
 	Don't send automatic replies	自動応答を送信しない
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	オンの間、送信者ごとに 1 日 1 回返信します。メール サーバーに保存されるので、このコンピューターの電源が切れていても動作します。
 	Empty	空にする
@@ -614,9 +629,16 @@ month	May	5月
 	Remove it from the server after	次の期間後にサーバーから削除:
 	days	日
 	Remove it from the server once it's deleted from Deleted Items	[削除済みアイテム] から削除したらサーバーからも削除する
+	A copy on the server	サーバー上のコピー
+	None: mail is removed from the server once downloaded	なし: ダウンロードしたメールはサーバーから削除されます
+	Kept for {n} days	{n} 日間保存
+	Kept for {n} days, or until deleted from Deleted Items	{n} 日間、または [削除済みアイテム] から削除するまで保存
+	Kept until deleted from Deleted Items	[削除済みアイテム] から削除するまで保存
+	Kept for good	無期限に保存
 	Arrange by: {field}	並べ替え: {field}
 	By {field} ⏷	{field} 順 ⏷
 	Reverse sort	逆順に並べ替え
+	Show in groups	グループで表示
 	Size	サイズ
 	Flag status	フラグの状態
 	Attachments	添付ファイル
@@ -658,7 +680,10 @@ month	May	5月
 	Low importance	重要度 - 低
 	Read receipt	開封確認
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	受信者に開封の確認を求めます (受信者のメール アプリが応答しない場合や、確認を求める場合があります)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	IMAP または POP と SMTP、JMAP、Exchange に対応したどのプロバイダーでも使えます。パスワードはこのコンピューターのキーチェーンに保存され、メール サーバーにのみ送信されます。
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	IMAP、POP、JMAP、Exchange に対応しています。パスワードはこのコンピューターのキーチェーンに保存され、メール サーバーにのみ送信されます。
+	Mail stays on the server and looks the same on every device.	メールはサーバーに残り、どのデバイスでも同じように表示されます。
+	Mail is downloaded to this computer. The server can keep a copy for a while.	メールはこのコンピューターにダウンロードされます。サーバーにしばらくコピーを残すこともできます。
+	A newer way to reach your mail, offered by some providers such as Fastmail.	メールにアクセスする新しい方法で、Fastmail など一部のプロバイダーが提供しています。
 	Run it now on the mail already in the Inbox	受信トレイにあるメールに今すぐ実行する
 	Run on the mail already in the Inbox	受信トレイにあるメールに実行
 	More options	その他のオプション
@@ -953,6 +978,9 @@ month	May	5月
 	Opened by the server for your access to it	アクセス権があるため、サーバーが開いています
 	Shared mailbox {address}, opened by {email}	共有メールボックス {address} ({email} で開いています)
 	The outgoing server has its own user name and password	送信サーバーには独自のユーザー名とパスワードがある
+	Sign in with	サインイン方法
+	NTLM (Secure Password Authentication)	NTLM (セキュリティで保護されたパスワード認証)
+	No sign-in	サインインしない
 	Its user name	そのユーザー名
 	Its password	そのパスワード
 	Password (unchanged when empty)	パスワード (空欄なら変更なし)
@@ -976,7 +1004,7 @@ month	May	5月
 	Close anyway	閉じる
 	Edit notes	メモを編集
 	Getting them from the server…	サーバーから取得しています…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	メールはサーバーに残り、MailCraft の実行中はメモリにのみ保持されます。このコンピューターには何も書き込まれず、各メッセージは開いたときにダウンロードされます。送信したメールはそのままサーバーに送られます。まだ送信できないメール (オフライン時) だけが待機し、先に MailCraft を閉じるとオフライン中の変更とともに失われます (確認されます)。サーバー上の予定表・連絡先・メモはそのまま残ります。MailCraft にのみ保存されているものは閉じると失われます。
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	メッセージは開いたときにダウンロードされ、メモリにのみ保持されます。このコンピューターには何も書き込まれません。オフライン中の変更、送信待ちのメール、MailCraft にのみある予定表、連絡先、メモは、終了時に失われます (先に確認されます)。
 	Mail older than what's kept here is only on the server.	ここに保存されているより古いメールはサーバーにのみあります。
 	Search the server	サーバーを検索
 	Searching the server…	サーバーを検索しています…
@@ -1095,6 +1123,7 @@ month	May	5月
 	Added to your calendar from {file}: {n}	{file} から予定表に追加: {n}
 	Added to your contacts from {file}: {n}	{file} から連絡先に追加: {n}
 	Add an account first: a new message needs an account to send from.	先にアカウントを追加してください。新しいメッセージの送信にはアカウントが必要です。
+	{folder} isn't attached: it's a folder	{folder} は添付されません: フォルダーです
 	Add an account first: events and people are kept with an account.	先にアカウントを追加してください。予定と連絡先はアカウントに保存されます。
 	Couldn't open {file}: {error}	{file} を開けませんでした: {error}
 	Safety	安全
@@ -1280,6 +1309,8 @@ month	May	5月
 	Your provider's calendar server wasn't found: give its address	プロバイダーの予定表サーバーが見つかりません: アドレスを入力してください
 	Classic ribbon	クラシック リボン
 	Big buttons with their names under them, in named groups	名前付きのグループに、名前を下に表示した大きなボタン
+	Hide the ribbon	リボンを非表示にする
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	タブは上部のバーに残ります: クリックでボタンを表示し、ダブルクリックで表示したままにします
 	New	新規
 	Respond	返信
 	Tags	タグ
@@ -1701,9 +1732,12 @@ month	May	5月
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	自動では、サーバーが通知できる場合は新着メールをすぐに受け取り、できない場合は 2 分ごとに確認します。時間を設定すると、アカウントはそのときだけ確認します。送信するメールはすぐに送られ、送受信はすぐに確認します。
 	Automatically	自動
 	Every {n} minutes	{n} 分ごと
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	予定表と連絡先のみ、メールなし (CalDAV と CardDAV)
+	Only calendars and contacts, with no email?	予定表と連絡先だけで、メールは使いませんか?
+	Add a CalDAV and CardDAV account	CalDAV と CardDAV のアカウントを追加
 	Calendar and contacts server	予定表と連絡先のサーバー
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Nextcloud、Baïkal、SOGo、Radicale など、メールなしで予定表と連絡先を保存する CalDAV / CardDAV サーバー用です。パスワードはこのコンピューターのキーチェーンに保存され、そのサーバーにのみ送信されます。
+	Add calendars and contacts	予定表と連絡先を追加
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	メールのない CalDAV と CardDAV のサーバー (Nextcloud、Baïkal、SOGo、Radicale など) 用です。パスワードはこのコンピューターのキーチェーンに保存され、そのサーバーにのみ送信されます。
+	Add an email account instead	代わりにメール アカウントを追加
 	Server: {url} (CalDAV and CardDAV)	サーバー: {url} (CalDAV と CardDAV)
 	Not available: this account has no mail server.	利用できません: このアカウントにはメール サーバーがありません。
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	メールは以前の MailCraft の Flatpak から引き継がれました。そちらはまだインストールされています。削除するには次を実行してください: flatpak uninstall --delete-data {id}
@@ -1718,3 +1752,49 @@ month	May	5月
 	{name} couldn't be downloaded: {error}	{name} をダウンロードできませんでした: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	ウィンドウで問題が起きたため、実行中の処理を中止しました。MailCraft はそのまま使えます。発生した場所はログに記録されています。
 	Font size	フォントサイズ
+	Repeats every	繰り返しの間隔
+	On these days	曜日
+	Which day	日付の指定
+	Series ends	シリーズの終了
+	After	回数
+	Pick a date	日付を選ぶ
+	On day {day}	毎月{day}日
+	On {month} {day}	毎年{month}{day}日
+	On the {nth} {weekday}	毎月{nth}{weekday}
+	On the {nth} {weekday} of {month}	毎年{month}の{nth}{weekday}
+interval	days	日ごと
+interval	weeks	週ごと
+interval	months	か月ごと
+interval	years	年ごと
+nth	first	第1
+nth	second	第2
+nth	third	第3
+nth	fourth	第4
+nth	last	最終
+count	occurrences	回
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	Web 上の画像はここには表示されません。ここで変更せずに HTML コードに戻すと、画像は保持されます。
+	Messages on a light background	メッセージを明るい背景で表示
+	In the dark theme, messages keep the light page and colours they were written in	ダーク テーマでも、メッセージは書かれたときの明るいページと色のまま表示されます
+	Show messages on a light background	メッセージを明るい背景で表示する
+	Show messages on the dark background	メッセージを暗い背景で表示する
+	Copy picture	画像をコピー
+	Save picture as…	名前を付けて画像を保存…
+	The picture couldn't be copied	画像をコピーできませんでした
+	The picture couldn't be saved	画像を保存できませんでした
+	Only when I ask	指示したときだけ
+	Send / Receive on the account looks; Send / Receive for all leaves it out	アカウントで [送受信] すると確認します。すべての [送受信] では対象外です
+	There's no folder to put the PDF in for the viewer	ビューアー用の PDF を置くフォルダーがありません
+	Trust this mail server's certificate?	このメールサーバーの証明書を信頼しますか？
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	{host} が示す証明書を、このコンピューターが信頼する認証局は保証していません。会社や自宅のメールサーバーは独自の証明書を作ることがありますが、あなたとサーバーの間にいる第三者も同じように証明書を示すことができます。サーバーの管理者がこのフィンガープリントを確認した場合にのみ信頼してください。
+	Issued to	発行先
+	Issued by	発行者
+	Valid	有効期間
+	{from} to {until}	{from} から {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	管理者から証明書をファイルで受け取ることもできます: サーバー設定 › 証明書ファイルを信頼…
+	Certificates	証明書
+	Issued by {issuer}	発行者: {issuer}
+	Trusted when asked	確認して信頼済み
+	Stop trusting	信頼をやめる
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	組織が運用する認証局、またはメールサーバー自身の証明書 (.pem、.crt、.cer)
+	Trust a certificate file…	証明書ファイルを信頼…
+	The certificate is trusted for this account	このアカウントでこの証明書を信頼しました

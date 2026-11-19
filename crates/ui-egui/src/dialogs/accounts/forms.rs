@@ -20,6 +20,8 @@ pub struct AccountForm {
     pub smtp_security: Security,
     /// The outgoing server's own user name and password.
     pub smtp_sign_in: SmtpSignIn,
+    /// How each server is signed in to (issue #123).
+    pub sign_in: SignInMethods,
     /// The kind of mail server: each kind uses its own fields below.
     pub kind: AccountKind,
     /// JMAP: its session address.
@@ -36,6 +38,8 @@ pub struct AccountForm {
     pub pop_keep: PopKeep,
     /// POP: an existing data file (Outlook's `.pst` or MailCraft's own `.mailcraft`) whose mail comes in first.
     pub pst: String,
+    /// Its part of the form opened.
+    pub pst_open: bool,
     /// Keep none of its mail on this computer (issue #4; not for POP). Until it's chosen, as
     /// MailCraft runs: on when portable.
     pub online_only: Option<bool>,
@@ -120,6 +124,64 @@ impl SmtpSignIn {
     }
 }
 
+/// How the incoming and outgoing servers are signed in to with the password (issue #123), as
+/// Outlook's Secure Password Authentication and "My outgoing server requires authentication"
+/// choose it: left to MailCraft, the password, NTLM, or, for the outgoing server, no sign-in.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SignInMethods {
+    pub incoming: SignInMethod,
+    pub outgoing: SignInMethod,
+}
+
+impl SignInMethods {
+    pub(crate) fn of(c: &AccountConfig) -> SignInMethods {
+        SignInMethods { incoming: c.sign_in, outgoing: c.smtp_sign_in }
+    }
+
+    /// `signIn` and `smtpSignIn`.
+    pub(crate) fn params(&self, p: &mut serde_json::Value) {
+        p["signIn"] = json!(self.incoming.code());
+        p["smtpSignIn"] = json!(self.outgoing.code());
+    }
+
+    /// Under the incoming server's row: how it's signed in to.
+    pub(crate) fn incoming_ui(&mut self, ui: &mut Ui) {
+        method_row(ui, "sign-in-incoming", &mut self.incoming, false);
+    }
+
+    /// Under the outgoing server's row: how it's signed in to, or that it isn't.
+    pub(crate) fn outgoing_ui(&mut self, ui: &mut Ui) {
+        method_row(ui, "sign-in-outgoing", &mut self.outgoing, true);
+    }
+}
+
+/// "Sign in with" and a server's sign-in method; `none` offers No sign-in (the outgoing
+/// server's alone).
+fn method_row(ui: &mut Ui, id: &str, v: &mut SignInMethod, none: bool) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(tl!("Sign in with")).small());
+        method_combo(ui, id, v, none);
+    });
+}
+
+fn method_combo(ui: &mut Ui, id: &str, v: &mut SignInMethod, none: bool) {
+    let name = |m: SignInMethod| match m {
+        SignInMethod::Automatic => tl!("Automatic"),
+        SignInMethod::Password => tl!("Password"),
+        SignInMethod::Ntlm => tl!("NTLM (Secure Password Authentication)"),
+        SignInMethod::None => tl!("No sign-in"),
+    };
+    let mut methods = vec![SignInMethod::Automatic, SignInMethod::Password, SignInMethod::Ntlm];
+    if none {
+        methods.push(SignInMethod::None);
+    }
+    egui::ComboBox::from_id_salt(id).selected_text(name(*v)).show_ui(ui, |ui| {
+        for m in methods {
+            ui.selectable_value(v, m, name(m));
+        }
+    });
+}
+
 /// When a POP server's copy of downloaded mail goes: kept (for so many days, or until it's deleted
 /// here for good), or removed at once.
 #[derive(Clone, Debug)]
@@ -128,12 +190,14 @@ pub struct PopKeep {
     pub for_days: bool,
     pub days: String,
     pub until_deleted: bool,
+    /// Its part of the form opened (closed, a line says what it's set to).
+    pub open: bool,
 }
 
 impl Default for PopKeep {
     /// A copy stays on the server for 14 days.
     fn default() -> Self {
-        PopKeep { keep: true, for_days: true, days: "14".into(), until_deleted: false }
+        PopKeep { keep: true, for_days: true, days: "14".into(), until_deleted: false, open: false }
     }
 }
 
@@ -144,18 +208,45 @@ impl PopKeep {
             for_days: c.pop_keep_days.is_some(),
             days: c.pop_keep_days.unwrap_or(14).to_string(),
             until_deleted: c.pop_delete_with_trash,
+            open: false,
         }
+    }
+
+    /// For how many days a copy is kept (14 when what's typed isn't a number of days).
+    fn days(&self) -> u32 {
+        self.days.trim().parse::<u32>().ok().filter(|d| *d > 0).unwrap_or(14)
     }
 
     /// `popDelete`, `popKeepDays` (0: for good) and `popDeleteWithTrash`.
     pub(crate) fn params(&self, p: &mut serde_json::Value) {
-        let days = if self.keep && self.for_days { self.days.trim().parse::<u32>().ok().filter(|d| *d > 0).unwrap_or(14) } else { 0 };
+        let days = if self.keep && self.for_days { self.days() } else { 0 };
         p["popDelete"] = json!(!self.keep);
         p["popKeepDays"] = json!(days);
         p["popDeleteWithTrash"] = json!(self.keep && self.until_deleted);
     }
 
-    pub(crate) fn ui(&mut self, ui: &mut Ui) {
+    /// What's chosen, in brief, for when its part of the form is closed.
+    fn summary(&self) -> String {
+        match (self.keep, self.for_days, self.until_deleted) {
+            (false, _, _) => tl!("None: mail is removed from the server once downloaded").to_string(),
+            (true, true, false) => tf!("Kept for {n} days", n = self.days()),
+            (true, true, true) => tf!("Kept for {n} days, or until deleted from Deleted Items", n = self.days()),
+            (true, false, true) => tl!("Kept until deleted from Deleted Items").to_string(),
+            (true, false, false) => tl!("Kept for good").to_string(),
+        }
+    }
+
+    /// A part of its own, closed at first: most leave it as it is.
+    pub(crate) fn ui(&mut self, ui: &mut Ui, t: &Tokens) {
+        let summary = self.summary();
+        disclosure(ui, t, &mut self.open, "A copy on the server", Some(&summary));
+        if !self.open {
+            return;
+        }
+        indented(ui, |ui| self.choices(ui));
+    }
+
+    fn choices(&mut self, ui: &mut Ui) {
         ui.checkbox(&mut self.keep, tl!("Keep a copy of downloaded mail on the server"));
         ui.add_enabled_ui(self.keep, |ui| {
             ui.horizontal(|ui| {
@@ -239,6 +330,7 @@ impl AccountForm {
             p["smtpPort"] = json!(port(&self.smtp_port));
             p["smtpSecurity"] = json!(self.smtp_security.code());
             self.smtp_sign_in.params(&mut p);
+            self.sign_in.params(&mut p);
         }
         p
     }
@@ -269,6 +361,10 @@ pub struct EditForm {
     pub smtp_security: Security,
     /// The outgoing server's own user name and password.
     pub smtp_sign_in: SmtpSignIn,
+    /// How each server is signed in to (issue #123); not for an account signing in through the
+    /// browser (`oauth`), which has no password to sign in with.
+    pub sign_in: SignInMethods,
+    pub oauth: bool,
     /// Keep none of its mail on this computer (issue #4; not for POP).
     pub online_only: bool,
     pub error: Option<String>,
@@ -311,6 +407,9 @@ impl EditForm {
             });
             self.pop_keep.params(&mut v);
             self.smtp_sign_in.params(&mut v);
+            if !self.oauth {
+                self.sign_in.params(&mut v);
+            }
             return v;
         }
         let mut v = json!({
@@ -326,6 +425,9 @@ impl EditForm {
             "smtpSecurity": self.smtp_security.code(),
         });
         self.smtp_sign_in.params(&mut v);
+        if !self.oauth {
+            self.sign_in.params(&mut v);
+        }
         v
     }
 }

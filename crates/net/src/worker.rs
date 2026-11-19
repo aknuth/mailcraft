@@ -358,26 +358,24 @@ impl Pool {
     }
 }
 
-mod changes;
-mod compact;
-mod connect;
+mod account;
 mod credentials;
-mod directory;
+mod data_files;
 mod edits;
-mod imports;
 mod indexing;
-mod opening;
-mod pgp;
-mod remote;
+mod keys;
 mod routing;
-mod send;
-mod smime;
 
 /// The keychain entry of an account's calendar and contacts server's own password.
 pub(crate) const DAV_SECRET: &str = "dav";
 /// Where an Exchange Online account's directory sign-in (its refresh token) is kept (issue #9).
 pub(crate) const DIRECTORY_SECRET: &str = "directory";
-mod sync;
+
+#[cfg(test)]
+use account::sync;
+use account::{changes, connect, remote};
+use data_files::{compact, imports};
+use keys::{pgp, smime};
 
 pub use credentials::{Credentials, MemoryCredentials};
 #[cfg(test)]
@@ -571,6 +569,7 @@ impl Worker {
         let opts = if acc.keeps_online() { SyncOptions { prefetch: 0, ..opts } } else { opts };
         let windows = store.load_account_doc(&acc.id, WINDOWS).unwrap_or_default();
         let removals = store.removals(&acc.id);
+        let by_hand = acc.check_by_hand;
         Worker {
             acc,
             auth,
@@ -600,7 +599,8 @@ impl Worker {
             waits: Arc::default(),
             backoff: FIRST_BACKOFF,
             next_attempt: Instant::now(),
-            last_full: None,
+            // Looking only when asked (issue #104): every folder read when Send / Receive asks.
+            last_full: by_hand.then(Instant::now),
             looked: None,
             directory_token: None,
             auth_failed: false,
@@ -683,7 +683,9 @@ impl Worker {
                 continue;
             }
             if self.conn.is_none() {
-                if self.auth_failed {
+                // Looking only when asked (issue #104): connected again only for what's asked
+                // (Send / Receive connects, as does a message opened), not by itself.
+                if self.acc.check_by_hand || self.auth_failed {
                     self.working(false);
                     match rx.recv() {
                         Ok(j) => push_job(&mut self.queue, j),

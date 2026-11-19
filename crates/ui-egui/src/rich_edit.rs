@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Color32, FontId, Galley, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, vec2};
-use mailcraft_engine::Compose;
 use mailcraft_engine::mime::rich::{self, Align, List, PICTURE, Style, Styles};
 use mailcraft_engine::model::dates::Clock;
+use mailcraft_engine::{Compose, Quote};
 
 use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
@@ -147,7 +147,31 @@ pub(crate) const SIGNATURE_ID: u64 = u64::MAX;
 
 /// The message text box's id.
 pub(crate) fn body_id(c: &Compose) -> egui::Id {
-    egui::Id::unique(("compose-body", c.id))
+    text_id(c.id)
+}
+
+/// The id of the text box of message `id` (or of a block of a quote's, under its own id).
+pub(crate) fn text_id(id: u64) -> egui::Id {
+    egui::Id::unique(("compose-body", id))
+}
+
+/// Select `range` of the text in `ed`'s box, as if it were selected there (drawn behind the
+/// text while another box has the keyboard).
+pub(crate) fn select(ctx: &egui::Context, ed: &mut Editor, range: Range<usize>) {
+    set_selection(ctx, text_id(ed.id), range.clone());
+    ed.sel = range;
+}
+
+/// Take away the text and the original quoted under it, all of it selected (issue #118): one
+/// step to undo, which what's typed in its place joins.
+pub(crate) fn clear_all(ctx: &egui::Context, ed: &mut Editor, c: &mut Compose) {
+    let n = c.body.chars().count();
+    let style = typing_style(&c.body, &c.styles, 0);
+    replace(ed, c, 0..n, "", style.clone());
+    c.quote = None;
+    ed.typing = Some(style);
+    ed.last_change = ctx.input(|i| i.time);
+    set_selection(ctx, body_id(c), 0..0);
 }
 
 fn selection(ctx: &egui::Context, id: egui::Id, n: usize) -> Option<Range<usize>> {
@@ -326,6 +350,11 @@ fn undo(ed: &mut Editor, c: &mut Compose, ctx: &egui::Context, redo: bool) {
     to.push(Snap::of(c, ed.sel.end));
     c.body = s.text;
     c.styles = s.styles;
+    // The original quoted under the text comes back (or goes again) with the step that took it
+    // away; otherwise it stays as it is, with what was changed in it since.
+    if s.quote.is_some() != c.quote.is_some() {
+        c.quote = s.quote;
+    }
     let at = s.cursor.min(c.body.chars().count());
     ed.sel = at..at;
     ed.typing = None;
@@ -482,12 +511,31 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
     let tokens = *t;
     let own = if plain { HashMap::new() } else { pictures::own_sizes(ui.ctx(), ed, c) };
     let card = ed.card.clone().filter(|_| !plain);
-    // The text box changes the text; its look is laid out as it was at the frame's start.
+    // The text box changes the text in this frame, and lays it out at once: its look (and the
+    // card's place) moved along with the change, as they are once the frame is over. Laid out
+    // with the frame's first ones, all that followed the change was a letter off for a frame: a
+    // picture after it was laid out as a letter, and the text under it jumped (issue #114).
+    let was = c.body.clone();
+    let (typing, at) = (ed.typing.clone(), ed.sel.start);
+    let mut moved: Option<(String, Styles, Option<Card>)> = None;
     let mut text = Tracked::new(&mut c.body);
     let styles = &c.styles;
     let laid = &mut ed.laid;
     let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-        layout_kept(laid, ui, buf.as_str(), Lay { st: styles, plain, t: &tokens, wrap, own: &own, card: card.as_ref() })
+        let now = buf.as_str();
+        if now == was {
+            return layout_kept(laid, ui, now, Lay { st: styles, plain, t: &tokens, wrap, own: &own, card: card.as_ref() });
+        }
+        if moved.as_ref().is_none_or(|(laid_for, ..)| laid_for != now) {
+            let mut st = styles.clone();
+            let typing = typing.clone().unwrap_or_else(|| typing_style(&was, styles, at));
+            st.edit_at(&was, now, &typing, None);
+            moved = Some((now.to_string(), st, card.as_ref().and_then(|card| card.moved(&was, now))));
+        }
+        let Some((_, st, card)) = moved.as_ref() else {
+            return layout_kept(laid, ui, now, Lay { st: styles, plain, t: &tokens, wrap, own: &own, card: None });
+        };
+        layout_kept(laid, ui, now, Lay { st, plain, t: &tokens, wrap, own: &own, card: card.as_ref() })
     };
     // As tall as the pane, or, above the original of a reply shown as it came, as its text.
     let height = ed.min_height.unwrap_or_else(|| if c.quote.is_some() { 96.0 } else { ui.available_height().max(220.0) });
@@ -569,7 +617,7 @@ pub(crate) fn body(ui: &mut Ui, t: &Tokens, ed: &mut Editor, c: &mut Compose, st
         ed.last_change = now;
         c.styles.edit_at(&before, &c.body, &typing, cursor.as_ref().map(|r| r.end));
         if let Some(styles) = styles {
-            ed.remember_snap(Snap { text: before, styles, cursor: ed.sel.start });
+            ed.remember_snap(Snap { text: before, styles, quote: c.quote.clone(), cursor: ed.sel.start });
         }
         ui.ctx().request_repaint();
     } else if cursor.as_ref().is_some_and(|r| *r != ed.sel) {

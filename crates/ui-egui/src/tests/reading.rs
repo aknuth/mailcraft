@@ -124,13 +124,13 @@ fn attachments_drag_out_as_files() {
     a.run("list.open", json!({"key": k.to_id()}));
     frame(&ctx, &mut a, vec![]);
     // Not offered where the system can't take the file.
-    a.act(crate::Action::DragOut(0));
-    assert!(a.take_drag_out().is_none());
+    a.act(crate::Action::DragOut(vec![0]));
+    assert!(a.take_drag_out().is_empty());
     a.services = Box::new(Recorder(Default::default()));
     a.ui.can_drag_out = true;
     let index = a.session.reading.as_ref().and_then(|r| r.parsed.as_ref()).and_then(|p| p.attachments.first()).map(|x| x.index).unwrap();
-    a.act(crate::Action::DragOut(index));
-    let path = a.take_drag_out().expect("a file to drag");
+    a.act(crate::Action::DragOut(vec![index]));
+    let path = a.take_drag_out().pop().expect("a file to drag");
     assert!(path.is_file() && path.metadata().unwrap().len() > 0, "{path:?}");
     assert!(path.starts_with(own_scratch_dir("open").unwrap()), "the test's own folder, not the user's: {path:?}");
 }
@@ -642,3 +642,119 @@ fn ctrl_a_in_the_search_box_after_a_long_message_does_not_copy_it_whole() {
 }
 
 mod text_selection;
+
+/// Issue #109: in the dark theme, messages can be shown on a light background, with the colours
+/// they were written in (dark text on a light page), from Options or the switch above the
+/// message; off, they're in the theme's colours as before.
+#[test]
+fn messages_on_a_light_background_in_the_dark_theme() {
+    let (mut a, _) = app("light-messages");
+    let ctx = egui::Context::default();
+    let k = a
+        .session
+        .list
+        .iter()
+        .find(|m| m.subject.contains("Storyboard review on Thursday") && !m.subject.starts_with("Re:"))
+        .map(|m| m.key.clone())
+        .unwrap();
+    a.run("list.open", json!({"key": k.to_id()}));
+    a.ui.dark = Some(true);
+    let size = egui::vec2(1280.0, 800.0);
+    // How light the body's text is drawn (0 black to 255 white).
+    let ink = |a: &mut MailApp| {
+        frame(&ctx, a, vec![]);
+        let out = sized_frame(&ctx, a, size, vec![]);
+        // The reading pane's (the list's preview has the same words, further left).
+        let mut found: Vec<(f32, egui::Color32)> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text.contains("The animatic is in good shape") => {
+                    // A section's own colour, else (a placeholder) the colour the shape is drawn in.
+                    let own = t.galley.job.sections.first().map(|x| x.format.color).filter(|c| *c != egui::Color32::PLACEHOLDER);
+                    Some((t.pos.x, t.override_text_color.or(own).unwrap_or(t.fallback_color)))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let color = found.last().map(|f| f.1);
+        let [r, g, b, _] = color.expect("the body is drawn").to_array();
+        (u32::from(r) + u32::from(g) + u32::from(b)) / 3
+    };
+    assert!(ink(&mut a) > 150, "light text on the dark page");
+    let switch = "Show messages on a light background";
+    assert!(drawn_text(&ctx, &mut a, size).iter().all(|d| d.text != switch), "{switch}: a tooltip, not text");
+    a.run("view.lightMessages", json!({}));
+    assert!(a.session.prefs.light_messages);
+    assert!(ink(&mut a) < 110, "dark text on a light page");
+    a.ui.dark = Some(false);
+    assert!(ink(&mut a) < 110, "the light theme as ever");
+}
+
+/// Issue #110: a picture in a message, right-clicked, offers to copy it (its pixels go on the
+/// clipboard, for another app to paste) and to save it as a file.
+#[test]
+fn a_picture_is_copied_or_saved_from_its_menu() {
+    let (mut a, dir) = app("picture-menu");
+    let k = a.session.list.iter().find(|m| m.subject.contains("winter group show")).map(|m| m.key.clone()).unwrap();
+    a.run("list.open", json!({"key": k.to_id()}));
+    let src = "cid:poster@gallery.example";
+    // The menu on a picture's place, as the reading pane gives it, in a window of its own.
+    let ctx = egui::Context::default();
+    let mut acts = Vec::new();
+    let run = |events: Vec<Event>, acts: &mut Vec<crate::Action>| {
+        let input =
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            let (_, resp) = ui.allocate_exact_size(egui::vec2(120.0, 120.0), egui::Sense::click());
+            crate::reading::picture_menu_for_tests(&resp, &a.session, &k, src, acts);
+        });
+        out.textures_delta.clear();
+        out
+    };
+    let at = egui::pos2(50.0, 50.0);
+    let press = |button, pressed| Event::PointerButton { pos: at, button, pressed, modifiers: Modifiers::NONE };
+    run(vec![Event::PointerMoved(at)], &mut acts);
+    run(vec![press(egui::PointerButton::Secondary, true)], &mut acts);
+    run(vec![press(egui::PointerButton::Secondary, false)], &mut acts);
+    let out = run(vec![], &mut acts);
+    let menu = crate::tests::texts_in(&out.shapes);
+    assert!(menu.iter().any(|d| d.text == "Save picture as…"), "{:?}", menu.iter().map(|d| &d.text).collect::<Vec<_>>());
+    let copy = menu.iter().find(|d| d.text == "Copy picture").map(|d| d.rect.center()).expect("Copy picture offered");
+    let click = |pressed| Event::PointerButton { pos: copy, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    run(vec![Event::PointerMoved(copy)], &mut acts);
+    run(vec![click(true)], &mut acts);
+    let out = run(vec![click(false)], &mut acts);
+    let copied = out.platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyImage(img) => Some(img.size),
+        _ => None,
+    });
+    assert!(copied.is_some_and(|[w, h]| w > 0 && h > 0), "its pixels on the clipboard: {:?}", out.platform_output.commands);
+    assert!(acts.is_empty(), "copied, so nothing to tell");
+
+    // Saved: the picture's own bytes, as the message carries it.
+    let path = dir.join("poster.png");
+    a.run("picture.save", json!({"key": k.to_id(), "src": src, "path": path.to_string_lossy()}));
+    let saved = std::fs::read(&path).expect("saved");
+    assert_eq!(Some(saved), a.session.picture_bytes(&k, src));
+    assert!(!a.session.picture_name(&k, src).is_empty());
+    // One from the web that isn't loaded isn't here to save.
+    assert_eq!(a.session.picture_bytes(&k, "https://gallery.example/track/open.gif"), None);
+}
+
+/// Issue #97: Print shows the message as it will print before it prints, in the PDF viewer, at
+/// once: not asked first where to save a PDF (the test's services pick no place, and it printed
+/// nothing).
+#[test]
+fn print_opens_the_message_as_it_will_print() {
+    let (mut a, _) = app("print-preview");
+    let k = a.session.list.iter().find(|m| m.subject.contains("winter group show")).map(|m| m.key.clone()).unwrap();
+    a.run("list.open", json!({"key": k.to_id()}));
+    a.act(crate::Action::Print);
+    let dir = crate::scratch_dir("print").expect("a folder for the viewer");
+    let made: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).map(|e| e.path()).collect();
+    assert_eq!(made.len(), 1, "{made:?}");
+    let pdf = std::fs::read(&made[0]).unwrap();
+    assert!(pdf.starts_with(b"%PDF"), "a PDF");
+}

@@ -8,13 +8,49 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 version is a milestone, named in italics under its heading. Numbers like (#11) are tester issues
 on GitHub.
 
-## 0.39.0
+## 0.40.0
+
+*What testers met in their first days with 0.39.*
+
+Thanks to Peter Páleník for the Slovak translation (#124), and to flash7777 for #125–#130.
+
+### Added
+
+- Slovak as an interface language (#121): **File › Options › General › Language › Slovenčina**, and a Slovak system picks it.
+- Attachments selected together (Ctrl+click, ⌘-click on a Mac) drag out together (#120), onto a folder to save them there or into another app, as **Save Selected** saves them: only the one under the pointer went.
+- Choose how MailCraft signs in to an account's mail servers (#123), under **Server settings** when it's added or changed: **Sign in with**, under each server, Automatic, Password, or NTLM (Secure Password Authentication, as a company's Exchange may ask for it: the password never crosses the network), and for the outgoing server No sign-in. Left on Automatic, a server that offers NTLM and not a password is signed in to with NTLM.
+- The message list can leave out its headings, such as Today and Yesterday (#129): **Show in groups** in the menu of how the list is arranged (By Date ⏷), on as before.
+- The ribbon can be hidden, for more room for mail (#127): **File › Options › General › Hide the ribbon**, Ctrl+F1, or a double click on one of its tabs. The tabs stay on the top bar: a click on one shows its buttons until you click elsewhere.
+- The message list can show a message on one line, as a table's row (#125): the sender, the subject, its markers and the time, so many more fit in the window. **View › Single line**, or **File › Options › Mail › Single-line list**. Its head is one line too: the folder's name, with the filters (All, Unread…) in a menu beside it.
+
+### Changed
+
+- **Add an email account** is shorter and says more: what it works with and where your password goes, at the top; **Server settings** folds away, naming the servers it found; opened, the kind of mail server is picked from a list, with a line saying what each is, and a POP account's copy on the server and data file to start from fold away too, saying what they're set to; an Exchange (Microsoft 365) or Outlook.com account goes on with **Sign in with Microsoft**, its only way in; and an account for calendars and contacts alone is a link under the form, to a form of its own. **Server settings** for an account already added are laid out the same way, each server and how it's signed in to.
+
+### Fixed
+
+- On Linux and the BSDs, attachments drag out of MailCraft on a desktop running Wayland, such as GNOME's or KDE Plasma's (#120): drag one onto a folder in your file manager to save it there. The window opens through XWayland so that they can, but dragging them was still left off there, and nothing happened.
+- Newsletters that put a table around each section for Outlook alone, as HubSpot's do, show their text (#122): every section came out empty, and only the background and pictures showed. A title in a quote in a colour of its own no longer starts with `> ##`.
+- A table whose rows are inside a form, as a survey in a newsletter has them, shows its rows: it came out empty.
+- Mail goes out through an outgoing server that takes it without a sign-in, as a company's own may (#123): MailCraft signed in anyway, and couldn't send. A server that offers only sign-in methods MailCraft doesn't speak is said to, naming them.
+
+## 0.39.0 - 2026-11-16
 
 *What testers met in their first days with 0.38.*
 
 ### Added
 
+- A mail server whose certificate no authority vouches for can be trusted, as other mail apps let you (#105): a company's own, or one set up at home. MailCraft asks, showing whom the certificate is for, who issued it, until when, and its fingerprint for whoever runs the server to confirm, and **Trust this certificate** keeps it for that account. Or the certificate file they give you, the server's own or the authority that issues it, is trusted under **File › Info › Server settings… › Trust a certificate file…**, where **Stop trusting** takes one back. Only for the account's mail servers, only a certificate in date and for the server's name, never for a major mail service's servers, and MailCraft asks again if it changes.
+- macOS: the Dock icon shows how much unread mail is in the Inboxes, as the window's title does, and nothing once it's all read (#93).
+- An account can look for new mail only when you ask (#104): **File › Options › Mail › Checking for new mail › Only when I ask**. It isn't signed in as MailCraft starts nor looks by itself; **Send / Receive** on the account looks (and now looks at that account only: it looked at all of them), Send / Receive for all leaves it out, and sending or opening a message not downloaded yet still works.
+- A picture in a message has a menu on a right-click (#110): **Copy picture**, for another app to paste, and **Save picture as…**, for one the message carries or one from the web that's been shown.
+- In the dark theme, messages can be shown on a light background, in the colours they were written in (#109): **File › Options › General › Messages on a light background**, or the sun above a message to switch.
+- An event's repeat can be set as you need it (#103): every so many days, weeks, months or years, on the weekdays you pick, on a day of the month or its nth weekday (the third Thursday, the last Friday), and ending never, after so many times or on a date. A series from elsewhere opens with its rule to change, unless it says more than the form shows. A small month beside each date picks a day, and the end follows the start, keeping the event's length.
 - One of an account's other addresses can be the one new mail is written from (#88): tick **Write new mail from this address** when you add or change it under **File › Info › Other addresses**. A new message then starts from it, with its name and signature, and **From** still offers the others. An answer goes from the address the mail came to, as before, and from the chosen one when the mail came to none of the account's addresses (a list's mail, a hidden copy). For a mailbox that signs in as one address and writes as another, such as a Gmail mailbox with a domain of your own.
+- Files can be sent from where they are (#96): **Send to › MailCraft** in Windows' Explorer, **Send with MailCraft** in Dolphin's, Nemo's and PCManFM-Qt's menus for files (from the .deb, .rpm and FreeBSD packages), and on a Mac any file dropped on MailCraft's Dock icon start a new message with them attached, in the MailCraft already open if there is one. `mailcraft --attach FILE…` does the same from a script.
+- Ctrl+Enter asks before it sends the message you're writing (#115), so a slip of the keys sends nothing unfinished: **Don't ask again** keeps the answer, and **File › Options › Mail › Ctrl+Enter in a message** sets it to ask first, send, or do nothing. Alt+S and Send send as before.
+- MailCraft can start in the notification area (#116): with **File › Options › General › Keep MailCraft running when its window is closed** on, **Start MailCraft in the notification area** starts it there, checking for mail and announcing it with no window coming up (minimized where a window can't be hidden, as on a Mac). Started to open a link or a file, it opens the window.
+- MailCraft's icon in the notification area shows how much unread mail the Inboxes have, in its corner (#117), as the window's title does; **Show the unread mail on its icon** turns that off.
 
 ### Removed
 
@@ -22,6 +58,16 @@ on GitHub.
 
 ### Fixed
 
+- **Print** shows the message as it will print at once, in your PDF viewer, to look over and print from (#97): it asked first where to save a PDF, as Save as PDF does.
+- A signature in HTML code with pictures from the web keeps them when you look at it under Formatted and go back (#91): Formatted can't show them, and coming back made the code anew without them. Formatted now says so. While writing, the signature is drawn as it's sent, its web pictures shown when you click Show pictures.
+- Enter opens the message selected in the list in a window of its own, as a double-click does, and a draft to go on writing it (#92). It did nothing, on every system.
+- A folder named archive inside the Inbox, with folders of its own, shows with them under it (#94): MailCraft takes it for the Archive, as it does on servers that don't mark one, and its folders were drawn among the Inbox's, under the wrong parent.
+- A meeting series' first invitation, once the organizer has changed one of its occurrences, says it's out of date (#101). Its answer buttons were still there, and answering it put the series back without the change.
+- Declining one changed occurrence of a meeting series works on SOGo (#101): it was refused (HTTP 403) and nothing reached the organizer. The occurrence now keeps your answer instead of being taken out of the organizer's meeting, and isn't shown in your calendar. An answered invitation goes out of the Inbox only once the server has the answer: one it refuses stays to be answered again.
+- Your meeting saved again without a change no longer sends the guests an update (#102), nor does a change only you see: its reminder, its categories or how it shows your time. Each update asked the guests to answer again.
+- An event moved to another start keeps its length: a half-hour meeting moved became an hour long.
+- A recurring meeting moved to another time keeps the occurrences taken out of it out (#100): one deleted came back, for you and the guests, and an occurrence changed on its own stood beside the series' new one that day. Each moves with the series, and the guests' update carries the changed occurrences along.
+- Meeting invitations, answers and cancellations sent by MailCraft arrive in Exchange and Outlook as meetings, with buttons to answer (#98), not as a message with an `invite.ics` file: the calendar now goes inline beside the text, with its method and character set, as iMIP (RFC 6047) asks.
 - A certificate file (`.p12`, `.pfx`) saved by Thunderbird or Firefox is imported (#89): they write the file another way than OpenSSL and Windows do, and every one was refused as a wrong password, old files and new. What stops an import is now said as what it is: a wrong password, a file locked in a way MailCraft doesn't read, or a file that isn't a certificate file.
 - An account with calendars and contacts only is no longer listed in the mail folder pane (#86), where it opened to nothing and several of them filled the pane. Its calendars and contacts are in Calendar and People as before, and the account under **File › Info**. **All Inboxes** and **All Sent** show only when more than one account has mail.
 - A signature set out in columns keeps them (#90): a logo, a name and an address side by side went one under the other in a reading pane of the usual width, and the line between them was gone, unless the window was wide. Short lines now wrap a little beside columns that say how wide they are, as in a browser. A signature written as HTML code also shows that way in the message you're writing, where it was its text, one part under another: its columns, colours, lines and pictures, as it's sent. It's one thing in the text there: the cursor passes it, and Backspace after it takes all of it. Pictures it names on the web load when you ask (**Show pictures**, under it), as for a message you read. Change it under **Signature**.
@@ -221,6 +267,11 @@ on GitHub.
 - On Windows, MailCraft started again in the instant the running one sets up to answer launches no longer waits five seconds and opens a second window: a launch that asked too early asks again, and Windows sometimes didn't tell the running MailCraft the first ask was gone, so it waited for it while the second one timed out.
 - On Windows, a pen or a finger moves the window by MailCraft's own title bar and resizes it from its edges, and drags a maximized window out restored, under the pen where it took it. It did nothing, and afterwards the mouse couldn't move the window either until MailCraft was restarted. A resize stops at the window's smallest size, as the mouse's does.
 - A screen reader says what each drop-down is for: **Font size** while writing, **When mail** and **Then** in a rule, **Show as**, **Reminder** and **Repeat** on an event or task, **Language** and **Dates** in **File › Options**, and the others with them. They were read only by what they showed ("combo box, 15 minutes"), and one showing nothing by nothing at all.
+- On Linux, a mail file MailCraft is started with opens in front of the main window: its window opened behind it, as the main window took the focus once it had drawn.
+- Typing above a signature with a picture in it no longer makes the text under it jump at every letter (#114).
+- Ctrl+A in a reply or forward selects all of it, the original under your text included (#118): it stopped at a paragraph, selecting only your text or the block of the original with the cursor. Copy and Cut take all of it, Delete removes all of it and typing replaces it, and Undo brings it back.
+- A right-click on a calendar in the Calendar's list of calendars opens its menu, from its name or anywhere on its row (#119): its name took the click, so **Remove this calendar** for one you subscribed to, **Refresh** and **Use as default calendar** couldn't be reached.
+- On a Mac, Control-click opens the right-click menus, as in other Mac apps (#119): it was taken as a plain click, so on a Mac with no second button or two-finger click no menu could be opened. Command-click still adds a message to the selection.
 
 ## 0.38.0 - 2026-11-13
 

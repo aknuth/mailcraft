@@ -31,21 +31,18 @@ use mailcraft_model::{EmailAddress, Flags, Folder, FolderRole, MessageKey, utf7}
 use mailcraft_pst::{Attachment, AttachmentData, Message, PropertyValue, PstFile, PstFolder, PstStore, Row, Table};
 use mailcraft_store::{FolderState, Store};
 
-mod budget;
 mod chunked;
 mod embedded;
 mod fuzzing;
 mod item;
-mod lanes;
 mod open;
-mod order;
 mod out;
-mod plan;
+mod pipeline;
+use pipeline::{budget, lanes, order, plan, run};
 pub(in crate::data_files) use plan::{Guard, MAX_ROWS};
 mod props;
 mod rebuild;
 mod resume;
-mod run;
 mod stats;
 #[cfg(test)]
 mod tests;
@@ -229,7 +226,7 @@ pub struct ImportOptions {
     pub space: Option<Arc<dyn Space>>,
     /// Leave the account's search index alone: the mail is indexed afterwards, by reading every
     /// message again. For a file read into a store of its own before it's added to an account
-    /// (`worker/imports/rereading.rs`), and for measuring what indexing as it imports costs.
+    /// (`worker/data_files/imports/rereading.rs`), and for measuring what indexing as it imports costs.
     #[doc(hidden)]
     pub no_index: bool,
     /// The reader's chunk of the file, in KiB, the data file's cache while the import writes to

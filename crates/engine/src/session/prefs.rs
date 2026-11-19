@@ -37,6 +37,18 @@ pub enum ReadInPane {
     Left,
 }
 
+/// What Ctrl+Enter does in a message being written (issue #115): it sent at once, and a slip of
+/// the keys sent a message unfinished. It asks first, as Outlook does the first time, until the
+/// answer is kept ("Don't ask again", or File › Options › Mail); Alt+S and Send are as ever.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CtrlEnter {
+    #[default]
+    Ask,
+    Send,
+    Nothing,
+}
+
 /// Settings the user changes from the View tab (saved by the app).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -74,15 +86,26 @@ pub struct Prefs {
     pub show_preview: bool,
     /// Tighter rows.
     pub compact: bool,
+    /// The list under headings, as it's arranged (Today, Yesterday…; a sender's name): off, its
+    /// messages follow one another with nothing between.
+    pub groups: bool,
+    /// A message on one line, as a table's row: the sender, the subject, the time.
+    pub single_line: bool,
     /// The classic ribbon (issue #8): big icons over their labels, in named groups, instead of
     /// one row of small ones.
     pub classic_ribbon: bool,
+    /// The ribbon's buttons hidden, its tabs kept on the top bar: one clicked shows its buttons
+    /// until a click elsewhere.
+    pub ribbon_hidden: bool,
     /// The accent colour (issue #8): empty for MailCraft's teal, a named one ([`ACCENTS`]), or
     /// any colour as `#rrggbb`. The window adjusts it to read well in light and dark.
     pub accent: String,
     /// The top bar in plain pane colours instead of the accent colour (issue #8, as Office's
     /// white theme).
     pub plain_top_bar: bool,
+    /// In the dark theme, messages are still shown on a light background, with the colours they
+    /// were written in (issue #109, as Outlook can keep them).
+    pub light_messages: bool,
     /// Windows: the system's title bar above MailCraft's top bar, instead of the top bar being the
     /// title bar (issue #22). Read as MailCraft starts.
     pub system_title_bar: bool,
@@ -96,6 +119,12 @@ pub struct Prefs {
     /// Closing the window leaves MailCraft running in the notification area, where the app
     /// has one (issue #67): mail is still checked and announced.
     pub close_to_tray: bool,
+    /// With `close_to_tray`, MailCraft starts with its window put away as a close puts it
+    /// (issue #116): at sign-in, it checks for mail and announces it with no window coming up.
+    /// Read as MailCraft starts.
+    pub start_in_tray: bool,
+    /// The notification area's icon shows the Inboxes' unread mail (issue #117).
+    pub tray_unread: bool,
     /// The categories offered, in order.
     pub categories: Vec<mailcraft_model::organize::Category>,
     /// Split the Inbox into Focused and Other.
@@ -121,6 +150,8 @@ pub struct Prefs {
     /// Replies and forwards open in a window of their own too, not in the reading pane (issue
     /// #11: Pop out each time).
     pub reply_window: bool,
+    /// What Ctrl+Enter does in a message being written.
+    pub ctrl_enter: CtrlEnter,
     /// The folder pane shows Favorites at its top (issue #11: it could only be collapsed).
     pub show_favorites: bool,
     /// Meeting invitations go into the calendar as tentative when they arrive, before they're
@@ -283,15 +314,22 @@ impl Default for Prefs {
             read_after_secs: 0,
             show_preview: true,
             compact: false,
+            groups: true,
+            single_line: false,
             classic_ribbon: false,
+            ribbon_hidden: false,
             accent: String::new(),
             plain_top_bar: false,
+            light_messages: false,
             system_title_bar: false,
             date_style: mailcraft_model::dates::DateStyle::default(),
             confirm_permanent_delete: true,
+            ctrl_enter: CtrlEnter::Ask,
             favorites: None,
             notify: true,
             close_to_tray: false,
+            start_in_tray: false,
+            tray_unread: true,
             categories: mailcraft_model::organize::default_categories(),
             focused_inbox: false,
             focus_overrides: std::collections::BTreeMap::new(),

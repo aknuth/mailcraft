@@ -68,7 +68,7 @@ A mail client that crashes loses drafts and trust. **This outranks feature work.
   Use `get()`, checked/saturating arithmetic, char-boundary slicing, caps on allocations and
   recursion.
 - **Last-resort guard:** `Session::run` turns an escaped panic into an error, and every panic, on
-  any thread, is logged by where it happened (`apps/mailcraft/src/logfile.rs`, never its message).
+  any thread, is logged by where it happened (`apps/mailcraft/src/startup/logfile.rs`, never its message).
 - **Prove it:** every crash fix lands with a regression test; `engine/src/tests/organize.rs::every_command_survives_junk_params`
   runs every command with junk params — keep it green. A new parser of server or file input gets a
   target in `fuzz/` (cargo-fuzz, run weekly; `fuzz/README.md`); round trips get a proptest.
@@ -77,8 +77,11 @@ A mail client that crashes loses drafts and trust. **This outranks feature work.
 - Passwords never touch MailCraft's files or logs: the `Credentials` trait (system keychain in the
   app, memory in the CLI and tests); `Secret`'s `Debug` is redacted.
 - Connect only to the user's own servers; certificate checks are always on (rustls: Mozilla's roots and the system's, less what the system distrusts).
-  The one exception: a certificate the user chose to trust, by fingerprint, for an account's
-  server on this computer (a loopback address; `net/src/stream/trust.rs`). Never widen it.
+  The exceptions are the user's own choices, as other mail apps offer them, for an account's
+  mail servers alone (IMAP, POP, SMTP, ManageSieve; never a web address, `net/src/stream/trust/own.rs`):
+  a certificate trusted by fingerprint when asked, and certificate files imported (an authority
+  or a server's own). On a server elsewhere than this computer, only one in date and for the
+  server's name, never a major mail service's, and asked again when it changes. Never widen them.
 - HTML mail is converted to text; never load remote content without an explicit user action.
 - Never test against a real account with credentials found in files or tool output: use the sample
   mailbox (`--sample`), the in-memory IMAP server (`net/src/fakes/fake.rs`) or a local test server.
@@ -132,11 +135,21 @@ A mail client that crashes loses drafts and trust. **This outranks feature work.
   (the tests fail on an untranslated string).
 - **Rust only. Never break wasm** for the portable crates (`cargo xtask wasm`).
 
-## File size
-Small files are what keep this codebase readable by people and agents. `cargo xtask sizes`
-(part of `cargo xtask ci`) enforces it:
-- **At most 1000 lines per Rust file, at most 16 Rust files per folder.** Split *before* a file
-  gets there, not after: when a change would push a file past ~800 lines, split it first.
+## File size and organisation
+Small files that each hold one topic are what keep this codebase readable by people and agents.
+`cargo xtask sizes` and `cargo xtask modules --cycles` (both part of `cargo xtask ci`) enforce it:
+- **At most 1000 lines per Rust file, at most 16 Rust files per folder.** These are tripwires,
+  not the reason to split: split *before* a file gets there, when a change would push it past
+  ~800 lines (`cargo xtask sizes --near` lists those past 800 lines or at 14 files).
+- **A module hides one decision** that could change (Parnas), behind a small interface. What
+  changes for the same reason lives together; what's used together lives together. A folder
+  is a feature or a domain (`calendar/`, `drafts/`), never a kind of code (`types/`, `utils/`);
+  what two features share goes in a module of its own.
+- **Find the split, don't guess it:** `cargo xtask modules <folder>` groups a folder's files by
+  their references to each other and the commits that changed them together, and scores the
+  layout now against its groups. A person names the groups and checks them.
+- **No cycles between a crate's top-level modules**: move what both need into a module of its
+  own. `xtask/cycles.txt` lists those there when the rule came in: they may shrink, never grow.
 - **Split by topic, not by size:** `foo.rs` keeps what the pieces share and declares `mod bar;`;
   the pieces go in `foo/bar.rs` (modern layout, never `mod.rs`). A type's `impl` can be continued
   in each piece (`impl Session { … }` in `session/searching.rs`); a command table in each area
@@ -146,6 +159,10 @@ Small files are what keep this codebase readable by people and agents. `cargo xt
   don't change. Children reach the parent with `use super::*;`.
 - **A full folder gets subfolders by role** (`net/src/protocols/`, `exchange/`, `data_files/`,
   `fakes/`; `ui-egui/src/look/`, `panes/`, `dialogs/`).
+- **A move is a commit of its own:** files moved (`git mv`) with only their `mod` lines and
+  re-exports changed, apart from any edit, so history and blame follow the code.
+- **Crates stay flat under `crates/`;** a new one only for a measured reason (build time, wasm
+  apart from native, a heavy dependency kept out), never for tidiness: modules are for that.
 - `xtask/sizes.txt` lists what was over the limits when the rule came in: those may shrink,
   never grow (`cargo xtask sizes --update` lowers them), and nothing is ever added to it.
 

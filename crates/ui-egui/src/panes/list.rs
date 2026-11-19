@@ -23,7 +23,7 @@ use row::{RowOf, message_row};
 /// the row height changes. The rows themselves are the engine's, borrowed each frame: a big
 /// folder's hundreds of thousands of rows were made again every frame, then each time it changed.
 pub(crate) struct ListRows {
-    key: (u64, u32),
+    key: (u64, u32, u32),
     tops: Vec<f32>,
     total: f32,
 }
@@ -35,6 +35,10 @@ pub struct DragKeys;
 const HEADER_H: f32 = 30.0;
 
 fn row_height(s: &Session) -> f32 {
+    // One line a message, whatever else is set: no avatar, no second line, no preview.
+    if s.prefs.single_line {
+        return 28.0;
+    }
     match (s.prefs.compact, s.prefs.show_preview) {
         (true, _) => 46.0,
         (false, true) => 76.0,
@@ -44,7 +48,9 @@ fn row_height(s: &Session) -> f32 {
 
 pub fn show(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>) {
     let t = st.tokens;
-    egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 10, top: 10, bottom: 6 }).show(ui, |ui| {
+    // The single-line list's head is one line too, close to its rows.
+    let (top, bottom) = if s.prefs.single_line { (5, 4) } else { (10, 6) };
+    egui::Frame::new().inner_margin(egui::Margin { left: 14, right: 10, top, bottom }).show(ui, |ui| {
         // Against the right in a right-to-left interface (egui runs its rows from there too).
         ui.with_layout(crate::bidi::column(), |ui| list_head(s, &t, ui, acts));
     });
@@ -53,28 +59,17 @@ pub fn show(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>) 
 
 /// The list's name, its Focused and Other tabs, its filters and how it's arranged.
 fn list_head(s: &Session, t: &theme::Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
+    if s.prefs.single_line {
+        list_head_line(s, t, ui, acts);
+        search_status(s, t, ui);
+        return;
+    }
     ui.horizontal(|ui| {
         ui.label(RichText::new(crate::view_title(s)).font(theme::bold(18.0)).color(t.text));
     });
     ui.add_space(4.0);
     if s.focus_split() {
-        ui.horizontal(|ui| {
-            for (other, label) in [(false, "Focused"), (true, "Other")] {
-                let on = s.focus_other == other;
-                let text =
-                    RichText::new(tl!(label)).color(if on { t.text } else { t.dim }).font(if on { theme::bold(14.0) } else { theme::regular(14.0) });
-                let r = ui.add(egui::Button::new(text).frame_when_inactive(false));
-                if on {
-                    ui.painter().line_segment(
-                        [pos2(r.rect.left() + 2.0, r.rect.bottom() + 1.0), pos2(r.rect.right() - 2.0, r.rect.bottom() + 1.0)],
-                        egui::Stroke::new(2.0, t.accent),
-                    );
-                }
-                if r.clicked() && !on {
-                    acts.push(Action::Run("list.focusTab", json!({"value": if other { "other" } else { "focused" }})));
-                }
-            }
-        });
+        ui.horizontal(|ui| focus_tabs(s, t, ui, 14.0, [false, true], acts));
         ui.add_space(2.0);
     }
     ui.horizontal(|ui| {
@@ -158,6 +153,80 @@ fn list_head(s: &Session, t: &theme::Tokens, ui: &mut Ui, acts: &mut Vec<Action>
         }
     });
     search_status(s, t, ui);
+}
+
+/// The Inbox's Focused and Other (`others` in the order they're laid out), the one shown
+/// underlined; text `size` points.
+fn focus_tabs(s: &Session, t: &theme::Tokens, ui: &mut Ui, size: f32, others: [bool; 2], acts: &mut Vec<Action>) {
+    for other in others {
+        let label = if other { "Other" } else { "Focused" };
+        let on = s.focus_other == other;
+        let text = RichText::new(tl!(label)).color(if on { t.text } else { t.dim }).font(if on { theme::bold(size) } else { theme::regular(size) });
+        let r = ui.add(egui::Button::new(text).frame_when_inactive(false));
+        if on {
+            ui.painter().line_segment(
+                [pos2(r.rect.left() + 2.0, r.rect.bottom() + 1.0), pos2(r.rect.right() - 2.0, r.rect.bottom() + 1.0)],
+                egui::Stroke::new(2.0, t.accent),
+            );
+        }
+        if r.clicked() && !on {
+            acts.push(Action::Run("list.focusTab", json!({"value": if other { "other" } else { "focused" }})));
+        }
+    }
+}
+
+/// The single-line list's head, on one line: the list's name, then against the other side its
+/// filter in a menu (named by the one chosen), where a search looks or how the list is arranged.
+fn list_head_line(s: &Session, t: &theme::Tokens, ui: &mut Ui, acts: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.with_layout(crate::bidi::row_from_end(egui::Align::Center), |ui| {
+            if s.search.is_none() {
+                let rev = s.prefs.reverse_sort;
+                if ui
+                    .add(egui::Button::new(RichText::new(if rev { "↓" } else { "↑" }).color(t.dim)).frame_when_inactive(false))
+                    .on_hover_text(tl!("Reverse sort"))
+                    .clicked()
+                {
+                    acts.push(Action::Run("view.reverseSort", json!({})));
+                }
+                let arrange = tf!("By {field} ⏷", field = tl!(s.prefs.arrange.label()));
+                let r = ui.add(egui::Button::new(RichText::new(arrange).color(t.dim).small()).frame_when_inactive(false));
+                egui::Popup::menu(&r).show(|ui| arrange_menu(ui, s, acts));
+            } else if let Some((q, current)) = s.search.as_ref().filter(|_| s.open_search_folder_name().is_none()) {
+                ui.menu_button(RichText::new(format!("{} ▾", crate::scope_label(*current))).small(), |ui| {
+                    for scope in SearchScope::ALL {
+                        if ui.selectable_label(scope == *current, crate::scope_label(scope)).clicked() {
+                            acts.push(Action::Run("search.run", json!({"query": q, "scope": scope.code()})));
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(tl!("Look in"));
+            }
+            // A filter chosen stands out, as its tab's underline does.
+            let chosen = s.filter != ListFilter::All;
+            let text = RichText::new(format!("{} ⏷", tl!(s.filter.label()))).color(if chosen { t.accent } else { t.dim }).small();
+            let r = ui.add(egui::Button::new(text).frame_when_inactive(false));
+            crate::widgets::named(ui, &r, tl!("Filter"), true, None);
+            egui::Popup::menu(&r).show(|ui| {
+                for f in ListFilter::ALL.into_iter().chain((!ListFilter::ALL.contains(&s.filter)).then_some(s.filter)) {
+                    if ui.selectable_label(s.filter == f, tl!(f.label())).clicked() {
+                        acts.push(Action::Run("list.filter", json!({"value": f.code()})));
+                        ui.close();
+                    }
+                }
+            });
+            // The Inbox's Focused and Other, before the filter (laid out from the end: Other first).
+            if s.focus_split() {
+                focus_tabs(s, t, ui, 12.5, [true, false], acts);
+            }
+            // The name has what's left, cut short where it's too long.
+            ui.with_layout(crate::bidi::row_from_start(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(crate::view_title(s)).font(theme::bold(13.5)).color(t.text)).truncate());
+            });
+        });
+    });
 }
 
 /// The filter tabs that fit in `room` (each `width` wide, `gap` apart) and those that go into
@@ -249,13 +318,15 @@ fn list_body(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>)
 
     let mh = row_height(s);
     let rows = s.rows();
-    let key = (s.nav_structure(), mh.to_bits());
+    // Not shown in groups: the headings take no room and aren't drawn.
+    let header_h = if s.prefs.groups { HEADER_H } else { 0.0 };
+    let key = (s.nav_structure(), mh.to_bits(), header_h.to_bits());
     if st.list_rows.as_ref().is_none_or(|c| c.key != key || c.tops.len() != rows.len()) {
         let mut tops = Vec::with_capacity(rows.len());
         let mut y = 0.0;
         for r in rows {
             tops.push(y);
-            y += if matches!(r, Row::Header(_) | Row::Group(_)) { HEADER_H } else { mh };
+            y += if matches!(r, Row::Header(_) | Row::Group(_)) { header_h } else { mh };
         }
         st.list_rows = Some(ListRows { key, tops, total: y });
     }
@@ -323,6 +394,7 @@ fn list_body(s: &Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action>)
                 break;
             }
             match row {
+                Row::Header(_) | Row::Group(_) if !s.prefs.groups => {}
                 Row::Header(label) => {
                     let r = Rect::from_min_size(origin + vec2(0.0, top), vec2(width, HEADER_H));
                     let m = crate::bidi::Mirror::new(r);
@@ -413,6 +485,10 @@ pub(crate) fn arrange_menu(ui: &mut Ui, s: &Session, acts: &mut Vec<Action>) {
     ui.separator();
     if ui.selectable_label(s.prefs.reverse_sort, tl!("Reverse sort")).clicked() {
         acts.push(Action::Run("view.reverseSort", json!({})));
+        ui.close();
+    }
+    if ui.selectable_label(s.prefs.groups, tl!("Show in groups")).clicked() {
+        acts.push(Action::Run("view.groups", json!({})));
         ui.close();
     }
 }

@@ -26,25 +26,22 @@ use mailcraft_net::worker::{Credentials, Pool};
 use mailcraft_ui_egui::{Backend, BootCard, FramePart, MailApp, Services, VideoFrame};
 use secrets::Keychain;
 
-mod appearance;
 #[cfg(target_os = "macos")]
-mod apple_events;
-mod args;
-mod desktop;
-mod display;
-mod graphics;
-mod logfile;
-mod portable;
-mod secrets;
-mod self_update;
-mod single_instance;
+use platform::apple_events;
 #[cfg(windows)]
-mod toast;
-mod video;
+use platform::toast;
+use platform::{appearance, secrets};
+use startup::{args, logfile, portable, single_instance};
+use window::{ClipboardKeys, app_icon, clipboard_files, drag_out, read_clipboard};
+use window::{display, graphics};
+
+mod desktop;
+mod platform;
+mod self_update;
+mod startup;
+mod window;
 #[cfg(test)]
 mod windows_manifest;
-#[cfg(all(unix, not(target_os = "macos")))]
-mod xdnd;
 
 /// The system's UI font, if installed (never bundled).
 fn system_fonts() -> (Option<Vec<u8>>, Option<Vec<u8>>) {
@@ -71,107 +68,6 @@ fn system_fonts() -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     (None, None)
 }
 
-/// Runs MailCraft's own keys on each window's input: Cut, Copy and Paste
-/// ([`mailcraft_ui_egui::clipboard_keys`]) and, on Windows, Alt+numpad character codes
-/// ([`mailcraft_ui_egui::alt_codes`], in the code pages for the user's language).
-struct ClipboardKeys {
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pages: (u16, u16),
-}
-
-impl eframe::ViewportHooks for ClipboardKeys {
-    /// No one-pixel offset of the window's contents: see `desktop/window_frame.rs`.
-    #[cfg(windows)]
-    fn window_created(&self, _viewport: egui::ViewportId, window: &winit::window::Window) {
-        use winit::platform::windows::WindowExtWindows as _;
-        window.set_undecorated_shadow(false);
-    }
-
-    fn raw_input(&self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        #[cfg(windows)]
-        mailcraft_ui_egui::alt_codes(ctx, raw_input, self.pages);
-        mailcraft_ui_egui::clipboard_keys(ctx, raw_input, &mut SystemClipboard);
-    }
-}
-
-/// The system clipboard, read as egui-winit reads it for a paste: its text, else its picture.
-struct SystemClipboard;
-
-impl mailcraft_ui_egui::ClipboardRead for SystemClipboard {
-    fn files(&mut self) -> Vec<PathBuf> {
-        clipboard_files()
-    }
-
-    fn paste(&mut self) -> Option<egui::Event> {
-        if let Some(text) = read_clipboard(|c| c.get_text().ok()) {
-            let text = text.replace("\r\n", "\n");
-            return (!text.is_empty()).then_some(egui::Event::Paste(text));
-        }
-        let img = read_clipboard(|c| c.get_image().ok())?;
-        // Its size and its bytes must agree (egui stops on a mismatch).
-        if img.width.checked_mul(img.height).and_then(|n| n.checked_mul(4)) != Some(img.bytes.len()) {
-            return None;
-        }
-        let image = egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &img.bytes);
-        Some(egui::Event::PasteImage(Arc::new(image)))
-    }
-}
-
-/// The committed app icon (`cargo xtask icons`), at 64 pixels.
-const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/64x64/apps/io.github.zidan44.MailCraft.png");
-
-/// The window icon: the app icon, or egui's default if it can't be decoded.
-fn app_icon() -> egui::IconData {
-    match image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png) {
-        Ok(img) => {
-            let img = img.into_rgba8();
-            egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
-        }
-        Err(_) => egui::IconData::default(),
-    }
-}
-
-/// Hand a file to the system's drag and drop (Windows and macOS; elsewhere egui has no way to).
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn drag_out(frame: &eframe::Frame, path: PathBuf) {
-    let options = drag::Options { skip_animatation_on_cancel_or_failure: false, mode: drag::DragMode::Copy };
-    // The drag crate is native code; a failure there must not take the app down.
-    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drag::start_drag(frame, drag::DragItem::Files(vec![path]), drag::Image::Raw(APP_ICON_PNG.to_vec()), |_, _| {}, options)
-    }));
-    match started {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!("drag out: {e}"),
-        Err(_) => log::warn!("drag out failed"),
-    }
-}
-
-/// Hand a file to X11's drag and drop (XDND), on a thread of its own while the button is held.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn drag_out(frame: &eframe::Frame, path: PathBuf) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let own = match frame.window_handle().map(|h| h.as_raw()) {
-        Ok(RawWindowHandle::Xlib(h)) => u32::try_from(h.window).ok(),
-        Ok(RawWindowHandle::Xcb(h)) => Some(h.window.get()),
-        _ => None,
-    };
-    let Some(own) = own else {
-        log::info!("drag out: not an X11 window");
-        return;
-    };
-    let spawned = std::thread::Builder::new().name("drag-out".into()).spawn(move || {
-        if let Err(e) = xdnd::drag(None, own, &path) {
-            log::warn!("drag out: {e}");
-        }
-    });
-    if let Err(e) = spawned {
-        log::warn!("drag out: {e}");
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-fn drag_out(_frame: &eframe::Frame, _path: PathBuf) {}
-
 struct App {
     app: MailApp,
     /// Writes the settings (`ui.json`) on a thread of its own.
@@ -186,6 +82,9 @@ struct App {
     /// Documents macOS sent over since the last frame (`apple_events.rs`).
     #[cfg(target_os = "macos")]
     finder: fmv_macos_events::Inbox,
+    /// The unread count the Dock icon shows (issue #93), once it's been set.
+    #[cfg(target_os = "macos")]
+    badge: Option<u32>,
     native_wayland: bool,
     /// Installs a downloaded update as MailCraft closes.
     updater: Option<self_update::Updater>,
@@ -270,12 +169,17 @@ impl App {
         }
         if let Some(handed) = self.instance.as_ref().and_then(single_instance::Server::take) {
             single_instance::show(ctx, self.native_wayland);
-            for h in &handed {
-                self.app.open_handed(h);
-            }
+            handed.give(&mut self.app);
         }
         #[cfg(target_os = "macos")]
-        apple_events::deliver(&self.finder, &mut self.app, ctx);
+        {
+            apple_events::deliver(&self.finder, &mut self.app, ctx);
+            let unread = self.app.session.inbox_unread();
+            if self.badge != Some(unread) {
+                apple_events::dock_badge(unread);
+                self.badge = Some(unread);
+            }
+        }
         // An update ready while the window is minimized or behind others: the system says so.
         self.app.follow_update(ctx);
         self.tray.follow(&mut self.app, ctx);
@@ -300,8 +204,9 @@ impl App {
         self.look_at_monitors(ui.ctx(), frame);
         self.app.ui(ui);
         self.keep_state(Some(ui.ctx()), false);
-        if let Some(path) = self.app.take_drag_out() {
-            drag_out(frame, path);
+        let dragged = self.app.take_drag_out();
+        if !dragged.is_empty() {
+            drag_out(frame, dragged);
         }
     }
     fn exiting(&mut self) {
@@ -479,39 +384,6 @@ fn start_logging(launch: &Launch) {
     }
 }
 
-/// How long a clipboard read may wait on the app that copied (Linux and the BSDs).
-#[cfg(all(unix, not(target_os = "macos")))]
-const CLIPBOARD_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Read the clipboard. On Linux and the BSDs the read runs on a thread of its own and gives up
-/// after [`CLIPBOARD_WAIT`]: a Wayland or X11 read waits on the app that copied, with no time
-/// limit of its own, so an app that hangs would hang MailCraft's window too (FigCraft found).
-#[cfg(all(unix, not(target_os = "macos")))]
-fn read_clipboard<T: Send + 'static>(read: fn(&mut arboard::Clipboard) -> Option<T>) -> Option<T> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("clipboard".into())
-        .spawn(move || {
-            let _ = tx.send(arboard::Clipboard::new().ok().and_then(|mut c| read(&mut c)));
-        })
-        .ok()?;
-    rx.recv_timeout(CLIPBOARD_WAIT).ok().flatten()
-}
-
-/// Files copied in a file manager. PCManFM ends its list with a NUL byte, which stayed on the
-/// last file's name: of two files copied, one was pasted (issue #10).
-fn clipboard_files() -> Vec<PathBuf> {
-    let files = read_clipboard(|c| c.get().file_list().ok()).unwrap_or_default();
-    let nul = char::from(0);
-    files.into_iter().map(|p| p.to_str().filter(|s| s.ends_with(nul)).map_or(p.clone(), |s| PathBuf::from(s.trim_end_matches(nul)))).collect()
-}
-
-/// Read the clipboard (Windows' and macOS's reads don't wait on the app that copied).
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn read_clipboard<T>(read: fn(&mut arboard::Clipboard) -> Option<T>) -> Option<T> {
-    read(&mut arboard::Clipboard::new().ok()?)
-}
-
 /// Tell standard error (and the log). `eprintln!` panics when standard error is a broken pipe,
 /// which a launch from another program can leave it as (PdfCraft and GridCraft found).
 fn say(what: &str) {
@@ -574,6 +446,7 @@ struct Started {
 fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
     let Started { launch, opening: Opening { progress, opened, card, made }, state_path, instance, updater, looks: Looks { saved_ui, theme, x11 } } =
         started;
+    let put_away = launch.starts_away(saved_ui.as_ref());
     let Launch { args: cmd_args, handed, sample, base, .. } = launch;
     // The guard stays here, outside the closure, so the handlers live as long as the loop.
     #[cfg(target_os = "macos")]
@@ -655,6 +528,7 @@ fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
                         updater: updater.clone(),
                         own_title_bar,
                         frame_guard,
+                        x11,
                         ..Default::default()
                     }),
                 );
@@ -674,9 +548,7 @@ fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
                     app.ui.dark = theme;
                 }
                 desktop::start::commands(&mut app, &args);
-                for h in &handed {
-                    app.open_handed(h);
-                }
+                handed.give(&mut app);
                 // From here the open message's body is read and parsed on a thread of its own (the
                 // commands above answered at once, as they do in the CLI).
                 app.defer_bodies();
@@ -689,6 +561,8 @@ fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
                     instance,
                     #[cfg(target_os = "macos")]
                     finder,
+                    #[cfg(target_os = "macos")]
+                    badge: None,
                     native_wayland,
                     updater,
                     looked: std::time::Instant::now(),
@@ -704,9 +578,11 @@ fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
                 start: Some(start),
                 instance,
                 updater: booting_updater,
-                handed: Vec::new(),
+                handed: args::Handed::default(),
                 native_wayland,
                 frame_guard: booting_guard,
+                put_away,
+                away: None,
             }))))
         }),
     )
@@ -715,6 +591,7 @@ fn run(options: eframe::NativeOptions, started: Started) -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use desktop::video;
 
     /// eframe is used without its default features, and copy and paste are one of them since
     /// 0.37: the app had no clipboard (nothing pasted anywhere) until it was named.

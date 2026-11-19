@@ -42,7 +42,7 @@ struct Args {
 const SWITCHES: [&str; 6] = ["--headers", "--checked", "--help", "-h", "--version", "-V"];
 
 /// The options that take the word after them, whatever it starts with (`--body "--Riley"`).
-const OPTIONS: [&str; 20] = [
+const OPTIONS: [&str; 22] = [
     "--data",
     "--email",
     "--name",
@@ -51,6 +51,8 @@ const OPTIONS: [&str; 20] = [
     "--smtp",
     "--imap-security",
     "--smtp-security",
+    "--sign-in",
+    "--smtp-sign-in",
     "--jmap",
     "--account",
     "--timeout",
@@ -204,7 +206,10 @@ fn start(s: &mut Session, store: &Store, account: &str) -> Result<Pool, String> 
     let mut pool = Pool::new(store.clone(), Arc::new(MemoryCredentials::default()));
     // Session::open queued Start jobs without passwords; replace them with one that has it.
     let _ = s.take_jobs();
-    pool.submit(Job::Start { account: config, password: Some(Secret(pw)) });
+    // Asked for, whatever the account is set to: one that looks only when asked (issue #104)
+    // is asked now, by the command (held back, it never signed in, and the command waited).
+    let account = mailcraft_engine::model::AccountConfig { check_by_hand: false, ..config };
+    pool.submit(Job::Start { account, password: Some(Secret(pw)) });
     Ok(pool)
 }
 

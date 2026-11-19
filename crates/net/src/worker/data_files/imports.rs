@@ -1,0 +1,759 @@
+//! Data files read into accounts, each on a thread of its own: one import at a time into an
+//! account, and each stopped as asked. Cancelled, it keeps what came in; paused (MailCraft
+//! closing), the same, less the folder it was part-way through; thrown away (the account
+//! removed), the data file it made goes once the import has let go of it, while the account
+//! still has it. A MailCraft data file is copied in whole or not at all. A file looked at before
+//! it's imported is planned then, and its import goes by that plan.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use mailcraft_model::job::{Blocked, DataFileFacts, ITEM_WEIGHT, ImportPhase, ImportProgress, ImportReport, StopHow, Work};
+use mailcraft_model::pim::{PIM_DOC, Pim};
+
+use super::*;
+use crate::pst::{ImportOptions, ImportSink, Imported, Planned, Progress, Stop};
+
+pub(crate) mod filing;
+mod looking;
+mod rereading;
+use looking::*;
+
+/// How long closing MailCraft waits for its imports to pause: each lets go of the items it's
+/// reading at their next read and writes what it holds. One that takes longer (a read stuck on a
+/// drive that doesn't answer) is let go.
+pub(crate) const IMPORT_STOP_WAIT: Duration = Duration::from_secs(10);
+/// The account's folder list is sent at most this often while an import finishes folders, but for
+/// a folder the list sent last didn't have.
+const FOLDERS_EVERY: Duration = Duration::from_millis(500);
+/// A data file that can't be removed at once (something letting go of it) is tried again this
+/// many times, a little later each time.
+const REMOVE_TRIES: u32 = 4;
+/// An Outlook data file's copy as a share of its messages' own sizes, in percent: 38.65 GB for
+/// 39.5 GB of messages, measured on a 41 GB file.
+const COPY_PCT: u64 = 98;
+/// The room asked for a copy, in percent of its size, and besides it: the file grows past its
+/// final size while it's written (pages freed under a reader are taken again only later), and
+/// the drive keeps some room after.
+const NEED_PCT: u64 = 130;
+const NEED_EXTRA: u64 = 2 << 30;
+/// How often a copy of MailCraft's own data file asks the room left as it goes.
+const ROOM_EVERY: Duration = Duration::from_millis(250);
+
+/// The imports running, by account, and the data file looked at last, as planned.
+#[derive(Default)]
+pub(crate) struct Imports {
+    running: HashMap<String, ImportCtl>,
+    looked: Arc<Mutex<Option<Looked>>>,
+}
+
+/// An account's import: how it's asked to stop (the one queued after it, once there is one), the
+/// import queued to follow it, and its thread, which ends with the data files of imports thrown
+/// away that couldn't be removed yet.
+struct ImportCtl {
+    stop: Stop,
+    queue: Arc<Mutex<Queue>>,
+    thread: JoinHandle<Vec<PathBuf>>,
+}
+
+/// An import asked for while the account's last one was being thrown away: it starts on the same
+/// thread once that one is over (its data file gone), not beside it. And a Keep asked for as an
+/// import stopped, its thread still ending: it follows on that thread.
+#[derive(Default)]
+struct Queue {
+    next: Option<(String, Stop)>,
+    keep: bool,
+    /// The thread is ending: nothing more is taken from here.
+    ended: bool,
+}
+
+/// What an account's import thread does next.
+enum Next {
+    /// Import the data file at `path` (`resume`: going on from where it stopped).
+    Import { path: String, resume: bool },
+    /// Read the data file at `path` again, adding what it has new (`rereading.rs`).
+    Reread { path: String },
+    /// Keep what a stopped import brought in as it is.
+    Keep,
+}
+
+impl Pool {
+    /// Import a data file on a thread of its own: an Outlook one (`.pst`), or MailCraft's own
+    /// (`.mailcraft`, copied in as it is). An account already importing isn't given a second;
+    /// one whose import is being thrown away gets it once that's over. One whose data file is
+    /// being compacted isn't begun (a compaction isn't begun beside an import either): one going
+    /// on stays paused, a new one is refused.
+    pub(crate) fn import_pst(&mut self, account: String, path: String, resume: bool) {
+        if self.compacting(&account) {
+            if resume {
+                never_began(&self.sink, &account, &path, StopHow::Pause);
+            } else {
+                self.sink.emit(failed(&account, "its data file is being compacted; import once that's done".to_string()));
+            }
+            return;
+        }
+        self.prune_imports();
+        if let Some(ctl) = self.imports.running.get_mut(&account) {
+            let mut queue = lock(&ctl.queue);
+            // The import last asked for (the one queued, when there is one) goes on.
+            if ctl.stop.how() != Some(StopHow::Discard) {
+                drop(queue);
+                return self.sink.emit(Event::Notice { account, message: "a data file is being imported into this account already".into() });
+            }
+            if !queue.ended {
+                // The one queued was thrown away in its turn (its account removed again): it
+                // never begins, and is said so now; this one takes its place.
+                if let Some((dropped, _)) = queue.next.take() {
+                    never_began(&self.sink, &account, &dropped, StopHow::Discard);
+                }
+                let stop = Stop::default();
+                queue.next = Some((path, stop.clone()));
+                drop(queue);
+                ctl.stop = stop;
+                return;
+            }
+            // Its thread is ending as this is asked: let go of it, and start afresh.
+            drop(queue);
+            self.let_go_of_import(&account);
+        }
+        if let Err(e) = self.spawn_import(&account, Next::Import { path, resume }) {
+            // No thread, no import: it ends here, as a failed one (the account isn't left importing).
+            self.sink.emit(failed(&account, format!("import: {e}")));
+        }
+    }
+
+    /// Read an Outlook data file again into the account keeping its copy (`rereading.rs`), on
+    /// the account's import thread: not beside an import or a compaction of the account, nor
+    /// while one is being thrown away (its account removed).
+    pub(crate) fn reread_data_file(&mut self, account: String, path: String) {
+        self.prune_imports();
+        let busy = if self.compacting(&account) {
+            Some("its data file is being compacted; read the file again once that's done")
+        } else if self.imports.running.contains_key(&account) {
+            Some("a data file is being imported into this account already")
+        } else {
+            None
+        };
+        let error = match busy {
+            Some(why) => why.to_string(),
+            None => match self.spawn_import(&account, Next::Reread { path }) {
+                Ok(()) => return,
+                Err(e) => format!("import: {e}"),
+            },
+        };
+        self.sink.emit(failed(&account, error));
+    }
+
+    /// Start an account's import thread on `first`, then on what's queued behind it.
+    fn spawn_import(&mut self, account: &str, first: Next) -> std::io::Result<()> {
+        let queue: Arc<Mutex<Queue>> = Arc::default();
+        let (sink, store, looked, stop) = (self.sink.clone(), self.store.clone(), self.imports.looked.clone(), Stop::default());
+        let (id, asked, queued) = (account.to_string(), stop.clone(), Arc::clone(&queue));
+        // No index pass for the account until the import thread ends.
+        let importing = self.indexer.importing(account);
+        let thread = std::thread::Builder::new().name("mail-import".into()).spawn(move || {
+            let _importing = importing;
+            #[cfg(test)]
+            let _ending = tests::Ending(id.clone());
+            let (mut work, mut stop, mut left) = (first, asked, Vec::new());
+            loop {
+                match &work {
+                    Next::Import { path, resume } => {
+                        let planned = planned_for(&looked, path);
+                        left.extend(run(&store, &sink, &id, path, &stop, planned, *resume));
+                    }
+                    Next::Reread { path } => left.extend(rereading::run(&store, &sink, &id, path, &stop)),
+                    Next::Keep => keep(&store, &sink, &id, &stop),
+                }
+                let mut q = lock(&queued);
+                work = match q.next.take() {
+                    // One asked for after an import thrown away starts afresh.
+                    Some((path, asked)) => {
+                        stop = asked;
+                        Next::Import { path, resume: false }
+                    }
+                    None if std::mem::take(&mut q.keep) => Next::Keep,
+                    None => {
+                        q.ended = true;
+                        return left;
+                    }
+                };
+            }
+        })?;
+        self.imports.running.insert(account.to_string(), ImportCtl { stop, queue, thread });
+        Ok(())
+    }
+
+    /// Stop an account's import as `how` says. With none running, the answer comes at once: it's
+    /// over, and nothing more will come of it (thrown away, as far as anything was left of it).
+    pub(crate) fn stop_import(&mut self, account: &str, how: StopHow) {
+        self.prune_imports();
+        match self.imports.running.get(account) {
+            Some(ctl) => ctl.stop.raise(how),
+            None => {
+                let report = ImportReport { stopped: Some(StopHow::Discard), ..ImportReport::default() };
+                self.sink.emit(ended(account, 0, 0, None, Some(report)));
+            }
+        }
+    }
+
+    /// Keep what an account's stopped import brought in as it is (`pst::keep_as_is`), on the
+    /// account's import thread: the folder it was part-way through comes into the folder list
+    /// with what it has, and [`Event::ImportKept`] says it's done. Asked for as the import that
+    /// stopped is still ending (it said so just before), it follows on that thread. An import or
+    /// a compaction asked for meanwhile is refused, as beside an import, and one asked for while
+    /// the data file is compacted is refused too. Removing the account stops it before it writes.
+    pub(crate) fn keep_import(&mut self, account: String) {
+        if self.compacting(&account) {
+            let error = Some("its data file is being compacted; keep it once that's done".to_string());
+            return self.sink.emit(Event::ImportKept { account, error });
+        }
+        self.prune_imports();
+        if let Some(ctl) = self.imports.running.get(&account) {
+            let mut queue = lock(&ctl.queue);
+            if !queue.ended {
+                queue.keep = true;
+                return;
+            }
+            // Its thread is ending as this is asked: let go of it, and keep on a new one.
+            drop(queue);
+            self.let_go_of_import(&account);
+        }
+        if let Err(e) = self.spawn_import(&account, Next::Keep) {
+            self.sink.emit(Event::ImportKept { account, error: Some(format!("keep: {e}")) });
+        }
+    }
+
+    /// Let go of the imports that have ended.
+    fn prune_imports(&mut self) {
+        let ended: Vec<String> = self.imports.running.iter().filter(|(_, c)| c.thread.is_finished()).map(|(a, _)| a.clone()).collect();
+        for account in ended {
+            self.let_go_of_import(&account);
+        }
+    }
+
+    /// Let go of an account's import thread (ended, or ending), and remove the data files of
+    /// imports thrown away that couldn't be removed while something held them. Each is removed by
+    /// the path the import wrote, never by the account's name, which another account may have by
+    /// now; and a file still there is no account's (a data file is never named after one that
+    /// exists).
+    fn let_go_of_import(&mut self, account: &str) {
+        let Some(ctl) = self.imports.running.remove(account) else { return };
+        let Ok(files) = ctl.thread.join() else { return };
+        for file in files {
+            if let Err(e) = remove(&file) {
+                let message = format!("the data file of an import stopped couldn't be removed ({}): {e}", file.display());
+                self.sink.emit(Event::Notice { account: account.to_string(), message });
+            }
+        }
+    }
+
+    /// Pause every import. With `wait`, wait up to that long for them to stop; those still going
+    /// after it, and all of them without it, are let go (they end on their own).
+    fn pause_imports(&mut self, wait: Option<Duration>) {
+        for ctl in self.imports.running.values() {
+            ctl.stop.raise(StopHow::Pause);
+        }
+        let Some(wait) = wait else {
+            self.imports.running.clear();
+            return;
+        };
+        #[cfg(test)]
+        tests::waited_for(self.imports.running.keys());
+        let end = Instant::now() + wait;
+        while self.imports.running.values().any(|c| !c.thread.is_finished()) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.prune_imports();
+        if !self.imports.running.is_empty() {
+            log::warn!("closing: {} import(s) didn't stop in time; left to end on their own", self.imports.running.len());
+        }
+    }
+
+    /// Stop every account's threads, and pause the imports, waiting a few seconds at most for
+    /// them to write what they hold (MailCraft closing). The changes to mail made so far are on
+    /// disk first (a message marked read just before closing stays read).
+    pub fn shutdown(&mut self) {
+        self.cancel_compacts();
+        self.edits.finish();
+        self.indexer.shutdown();
+        self.stop_all();
+        self.pause_imports(Some(IMPORT_STOP_WAIT));
+    }
+
+    /// Whether an account has an import running.
+    pub(crate) fn importing(&self, account: &str) -> bool {
+        self.imports.running.get(account).is_some_and(|c| !c.thread.is_finished())
+    }
+}
+
+/// Never waits for the imports: they are paused and let go (they end on their own, writing what
+/// they hold). Waits for the changes to mail made so far to be on disk (`edits.rs`).
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.edits.finish();
+        self.stop_all();
+        self.pause_imports(None);
+    }
+}
+
+/// An import, start to end, on its thread. Returns the data file of one thrown away that
+/// couldn't be removed yet.
+fn run(store: &Store, sink: &Sink, account: &str, path: &str, stop: &Stop, planned: Option<Arc<Planned>>, resume: bool) -> Option<PathBuf> {
+    // Stopped while it waited behind an import thrown away: it never began.
+    if let Some(how) = stop.how() {
+        return never_began(sink, account, path, how);
+    }
+    // The data file the import writes in: the account's own when it had one (never removed for
+    // a discard), else the one the import makes, noted once it's there.
+    let file = store.data_file(account).filter(|f| f.exists());
+    let own = file.is_none();
+    let mut told = Told::new(sink, store, account, stop, file, own);
+    told.say(ImportPhase::Planning);
+    if path.to_ascii_lowercase().ends_with(".mailcraft") {
+        return copy_in(&mut told, path);
+    }
+    let opts = ImportOptions { stop: stop.clone(), planned, resume, ..ImportOptions::default() };
+    #[cfg(test)]
+    let opts = ImportOptions { fault: tests::fault_for(account), space: tests::space_for(account), ..opts };
+    let result = crate::pst::import_into(Path::new(path), store, account, &opts, &mut told);
+    // Thrown away, however far it got (it may have ended on its own just before).
+    if stop.how() == Some(StopHow::Discard) {
+        let (messages, skipped) = result.as_ref().map_or((0, 0), |d| (d.messages, d.skipped));
+        return thrown_away(&told, path, messages, skipped);
+    }
+    match result {
+        // It can't go on (the file changed, went, or is held, or the drive is full): it waits on
+        // the user. Stopped for want of room part-way, what came in is kept, as when paused.
+        Ok(done) if done.blocked.is_some() => {
+            noted(store, account);
+            if !done.folders.is_empty() {
+                sink.emit(Event::Folders { account: account.to_string(), folders: done.folders });
+            }
+            told.last.imported = done.messages;
+            told.last.skipped = done.skipped;
+            let progress = ImportProgress { blocked: done.blocked, ..told.progress(ImportPhase::Blocked) };
+            sink.emit(Event::ImportProgress { account: account.to_string(), progress });
+        }
+        // Paused: what came in is kept, and only a word that it stopped is said, with the folders
+        // finished (the last of them may not have been said yet).
+        Ok(done) if done.stopped == Some(StopHow::Pause) => {
+            noted(store, account);
+            sink.emit(Event::Folders { account: account.to_string(), folders: done.folders });
+            told.last.imported = done.messages;
+            told.last.skipped = done.skipped;
+            told.say(ImportPhase::Paused);
+        }
+        Ok(done) => {
+            // What came in is noted, for the file read again later (`rereading.rs`): whole, or
+            // stopped part-way, so what's deleted here before it goes on stays noted.
+            noted(store, account);
+            let mut report = report_of(&done, path, store, account, told.began);
+            report.stopped = done.stopped;
+            report.stopped_in.clone_from(&done.stopped_in);
+            let paths: Vec<String> = done.folders.iter().map(|f| f.path.clone()).collect();
+            sink.emit(Event::Folders { account: account.to_string(), folders: done.folders });
+            for folder in paths {
+                sink.emit(Event::FolderChanged { account: account.to_string(), folder });
+            }
+            // A last save that failed is said with what came in (the account stays).
+            let (messages, skipped, error) = (done.messages, done.skipped, done.last_save);
+            sink.emit(ended(account, messages, skipped, error, Some(report)));
+        }
+        Err(e) => sink.emit(failed(account, e)),
+    }
+    None
+}
+
+/// What a stopped import brought in, kept as it is, and the window told: the folders, those just
+/// listed as changed, and that it's done.
+fn keep(store: &Store, sink: &Sink, account: &str, stop: &Stop) {
+    let error = match crate::pst::keep_as_is(store, account, stop) {
+        Ok(kept) => {
+            noted(store, account);
+            if !kept.is_empty() {
+                match store.load_folders(account) {
+                    Ok(folders) => sink.emit(Event::Folders { account: account.to_string(), folders }),
+                    Err(e) => log::warn!("{account}: {e}"),
+                }
+            }
+            for f in kept {
+                sink.emit(Event::FolderChanged { account: account.to_string(), folder: f.path });
+            }
+            None
+        }
+        Err(e) => Some(e),
+    };
+    sink.emit(Event::ImportKept { account: account.to_string(), error });
+}
+
+/// What an import brought in, noted as the file's (`Store::note_imported`): a later read of the
+/// file adds only what it has new. Not noted, the file isn't read again (`Store::merge_from`
+/// refuses).
+fn noted(store: &Store, account: &str) {
+    if let Err(e) = store.note_imported(account) {
+        log::warn!("{account}: what came in from its data file wasn't noted: {e}");
+    }
+}
+
+/// An import stopped before it began: said as one stopped so would be, with nothing in it.
+fn never_began(sink: &Sink, account: &str, path: &str, how: StopHow) -> Option<PathBuf> {
+    if how == StopHow::Pause {
+        let progress = ImportProgress { phase: ImportPhase::Paused, ..ImportProgress::default() };
+        sink.emit(Event::ImportProgress { account: account.to_string(), progress });
+    } else {
+        let report = ImportReport { file: path.to_string(), stopped: Some(how), runs: 1, ..ImportReport::default() };
+        sink.emit(ended(account, 0, 0, None, Some(report)));
+    }
+    None
+}
+
+/// MailCraft's own data file copied in, asked as it's copied whether to stop. Stopped part-way,
+/// nothing of it is kept: a part of a data file, copied in the order it keeps its files, is no
+/// account's mail (folder lists naming messages not there, all of them still the old account's).
+/// The room left is asked as it begins and every [`ROOM_EVERY`] as it goes: short of what writing
+/// on needs, or with a write the drive refuses, it stops as a pause does and waits on the user
+/// (gone on with, it's copied from the start).
+fn copy_in(told: &mut Told<'_>, path: &str) -> Option<PathBuf> {
+    let (store, sink, account, stop) = (told.store, told.sink, told.account, told.stop);
+    let (space, dir) = (drive_for(account), crate::space::data_dir(store, account));
+    // Room for the copy read from and the data file it fills (both on that drive), asked once: a
+    // copy that can't fit isn't begun, to fill the drive and be thrown away at every Continue.
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+    let needs = crate::space::needs(store.data_file(account).as_deref()).max(copy_need(size));
+    if let Some(free) = space.free(&dir).filter(|free| *free < needs) {
+        copy_blocked(told, free);
+        return None;
+    }
+    let file = RefCell::new(told.file.clone());
+    let (full, asked) = (Cell::new(None), Cell::new(None::<Instant>));
+    let copied = store.import_data_file_until(account, Path::new(path), &|| {
+        #[cfg(test)]
+        if let Some(crate::pst::Fault::Slow(ms)) = tests::fault_for(account) {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        // The data file being written, as the copy goes (it's made by the first batch).
+        if file.borrow().is_none() && stop.how() != Some(StopHow::Discard) {
+            *file.borrow_mut() = store.data_file(account);
+        }
+        if stop.raised() || full.get().is_some() {
+            return true;
+        }
+        if asked.get().is_none_or(|t: Instant| t.elapsed() >= ROOM_EVERY) {
+            asked.set(Some(Instant::now()));
+            full.set(crate::space::short(space.as_ref(), &dir, file.borrow().as_deref()));
+        }
+        full.get().is_some()
+    });
+    told.file = file.into_inner();
+    if stop.how() == Some(StopHow::Discard) {
+        return thrown_away(told, path, 0, 0);
+    }
+    let messages = match copied {
+        Ok(n) => n,
+        // A stop asked for wins over a full drive.
+        Err(mailcraft_store::StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::Interrupted && stop.raised() => {
+            return stopped_copy(told, path);
+        }
+        Err(e) if full.get().is_some() || crate::space::for_want_of_room(&e) => {
+            let free = full.get().or_else(|| space.free(&dir)).unwrap_or(0);
+            log::warn!("{account}: the drive is full ({} MiB left); the copy stopped until there's more", free >> 20);
+            let (error, left) = remove_written(told, false);
+            if let Some(e) = error {
+                log::warn!("{account}: {e}");
+            }
+            copy_blocked(told, free);
+            return left;
+        }
+        // Any other error is said, whatever was asked meanwhile.
+        Err(e) => {
+            sink.emit(failed(account, e.to_string()));
+            return None;
+        }
+    };
+    // Whole: a stop asked once the last batch was in came too late to matter.
+    said_copied(store, sink, account, path, messages, told.began);
+    None
+}
+
+/// A data file copied in whole (`messages` of them, from `path`): its folders and the import's
+/// end said. Its folder list read back can fail (the disk failing): that's said, not an empty
+/// list (found in review: the account showed no folders, and the import said all was well).
+fn said_copied(store: &Store, sink: &Sink, account: &str, path: &str, messages: usize, began: Instant) {
+    let (folders, error) = match store.load_folders(account) {
+        Ok(folders) => (Some(folders), None),
+        Err(e) => (None, Some(format!("its folder list couldn't be read: {e}"))),
+    };
+    let paths: Vec<String> = folders.iter().flatten().map(|f| f.path.clone()).collect();
+    // Its contacts, calendar and notes came with it.
+    let pim = store.load_account_doc::<Pim>(account, PIM_DOC).unwrap_or_default();
+    let brought = Brought { messages, folders: paths.len(), contacts: pim.cards.len(), events: pim.events.len(), notes: pim.notes.len(), tasks: 0 };
+    let report = brought.report(store, account, path, began);
+    if let Some(folders) = folders {
+        sink.emit(Event::Folders { account: account.to_string(), folders });
+    }
+    for folder in paths {
+        sink.emit(Event::FolderChanged { account: account.to_string(), folder });
+    }
+    sink.emit(ended(account, messages, 0, error, Some(report)));
+}
+
+/// A copy that can't go on for want of room (`free` left): it waits on the user, saying why.
+fn copy_blocked(told: &Told<'_>, free: u64) {
+    let progress = ImportProgress { blocked: Some(Blocked::DiskFull { free }), ..told.progress(ImportPhase::Blocked) };
+    told.sink.emit(Event::ImportProgress { account: told.account.to_string(), progress });
+}
+
+/// A copy cancelled, or paused as MailCraft closes, part-way: what came in goes (the account is
+/// still this one: it wasn't removed). Cancelled, it ends as a file that couldn't be opened, none
+/// of it kept; paused, only a word that it stopped is said.
+fn stopped_copy(told: &Told<'_>, path: &str) -> Option<PathBuf> {
+    let (error, left) = remove_written(told, false);
+    if told.stop.how() == Some(StopHow::Pause) {
+        if let Some(e) = error {
+            log::warn!("{}: {e}", told.account);
+        }
+        told.say(ImportPhase::Paused);
+        return left;
+    }
+    let stopped = "it was stopped before all of it was copied, and none of it was kept";
+    let error = Some(error.map_or_else(|| stopped.to_string(), |e| format!("{stopped} ({e})")));
+    let report = ImportReport { file: path.to_string(), stopped: told.stop.how(), runs: 1, elapsed_ms: ms(told.began), ..ImportReport::default() };
+    told.sink.emit(ended(told.account, 0, 0, error, Some(report)));
+    left
+}
+
+/// An import thrown away: the data file it made goes, and the end is said, with why the file is
+/// still there when it is (it's returned, to be tried again once the import's thread is over).
+fn thrown_away(told: &Told<'_>, path: &str, messages: usize, skipped: usize) -> Option<PathBuf> {
+    let (error, left) = remove_written(told, true);
+    let report = ImportReport { file: path.to_string(), stopped: Some(StopHow::Discard), runs: 1, ..ImportReport::default() };
+    told.sink.emit(ended(told.account, messages, skipped, error, Some(report)));
+    left
+}
+
+/// Remove the data file the import wrote in (with `made`, only one it made itself) while the
+/// account still has that very file: never by the account's id alone. A removed account lets go
+/// of its file before its import sees the stop (the file is kept, as a removed account's is), and
+/// its id may be another account's by then, whose file stays. Returns why it couldn't be removed,
+/// and the file, to be tried again.
+fn remove_written(told: &Told<'_>, made: bool) -> (Option<String>, Option<PathBuf>) {
+    let (store, account) = (told.store, told.account);
+    let Some(file) = told.file.clone().filter(|f| (told.own || !made) && store.data_file(account).as_ref() == Some(f)) else {
+        return (None, None);
+    };
+    let mut error = None;
+    // The store lets go of the file and forgets it, even when it can't be removed yet.
+    if let Err(e) = store.delete_account(account) {
+        error = Some(format!("its data file couldn't be removed: {e}"));
+    }
+    if let Err(e) = remove(&file) {
+        return (Some(format!("its data file couldn't be removed: {e}")), Some(file));
+    }
+    (error, None)
+}
+
+/// Remove a data file, trying again a little later while something still holds it.
+fn remove(file: &Path) -> std::io::Result<()> {
+    let mut n = 0u32;
+    loop {
+        match std::fs::remove_file(file) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if n.saturating_add(1) >= REMOVE_TRIES => return Err(e),
+            Err(_) => {
+                n = n.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(100).saturating_mul(n));
+            }
+        }
+    }
+}
+
+/// What an import came to, as the report says it.
+fn report_of(done: &Imported, path: &str, store: &Store, account: &str, began: Instant) -> ImportReport {
+    let brought = Brought {
+        messages: done.messages,
+        folders: done.folders.len(),
+        contacts: done.contacts,
+        events: done.events,
+        notes: done.notes,
+        tasks: done.tasks,
+    };
+    let mut report = brought.report(store, account, path, began);
+    // Gone on with from where it stopped: the earlier runs count too.
+    report.elapsed_ms = report.elapsed_ms.saturating_add(done.earlier_ms);
+    report.runs = done.runs.max(1);
+    for (reason, n) in &done.skips {
+        report.skip(*reason, count(*n));
+    }
+    report
+}
+
+/// What an import brought into the account, as its report counts it.
+struct Brought {
+    messages: usize,
+    folders: usize,
+    contacts: usize,
+    events: usize,
+    notes: usize,
+    tasks: usize,
+}
+
+impl Brought {
+    /// The report of one run, begun at `began`, that read `path` into the account and brought
+    /// this in: nothing left out, as far as it says.
+    fn report(&self, store: &Store, account: &str, path: &str, began: Instant) -> ImportReport {
+        ImportReport {
+            file: path.to_string(),
+            data_file: data_file(store, account),
+            messages: count(self.messages),
+            folders: u32::try_from(self.folders).unwrap_or(u32::MAX),
+            contacts: count(self.contacts),
+            events: count(self.events),
+            notes: count(self.notes),
+            tasks: count(self.tasks),
+            runs: 1,
+            elapsed_ms: ms(began),
+            ..ImportReport::default()
+        }
+    }
+}
+
+/// An import's end, as the window is told it: `messages` brought in and `skipped` left out, why
+/// it failed when it did, and its report.
+fn ended(account: &str, messages: usize, skipped: usize, error: Option<String>, report: Option<ImportReport>) -> Event {
+    Event::Imported { account: account.to_string(), messages, skipped, done: true, error, report: report.map(Box::new) }
+}
+
+/// An import that failed with `error`, nothing brought in and no report.
+fn failed(account: &str, error: String) -> Event {
+    ended(account, 0, 0, Some(error), None)
+}
+
+/// The file the account's mail was copied into ("" for a cache that isn't kept in one).
+fn data_file(store: &Store, account: &str) -> String {
+    store.data_file(account).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// The window, told how an import goes: its progress, and each folder as it's finished (the
+/// account's folder list with it, now and then), so it shows while the rest comes in. Folders
+/// part-way through aren't in the list, so none can be changed while it's written. Thrown away,
+/// it says nothing more but its end: the account is gone, and its id may be another's by then.
+/// It notes the data file the import writes in, the one file a stop may remove.
+struct Told<'a> {
+    sink: &'a Sink,
+    store: &'a Store,
+    account: &'a str,
+    stop: &'a Stop,
+    began: Instant,
+    last: Progress,
+    folders_done: usize,
+    folders_said: Option<Instant>,
+    /// The folders in the list sent last.
+    listed: HashSet<String>,
+    file: Option<PathBuf>,
+    /// The import made `file` (the account had none).
+    own: bool,
+}
+
+impl<'a> Told<'a> {
+    /// Telling the window of an import beginning now into `file` (`own`: one it makes itself).
+    fn new(sink: &'a Sink, store: &'a Store, account: &'a str, stop: &'a Stop, file: Option<PathBuf>, own: bool) -> Told<'a> {
+        let began = Instant::now();
+        Told { sink, store, account, stop, began, last: Progress::default(), folders_done: 0, folders_said: None, listed: HashSet::new(), file, own }
+    }
+
+    fn say(&self, phase: ImportPhase) {
+        if self.thrown_away() {
+            return;
+        }
+        self.sink.emit(Event::ImportProgress { account: self.account.to_string(), progress: self.progress(phase) });
+    }
+
+    /// How far the import has got, in `phase`. Going on from where it stopped, it says where this
+    /// run began and the time the earlier runs took, so the time left goes by this run's rate.
+    fn progress(&self, phase: ImportPhase) -> ImportProgress {
+        let t = &self.last;
+        let run_ms = ms(self.began);
+        let start = Work { done: count(t.start_read), total: count(t.total), bytes_done: t.start_bytes, bytes_total: t.bytes_total };
+        let phase = if phase == ImportPhase::Importing && self.stop.raised() { ImportPhase::Stopping } else { phase };
+        ImportProgress {
+            phase,
+            // Items read, which only go up: a batch that can't be written is still read.
+            work: Work { done: count(t.read), total: count(t.total), bytes_done: t.bytes_done, bytes_total: t.bytes_total },
+            folders_done: u32::try_from(self.folders_done).unwrap_or(u32::MAX),
+            folders_total: u32::try_from(t.folders).unwrap_or(u32::MAX),
+            imported: count(t.imported),
+            skipped: count(t.skipped),
+            elapsed_ms: t.earlier_ms.saturating_add(run_ms),
+            run_ms,
+            run_start_work: start.weighted_done(ITEM_WEIGHT),
+            ..ImportProgress::default()
+        }
+    }
+
+    fn thrown_away(&self) -> bool {
+        self.stop.how() == Some(StopHow::Discard)
+    }
+
+    /// The account's data file, noted once the import's first batch has made it: then only, and
+    /// never once the import is thrown away (its account may have let go of it by then, and a
+    /// file under its id be another account's).
+    fn note_file(&mut self) {
+        if self.file.is_none() && !self.thrown_away() {
+            self.file = self.store.data_file(self.account);
+        }
+    }
+}
+
+impl ImportSink for Told<'_> {
+    fn planned(&mut self, folders: &[mailcraft_model::job::PlannedFolder]) {
+        if !self.thrown_away() {
+            self.sink.emit(Event::ImportPlanned { account: self.account.to_string(), folders: folders.to_vec() });
+        }
+    }
+
+    fn progress(&mut self, p: Progress) {
+        self.last = p;
+        self.note_file();
+        self.say(ImportPhase::Importing);
+    }
+
+    fn folder(&mut self, done: &Folder) {
+        self.folders_done = self.folders_done.saturating_add(1);
+        self.note_file();
+        if self.thrown_away() {
+            return;
+        }
+        // Folders finished together are in the list on disk by the time the first is said. One
+        // said soon after a list it isn't in sends it again all the same (found testing under
+        // load: the Inbox, finished just after Deleted Items, was said changed and never listed,
+        // and stayed out of the folder pane while the rest of the file came in).
+        if !self.listed.contains(&done.path) || self.folders_said.is_none_or(|t| t.elapsed() >= FOLDERS_EVERY) {
+            self.folders_said = Some(Instant::now());
+            match self.store.load_folders(self.account) {
+                Ok(folders) => {
+                    self.listed = folders.iter().map(|f| f.path.clone()).collect();
+                    self.sink.emit(Event::Folders { account: self.account.to_string(), folders });
+                }
+                Err(e) => log::warn!("{}: {e}", self.account),
+            }
+        }
+        // Counted in the next word of progress (a word for each folder would be one too many).
+        self.sink.emit(Event::FolderChanged { account: self.account.to_string(), folder: done.path.clone() });
+    }
+}
+
+/// A count as the model keeps it.
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds since `began`.
+fn ms(began: Instant) -> u64 {
+    u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests;

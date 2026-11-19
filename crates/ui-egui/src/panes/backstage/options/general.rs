@@ -17,6 +17,14 @@ pub(super) fn general(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
                 acts.push(Action::SetDark(*v));
             }
         });
+        // Issue #109: messages on a light background in the dark theme, as they were written.
+        let light = Switch {
+            label: tl!("Messages on a light background"),
+            about: Some(tl!("In the dark theme, messages keep the light page and colours they were written in")),
+            on: s.prefs.light_messages,
+            cmd: "view.lightMessages",
+        };
+        switch_row(ui, &t, false, light, acts);
         // Issue #8: an accent colour of one's own (a named one, or any colour), made to read in
         // either theme, and the top bar in it or plain.
         setting(ui, &t, false, tl!("Accent colour"), Some(tl!("Buttons, links, the selection and the top bar")), |ui| {
@@ -29,6 +37,13 @@ pub(super) fn general(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
             cmd: "view.plainTopBar",
         };
         switch_row(ui, &t, false, plain, acts);
+        let ribbon = Switch {
+            label: tl!("Hide the ribbon"),
+            about: Some(tl!("Its tabs stay on the top bar: click one for its buttons, twice to keep them")),
+            on: s.prefs.ribbon_hidden,
+            cmd: "view.hideRibbon",
+        };
+        switch_row(ui, &t, false, ribbon, acts);
         // Windows: the top bar is the window's title bar (issue #22), or the system's is kept.
         if cfg!(windows) {
             let system = Switch {
@@ -88,6 +103,27 @@ pub(super) fn general(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
                 cmd: "view.closeToTray",
             };
             switch_row(ui, &t, false, keep, acts);
+            if s.prefs.close_to_tray {
+                // Issue #116: started at sign-in, MailCraft needn't bring its window up.
+                let label = match kept {
+                    crate::KeptOnClose::Hidden => tl!("Start MailCraft in the notification area"),
+                    crate::KeptOnClose::Minimized => tl!("Start MailCraft minimized"),
+                };
+                let about = tl!(
+                    "It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window."
+                );
+                switch_row(ui, &t, false, Switch { label, about: Some(about), on: s.prefs.start_in_tray, cmd: "view.startInTray" }, acts);
+                // Issue #117: the icon there says how much is unread (the Dock's does on a Mac).
+                if !cfg!(target_os = "macos") {
+                    let unread = Switch {
+                        label: tl!("Show the unread mail on its icon"),
+                        about: Some(tl!("How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area")),
+                        on: s.prefs.tray_unread,
+                        cmd: "view.trayUnread",
+                    };
+                    switch_row(ui, &t, false, unread, acts);
+                }
+            }
         }
         setting(ui, &t, false, tl!("Language"), None, |ui| {
             let language = st.language.as_str();

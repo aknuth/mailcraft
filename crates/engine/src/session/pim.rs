@@ -15,9 +15,11 @@ pub mod directory;
 pub use directory::Directory;
 mod find;
 pub use find::{EVENT_HITS_MAX, EventHit, EventWhen};
+pub mod invite;
 mod local;
 pub use local::LocalEvents;
 mod reminders;
+mod series;
 mod sync;
 mod tasks;
 pub use tasks::{ListedTask, TASKS_CALENDAR, TaskRef, TasksOrder};
@@ -270,7 +272,7 @@ impl Session {
                 for o in ical::occurrences(&events, from.saturating_sub(86_400), to.saturating_add(86_400)) {
                     let Some(e) = events.get(o.event) else { continue };
                     let (start, end) = if e.all_day { (self.clock.utc(o.start), self.clock.utc(o.end)) } else { (o.start, o.end) };
-                    if start >= to || end.max(start.saturating_add(1)) <= from {
+                    if start >= to || end.max(start.saturating_add(1)) <= from || super::invite::declined_occurrence(e, &mine) {
                         continue;
                     }
                     let needs_reply = e.attendees.iter().any(|a| a.partstat == "NEEDS-ACTION" && super::invite::is_mine(&a.email, &mine));
@@ -363,14 +365,27 @@ impl Session {
         if mailcraft_model::ical::details_hidden(&stored.event) {
             return Err(CmdError::Params("only this event's time can be seen: it can't be changed".into()));
         }
-        let mut e = stored.event.clone();
+        let old = stored.event.clone();
+        let mut e = old.clone();
         change(&mut e);
         check_event(&e)?;
-        e.sequence = e.sequence.saturating_add(1);
-        stored.event = e;
-        let remote = stored.calendar != LOCAL;
-        stored.dirty |= remote;
-        self.after_pim_change(&account, remote);
+        // Saved unchanged: nothing to write, and no new version for the guests (issue #102).
+        if e == old {
+            return Ok(serde_json::json!({"uid": uid}));
+        }
+        // Only what's the user's own changed (its reminder, how it shows their time): the same
+        // version, so the guests aren't asked again.
+        if !ical::same_for_guests(&old, &e) {
+            e.sequence = e.sequence.saturating_add(1);
+        }
+        let calendar = stored.calendar.clone();
+        let remote = calendar != LOCAL;
+        let occurrences = series::carry_occurrences(p, &calendar, uid, &old, &mut e);
+        if let Some(stored) = p.events.iter_mut().find(|x| x.event.uid == uid && x.calendar == calendar && x.event.recurrence_id.is_none()) {
+            stored.event = e;
+            stored.dirty |= remote;
+        }
+        self.after_pim_change(&account, remote || occurrences);
         Ok(serde_json::json!({"uid": uid}))
     }
 

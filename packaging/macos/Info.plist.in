@@ -23,6 +23,7 @@
     <string>nl</string>
     <string>pt-BR</string>
     <string>ru</string>
+    <string>sk</string>
     <string>tr</string>
     <string>zh-Hans</string>
     <string>zh-Hant</string>
@@ -69,7 +70,7 @@
   <!-- Documents MailCraft can be asked to open. Rank Alternate: it shows up in Open With and
        can be picked as the default in Get Info, but never takes a type over by itself. A saved
        message opens for reading; events and contacts are imported. macOS delivers them through
-       an Apple event that apps/mailcraft/src/apple_events.rs reads.
+       an Apple event that apps/mailcraft/src/platform/apple_events.rs reads.
 
        There is deliberately no CFBundleURLTypes entry for mailto. Links arrive as a different
        Apple event that MailCraft has no safe way to receive yet, so registering the scheme would
@@ -111,6 +112,22 @@
       </array>
       <key>LSHandlerRank</key>
       <string>Alternate</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+    </dict>
+    <!-- Any other file, to be dropped on the Dock icon and sent (issue #96): attached to a new
+         message (apple_events.rs). Rank None: MailCraft never becomes the app a type opens with
+         and isn't offered for one; it takes a file only when it's given one. No folder:
+         public.data is files alone. -->
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>MailCraft attachment</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.data</string>
+      </array>
+      <key>LSHandlerRank</key>
+      <string>None</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
     </dict>

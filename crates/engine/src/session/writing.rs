@@ -6,6 +6,7 @@ use super::*;
 
 mod drafts;
 mod keeping;
+mod outbox;
 mod quote;
 mod reactions;
 mod reopen;
@@ -563,6 +564,7 @@ impl Session {
             attachments: c.attachments.clone(),
             html,
             inline,
+            calendar: None,
             importance: c.importance,
             read_receipt: c.read_receipt,
             seven_bit: false,

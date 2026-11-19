@@ -45,6 +45,7 @@
 	Close	닫기
 	Code	코드
 	Compact	간단히
+	Single line	한 줄
 	Connect	연결
 	Connecting…	연결하는 중…
 	Conversations	대화
@@ -260,6 +261,13 @@
 	Select a message first.	먼저 메시지를 선택하세요.
 	Send	보내기
 	Send (Ctrl+Enter)	보내기 (Ctrl+Enter)
+	Send this message?	이 메시지를 보낼까요?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter를 누르면 작성 중인 메시지가 전송됩니다.
+	Don't ask again	다시 묻지 않기
+	Don't send	보내지 않기
+	Ctrl+Enter in a message	메시지에서 Ctrl+Enter
+	Ask first	먼저 묻기
+	Do nothing	아무것도 하지 않기
 	Send / Receive	보내기/받기
 	Send / Receive all folders (F9)	모든 폴더 보내기/받기 (F9)
 	Send anyway	그래도 보내기
@@ -275,6 +283,11 @@
 	Settings found: {source}	설정을 찾았습니다: {source}
 	Show a desktop notification when new mail arrives	새 메일이 오면 데스크톱 알림 표시
 	Keep MailCraft running when its window is closed	창을 닫아도 MailCraft 계속 실행
+	Start MailCraft in the notification area	알림 영역에서 MailCraft 시작
+	Start MailCraft minimized	MailCraft를 최소화된 상태로 시작
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	창을 닫았을 때처럼 창을 숨긴 채로 메일을 확인하고 알려 줍니다. 링크나 파일을 열려고 시작하면 창을 엽니다.
+	Show the unread mail on its icon	아이콘에 읽지 않은 메일 표시
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	받은 편지함의 읽지 않은 메시지 수를 알림 영역의 MailCraft 아이콘 모서리에 표시합니다
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	알림 영역에 남아 메일을 확인하고 새 메일을 알립니다. ‘파일’ 페이지나 아이콘 메뉴의 ‘끝내기’로 닫습니다.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	창이 최소화되고 MailCraft는 계속 메일을 확인하고 새 메일을 알립니다. ‘파일’ 페이지의 ‘끝내기’로 닫습니다.
 	Open MailCraft	MailCraft 열기
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	이 계정의 이름, 서버, 로그인 또는 서명을 변경합니다.
 	Checking with the server…	서버에 확인하는 중…
 	Compact list	간단한 목록
+	Single-line list	한 줄 목록
+	One line a message: the sender, the subject and the time	메시지마다 한 줄: 보낸 사람, 제목, 시간
 	Don't send automatic replies	자동 회신 보내지 않기
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	켜져 있는 동안 보낸 사람마다 하루에 한 번 회신합니다. 메일 서버에 보관되므로 이 컴퓨터가 꺼져 있어도 작동합니다.
 	Empty	비우기
@@ -611,9 +626,16 @@
 	Remove it from the server after	다음 기간 후 서버에서 제거:
 	days	일
 	Remove it from the server once it's deleted from Deleted Items	지운 편지함에서 삭제하면 서버에서도 제거
+	A copy on the server	서버의 사본
+	None: mail is removed from the server once downloaded	없음: 다운로드한 메일은 서버에서 제거됩니다
+	Kept for {n} days	{n}일 동안 보관
+	Kept for {n} days, or until deleted from Deleted Items	{n}일 동안 또는 지운 편지함에서 삭제할 때까지 보관
+	Kept until deleted from Deleted Items	지운 편지함에서 삭제할 때까지 보관
+	Kept for good	계속 보관
 	Arrange by: {field}	정렬 기준: {field}
 	By {field} ⏷	{field} 기준 ⏷
 	Reverse sort	역순 정렬
+	Show in groups	그룹으로 표시
 	Size	크기
 	Flag status	플래그 상태
 	Attachments	첨부 파일
@@ -655,7 +677,10 @@
 	Low importance	낮은 중요도
 	Read receipt	읽음 확인
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	받는 사람에게 읽었는지 확인을 요청합니다(메일 앱이 보내지 않거나 받는 사람에게 물을 수 있음)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	IMAP 또는 POP와 SMTP, JMAP, Exchange를 지원하는 모든 공급자에서 작동합니다. 암호는 이 컴퓨터의 키체인에 보관되며 메일 서버로만 전송됩니다.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	IMAP, POP, JMAP, Exchange에서 작동합니다. 암호는 이 컴퓨터의 키체인에 보관되며 메일 서버로만 전송됩니다.
+	Mail stays on the server and looks the same on every device.	메일이 서버에 남아 모든 기기에서 똑같이 보입니다.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	메일을 이 컴퓨터로 내려받습니다. 서버에 한동안 사본을 남겨 둘 수 있습니다.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	메일에 접근하는 새로운 방식으로, Fastmail 같은 일부 공급자가 제공합니다.
 	Run it now on the mail already in the Inbox	받은 편지함에 이미 있는 메일에 지금 실행
 	Run on the mail already in the Inbox	받은 편지함에 이미 있는 메일에 실행
 	More options	추가 옵션
@@ -956,6 +981,9 @@ month	May	5월
 	Opened by the server for your access to it	액세스 권한이 있어 서버가 엽니다
 	Shared mailbox {address}, opened by {email}	공유 사서함 {address}, {email}에서 열림
 	The outgoing server has its own user name and password	보내는 서버에 별도의 사용자 이름과 암호가 있음
+	Sign in with	로그인 방법
+	NTLM (Secure Password Authentication)	NTLM(보안 암호 인증)
+	No sign-in	로그인 안 함
 	Its user name	해당 사용자 이름
 	Its password	해당 암호
 	Password (unchanged when empty)	암호(비워 두면 그대로)
@@ -979,7 +1007,7 @@ month	May	5월
 	Close anyway	그래도 닫기
 	Edit notes	메모 편집
 	Getting them from the server…	서버에서 가져오는 중…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	메일은 서버에 남아 있고 MailCraft가 실행되는 동안 메모리에만 보관됩니다. 이 컴퓨터에는 아무것도 기록되지 않으며 각 메시지는 열 때 다운로드됩니다. 보내는 메일은 바로 서버로 갑니다. 아직 보낼 수 없는 메일(오프라인 중)만 대기하며, MailCraft가 먼저 닫히면 오프라인 중 변경 내용과 함께 사라집니다(확인을 요청합니다). 서버에 있는 일정·연락처·메모는 그대로 남고, MailCraft에만 보관된 것은 닫으면 사라집니다.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	메시지는 열 때 내려받아 메모리에만 보관되며, 이 컴퓨터에는 아무것도 기록되지 않습니다. 오프라인 중의 변경, 아직 보내지 않은 메일, MailCraft에만 있는 일정·연락처·메모는 종료할 때 사라집니다(먼저 묻습니다).
 	Mail older than what's kept here is only on the server.	여기에 보관된 것보다 오래된 메일은 서버에만 있습니다.
 	Search the server	서버 검색
 	Searching the server…	서버를 검색하는 중…
@@ -1098,6 +1126,7 @@ month	May	5월
 	Added to your calendar from {file}: {n}	{file}에서 일정에 추가됨: {n}
 	Added to your contacts from {file}: {n}	{file}에서 연락처에 추가됨: {n}
 	Add an account first: a new message needs an account to send from.	먼저 계정을 추가하세요. 새 메시지를 보내려면 계정이 필요합니다.
+	{folder} isn't attached: it's a folder	{folder}은(는) 첨부되지 않습니다: 폴더입니다
 	Add an account first: events and people are kept with an account.	먼저 계정을 추가하세요. 일정과 사람은 계정에 저장됩니다.
 	Couldn't open {file}: {error}	{file}을(를) 열 수 없습니다: {error}
 	Safety	안전
@@ -1283,6 +1312,8 @@ month	May	5월
 	Your provider's calendar server wasn't found: give its address	제공업체의 일정 서버를 찾지 못했습니다: 주소를 입력하세요
 	Classic ribbon	클래식 리본
 	Big buttons with their names under them, in named groups	이름 있는 그룹에 이름이 아래에 표시되는 큰 단추
+	Hide the ribbon	리본 숨기기
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	탭은 위쪽 막대에 남습니다: 클릭하면 단추가 표시되고, 두 번 클릭하면 계속 표시됩니다
 	New	새로 만들기
 	Respond	응답
 	Tags	태그
@@ -1704,9 +1735,12 @@ month	May	5월
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	자동은 서버가 알려 줄 수 있으면 새 메일을 바로 받고, 그렇지 않으면 2분마다 확인합니다. 시간을 정하면 계정은 그때만 확인합니다. 보내는 메일은 바로 전송되며 보내기/받기는 즉시 확인합니다.
 	Automatically	자동
 	Every {n} minutes	{n}분마다
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	일정과 연락처만, 메일 없음 (CalDAV 및 CardDAV)
+	Only calendars and contacts, with no email?	메일 없이 일정과 연락처만 사용하나요?
+	Add a CalDAV and CardDAV account	CalDAV 및 CardDAV 계정 추가
 	Calendar and contacts server	일정 및 연락처 서버
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Nextcloud, Baïkal, SOGo, Radicale처럼 메일 없이 일정과 연락처를 보관하는 모든 CalDAV 및 CardDAV 서버용입니다. 암호는 이 컴퓨터의 키체인에 보관되며 그 서버로만 전송됩니다.
+	Add calendars and contacts	일정과 연락처 추가
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	메일이 없는 CalDAV 및 CardDAV 서버(Nextcloud, Baïkal, SOGo, Radicale 등)용입니다. 암호는 이 컴퓨터의 키체인에 보관되며 그 서버로만 전송됩니다.
+	Add an email account instead	대신 이메일 계정 추가
 	Server: {url} (CalDAV and CardDAV)	서버: {url} (CalDAV 및 CardDAV)
 	Not available: this account has no mail server.	사용할 수 없음: 이 계정에는 메일 서버가 없습니다.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	메일을 이전 MailCraft Flatpak에서 가져왔습니다. 이전 Flatpak은 아직 설치되어 있습니다. 제거하려면 다음을 실행하세요: flatpak uninstall --delete-data {id}
@@ -1721,3 +1755,49 @@ month	May	5월
 	{name} couldn't be downloaded: {error}	{name}을(를) 다운로드할 수 없습니다: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	창에서 문제가 생겨 하던 작업을 중단했습니다. MailCraft는 계속 사용할 수 있으며, 문제가 생긴 위치는 로그에 있습니다.
 	Font size	글꼴 크기
+	Repeats every	반복 간격
+	On these days	요일
+	Which day	날짜 지정
+	Series ends	시리즈 종료
+	After	횟수
+	Pick a date	날짜 선택
+	On day {day}	매월 {day}일
+	On {month} {day}	매년 {month} {day}일
+	On the {nth} {weekday}	매월 {nth} {weekday}
+	On the {nth} {weekday} of {month}	매년 {month} {nth} {weekday}
+interval	days	일마다
+interval	weeks	주마다
+interval	months	개월마다
+interval	years	년마다
+nth	first	첫째
+nth	second	둘째
+nth	third	셋째
+nth	fourth	넷째
+nth	last	마지막
+count	occurrences	회
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	웹의 그림은 여기에 표시되지 않습니다. 여기서 바꾸지 않고 HTML 코드로 돌아가면 그대로 유지됩니다.
+	Messages on a light background	메시지를 밝은 배경에 표시
+	In the dark theme, messages keep the light page and colours they were written in	어두운 테마에서도 메시지는 작성된 밝은 페이지와 색을 그대로 유지합니다
+	Show messages on a light background	메시지를 밝은 배경에 표시
+	Show messages on the dark background	메시지를 어두운 배경에 표시
+	Copy picture	그림 복사
+	Save picture as…	다른 이름으로 그림 저장…
+	The picture couldn't be copied	그림을 복사할 수 없습니다
+	The picture couldn't be saved	그림을 저장할 수 없습니다
+	Only when I ask	요청할 때만
+	Send / Receive on the account looks; Send / Receive for all leaves it out	계정에서 보내기/받기를 하면 확인하고, 모두 보내기/받기에서는 제외합니다
+	There's no folder to put the PDF in for the viewer	뷰어용 PDF를 넣을 폴더가 없습니다
+	Trust this mail server's certificate?	이 메일 서버의 인증서를 신뢰하시겠습니까?
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	이 컴퓨터가 신뢰하는 인증 기관 중 어느 곳도 {host}이(가) 보여 주는 인증서를 보증하지 않습니다. 회사나 집의 메일 서버는 자체 인증서를 만들 수 있지만, 사용자와 서버 사이에 있는 누군가도 그런 인증서를 보여 줄 수 있습니다. 서버 관리자가 이 지문을 확인해 준 경우에만 신뢰하세요.
+	Issued to	발급 대상
+	Issued by	발급자
+	Valid	유효 기간
+	{from} to {until}	{from}부터 {until}까지
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	관리자가 인증서를 파일로 줄 수도 있습니다: 서버 설정 › 인증서 파일 신뢰…
+	Certificates	인증서
+	Issued by {issuer}	발급자: {issuer}
+	Trusted when asked	물어본 뒤 신뢰함
+	Stop trusting	신뢰 중지
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	조직이 운영하는 인증 기관 또는 메일 서버 자체의 인증서 (.pem, .crt, .cer)
+	Trust a certificate file…	인증서 파일 신뢰…
+	The certificate is trusted for this account	이 계정에서 인증서를 신뢰합니다

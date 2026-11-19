@@ -45,6 +45,7 @@
 	Close	إغلاق
 	Code	شيفرة
 	Compact	مضغوط
+	Single line	سطر واحد
 	Connect	اتصال
 	Connecting…	جارٍ الاتصال…
 	Conversations	المحادثات
@@ -260,6 +261,13 @@
 	Select a message first.	اختر رسالة أولًا.
 	Send	إرسال
 	Send (Ctrl+Enter)	إرسال (Ctrl+Enter)
+	Send this message?	هل تريد إرسال هذه الرسالة؟
+	Ctrl+Enter sends the message you're writing.	يرسل Ctrl+Enter الرسالة التي تكتبها.
+	Don't ask again	لا تسأل مرة أخرى
+	Don't send	لا ترسل
+	Ctrl+Enter in a message	Ctrl+Enter في الرسالة
+	Ask first	اسأل أولًا
+	Do nothing	لا تفعل شيئًا
 	Send / Receive	إرسال / استلام
 	Send / Receive all folders (F9)	إرسال / استلام كل المجلدات (F9)
 	Send anyway	إرسال على أي حال
@@ -275,6 +283,11 @@
 	Settings found: {source}	عُثر على الإعدادات: {source}
 	Show a desktop notification when new mail arrives	اعرض إشعارًا على سطح المكتب عند وصول بريد جديد
 	Keep MailCraft running when its window is closed	إبقاء MailCraft قيد التشغيل عند إغلاق نافذته
+	Start MailCraft in the notification area	تشغيل MailCraft في منطقة الإعلامات
+	Start MailCraft minimized	تشغيل MailCraft مصغّرًا
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	يتحقق من البريد ويعلن عنه ونافذته مخفية، كما لو كانت مغلقة. وإذا شُغّل لفتح رابط أو ملف، فإنه يفتح النافذة.
+	Show the unread mail on its icon	إظهار البريد غير المقروء على أيقونته
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	عدد الرسائل غير المقروءة في صناديق الوارد، في زاوية أيقونة MailCraft في منطقة الإعلامات
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	يبقى في منطقة الإعلامات، ويتحقق من البريد ويعلن عنه. يغلقه «خروج» في صفحة «ملف» أو في قائمة أيقونته.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	تُصغَّر نافذته، ويواصل MailCraft التحقق من البريد والإعلان عنه. يغلقه «خروج» في صفحة «ملف».
 	Open MailCraft	فتح MailCraft
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	غيّر اسم هذا الحساب وخوادمه وتسجيل دخوله، أو توقيعه.
 	Checking with the server…	جارٍ التحقق مع الخادم…
 	Compact list	قائمة مضغوطة
+	Single-line list	قائمة بسطر واحد
+	One line a message: the sender, the subject and the time	سطر واحد لكل رسالة: المرسل والموضوع والوقت
 	Don't send automatic replies	لا ترسل ردودًا تلقائية
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	يتلقى كل مرسل ردًا واحدًا يوميًا أثناء تشغيلها. تُحفظ على خادم بريدك، فتعمل حتى عندما يكون هذا الكمبيوتر مطفأ.
 	Empty	إفراغ
@@ -613,9 +628,16 @@ month	May	مايو
 	Remove it from the server after	إزالتها من الخادم بعد
 	days	يومًا
 	Remove it from the server once it's deleted from Deleted Items	إزالتها من الخادم بعد حذفها من «العناصر المحذوفة»
+	A copy on the server	نسخة على الخادم
+	None: mail is removed from the server once downloaded	لا شيء: يُزال البريد من الخادم بعد تنزيله
+	Kept for {n} days	تُحفظ لمدة {n} يومًا
+	Kept for {n} days, or until deleted from Deleted Items	تُحفظ لمدة {n} يومًا، أو حتى حذفها من «العناصر المحذوفة»
+	Kept until deleted from Deleted Items	تُحفظ حتى حذفها من «العناصر المحذوفة»
+	Kept for good	تُحفظ دائمًا
 	Arrange by: {field}	ترتيب حسب: {field}
 	By {field} ⏷	حسب {field} ⏷
 	Reverse sort	عكس الترتيب
+	Show in groups	العرض في مجموعات
 	Size	الحجم
 	Flag status	حالة العلامة
 	Attachments	المرفقات
@@ -657,7 +679,10 @@ month	May	مايو
 	Low importance	أهمية منخفضة
 	Read receipt	إيصال القراءة
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	اطلب من المستلمين تأكيد قراءتها (قد لا يفعل تطبيق البريد لديهم ذلك، أو قد يسألهم)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	يعمل مع أي مزوّد: IMAP أو POP مع SMTP، أو JMAP، أو Exchange. تُحفظ كلمة مرورك في سلسلة مفاتيح هذا الكمبيوتر ولا تُرسل إلا إلى خادم بريدك.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	يعمل مع IMAP وPOP وJMAP وExchange. تُحفظ كلمة مرورك في سلسلة مفاتيح هذا الكمبيوتر ولا تُرسل إلا إلى خادم بريدك.
+	Mail stays on the server and looks the same on every device.	يبقى البريد على الخادم ويظهر بالشكل نفسه على كل جهاز.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	يُنزَّل البريد إلى هذا الكمبيوتر. يمكن للخادم الاحتفاظ بنسخة منه لفترة.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	طريقة أحدث للوصول إلى بريدك، يقدّمها بعض المزوّدين مثل Fastmail.
 	Run it now on the mail already in the Inbox	تشغيلها الآن على البريد الموجود في «علبة الوارد»
 	Run on the mail already in the Inbox	تشغيل على البريد الموجود في «علبة الوارد»
 	More options	خيارات أخرى
@@ -952,6 +977,9 @@ month	May	مايو
 	Opened by the server for your access to it	يفتحه الخادم لأن لديك حق الوصول إليه
 	Shared mailbox {address}, opened by {email}	صندوق البريد المشترك {address}، يفتحه {email}
 	The outgoing server has its own user name and password	لخادم البريد الصادر اسم مستخدم وكلمة مرور خاصان به
+	Sign in with	تسجيل الدخول باستخدام
+	NTLM (Secure Password Authentication)	NTLM (مصادقة كلمة المرور الآمنة)
+	No sign-in	بدون تسجيل دخول
 	Its user name	اسم المستخدم الخاص به
 	Its password	كلمة المرور الخاصة به
 	Password (unchanged when empty)	كلمة المرور (لا تتغير إن تُركت فارغة)
@@ -975,7 +1003,7 @@ month	May	مايو
 	Close anyway	إغلاق على أي حال
 	Edit notes	تحرير الملاحظات
 	Getting them from the server…	جارٍ جلبها من الخادم…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	يبقى بريده على الخادم ويُحتفظ به في الذاكرة فقط أثناء تشغيل MailCraft: لا يُكتب منه شيء على هذا الكمبيوتر، وتُنزَّل كل رسالة عند فتحها. يذهب البريد الذي ترسله إلى الخادم مباشرة؛ ولا ينتظر إلا البريد الذي لا يمكن إرساله بعد (دون اتصال)، ويضيع مع التغييرات التي أُجريت دون اتصال إذا أُغلق MailCraft قبل ذلك (وستُسأل). تبقى التقويمات وجهات الاتصال والملاحظات الموجودة على خادم هناك؛ أما المحفوظة في MailCraft فقط فتضيع عند إغلاقه.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	تُنزَّل الرسائل عند فتحها وتُحفظ في الذاكرة فقط: لا يُكتب شيء على هذا الكمبيوتر. التغييرات التي تُجرى دون اتصال، والبريد الذي ينتظر الإرسال، والتقويمات وجهات الاتصال والملاحظات المحفوظة في MailCraft وحده تضيع عند إغلاقه (يُسأل عن ذلك أولًا).
 	Mail older than what's kept here is only on the server.	البريد الأقدم مما يُحتفظ به هنا موجود على الخادم فقط.
 	Search the server	البحث في الخادم
 	Searching the server…	جارٍ البحث في الخادم…
@@ -1094,6 +1122,7 @@ month	May	مايو
 	Added to your calendar from {file}: {n}	أُضيفت إلى التقويم من {file}: {n}
 	Added to your contacts from {file}: {n}	أُضيفت إلى جهات الاتصال من {file}: {n}
 	Add an account first: a new message needs an account to send from.	أضف حسابًا أولًا: تحتاج الرسالة الجديدة إلى حساب لإرسالها منه.
+	{folder} isn't attached: it's a folder	لم يُرفق {folder}: إنه مجلد
 	Add an account first: events and people are kept with an account.	أضف حسابًا أولًا: تُحفظ الأحداث والأشخاص في حساب.
 	Couldn't open {file}: {error}	تعذّر فتح {file}: {error}
 	Safety	الأمان
@@ -1279,6 +1308,8 @@ month	May	مايو
 	Your provider's calendar server wasn't found: give its address	لم يُعثر على خادم التقويم لدى مزوّدك: أدخل عنوانه
 	Classic ribbon	الشريط الكلاسيكي
 	Big buttons with their names under them, in named groups	أزرار كبيرة تحتها أسماؤها، في مجموعات مسمّاة
+	Hide the ribbon	إخفاء الشريط
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	تبقى علامات تبويبه في الشريط العلوي: نقرة تُظهر أزراره، ونقرة مزدوجة تُبقيها
 	New	جديد
 	Respond	الرد
 	Tags	العلامات
@@ -1700,9 +1731,12 @@ month	May	مايو
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	تلقائيًا: يصل البريد الجديد فور إبلاغ الخادم عنه إن كان قادرًا على ذلك، وإلا يتم التحقق كل دقيقتين. عند تحديد وقت، لا يتحقق الحساب إلا حينها. ما ترسله يخرج فورًا، و«إرسال/تلقي» يتحقق في الحال.
 	Automatically	تلقائيًا
 	Every {n} minutes	كل {n} دقيقة
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	التقويمات وجهات الاتصال فقط، دون بريد إلكتروني (CalDAV وCardDAV)
+	Only calendars and contacts, with no email?	تقويمات وجهات اتصال فقط، دون بريد إلكتروني؟
+	Add a CalDAV and CardDAV account	إضافة حساب CalDAV وCardDAV
 	Calendar and contacts server	خادم التقويمات وجهات الاتصال
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	لأي خادم CalDAV وCardDAV يحفظ تقويماتك وجهات اتصالك، مثل Nextcloud أو Baïkal أو SOGo أو Radicale، دون بريد إلكتروني. تُحفظ كلمة مرورك في سلسلة مفاتيح هذا الكمبيوتر ولا تُرسل إلا إلى ذلك الخادم.
+	Add calendars and contacts	إضافة تقويمات وجهات اتصال
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	لخادم CalDAV وCardDAV دون بريد إلكتروني، مثل Nextcloud أو Baïkal أو SOGo أو Radicale. تُحفظ كلمة مرورك في سلسلة مفاتيح هذا الكمبيوتر ولا تُرسل إلا إلى ذلك الخادم.
+	Add an email account instead	إضافة حساب بريد إلكتروني بدلًا من ذلك
 	Server: {url} (CalDAV and CardDAV)	الخادم: {url} (CalDAV وCardDAV)
 	Not available: this account has no mail server.	غير متاح: هذا الحساب بلا خادم بريد.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	انتقل بريدك من إصدار Flatpak السابق من MailCraft، وهو لا يزال مثبتًا. لإزالته، شغّل: flatpak uninstall --delete-data {id}
@@ -1717,3 +1751,49 @@ month	May	مايو
 	{name} couldn't be downloaded: {error}	تعذّر تنزيل {name}: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	حدث خطأ في النافذة، فأُوقف ما كانت تقوم به. يواصل MailCraft العمل، ويذكر السجل أين حدث ذلك.
 	Font size	حجم الخط
+	Repeats every	التكرار كل
+	On these days	في هذه الأيام
+	Which day	أي يوم
+	Series ends	تنتهي السلسلة
+	After	بعد
+	Pick a date	اختر تاريخًا
+	On day {day}	في اليوم {day}
+	On {month} {day}	في {day} {month}
+	On the {nth} {weekday}	في {weekday} {nth}
+	On the {nth} {weekday} of {month}	في {weekday} {nth} من {month}
+interval	days	أيام
+interval	weeks	أسابيع
+interval	months	أشهر
+interval	years	سنوات
+nth	first	الأول
+nth	second	الثاني
+nth	third	الثالث
+nth	fourth	الرابع
+nth	last	الأخير
+count	occurrences	مرات
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	لا تظهر صوره من الويب هنا. عد إلى رمز HTML دون تغييره هنا، وستبقى محفوظة.
+	Messages on a light background	الرسائل على خلفية فاتحة
+	In the dark theme, messages keep the light page and colours they were written in	في السمة الداكنة، تحتفظ الرسائل بالصفحة الفاتحة والألوان التي كُتبت بها
+	Show messages on a light background	عرض الرسائل على خلفية فاتحة
+	Show messages on the dark background	عرض الرسائل على الخلفية الداكنة
+	Copy picture	نسخ الصورة
+	Save picture as…	حفظ الصورة باسم…
+	The picture couldn't be copied	تعذّر نسخ الصورة
+	The picture couldn't be saved	تعذّر حفظ الصورة
+	Only when I ask	فقط عندما أطلب
+	Send / Receive on the account looks; Send / Receive for all leaves it out	إرسال/تلقي على الحساب يتحقق منه؛ وإرسال/تلقي للكل يستثنيه
+	There's no folder to put the PDF in for the viewer	لا يوجد مجلد لوضع ملف PDF فيه للعارض
+	Trust this mail server's certificate?	هل تثق بشهادة خادم البريد هذا؟
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	لا تضمن أي جهة يثق بها هذا الحاسوب الشهادة التي يعرضها {host}. قد يُنشئ خادم بريد لشركة أو خادم منزلي شهادته الخاصة، لكن قد يعرض شخص ما بينك وبين الخادم شهادة مثلها أيضًا. لا تثق بها إلا إذا أكّد لك من يدير الخادم هذه البصمة.
+	Issued to	صادرة إلى
+	Issued by	صادرة عن
+	Valid	صالحة
+	{from} to {until}	من {from} إلى {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	يمكن لمن يديره أن يعطيك شهادته في ملف بدلًا من ذلك: إعدادات الخادم › الوثوق بملف شهادة…
+	Certificates	الشهادات
+	Issued by {issuer}	صادرة عن {issuer}
+	Trusted when asked	موثوقة عند السؤال
+	Stop trusting	إيقاف الثقة
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	جهة إصدار تديرها مؤسستك، أو الشهادة الخاصة بخادم بريدك (.pem، .crt، .cer)
+	Trust a certificate file…	الوثوق بملف شهادة…
+	The certificate is trusted for this account	الشهادة موثوقة لهذا الحساب

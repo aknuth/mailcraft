@@ -45,6 +45,7 @@
 	Close	关闭
 	Code	代码
 	Compact	紧凑
+	Single line	单行
 	Connect	连接
 	Connecting…	正在连接…
 	Conversations	对话
@@ -260,6 +261,13 @@
 	Select a message first.	请先选择一封邮件。
 	Send	发送
 	Send (Ctrl+Enter)	发送 (Ctrl+Enter)
+	Send this message?	发送这封邮件吗?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter 会发送你正在写的邮件。
+	Don't ask again	不再询问
+	Don't send	不发送
+	Ctrl+Enter in a message	邮件中的 Ctrl+Enter
+	Ask first	先询问
+	Do nothing	不执行任何操作
 	Send / Receive	发送/接收
 	Send / Receive all folders (F9)	发送/接收所有文件夹 (F9)
 	Send anyway	仍然发送
@@ -275,6 +283,11 @@
 	Settings found: {source}	已找到设置: {source}
 	Show a desktop notification when new mail arrives	收到新邮件时显示桌面通知
 	Keep MailCraft running when its window is closed	关闭窗口后让 MailCraft 继续运行
+	Start MailCraft in the notification area	在通知区域启动 MailCraft
+	Start MailCraft minimized	以最小化方式启动 MailCraft
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	它会像关闭窗口时一样，在窗口收起的情况下检查并提示新邮件。为打开链接或文件而启动时，它会打开窗口。
+	Show the unread mail on its icon	在图标上显示未读邮件
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	收件箱中未读邮件的数量，显示在通知区域中 MailCraft 图标的角上
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	它会留在通知区域，检查邮件并在有新邮件时通知。在“文件”页或其图标菜单中选择“退出”可将其关闭。
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	窗口会最小化，MailCraft 会继续检查邮件并在有新邮件时通知。在“文件”页选择“退出”可将其关闭。
 	Open MailCraft	打开 MailCraft
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	更改此帐户的名称、服务器和登录方式，或签名。
 	Checking with the server…	正在向服务器查询…
 	Compact list	紧凑列表
+	Single-line list	单行列表
+	One line a message: the sender, the subject and the time	每封邮件一行：发件人、主题和时间
 	Don't send automatic replies	不发送自动答复
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	开启期间，每位发件人每天收到一次答复。答复保存在邮件服务器上，因此即使这台电脑关机也能工作。
 	Empty	清空
@@ -614,9 +629,16 @@ month	May	5月
 	Remove it from the server after	在以下天数后从服务器删除：
 	days	天
 	Remove it from the server once it's deleted from Deleted Items	从“已删除邮件”中删除后，也从服务器删除
+	A copy on the server	服务器上的副本
+	None: mail is removed from the server once downloaded	无：邮件下载后即从服务器删除
+	Kept for {n} days	保留 {n} 天
+	Kept for {n} days, or until deleted from Deleted Items	保留 {n} 天，或直到从“已删除邮件”中删除
+	Kept until deleted from Deleted Items	保留到从“已删除邮件”中删除为止
+	Kept for good	一直保留
 	Arrange by: {field}	排列方式：{field}
 	By {field} ⏷	按{field} ⏷
 	Reverse sort	反向排序
+	Show in groups	按组显示
 	Size	大小
 	Flag status	标记状态
 	Attachments	附件
@@ -658,7 +680,10 @@ month	May	5月
 	Low importance	重要性 - 低
 	Read receipt	已读回执
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	请收件人确认已读（对方的邮件应用可能不发送，或会询问对方）
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	适用于任何提供商：IMAP 或 POP 加 SMTP、JMAP 或 Exchange。密码保存在这台电脑的钥匙串中，只会发送到你的邮件服务器。
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	适用于 IMAP、POP、JMAP 和 Exchange。密码保存在这台电脑的钥匙串中，只会发送到你的邮件服务器。
+	Mail stays on the server and looks the same on every device.	邮件保留在服务器上，在每台设备上都一样。
+	Mail is downloaded to this computer. The server can keep a copy for a while.	邮件会下载到这台电脑。服务器可以保留一段时间的副本。
+	A newer way to reach your mail, offered by some providers such as Fastmail.	一种较新的收取邮件方式，部分提供商（如 Fastmail）提供。
 	Run it now on the mail already in the Inbox	立即对收件箱中已有的邮件运行
 	Run on the mail already in the Inbox	对收件箱中已有的邮件运行
 	More options	更多选项
@@ -953,6 +978,9 @@ month	May	5月
 	Opened by the server for your access to it	因你有访问权限，由服务器打开
 	Shared mailbox {address}, opened by {email}	共享邮箱 {address}，由 {email} 打开
 	The outgoing server has its own user name and password	发送服务器有自己的用户名和密码
+	Sign in with	登录方式
+	NTLM (Secure Password Authentication)	NTLM（安全密码身份验证）
+	No sign-in	不登录
 	Its user name	其用户名
 	Its password	其密码
 	Password (unchanged when empty)	密码（留空则不变）
@@ -976,7 +1004,7 @@ month	May	5月
 	Close anyway	仍然关闭
 	Edit notes	编辑备注
 	Getting them from the server…	正在从服务器获取…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	其邮件保留在服务器上，仅在 MailCraft 运行期间保存在内存中：不会写入此电脑，每封邮件在打开时下载。你发送的邮件会直接发往服务器；只有暂时无法发送的邮件（脱机时）才会等待，如果 MailCraft 先关闭，它们会连同脱机时所做的更改一起丢失（会先询问你）。服务器上的日历、联系人和便笺会保留在那里；仅保存在 MailCraft 中的会在关闭时丢失。
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	邮件在打开时下载，只保存在内存中：不会写入这台电脑。离线时所做的更改、尚待发送的邮件，以及只保存在 MailCraft 中的日历、联系人和笔记，会在它关闭时丢失（会先询问你）。
 	Mail older than what's kept here is only on the server.	比此处保留的更早的邮件仅在服务器上。
 	Search the server	搜索服务器
 	Searching the server…	正在搜索服务器…
@@ -1095,6 +1123,7 @@ month	May	5月
 	Added to your calendar from {file}: {n}	已从 {file} 添加到日历：{n}
 	Added to your contacts from {file}: {n}	已从 {file} 添加到联系人：{n}
 	Add an account first: a new message needs an account to send from.	请先添加帐户：新邮件需要一个用于发送的帐户。
+	{folder} isn't attached: it's a folder	{folder} 未附加：它是文件夹
 	Add an account first: events and people are kept with an account.	请先添加帐户：事件和联系人保存在帐户中。
 	Couldn't open {file}: {error}	无法打开 {file}：{error}
 	Safety	安全
@@ -1280,6 +1309,8 @@ month	May	5月
 	Your provider's calendar server wasn't found: give its address	没有找到服务商的日历服务器：请填写其地址
 	Classic ribbon	经典功能区
 	Big buttons with their names under them, in named groups	按命名分组排列、名称显示在下方的大按钮
+	Hide the ribbon	隐藏功能区
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	选项卡仍留在顶部栏：单击显示其按钮，双击保持显示
 	New	新建
 	Respond	响应
 	Tags	标记
@@ -1701,9 +1732,12 @@ month	May	5月
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	自动：服务器能通知时，新邮件一到就收取，否则每两分钟检查一次。设置时间后，帐户只在那时检查。发送的邮件会立即发出，“发送/接收”会马上检查。
 	Automatically	自动
 	Every {n} minutes	每 {n} 分钟
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	仅日历和联系人，无邮件 (CalDAV 和 CardDAV)
+	Only calendars and contacts, with no email?	只要日历和联系人，不用邮件？
+	Add a CalDAV and CardDAV account	添加 CalDAV 和 CardDAV 帐户
 	Calendar and contacts server	日历和联系人服务器
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	用于任何保存日历和联系人但不含邮件的 CalDAV 和 CardDAV 服务器，例如 Nextcloud、Baïkal、SOGo 或 Radicale。密码保存在这台电脑的钥匙串中，只会发送到该服务器。
+	Add calendars and contacts	添加日历和联系人
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	适用于没有邮件的 CalDAV 和 CardDAV 服务器，例如 Nextcloud、Baïkal、SOGo 或 Radicale。密码保存在这台电脑的钥匙串中，只会发送到该服务器。
+	Add an email account instead	改为添加电子邮件帐户
 	Server: {url} (CalDAV and CardDAV)	服务器: {url} (CalDAV 和 CardDAV)
 	Not available: this account has no mail server.	不可用：此帐户没有邮件服务器。
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	邮件已从 MailCraft 之前的 Flatpak 迁移过来，旧版仍已安装。要删除它，请运行：flatpak uninstall --delete-data {id}
@@ -1718,3 +1752,49 @@ month	May	5月
 	{name} couldn't be downloaded: {error}	无法下载 {name}: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	窗口出了问题，正在进行的操作已停止。MailCraft 可以继续使用；日志中记录了出错的位置。
 	Font size	字号
+	Repeats every	重复间隔
+	On these days	在这些日子
+	Which day	哪一天
+	Series ends	系列结束
+	After	次数
+	Pick a date	选择日期
+	On day {day}	每月{day}日
+	On {month} {day}	每年{month}{day}日
+	On the {nth} {weekday}	每月{nth}{weekday}
+	On the {nth} {weekday} of {month}	每年{month}{nth}{weekday}
+interval	days	天
+interval	weeks	周
+interval	months	个月
+interval	years	年
+nth	first	第一个
+nth	second	第二个
+nth	third	第三个
+nth	fourth	第四个
+nth	last	最后一个
+count	occurrences	次
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	此处不显示来自网络的图片。不在此处修改并切换回 HTML 代码，图片即会保留。
+	Messages on a light background	在浅色背景上显示邮件
+	In the dark theme, messages keep the light page and colours they were written in	在深色主题下，邮件保留其撰写时的浅色页面和颜色
+	Show messages on a light background	在浅色背景上显示邮件
+	Show messages on the dark background	在深色背景上显示邮件
+	Copy picture	复制图片
+	Save picture as…	图片另存为…
+	The picture couldn't be copied	无法复制图片
+	The picture couldn't be saved	无法保存图片
+	Only when I ask	仅在我要求时
+	Send / Receive on the account looks; Send / Receive for all leaves it out	在该账户上“发送/接收”会检查它；对所有账户“发送/接收”时跳过它
+	There's no folder to put the PDF in for the viewer	没有可放置 PDF 供查看器使用的文件夹
+	Trust this mail server's certificate?	信任此邮件服务器的证书吗？
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	此电脑信任的任何颁发机构都没有为 {host} 出示的证书担保。公司或家庭的邮件服务器可能会自己制作证书，但你与服务器之间的人也可能出示这样的证书。只有在服务器管理员确认此指纹后才信任它。
+	Issued to	颁发给
+	Issued by	颁发者
+	Valid	有效期
+	{from} to {until}	{from} 至 {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	管理员也可以把证书作为文件交给你：服务器设置 › 信任证书文件…
+	Certificates	证书
+	Issued by {issuer}	颁发者：{issuer}
+	Trusted when asked	询问后已信任
+	Stop trusting	停止信任
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	你所在组织运营的颁发机构，或你的邮件服务器自己的证书 (.pem、.crt、.cer)
+	Trust a certificate file…	信任证书文件…
+	The certificate is trusted for this account	此帐户已信任该证书

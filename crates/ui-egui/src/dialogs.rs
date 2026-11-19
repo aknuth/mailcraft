@@ -4,18 +4,16 @@ use egui::{Margin, Rect, RichText, Sense, Ui, vec2};
 use mailcraft_engine::Compose;
 use mailcraft_engine::Session;
 use mailcraft_engine::model::organize::{Condition, Rule, RuleAction};
-use mailcraft_engine::model::{AccountConfig, Folder, FolderRole, Security};
+use mailcraft_engine::model::{AccountConfig, Folder, FolderRole, Security, SignInMethod};
 use serde_json::json;
 
 use crate::theme::{self, Tokens};
 use crate::{Action, Icon, widgets};
 
 mod accounts;
-mod addresses;
 mod backup;
 mod categories;
 mod closing;
-mod dav;
 mod folders;
 mod importing;
 mod mailbox;
@@ -23,10 +21,12 @@ mod organize;
 mod other;
 pub(crate) mod pim_dialogs;
 mod signatures;
-mod trust;
+#[cfg(test)]
+pub(crate) use signatures::has_web_pictures;
 mod writing;
 
 pub use accounts::*;
+use accounts::{addresses, dav, trust};
 pub use addresses::AddressForm;
 pub use backup::RestoreForm;
 pub use dav::DavForm;
@@ -124,6 +124,10 @@ pub enum Dialog {
         copy: bool,
     },
     EmptySubject,
+    /// Ctrl+Enter pressed in a message (issue #115): send it? `remember`: "Don't ask again".
+    CtrlEnter {
+        remember: bool,
+    },
     /// What `compose.send` held the message for (a lookalike recipient, many people seeing each
     /// other's addresses).
     SendCheck(Vec<mailcraft_engine::SendCheck>),
@@ -137,12 +141,11 @@ pub enum Dialog {
         email: String,
         error: String,
     },
-    /// A mail server on this computer showed a certificate no authority vouches for (issue #77):
-    /// whether to trust that one for the account.
+    /// A mail server showed a certificate no authority vouches for (issues #77 and #105): whether
+    /// to trust that one for the account.
     TrustCertificate {
         account: String,
-        host: String,
-        fingerprint: String,
+        shown: Box<mailcraft_engine::model::UntrustedCertificate>,
     },
     Signature(Box<SignatureForm>),
     /// An account's name, user name and servers.
@@ -309,6 +312,7 @@ impl Dialog {
                     | Dialog::MailboxClosed { .. }
                     | Dialog::TrustCertificate { .. }
                     | Dialog::EmptySubject
+                    | Dialog::CtrlEnter { .. }
                     | Dialog::SaveChanges
                     | Dialog::SendCheck(_)
             )
@@ -329,8 +333,15 @@ impl Dialog {
 
     /// Dialogs that belong to the message being written (shown in its window when it has one).
     pub fn for_compose(&self) -> bool {
-        matches!(self, Dialog::SelectNames(_) | Dialog::SaveChanges | Dialog::EmptySubject | Dialog::SendCheck(_) | Dialog::WordCount(..))
-            || matches!(self, Dialog::Signature(f) if f.insert)
+        matches!(
+            self,
+            Dialog::SelectNames(_)
+                | Dialog::SaveChanges
+                | Dialog::EmptySubject
+                | Dialog::CtrlEnter { .. }
+                | Dialog::SendCheck(_)
+                | Dialog::WordCount(..)
+        ) || matches!(self, Dialog::Signature(f) if f.insert)
     }
 
     /// The add-account dialog with the address filled in (servers guessed from it).
@@ -447,6 +458,8 @@ impl Dialog {
             smtp_port: a.smtp.port.to_string(),
             smtp_security: a.smtp.security,
             smtp_sign_in: SmtpSignIn::of(a),
+            sign_in: SignInMethods::of(a),
+            oauth: a.oauth.is_some(),
             online_only: a.online_only,
             error: None,
         }))
@@ -695,9 +708,12 @@ fn body(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::reading::Pic
         | Dialog::ConfirmEmpty { .. } => folders::draw(ui, d, s, t, acts),
         Dialog::NewCategory { .. } | Dialog::Categories => categories::draw(ui, d, s, t, acts),
         Dialog::Rules | Dialog::EditRule(..) | Dialog::SearchFolder(..) | Dialog::QuickStep(..) => organize::draw(ui, d, s, t, acts),
-        Dialog::SelectNames(..) | Dialog::SaveChanges | Dialog::EmptySubject | Dialog::SendCheck(_) | Dialog::WordCount(..) => {
-            writing::draw(ui, d, s, t, acts)
-        }
+        Dialog::SelectNames(..)
+        | Dialog::SaveChanges
+        | Dialog::EmptySubject
+        | Dialog::CtrlEnter { .. }
+        | Dialog::SendCheck(_)
+        | Dialog::WordCount(..) => writing::draw(ui, d, s, t, acts),
         Dialog::ConfirmDeleteContact { .. }
         | Dialog::PicturePreview { .. }
         | Dialog::Preview { .. }

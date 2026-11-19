@@ -336,6 +336,163 @@ fn the_classic_ribbon_draws_every_tab() {
     assert!((a.ui.ribbon_rect.unwrap().height() - simplified).abs() < 1.0);
 }
 
+/// Not shown in groups, the list has no headings (Today, Yesterday…) between its messages;
+/// shown in groups again, the headings are back.
+#[test]
+fn the_list_without_groups_has_no_headings() {
+    let (mut a, _) = app("list-no-groups");
+    let ctx = egui::Context::default();
+    let size = egui::vec2(1280.0, 800.0);
+    let headings: Vec<&'static str> =
+        a.session.rows().iter().filter_map(|r| if let mailcraft_engine::Row::Header(h) = r { Some(*h) } else { None }).collect();
+    assert!(headings.len() > 1, "the sample's list has headings: {headings:?}");
+    let drawn_headings = |ctx: &egui::Context, a: &mut MailApp| {
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            drawn = drawn_text(ctx, a, size);
+        }
+        drawn.iter().filter(|d| d.seen() && headings.contains(&d.text.as_str())).count()
+    };
+    assert!(drawn_headings(&ctx, &mut a) > 0, "headings are drawn");
+    a.run("view.groups", json!({}));
+    assert!(!a.session.prefs.groups);
+    assert_eq!(drawn_headings(&ctx, &mut a), 0, "no heading is drawn");
+    a.run("view.groups", json!({}));
+    assert!(drawn_headings(&ctx, &mut a) > 0, "headings again");
+}
+
+/// The ribbon hidden: its buttons go and the list has their room, the tabs stay on the top bar;
+/// a click on a tab shows its buttons until a click elsewhere, and Ctrl+F1 brings it back.
+#[test]
+fn the_ribbon_hides_and_a_tab_shows_it_for_now() {
+    let (mut a, _) = app("ribbon-hidden");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    for _ in 0..3 {
+        frame(&ctx, &mut a, vec![]);
+    }
+    let ribbon = a.ui.ribbon_rect.expect("the ribbon is drawn");
+    let rows_before = a.ui.list_page;
+    a.run("view.hideRibbon", json!({}));
+    assert!(a.session.prefs.ribbon_hidden);
+    for _ in 0..3 {
+        frame(&ctx, &mut a, vec![]);
+    }
+    assert!(a.ui.ribbon_rect.is_none(), "the ribbon's buttons are gone");
+    assert!(a.ui.top_bar_rect.is_some(), "the top bar, with the tabs, stays");
+    assert!(a.ui.list_page > rows_before, "{} rows, {rows_before} before", a.ui.list_page);
+    // A tab shows its buttons, over where they were.
+    click_named(&ctx, &mut a, "View");
+    frame(&ctx, &mut a, vec![]);
+    assert_eq!(a.ui.tab, crate::RibbonTab::View);
+    let shown = a.ui.ribbon_rect.expect("a tab clicked shows the ribbon");
+    assert!((shown.height() - ribbon.height()).abs() < 1.0);
+    // A click on the ribbon keeps it, one in the window below puts it away.
+    click(&ctx, &mut a, egui::pos2(shown.right() - 4.0, shown.center().y));
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.ribbon_rect.is_some(), "a click on the ribbon keeps it");
+    let size = SIZE.with(std::cell::Cell::get);
+    click(&ctx, &mut a, egui::pos2(size.x - 30.0, size.y - 60.0));
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.ribbon_rect.is_none(), "a click elsewhere puts it away");
+    assert!(a.session.prefs.ribbon_hidden);
+    // The same tab clicked twice: shown, then put away.
+    click_named(&ctx, &mut a, "Home");
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.ribbon_rect.is_some());
+    click_named(&ctx, &mut a, "Home");
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.ribbon_rect.is_none(), "its tab clicked again puts it away");
+    // Ctrl+F1 brings it back for good.
+    frame(&ctx, &mut a, vec![key(egui::Key::F1, egui::Modifiers::COMMAND)]);
+    for _ in 0..2 {
+        frame(&ctx, &mut a, vec![]);
+    }
+    assert!(!a.session.prefs.ribbon_hidden);
+    assert!(a.ui.ribbon_rect.is_some());
+    assert_eq!(a.ui.list_page, rows_before);
+}
+
+/// The single-line list's head is one line: the folder's name, and on the same line the filter,
+/// in a menu named by the one chosen; choosing another there filters the list.
+#[test]
+fn the_single_line_list_has_its_head_on_one_line() {
+    let (mut a, _) = app("single-line-head");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    let size = egui::vec2(1280.0, 800.0);
+    let title = crate::view_title(&a.session);
+    // The filter's menu, and the folder's name where it's drawn on that line (the folder pane has it too).
+    let places = |ctx: &egui::Context, a: &mut MailApp, filter: &str| {
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            drawn = drawn_text(ctx, a, size);
+        }
+        let menu = drawn.iter().find(|d| d.text == filter && d.seen()).map(|d| d.rect).unwrap_or_else(|| panic!("{filter} isn't drawn"));
+        let name = drawn.iter().filter(|d| d.text == title && d.seen()).map(|d| d.rect).find(|r| r.top() < menu.bottom() && r.bottom() > menu.top());
+        (name, menu)
+    };
+    a.run("view.singleLine", json!({}));
+    let (name, filter) = places(&ctx, &mut a, "All ⏷");
+    let name = name.expect("the folder's name is on the filter's line");
+    assert!(filter.left() > name.right(), "the filter after the name: {name:?} {filter:?}");
+    // Its menu has the filters.
+    click(&ctx, &mut a, filter.center());
+    frame(&ctx, &mut a, vec![]);
+    click_named(&ctx, &mut a, "Unread");
+    frame(&ctx, &mut a, vec![]);
+    assert_eq!(a.session.filter, mailcraft_engine::ListFilter::Unread);
+    places(&ctx, &mut a, "Unread ⏷");
+}
+
+/// The single-line list's head keeps the Inbox's Focused and Other: one of them clicked shows
+/// that part of the Inbox, as in the list's usual head.
+#[test]
+fn the_single_line_list_keeps_focused_and_other() {
+    let (mut a, _) = app("single-line-focused");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    a.session.prefs.focused_inbox = true;
+    a.run("view.singleLine", json!({}));
+    assert!(a.session.focus_split(), "the sample opens on its Inbox");
+    let size = egui::vec2(1280.0, 800.0);
+    let seen = |ctx: &egui::Context, a: &mut MailApp, text: &str| {
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            drawn = drawn_text(ctx, a, size);
+        }
+        drawn.iter().any(|d| d.text == text && d.seen())
+    };
+    assert!(seen(&ctx, &mut a, "Focused") && seen(&ctx, &mut a, "Other"), "Focused and Other on the head's line");
+    assert!(!a.session.focus_other);
+    click_named(&ctx, &mut a, "Other");
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.session.focus_other, "Other clicked shows the Inbox's other mail");
+}
+
+/// Shown for now by a tab while hidden, then kept (Ctrl+F1) and hidden again (Ctrl+F1): it hides,
+/// as it would had no tab been clicked.
+#[test]
+fn the_ribbon_hidden_again_hides_after_a_tab_showed_it() {
+    let (mut a, _) = app("ribbon-hidden-again");
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    a.run("view.hideRibbon", json!({}));
+    for _ in 0..3 {
+        frame(&ctx, &mut a, vec![]);
+    }
+    click_named(&ctx, &mut a, "View");
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.ribbon_rect.is_some(), "a tab clicked shows it");
+    for _ in 0..2 {
+        frame(&ctx, &mut a, vec![key(egui::Key::F1, egui::Modifiers::COMMAND)]);
+        frame(&ctx, &mut a, vec![]);
+    }
+    assert!(a.session.prefs.ribbon_hidden);
+    frame(&ctx, &mut a, vec![]);
+    assert!(a.ui.ribbon_rect.is_none(), "hidden again, it's hidden");
+}
+
 /// Issue #22: the ribbon's tabs and the search box share the top bar, one row where there were
 /// two, with the ribbon's buttons right under it, as tall on every tab and in every module, in a
 /// wide window, the narrowest and a narrow one; the File page has the window to itself.
@@ -392,4 +549,53 @@ fn the_tabs_and_search_share_one_bar() {
     a.act(crate::Action::Backstage(crate::backstage::Page::Info));
     frame(&ctx, &mut a, vec![]);
     assert!(a.ui.top_bar_rect.is_none() && a.ui.ribbon_rect.is_none(), "the File page has no bar");
+}
+
+/// The single-line list: a message's sender, subject and time on one line, the subject after
+/// the sender's column, and more messages in the same height; switched off, the subject is
+/// back under the sender.
+#[test]
+fn the_single_line_list_has_a_message_on_one_line() {
+    let (mut a, _) = app("single-line-list");
+    let ctx = egui::Context::default();
+    let (name, subject) = ("Alexandra Whitfield", "Quarterly figures for the board");
+    let d = mailcraft_engine::mime::Draft { subject: subject.into(), body: "Attached.".into(), ..Default::default() };
+    let from = mailcraft_engine::model::EmailAddress::new(name, "alexandra@example.com");
+    let raw = mailcraft_engine::mime::build(&d, &from, NOW, "<single@x>").unwrap();
+    with_raw(&mut a, 9902, &raw);
+    a.session.prefs.reading_pane = ReadingPane::Bottom;
+    let size = egui::vec2(1280.0, 800.0);
+    let places = |ctx: &egui::Context, a: &mut MailApp| {
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            drawn = drawn_text(ctx, a, size);
+        }
+        let of = |text: &str| drawn.iter().find(|d| d.text == text && d.seen()).map(|d| d.rect).unwrap_or_else(|| panic!("{text} isn't drawn"));
+        (of(name), of(subject))
+    };
+    let (who, what) = places(&ctx, &mut a);
+    assert!(what.top() > who.bottom() - 4.0, "the subject under the sender: {who:?} {what:?}");
+    let page = a.ui.list_page;
+    a.run("view.singleLine", json!({}));
+    assert!(a.session.prefs.single_line);
+    let (who, what) = places(&ctx, &mut a);
+    assert!((what.center().y - who.center().y).abs() < 3.0, "on one line: {who:?} {what:?}");
+    assert!(what.left() > who.right(), "the subject after the sender: {who:?} {what:?}");
+    assert!(a.ui.list_page > page, "more rows a page: {} then {page}", a.ui.list_page);
+    // Every other setting of the list with it, light and dark, wide and narrow, right to left.
+    for (compact, preview) in [(true, false), (false, true)] {
+        a.session.prefs.compact = compact;
+        a.session.prefs.show_preview = preview;
+        for pane in [ReadingPane::Right, ReadingPane::Off, ReadingPane::Bottom] {
+            a.session.prefs.reading_pane = pane;
+            for w in [1280.0, 520.0] {
+                sized(&ctx, &mut a, w);
+            }
+        }
+    }
+    let (who, what) = places(&ctx, &mut a);
+    assert!((what.center().y - who.center().y).abs() < 3.0, "still on one line: {who:?} {what:?}");
+    a.run("view.singleLine", json!({"on": false}));
+    let (who, what) = places(&ctx, &mut a);
+    assert!(what.top() > who.bottom() - 4.0, "the subject under the sender again: {who:?} {what:?}");
 }

@@ -45,6 +45,7 @@
 	Close	סגור
 	Code	קוד
 	Compact	צפוף
+	Single line	שורה אחת
 	Connect	התחבר
 	Connecting…	מתחבר…
 	Conversations	שיחות
@@ -260,6 +261,13 @@
 	Select a message first.	בחר הודעה קודם.
 	Send	שלח
 	Send (Ctrl+Enter)	שלח (Ctrl+Enter)
+	Send this message?	לשלוח את ההודעה הזו?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter שולח את ההודעה שאתה כותב.
+	Don't ask again	אל תשאל שוב
+	Don't send	אל תשלח
+	Ctrl+Enter in a message	Ctrl+Enter בהודעה
+	Ask first	לשאול קודם
+	Do nothing	לא לעשות דבר
 	Send / Receive	שלח / קבל
 	Send / Receive all folders (F9)	שלח וקבל בכל התיקיות (F9)
 	Send anyway	שלח בכל זאת
@@ -275,6 +283,11 @@
 	Settings found: {source}	נמצאו הגדרות: {source}
 	Show a desktop notification when new mail arrives	הצג התראה בשולחן העבודה כשמגיע דואר חדש
 	Keep MailCraft running when its window is closed	להשאיר את MailCraft פועל כשהחלון שלו נסגר
+	Start MailCraft in the notification area	הפעלת MailCraft באזור ההודעות
+	Start MailCraft minimized	הפעלת MailCraft ממוזער
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	הוא בודק דואר ומודיע עליו כשהחלון שלו מוסתר, כמו כשהוא סגור. כשהוא מופעל כדי לפתוח קישור או קובץ, הוא פותח את החלון.
+	Show the unread mail on its icon	הצגת הדואר שלא נקרא על הסמל שלו
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	כמה הודעות שלא נקראו יש בתיבות הדואר הנכנס, בפינת הסמל של MailCraft באזור ההודעות
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	הוא נשאר באזור ההודעות, בודק דואר ומודיע עליו. ”יציאה“ בדף ”קובץ“, או בתפריט של הסמל שלו, סוגרת אותו.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	החלון שלו ממוזער, ו־MailCraft ממשיך לבדוק דואר ולהודיע עליו. ”יציאה“ בדף ”קובץ“ סוגרת אותו.
 	Open MailCraft	פתיחת MailCraft
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	שנה את שם החשבון, השרתים והכניסה שלו, או את החתימה שלו.
 	Checking with the server…	בודק מול השרת…
 	Compact list	רשימה צפופה
+	Single-line list	רשימה בשורה אחת
+	One line a message: the sender, the subject and the time	שורה אחת לכל הודעה: השולח, הנושא והשעה
 	Don't send automatic replies	אל תשלח תשובות אוטומטיות
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	כל שולח מקבל תשובה אחת ביום כל עוד הן פעילות. הן נשמרות בשרת הדואר שלך, כך שהן פועלות גם כשהמחשב כבוי.
 	Empty	רוקן
@@ -613,9 +628,16 @@ month	May	מאי
 	Remove it from the server after	הסר אותו מהשרת אחרי
 	days	ימים
 	Remove it from the server once it's deleted from Deleted Items	הסר אותו מהשרת כשהוא נמחק מ'פריטים שנמחקו'
+	A copy on the server	עותק בשרת
+	None: mail is removed from the server once downloaded	ללא: הדואר מוסר מהשרת לאחר ההורדה
+	Kept for {n} days	נשמר למשך {n} ימים
+	Kept for {n} days, or until deleted from Deleted Items	נשמר למשך {n} ימים, או עד שנמחק מ'פריטים שנמחקו'
+	Kept until deleted from Deleted Items	נשמר עד שנמחק מ'פריטים שנמחקו'
+	Kept for good	נשמר לצמיתות
 	Arrange by: {field}	סדר לפי: {field}
 	By {field} ⏷	לפי {field} ⏷
 	Reverse sort	הפוך מיון
+	Show in groups	הצגה בקבוצות
 	Size	גודל
 	Flag status	מצב סימון
 	Attachments	קבצים מצורפים
@@ -657,7 +679,10 @@ month	May	מאי
 	Low importance	חשיבות נמוכה
 	Read receipt	אישור קריאה
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	בקש מהנמענים לאשר שקראו (ייתכן שתוכנת הדואר שלהם לא תעשה זאת, או שתשאל אותם)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	עובד עם כל ספק: IMAP או POP עם SMTP, ‏JMAP או Exchange. הסיסמה נשמרת במחזיק המפתחות של המחשב הזה ונשלחת רק לשרת הדואר שלך.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	עובד עם IMAP, ‏POP, ‏JMAP ו־Exchange. הסיסמה נשמרת במחזיק המפתחות של המחשב הזה ונשלחת רק לשרת הדואר שלך.
+	Mail stays on the server and looks the same on every device.	הדואר נשאר בשרת ונראה אותו דבר בכל מכשיר.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	הדואר מורד למחשב הזה. השרת יכול לשמור עותק לזמן מה.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	דרך חדשה יותר להגיע לדואר שלך, שחלק מהספקים מציעים, כמו Fastmail.
 	Run it now on the mail already in the Inbox	הפעל אותו עכשיו על הדואר שכבר בתיבת הדואר הנכנס
 	Run on the mail already in the Inbox	הפעל על הדואר שכבר בתיבת הדואר הנכנס
 	More options	אפשרויות נוספות
@@ -952,6 +977,9 @@ month	May	מאי
 	Opened by the server for your access to it	נפתחה על ידי השרת כי יש לך גישה אליה
 	Shared mailbox {address}, opened by {email}	תיבת דואר משותפת {address}, נפתחת על ידי {email}
 	The outgoing server has its own user name and password	לשרת הדואר היוצא יש שם משתמש וסיסמה משלו
+	Sign in with	כניסה באמצעות
+	NTLM (Secure Password Authentication)	NTLM (אימות סיסמה מאובטח)
+	No sign-in	ללא כניסה
 	Its user name	שם המשתמש שלו
 	Its password	הסיסמה שלו
 	Password (unchanged when empty)	סיסמה (ללא שינוי אם ריקה)
@@ -975,7 +1003,7 @@ month	May	מאי
 	Close anyway	לסגור בכל זאת
 	Edit notes	עריכת הערות
 	Getting them from the server…	מביא אותן מהשרת…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	הדואר שלו נשאר בשרת ונשמר בזיכרון בלבד בזמן ש-MailCraft פועל: דבר ממנו אינו נכתב למחשב הזה, וכל הודעה מורדת כשפותחים אותה. דואר שאתה שולח הולך ישר לשרת; רק דואר שעדיין אי אפשר לשלוח (במצב לא מקוון) ממתין, והוא אובד יחד עם שינויים שנעשו במצב לא מקוון אם MailCraft נסגר קודם (תישאל). לוחות שנה, אנשי קשר והערות בשרת נשארים שם; אלה שנשמרים רק ב-MailCraft אובדים כשהוא נסגר.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	ההודעות מורדות כשפותחים אותן ונשמרות בזיכרון בלבד: שום דבר לא נכתב למחשב הזה. שינויים שנעשו במצב לא מקוון, דואר שעדיין ממתין לשליחה ולוחות שנה, אנשי קשר ופתקים שנשמרו רק ב־MailCraft אובדים כשהוא נסגר (תתבקש לאשר קודם).
 	Mail older than what's kept here is only on the server.	דואר ישן יותר ממה שנשמר כאן נמצא רק בשרת.
 	Search the server	חיפוש בשרת
 	Searching the server…	מחפש בשרת…
@@ -1094,6 +1122,7 @@ month	May	מאי
 	Added to your calendar from {file}: {n}	נוספו ללוח השנה מתוך {file}: {n}
 	Added to your contacts from {file}: {n}	נוספו לאנשי הקשר מתוך {file}: {n}
 	Add an account first: a new message needs an account to send from.	יש להוסיף חשבון קודם: הודעה חדשה צריכה חשבון לשליחה.
+	{folder} isn't attached: it's a folder	{folder} לא צורף: זו תיקייה
 	Add an account first: events and people are kept with an account.	יש להוסיף חשבון קודם: אירועים ואנשים נשמרים בחשבון.
 	Couldn't open {file}: {error}	לא ניתן לפתוח את {file}: {error}
 	Safety	בטיחות
@@ -1279,6 +1308,8 @@ month	May	מאי
 	Your provider's calendar server wasn't found: give its address	שרת לוח השנה של הספק לא נמצא: יש להזין את כתובתו
 	Classic ribbon	רצועת כלים קלאסית
 	Big buttons with their names under them, in named groups	לחצנים גדולים ושמם מתחתם, בקבוצות בעלות שם
+	Hide the ribbon	הסתרת רצועת הכלים
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	הלשוניות נשארות בסרגל העליון: לחיצה מציגה את הלחצנים, לחיצה כפולה משאירה אותם
 	New	חדש
 	Respond	מענה
 	Tags	תגיות
@@ -1700,9 +1731,12 @@ month	May	מאי
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	אוטומטית: דואר חדש מגיע ברגע שהשרת מודיע עליו, אם הוא יכול, ואחרת הבדיקה נעשית כל שתי דקות. עם זמן קבוע, החשבון בודק רק אז. מה ששולחים יוצא מיד, ו"שליחה/קבלה" בודק מיד.
 	Automatically	אוטומטית
 	Every {n} minutes	כל {n} דקות
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	לוחות שנה ואנשי קשר בלבד, ללא דואר (CalDAV ו־CardDAV)
+	Only calendars and contacts, with no email?	רק לוחות שנה ואנשי קשר, בלי דואר?
+	Add a CalDAV and CardDAV account	הוספת חשבון CalDAV ו־CardDAV
 	Calendar and contacts server	שרת לוחות שנה ואנשי קשר
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	לכל שרת CalDAV ו-CardDAV ששומר את לוחות השנה ואנשי הקשר שלך, כמו Nextcloud, Baïkal, SOGo או Radicale, ללא דואר. הסיסמה נשמרת במחזיק המפתחות של המחשב הזה ונשלחת רק לשרת הזה.
+	Add calendars and contacts	הוספת לוחות שנה ואנשי קשר
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	לשרת CalDAV ו־CardDAV בלי דואר, כמו Nextcloud, ‏Baïkal, ‏SOGo או Radicale. הסיסמה נשמרת במחזיק המפתחות של המחשב הזה ונשלחת רק לשרת הזה.
+	Add an email account instead	הוספת חשבון דואר אלקטרוני במקום זאת
 	Server: {url} (CalDAV and CardDAV)	שרת: {url} (CalDAV ו־CardDAV)
 	Not available: this account has no mail server.	לא זמין: לחשבון הזה אין שרת דואר.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	הדואר שלך הועבר מה-Flatpak הקודם של MailCraft, שעדיין מותקן. כדי להסיר אותו, הרץ: flatpak uninstall --delete-data {id}
@@ -1717,3 +1751,49 @@ month	May	מאי
 	{name} couldn't be downloaded: {error}	לא ניתן היה להוריד את {name}: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	משהו השתבש בחלון, ומה שעשה הופסק. MailCraft ממשיך לפעול; היומן מציין היכן זה קרה.
 	Font size	גודל גופן
+	Repeats every	חזרה כל
+	On these days	בימים אלה
+	Which day	איזה יום
+	Series ends	סיום הסדרה
+	After	אחרי
+	Pick a date	בחירת תאריך
+	On day {day}	ביום {day} בחודש
+	On {month} {day}	ב-{day} {month}
+	On the {nth} {weekday}	{weekday} ה{nth} בחודש
+	On the {nth} {weekday} of {month}	{weekday} ה{nth} ב{month}
+interval	days	ימים
+interval	weeks	שבועות
+interval	months	חודשים
+interval	years	שנים
+nth	first	ראשון
+nth	second	שני
+nth	third	שלישי
+nth	fourth	רביעי
+nth	last	אחרון
+count	occurrences	פעמים
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	התמונות שלו מהאינטרנט אינן מוצגות כאן. חזרה לקוד ה-HTML בלי לשנות כאן שומרת עליהן.
+	Messages on a light background	הודעות על רקע בהיר
+	In the dark theme, messages keep the light page and colours they were written in	בערכת הנושא הכהה, ההודעות שומרות על הדף הבהיר והצבעים שבהם נכתבו
+	Show messages on a light background	הצגת הודעות על רקע בהיר
+	Show messages on the dark background	הצגת הודעות על הרקע הכהה
+	Copy picture	העתקת התמונה
+	Save picture as…	שמירת התמונה בשם…
+	The picture couldn't be copied	לא ניתן היה להעתיק את התמונה
+	The picture couldn't be saved	לא ניתן היה לשמור את התמונה
+	Only when I ask	רק כשאבקש
+	Send / Receive on the account looks; Send / Receive for all leaves it out	שליחה/קבלה בחשבון בודקת אותו; שליחה/קבלה לכולם מדלגת עליו
+	There's no folder to put the PDF in for the viewer	אין תיקייה לשים בה את ה-PDF עבור המציג
+	Trust this mail server's certificate?	לתת אמון באישור של שרת הדואר הזה?
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	אף רשות שהמחשב הזה נותן בה אמון אינה עומדת מאחורי האישור ש-{host} מציג. שרת דואר של חברה או שרת ביתי עשוי ליצור אישור משלו, אבל גם מישהו שנמצא בינך לבין השרת יכול להציג אישור כזה. תן בו אמון רק אם מי שמפעיל את השרת מאשר את טביעת האצבע הזו.
+	Issued to	הונפק עבור
+	Issued by	הונפק על ידי
+	Valid	בתוקף
+	{from} to {until}	{from} עד {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	מי שמפעיל אותו יכול לתת לך את האישור שלו כקובץ במקום: הגדרות שרת › לתת אמון בקובץ אישור…
+	Certificates	אישורים
+	Issued by {issuer}	הונפק על ידי {issuer}
+	Trusted when asked	קיבל אמון כשנשאלת
+	Stop trusting	להפסיק לתת אמון
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	רשות שהארגון שלך מפעיל, או האישור של שרת הדואר שלך עצמו (.pem, .crt, .cer)
+	Trust a certificate file…	לתת אמון בקובץ אישור…
+	The certificate is trusted for this account	לאישור ניתן אמון עבור החשבון הזה

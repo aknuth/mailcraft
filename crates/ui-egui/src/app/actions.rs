@@ -9,6 +9,169 @@ mod security;
 
 use crate::*;
 
+/// Something a pane asks for; run after drawing so panes only borrow what they read.
+pub enum Action {
+    Run(&'static str, Value),
+    /// Close MailCraft though online-only accounts hold unsent mail or changes (issue #4).
+    CloseAnyway,
+    /// Close, install the downloaded version, and open it.
+    RestartToUpdate,
+    /// Closing, with the update asked about: installed as MailCraft closes (true), or kept for
+    /// later (false).
+    UpdateOnClose(bool),
+    /// The update said to be ready put off (that version): the bar above the panes goes too.
+    UpdateLater(String),
+    /// Closing, with a data file to compact: that account's compacted first, MailCraft closing
+    /// once it's done (`Some`), or closed now (`None`). The account rides in the action: the
+    /// dialog that asked is gone by the time it runs.
+    CompactOnClose(Option<String>),
+    Open(MessageKey),
+    Dialog(Dialog),
+    /// An action from one message's window: done to that message (several can be written at
+    /// once, each in a window of its own).
+    ForCompose(u64, Box<Action>),
+    OpenAttachment(usize),
+    SaveAttachment(usize),
+    /// Something to tell the user, as the app's notices do (already in their language).
+    Notice(String),
+    /// A picture in an open message (`src` as it names it) saved as a file (issue #110).
+    SavePicture {
+        key: MessageKey,
+        src: String,
+    },
+    AttachFiles,
+    FocusSearch,
+    /// Make a note and write on it.
+    NewNote,
+    /// A note's file (by its place among the note's files): opened in another app, or saved
+    /// where asked.
+    NoteFile {
+        uid: String,
+        index: usize,
+        open: bool,
+    },
+    /// Search every folder for this (shown in the box, with the Search tab).
+    Search(String),
+    SetDark(Option<bool>),
+    /// Print the open message: with the system's print dialog, MailCraft's own (choosing the
+    /// printer), or as a PDF opened in the system's viewer.
+    Print,
+    /// Print a PDF on a printer chosen in MailCraft's print dialog.
+    PrintOn {
+        printer: String,
+        copies: u16,
+        title: String,
+        pdf: Vec<u8>,
+    },
+    /// Save the open message as a PDF, or as its `.eml` source.
+    ExportPdf,
+    SaveMessage,
+    /// Open an attachment in a Craft app (its command name).
+    OpenInCraft(usize, &'static str),
+    /// Save every attachment of the open message into a folder.
+    SaveAll,
+    /// Save some attachments of the open message (by index) into a folder.
+    SaveAttachments(Vec<usize>),
+    /// The rules to a file, or rules from one (Outlook's Export and Import Rules).
+    ExportRules,
+    ImportRules,
+    /// The category list to a file, or categories from one.
+    ExportCategories,
+    ImportCategories,
+    /// Save a backup of what the browser keeps (issue #83), locked with the password when
+    /// there's one, with the downloaded mail when asked; pick one to bring back; bring it back.
+    Backup {
+        password: String,
+        mail: bool,
+    },
+    PickBackup,
+    Restore {
+        data: std::sync::Arc<Vec<u8>>,
+        password: String,
+    },
+    /// Pick a `.p12` / `.pfx` file for an account's certificate, then ask its password.
+    ImportCertificate(String),
+    /// Pick a certificate file (`.pem`, `.crt`, `.cer`) for an account's mail servers to trust:
+    /// an authority the organisation runs, or a server's own (issue #105).
+    TrustCertificateFile(String),
+    /// The browser: open the account's certificate it keeps, with its password, for this page.
+    UnlockCertificate(String),
+    /// Pick an OpenPGP secret key file for an account, then ask its passphrase.
+    ImportPgpKey(String),
+    /// Pick a file of correspondents' OpenPGP keys for an account, and keep them.
+    ImportPublicKey(String),
+    /// Choose a certificate on a smart card (or in the system's keychain) for an account.
+    UseSmartCard(String),
+    /// Choose one of the system's own certificates (Windows' store, the macOS Keychain).
+    UseSystemCertificate(String),
+    /// Sign an account in again: the browser for OAuth accounts, else the password dialog.
+    SignInAgain(String),
+    /// Insert a picture at the cursor of the message being written (from a file).
+    InsertPicture,
+    /// A signature of the account (by name; `None`: the one in it, else its own for this kind
+    /// of message) into the message being written: in place of the one there, else at the cursor.
+    InsertSignature(Option<String>),
+    /// Paste a picture from the clipboard, if there is one.
+    PastePicture,
+    /// A picture into the signature being edited: from a file, or (`paste`) the clipboard's.
+    SignaturePicture {
+        paste: bool,
+    },
+    /// A signature saved as a web page (an Outlook `.htm` signature) as the one being edited's
+    /// HTML code, with the pictures beside it.
+    SignatureFile,
+    /// The text's right-click Paste: files on the clipboard are attached.
+    PasteFiles,
+    /// Choose the interface language (`auto` or a code).
+    SetLanguage(String),
+    /// Open the signature editor for an account (`insert`: from a message, putting it in).
+    EditSignature {
+        account: String,
+        insert: bool,
+    },
+    /// A link in a message was clicked (web pages open in the browser; `mailto:` starts a message).
+    OpenUrl(String),
+    /// Run a command for the open dialog: it closes on success and shows the error otherwise.
+    Submit(&'static str, Value),
+    /// Bring the main window to the front (after acting from a message window).
+    FocusMain,
+    /// Open the File page at a page.
+    Backstage(backstage::Page),
+    /// Attachments are being dragged out of the window: hand them to the system as files.
+    DragOut(Vec<usize>),
+    /// Choose an Outlook data file and look at it before it's imported.
+    OpenDataFile,
+    /// A saved message to look at (`.eml`, `.msg`), picked here as one handed over by the system.
+    OpenMailFile,
+    /// Import the data file at `path` (`again`: though it's open as another account already;
+    /// `changes`: what becomes of a file changed since MailCraft's copy of it was read;
+    /// `take_over`: its copy is an account in another MailCraft data folder, and becomes this
+    /// one's).
+    ImportDataFile {
+        path: String,
+        again: bool,
+        changes: Option<mailcraft_engine::Changes>,
+        take_over: bool,
+    },
+    /// Show how an account's import is going, beside the status bar.
+    ImportDetails(String),
+    /// Choose an existing data file for the account being added (its mail comes in first).
+    PickAccountDataFile,
+    /// An action from a message's own window, on that message (its attachments, Save As, Print).
+    InWindow(MessageKey, Box<Action>),
+    /// Choose where to write an account's mail as an Outlook data file.
+    ExportDataFile(String),
+    /// Show a folder in the system's file manager.
+    OpenFolder(PathBuf),
+    /// Choose a folder to move MailCraft's data into (at the next start).
+    MoveDataFolder,
+    /// Show one message formatted (true) or as plain text, whatever the setting for all mail
+    /// says (that stays as it is).
+    ShowFormatted(MessageKey, bool),
+    /// Forget a move asked for.
+    CancelDataMove,
+}
+
 impl MailApp {
     /// New mail: a desktop notification and the unread count in the window title.
     pub(crate) fn announce(&mut self, ctx: &egui::Context) {
@@ -20,11 +183,11 @@ impl MailApp {
                 self.ui.dialog = Some(Dialog::password(&a.config));
             }
         }
-        // A mail server on this computer with a certificate of its own asks to be trusted, the
-        // same way (issue #77).
+        // A mail server with a certificate no authority vouches for asks to be trusted, the same
+        // way (issues #77 and #105).
         if self.ui.dialog.is_none() && self.ui.backstage.is_none() && !self.session.ask_certificate.is_empty() {
-            let (account, host, fingerprint) = self.session.ask_certificate.remove(0);
-            self.ui.dialog = Some(Dialog::TrustCertificate { account, host, fingerprint });
+            let (account, shown) = self.session.ask_certificate.remove(0);
+            self.ui.dialog = Some(Dialog::TrustCertificate { account, shown: Box::new(shown) });
         }
         let news = self.session.take_new_mail();
         if !news.is_empty() {
@@ -146,6 +309,7 @@ impl MailApp {
             Action::Restore { data, password } => self.restore_backup(&data, &password),
             // An account's keys (`actions/security.rs`).
             Action::ImportCertificate(account) => self.import_certificate(account),
+            Action::TrustCertificateFile(account) => self.trust_certificate_file(account),
             Action::UnlockCertificate(account) => {
                 self.ui.dialog = Some(Dialog::Certificate { account, path: String::new(), data: None, password: String::new() });
             }
@@ -159,11 +323,13 @@ impl MailApp {
             Action::ExportPdf => self.save_message(true),
             Action::SaveMessage => self.save_message(false),
             Action::SaveAttachment(i) => self.save_attachment(i),
+            Action::Notice(text) => self.session.notice(text, true),
+            Action::SavePicture { key, src } => self.save_picture(&key, &src),
             Action::OpenAttachment(i) => self.open_attachment(i),
             Action::SaveAll => self.save_attachments(None),
             Action::SaveAttachments(v) => self.save_attachments(Some(v)),
             Action::OpenInCraft(i, cmd) => self.open_in_craft(i, cmd),
-            Action::DragOut(i) => self.drag_out(i),
+            Action::DragOut(v) => self.drag_out(v),
             Action::NoteFile { uid, index, open } => self.note_file(&uid, index, open),
             // Into the message being written or the signature being edited (`actions/inserting.rs`).
             Action::EditSignature { account, insert } => {
@@ -309,9 +475,9 @@ impl MailApp {
         use mailcraft_engine::model::FailureKind;
         let Some((config, status)) = self.session.account(id).map(|a| (a.config.clone(), a.status.clone())) else { return };
         match status {
-            // A server on this computer with a certificate of its own: asked about again.
-            SyncStatus::Error { kind: FailureKind::LocalCertificate { host, fingerprint }, .. } => {
-                self.ui.dialog = Some(Dialog::TrustCertificate { account: id.to_string(), host, fingerprint });
+            // A server with a certificate no authority vouches for: asked about again.
+            SyncStatus::Error { kind: FailureKind::UntrustedCertificate(shown), .. } => {
+                self.ui.dialog = Some(Dialog::TrustCertificate { account: id.to_string(), shown });
                 return;
             }
             // Microsoft took the sign-in but won't open the mailbox: say why, and what helps.

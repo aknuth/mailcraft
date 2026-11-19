@@ -45,6 +45,7 @@
 	Close	Закрыть
 	Code	Код
 	Compact	Компактно
+	Single line	Одна строка
 	Connect	Подключить
 	Connecting…	Подключение…
 	Conversations	Беседы
@@ -260,6 +261,13 @@
 	Select a message first.	Сначала выберите письмо.
 	Send	Отправить
 	Send (Ctrl+Enter)	Отправить (Ctrl+Enter)
+	Send this message?	Отправить это письмо?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter отправляет письмо, которое вы пишете.
+	Don't ask again	Больше не спрашивать
+	Don't send	Не отправлять
+	Ctrl+Enter in a message	Ctrl+Enter в письме
+	Ask first	Сначала спрашивать
+	Do nothing	Ничего не делать
 	Send / Receive	Отправить и получить
 	Send / Receive all folders (F9)	Отправить и получить во всех папках (F9)
 	Send anyway	Всё равно отправить
@@ -275,6 +283,11 @@
 	Settings found: {source}	Параметры найдены: {source}
 	Show a desktop notification when new mail arrives	Показывать уведомление на рабочем столе при новой почте
 	Keep MailCraft running when its window is closed	Не завершать MailCraft при закрытии окна
+	Start MailCraft in the notification area	Запускать MailCraft в области уведомлений
+	Start MailCraft minimized	Запускать MailCraft свёрнутым
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	Он проверяет почту и сообщает о ней, пока окно убрано, как после закрытия. Запущенный, чтобы открыть ссылку или файл, он открывает окно.
+	Show the unread mail on its icon	Показывать непрочитанную почту на значке
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	Сколько непрочитанных писем во входящих — в углу значка MailCraft в области уведомлений
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Он остаётся в области уведомлений, проверяет почту и сообщает о новой. «Выход» на странице «Файл» или в меню значка закрывает его.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Окно сворачивается, а MailCraft продолжает проверять почту и сообщать о новой. «Выход» на странице «Файл» закрывает его.
 	Open MailCraft	Открыть MailCraft
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	Измените имя, серверы и вход этой учётной записи или её подпись.
 	Checking with the server…	Запрос к серверу…
 	Compact list	Компактный список
+	Single-line list	Список в одну строку
+	One line a message: the sender, the subject and the time	Одна строка на сообщение: отправитель, тема и время
 	Don't send automatic replies	Не отправлять автоответы
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	Каждый отправитель получает один ответ в день, пока они включены. Они хранятся на почтовом сервере и работают, даже когда этот компьютер выключен.
 	Empty	Очистить
@@ -611,9 +626,16 @@
 	Remove it from the server after	Удалять её с сервера через
 	days	дн.
 	Remove it from the server once it's deleted from Deleted Items	Удалять её с сервера после удаления из папки «Удаленные»
+	A copy on the server	Копия на сервере
+	None: mail is removed from the server once downloaded	Нет: почта удаляется с сервера после загрузки
+	Kept for {n} days	Хранится {n} дн.
+	Kept for {n} days, or until deleted from Deleted Items	Хранится {n} дн. или до удаления из папки «Удаленные»
+	Kept until deleted from Deleted Items	Хранится до удаления из папки «Удаленные»
+	Kept for good	Хранится всегда
 	Arrange by: {field}	Упорядочить по: {field}
 	By {field} ⏷	По: {field} ⏷
 	Reverse sort	Обратный порядок
+	Show in groups	Показывать группами
 	Size	Размер
 	Flag status	Флажок
 	Attachments	Вложения
@@ -655,7 +677,10 @@
 	Low importance	Низкая важность
 	Read receipt	Уведомление о прочтении
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	Попросить получателей подтвердить прочтение (их почтовая программа может этого не сделать или спросить их)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	Работает с любым поставщиком: IMAP или POP с SMTP, JMAP или Exchange. Пароль хранится в связке ключей этого компьютера и отправляется только на ваш почтовый сервер.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	Работает с IMAP, POP, JMAP и Exchange. Пароль хранится в связке ключей этого компьютера и отправляется только на ваш почтовый сервер.
+	Mail stays on the server and looks the same on every device.	Почта остаётся на сервере и выглядит одинаково на всех устройствах.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	Почта загружается на этот компьютер. Сервер может некоторое время хранить копию.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	Более новый способ доступа к почте, который предлагают некоторые поставщики, например Fastmail.
 	Run it now on the mail already in the Inbox	Применить сейчас к почте во «Входящих»
 	Run on the mail already in the Inbox	Применить к почте во «Входящих»
 	More options	Другие действия
@@ -956,6 +981,9 @@ month	May	Май
 	Opened by the server for your access to it	Открыт сервером, так как у вас есть доступ
 	Shared mailbox {address}, opened by {email}	Общий почтовый ящик {address}, открыт через {email}
 	The outgoing server has its own user name and password	У сервера исходящей почты свои имя пользователя и пароль
+	Sign in with	Способ входа
+	NTLM (Secure Password Authentication)	NTLM (безопасная проверка пароля)
+	No sign-in	Без входа
 	Its user name	Его имя пользователя
 	Its password	Его пароль
 	Password (unchanged when empty)	Пароль (без изменений, если пусто)
@@ -979,7 +1007,7 @@ month	May	Май
 	Close anyway	Всё равно закрыть
 	Edit notes	Изменить заметки
 	Getting them from the server…	Загрузка с сервера…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	Почта остаётся на сервере и хранится только в памяти, пока работает MailCraft: на этот компьютер ничего не записывается, а каждое сообщение загружается при открытии. Отправляемые письма сразу уходят на сервер; ждут только те, что пока нельзя отправить (вне сети), и они теряются вместе с изменениями, сделанными вне сети, если MailCraft закроется раньше (вас спросят). Календари, контакты и заметки на сервере остаются там; хранящиеся только в MailCraft теряются при его закрытии.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	Сообщения загружаются при открытии и хранятся только в памяти: на этот компьютер ничего не записывается. Изменения, сделанные без сети, ещё не отправленная почта, а также календари, контакты и заметки, которые есть только в MailCraft, теряются при его закрытии (сначала вас спросят).
 	Mail older than what's kept here is only on the server.	Письма старше хранящихся здесь есть только на сервере.
 	Search the server	Искать на сервере
 	Searching the server…	Поиск на сервере…
@@ -1098,6 +1126,7 @@ month	May	Май
 	Added to your calendar from {file}: {n}	Добавлено в календарь из {file}: {n}
 	Added to your contacts from {file}: {n}	Добавлено в контакты из {file}: {n}
 	Add an account first: a new message needs an account to send from.	Сначала добавьте учётную запись: новому письму нужна учётная запись для отправки.
+	{folder} isn't attached: it's a folder	{folder} не прикрепляется: это папка
 	Add an account first: events and people are kept with an account.	Сначала добавьте учётную запись: события и люди хранятся в учётной записи.
 	Couldn't open {file}: {error}	Не удалось открыть {file}: {error}
 	Safety	Безопасность
@@ -1283,6 +1312,8 @@ month	May	Май
 	Your provider's calendar server wasn't found: give its address	Сервер календаря вашего провайдера не найден: укажите его адрес
 	Classic ribbon	Классическая лента
 	Big buttons with their names under them, in named groups	Крупные кнопки с подписями под ними, в именованных группах
+	Hide the ribbon	Скрыть ленту
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	Вкладки остаются на верхней панели: щелчок показывает кнопки, двойной щелчок оставляет их
 	New	Создать
 	Respond	Ответить
 	Tags	Пометки
@@ -1704,9 +1735,12 @@ month	May	Май
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Автоматически: новая почта приходит, как только сервер сообщит о ней, если он это умеет, иначе проверка идёт каждые две минуты. С заданным временем учётная запись проверяет почту только тогда. Отправленное уходит сразу, а «Отправить/получить» проверяет немедленно.
 	Automatically	Автоматически
 	Every {n} minutes	Каждые {n} мин.
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	Только календари и контакты, без почты (CalDAV и CardDAV)
+	Only calendars and contacts, with no email?	Только календари и контакты, без почты?
+	Add a CalDAV and CardDAV account	Добавить учётную запись CalDAV и CardDAV
 	Calendar and contacts server	Сервер календарей и контактов
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Для любого сервера CalDAV и CardDAV с вашими календарями и контактами, например Nextcloud, Baïkal, SOGo или Radicale, без почты. Пароль хранится в связке ключей этого компьютера и отправляется только на этот сервер.
+	Add calendars and contacts	Добавить календари и контакты
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	Для сервера CalDAV и CardDAV без почты, например Nextcloud, Baïkal, SOGo или Radicale. Пароль хранится в связке ключей этого компьютера и отправляется только на этот сервер.
+	Add an email account instead	Вместо этого добавить учётную запись почты
 	Server: {url} (CalDAV and CardDAV)	Сервер: {url} (CalDAV и CardDAV)
 	Not available: this account has no mail server.	Недоступно: у этой учётной записи нет почтового сервера.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Почта перенесена из прежнего Flatpak MailCraft, который всё ещё установлен. Чтобы удалить его, выполните: flatpak uninstall --delete-data {id}
@@ -1721,3 +1755,49 @@ month	May	Май
 	{name} couldn't be downloaded: {error}	Не удалось загрузить {name}: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	В окне что-то пошло не так, и то, что оно делало, остановлено. MailCraft продолжает работу; в журнале указано, где это произошло.
 	Font size	Размер шрифта
+	Repeats every	Повторять каждые
+	On these days	По этим дням
+	Which day	Какой день
+	Series ends	Конец серии
+	After	После
+	Pick a date	Выбрать дату
+	On day {day}	{day}-го числа
+	On {month} {day}	{month}, {day}-го
+	On the {nth} {weekday}	В {nth} {weekday}
+	On the {nth} {weekday} of {month}	В {nth} {weekday} ({month})
+interval	days	дн.
+interval	weeks	нед.
+interval	months	мес.
+interval	years	г.
+nth	first	первый
+nth	second	второй
+nth	third	третий
+nth	fourth	четвёртый
+nth	last	последний
+count	occurrences	повторений
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	Изображения из интернета здесь не показываются. Вернитесь к HTML-коду, ничего здесь не меняя, и они сохранятся.
+	Messages on a light background	Сообщения на светлом фоне
+	In the dark theme, messages keep the light page and colours they were written in	В тёмной теме сообщения сохраняют светлую страницу и цвета, в которых их написали
+	Show messages on a light background	Показывать сообщения на светлом фоне
+	Show messages on the dark background	Показывать сообщения на тёмном фоне
+	Copy picture	Копировать изображение
+	Save picture as…	Сохранить изображение как…
+	The picture couldn't be copied	Не удалось скопировать изображение
+	The picture couldn't be saved	Не удалось сохранить изображение
+	Only when I ask	Только по запросу
+	Send / Receive on the account looks; Send / Receive for all leaves it out	«Отправить/получить» для учётной записи проверяет её; «Отправить/получить» для всех её пропускает
+	There's no folder to put the PDF in for the viewer	Нет папки, куда положить PDF для просмотра
+	Trust this mail server's certificate?	Доверять сертификату этого почтового сервера?
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	Ни один центр, которому доверяет этот компьютер, не ручается за сертификат, который показывает {host}. Почтовый сервер компании или домашний сервер может выпустить собственный, но и кто-то между вами и сервером может показать такой же. Доверяйте ему, только если тот, кто управляет сервером, подтвердит этот отпечаток.
+	Issued to	Кому выдан
+	Issued by	Кем выдан
+	Valid	Действителен
+	{from} to {until}	С {from} по {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	Администратор сервера может вместо этого дать вам его сертификат в виде файла: Параметры сервера › Доверять файлу сертификата…
+	Certificates	Сертификаты
+	Issued by {issuer}	Кем выдан: {issuer}
+	Trusted when asked	Доверен по запросу
+	Stop trusting	Больше не доверять
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Центр сертификации вашей организации или собственный сертификат вашего почтового сервера (.pem, .crt, .cer)
+	Trust a certificate file…	Доверять файлу сертификата…
+	The certificate is trusted for this account	Сертификату доверяют для этой учётной записи

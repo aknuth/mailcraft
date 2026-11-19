@@ -23,14 +23,9 @@ use crate::{CmdError, CmdResult, Registry};
 mod accounts;
 mod changing;
 mod events;
-mod folder_edits;
-pub mod invite;
-mod mailbox_settings;
 mod mailboxes;
 mod opening;
 mod organize;
-mod outbox;
-mod pictures;
 mod prefs;
 mod searching;
 mod security;
@@ -38,12 +33,12 @@ mod writing;
 #[cfg(test)]
 pub(crate) use accounts::REMOVE_BACKSTOP;
 pub(crate) use accounts::data_file_path;
-pub use accounts::{Changes, ImportState, Imports};
+pub use accounts::{Changes, ImportState, Imports, TrustedCertificate};
+pub use accounts::{Compacting, Compaction, IDLE_AFTER_S};
 use changing::Batch;
+use changing::keys_by_account;
 #[cfg(test)]
 pub(crate) use changing::{MOVED_IN_MAX, MovedIn};
-use folder_edits::keys_by_account;
-pub use mailbox_settings::{Compacting, Compaction, IDLE_AFTER_S};
 #[cfg(test)]
 pub(crate) use opening::source_lines;
 pub use opening::{BodyWork, PreparedBody, SOURCE_SHOWN, SourceView, Toward};
@@ -60,8 +55,9 @@ pub use mailboxes::{ARRANGE_HEADINGS, Arrange, ListFilter, Row};
 // Organizing mail's own parts, named here as before.
 pub use opening::SenderMarks;
 pub use organize::{junk, quick_steps, search_folders};
-pub use prefs::{ACCENTS, NotesOrder, Prefs, ReadInPane, ReadingPane, SenderAddresses, accent_code, accent_rgb};
+pub use prefs::{ACCENTS, CtrlEnter, NotesOrder, Prefs, ReadInPane, ReadingPane, SenderAddresses, accent_code, accent_rgb};
 pub mod pim;
+pub use pim::invite;
 
 /// One account and what the session knows about it.
 #[derive(Clone, Debug, PartialEq)]
@@ -291,7 +287,7 @@ pub struct Session {
     /// Certificates to ask about now (issue #77): a mail server on this computer showed one no
     /// authority vouches for. The account, the server and the certificate's fingerprint; once
     /// each while MailCraft runs, and the window asks when nothing else is open.
-    pub ask_certificate: Vec<(String, String, String)>,
+    pub ask_certificate: Vec<(String, mailcraft_model::UntrustedCertificate)>,
     asked_certificate: HashSet<(String, String)>,
     /// The messages on screen, newest first.
     pub list: Vec<SharedSummary>,
@@ -412,6 +408,8 @@ pub struct Session {
     pub(crate) transfers: Vec<mailboxes::Transfer>,
     /// Mail that arrived and may hold an invitation, waiting for its body (issue #20).
     pub(crate) arrived_invites: Vec<MessageKey>,
+    /// Answered invitations to put out of the way once the server has the answer (issue #101).
+    pub(crate) tidy_waiting: Vec<invite::WaitingTidy>,
     /// New mail to announce (desktop notifications), oldest first.
     pub new_mail: Vec<Summary>,
     /// Inbox rules, run on mail as it arrives (`rules.json`).
@@ -567,6 +565,7 @@ impl Session {
             moved_at: 0,
             transfers: Vec::new(),
             arrived_invites: Vec::new(),
+            tidy_waiting: Vec::new(),
             new_mail: Vec::new(),
             rules: Vec::new(),
             snoozes: Vec::new(),

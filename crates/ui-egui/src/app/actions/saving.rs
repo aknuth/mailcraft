@@ -32,9 +32,15 @@ impl MailApp {
             }
             return;
         }
-        // No print dialog to hand it to: the message as a PDF, saved where asked, then opened to
-        // print from the viewer.
-        let Some(path) = self.services.save_path(&format!("{}.pdf", self.message_file_name())) else { return };
+        // No print dialog to hand it to. Shown as it will print before it prints (issue #97):
+        // straight into the PDF viewer, its pages there to look at and print. Not asked where to
+        // save it first (that's Save as PDF): a copy of MailCraft's own, in its scratch folder.
+        let name = mailcraft_engine::mime::sanitize_filename(&format!("{}.pdf", self.message_file_name()));
+        let Some(dir) = crate::scratch_dir("print") else {
+            self.session.notice(tl!("There's no folder to put the PDF in for the viewer"), true);
+            return;
+        };
+        let path = dir.join(name);
         match self.message_pdf().and_then(|b| std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))) {
             Ok(()) => match self.services.open_path(&path) {
                 Ok(()) => self.session.notice(tl!("Opened as a PDF: print it from the viewer"), false),
@@ -109,10 +115,24 @@ impl MailApp {
         }
     }
 
-    pub(super) fn drag_out(&mut self, i: usize) {
-        if self.services.can_drag_out() {
-            self.ui.drag_out = self.attachment_to_temp(i, false);
+    /// The attachments `v` dragged out together (those selected, or the one dragged), each as a
+    /// file for the system's drag and drop. Two of the same name keep it, the second in a folder
+    /// of its own (`open/2`), rather than one written over the other.
+    pub(super) fn drag_out(&mut self, v: Vec<usize>) {
+        if !self.services.can_drag_out() {
+            return;
         }
+        let mut names: Vec<String> = Vec::new();
+        let mut files = Vec::new();
+        for i in v {
+            let name = mailcraft_engine::mime::sanitize_filename(&self.attachment_name(i)).to_lowercase();
+            let before = names.iter().filter(|n| **n == name).count();
+            names.push(name);
+            if let Some(path) = self.attachment_to_temp_in(i, false, (before > 0).then_some(before.saturating_add(1))) {
+                files.push(path);
+            }
+        }
+        self.ui.drag_out = files;
     }
 
     /// An attachment downloaded (the browser's, to save or open it).
@@ -132,6 +152,21 @@ impl MailApp {
         let name = self.attachment_name(i);
         if let Some(path) = self.services.save_path(&name) {
             self.run("attachment.save", json!({"index": i, "path": path.to_string_lossy()}));
+        }
+    }
+
+    /// A picture of an open message saved as a file (issue #110); in the browser, downloaded.
+    pub(super) fn save_picture(&mut self, key: &MessageKey, src: &str) {
+        let name = self.session.picture_name(key, src);
+        if self.services.downloads() {
+            match self.session.picture_bytes(key, src) {
+                Some(b) => self.services.download(&name, &b),
+                None => self.session.notice(tl!("The picture couldn't be saved").to_string(), true),
+            }
+            return;
+        }
+        if let Some(path) = self.services.save_path(&name) {
+            self.run("picture.save", json!({"key": key.to_id(), "src": src, "path": path.to_string_lossy()}));
         }
     }
 
@@ -193,11 +228,20 @@ impl MailApp {
     /// Write an attachment to a temporary file to hand to another app: dragged out (a copy, as
     /// saving), or to be opened (never a program, script or shortcut: the engine refuses).
     pub(crate) fn attachment_to_temp(&mut self, i: usize, open: bool) -> Option<PathBuf> {
+        self.attachment_to_temp_in(i, open, None)
+    }
+
+    /// [`Self::attachment_to_temp`], in the numbered folder `sub` of the temporary one when given.
+    fn attachment_to_temp_in(&mut self, i: usize, open: bool, sub: Option<usize>) -> Option<PathBuf> {
         if !self.ui.has_files {
             return None;
         }
         let name = self.attachment_name(i);
-        let Some(dir) = crate::scratch_dir("open") else {
+        let dir = crate::scratch_dir("open").and_then(|d| match sub {
+            Some(n) => std::fs::create_dir_all(d.join(n.to_string())).ok().map(|()| d.join(n.to_string())),
+            None => Some(d),
+        });
+        let Some(dir) = dir else {
             self.session.notice(tl!("There's no folder to put the attachment in for another app"), true);
             return None;
         };

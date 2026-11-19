@@ -45,6 +45,7 @@
 	Close	Sluiten
 	Code	Code
 	Compact	Compact
+	Single line	Eén regel
 	Connect	Verbinden
 	Connecting…	Verbinden…
 	Conversations	Gesprekken
@@ -260,6 +261,13 @@
 	Select a message first.	Selecteer eerst een bericht.
 	Send	Verzenden
 	Send (Ctrl+Enter)	Verzenden (Ctrl+Enter)
+	Send this message?	Dit bericht verzenden?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter verzendt het bericht dat je schrijft.
+	Don't ask again	Niet meer vragen
+	Don't send	Niet verzenden
+	Ctrl+Enter in a message	Ctrl+Enter in een bericht
+	Ask first	Eerst vragen
+	Do nothing	Niets doen
 	Send / Receive	Verzenden/ontvangen
 	Send / Receive all folders (F9)	Alle mappen verzenden/ontvangen (F9)
 	Send anyway	Toch verzenden
@@ -275,6 +283,11 @@
 	Settings found: {source}	Instellingen gevonden: {source}
 	Show a desktop notification when new mail arrives	Een bureaubladmelding tonen wanneer er nieuwe mail binnenkomt
 	Keep MailCraft running when its window is closed	MailCraft actief houden wanneer het venster wordt gesloten
+	Start MailCraft in the notification area	MailCraft starten in het systeemvak
+	Start MailCraft minimized	MailCraft geminimaliseerd starten
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	Het controleert op e-mail en meldt die met het venster weggezet, zoals wanneer het gesloten is. Gestart om een link of bestand te openen, opent het het venster.
+	Show the unread mail on its icon	Ongelezen e-mail op het pictogram tonen
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	Hoeveel ongelezen berichten de Postvakken IN hebben, in de hoek van het MailCraft-pictogram in het systeemvak
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Het blijft in het systeemvak, controleert op e-mail en meldt die. ‘Afsluiten’ op de pagina Bestand, of in het menu van het pictogram, sluit het.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Het venster wordt geminimaliseerd en MailCraft blijft op e-mail controleren en die melden. ‘Afsluiten’ op de pagina Bestand sluit het.
 	Open MailCraft	MailCraft openen
@@ -388,6 +401,8 @@
 	Change this account's name, servers and sign-in, or its signature.	Wijzig de naam, servers en aanmelding van dit account, of de handtekening.
 	Checking with the server…	Navragen bij de server…
 	Compact list	Compacte lijst
+	Single-line list	Lijst met één regel
+	One line a message: the sender, the subject and the time	Eén regel per bericht: de afzender, het onderwerp en de tijd
 	Don't send automatic replies	Geen automatische antwoorden verzenden
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	Elke afzender krijgt één antwoord per dag zolang ze aanstaan. Ze staan op je mailserver, dus ze werken ook als deze computer uit staat.
 	Empty	Leegmaken
@@ -611,9 +626,16 @@
 	Remove it from the server after	Van de server verwijderen na
 	days	dagen
 	Remove it from the server once it's deleted from Deleted Items	Van de server verwijderen zodra het uit Verwijderde items is verwijderd
+	A copy on the server	Een kopie op de server
+	None: mail is removed from the server once downloaded	Geen: mail wordt na het downloaden van de server verwijderd
+	Kept for {n} days	{n} dagen bewaard
+	Kept for {n} days, or until deleted from Deleted Items	{n} dagen bewaard, of tot het uit Verwijderde items is verwijderd
+	Kept until deleted from Deleted Items	Bewaard tot het uit Verwijderde items is verwijderd
+	Kept for good	Voorgoed bewaard
 	Arrange by: {field}	Rangschikken op: {field}
 	By {field} ⏷	Op {field} ⏷
 	Reverse sort	Omgekeerd sorteren
+	Show in groups	In groepen weergeven
 	Size	Grootte
 	Flag status	Markeringsstatus
 	Attachments	Bijlagen
@@ -655,7 +677,10 @@
 	Low importance	Lage urgentie
 	Read receipt	Leesbevestiging
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	De ontvangers vragen te bevestigen dat ze het hebben gelezen (hun mail-app doet dat misschien niet, of vraagt het hun)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	Werkt met elke provider: IMAP of POP met SMTP, JMAP of Exchange. Je wachtwoord wordt in de sleutelhanger van deze computer bewaard en alleen naar je mailserver verzonden.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	Werkt met IMAP, POP, JMAP en Exchange. Je wachtwoord wordt in de sleutelhanger van deze computer bewaard en alleen naar je mailserver verzonden.
+	Mail stays on the server and looks the same on every device.	E-mail blijft op de server en ziet er op elk apparaat hetzelfde uit.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	E-mail wordt naar deze computer gedownload. De server kan een tijdje een kopie bewaren.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	Een nieuwere manier om bij je e-mail te komen, aangeboden door sommige providers zoals Fastmail.
 	Run it now on the mail already in the Inbox	Nu uitvoeren op de mail die al in Postvak IN staat
 	Run on the mail already in the Inbox	Uitvoeren op de mail die al in Postvak IN staat
 	More options	Meer opties
@@ -952,6 +977,9 @@ month	May	mei
 	Opened by the server for your access to it	Door de server geopend omdat u er toegang toe hebt
 	Shared mailbox {address}, opened by {email}	Gedeeld postvak {address}, geopend via {email}
 	The outgoing server has its own user name and password	De server voor uitgaande e-mail heeft een eigen gebruikersnaam en wachtwoord
+	Sign in with	Aanmelden met
+	NTLM (Secure Password Authentication)	NTLM (beveiligde wachtwoordverificatie)
+	No sign-in	Zonder aanmelden
 	Its user name	Gebruikersnaam ervan
 	Its password	Wachtwoord ervan
 	Password (unchanged when empty)	Wachtwoord (ongewijzigd als leeg)
@@ -975,7 +1003,7 @@ month	May	mei
 	Close anyway	Toch sluiten
 	Edit notes	Notities bewerken
 	Getting them from the server…	Ophalen van de server…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	De e-mail blijft op de server en wordt alleen in het geheugen gehouden zolang MailCraft draait: er wordt niets op deze computer geschreven, en elk bericht wordt gedownload wanneer u het opent. E-mail die u verzendt, gaat direct naar de server; alleen e-mail die nog niet kan worden verzonden (offline) wacht, en die gaat samen met offline gemaakte wijzigingen verloren als MailCraft eerder wordt gesloten (u wordt dit gevraagd). Agenda's, contactpersonen en notities op een server blijven daar; die alleen in MailCraft staan, gaan verloren bij het sluiten.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	Berichten worden gedownload als je ze opent en alleen in het geheugen bewaard: er wordt niets op deze computer geschreven. Wijzigingen die je offline maakt, e-mail die nog verzonden moet worden en agenda's, contactpersonen en notities die alleen in MailCraft staan, gaan verloren als het sluit (je wordt eerst gevraagd).
 	Mail older than what's kept here is only on the server.	E-mail die ouder is dan wat hier wordt bewaard, staat alleen op de server.
 	Search the server	Zoeken op de server
 	Searching the server…	Zoeken op de server…
@@ -1094,6 +1122,7 @@ month	May	mei
 	Added to your calendar from {file}: {n}	Aan je agenda toegevoegd uit {file}: {n}
 	Added to your contacts from {file}: {n}	Aan je contactpersonen toegevoegd uit {file}: {n}
 	Add an account first: a new message needs an account to send from.	Voeg eerst een account toe: een nieuw bericht heeft een account nodig om vanaf te verzenden.
+	{folder} isn't attached: it's a folder	{folder} wordt niet bijgevoegd: het is een map
 	Add an account first: events and people are kept with an account.	Voeg eerst een account toe: afspraken en personen worden bij een account bewaard.
 	Couldn't open {file}: {error}	{file} kon niet worden geopend: {error}
 	Safety	Veiligheid
@@ -1279,6 +1308,8 @@ month	May	mei
 	Your provider's calendar server wasn't found: give its address	De agendaserver van uw provider is niet gevonden: geef het adres op
 	Classic ribbon	Klassiek lint
 	Big buttons with their names under them, in named groups	Grote knoppen met hun naam eronder, in benoemde groepen
+	Hide the ribbon	Het lint verbergen
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	De tabbladen blijven in de bovenste balk: één klik toont de knoppen, een dubbelklik houdt ze zichtbaar
 	New	Nieuw
 	Respond	Beantwoorden
 	Tags	Labels
@@ -1700,9 +1731,12 @@ month	May	mei
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Automatisch haalt nieuwe e-mail op zodra de server die meldt, als een server dat kan, en kijkt anders elke twee minuten. Met een vaste tijd kijkt een account alleen dan. Wat je verstuurt gaat meteen weg en Verzenden/ontvangen kijkt direct.
 	Automatically	Automatisch
 	Every {n} minutes	Elke {n} minuten
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	Alleen agenda's en contactpersonen, zonder e-mail (CalDAV en CardDAV)
+	Only calendars and contacts, with no email?	Alleen agenda's en contactpersonen, zonder e-mail?
+	Add a CalDAV and CardDAV account	Een CalDAV- en CardDAV-account toevoegen
 	Calendar and contacts server	Server voor agenda's en contactpersonen
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Voor elke CalDAV- en CardDAV-server die je agenda's en contactpersonen bewaart, zoals Nextcloud, Baïkal, SOGo of Radicale, zonder e-mail. Je wachtwoord wordt in de sleutelhanger van deze computer bewaard en alleen naar die server verzonden.
+	Add calendars and contacts	Agenda's en contactpersonen toevoegen
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	Voor een CalDAV- en CardDAV-server zonder e-mail, zoals Nextcloud, Baïkal, SOGo of Radicale. Je wachtwoord wordt in de sleutelhanger van deze computer bewaard en alleen naar die server verzonden.
+	Add an email account instead	In plaats daarvan een e-mailaccount toevoegen
 	Server: {url} (CalDAV and CardDAV)	Server: {url} (CalDAV en CardDAV)
 	Not available: this account has no mail server.	Niet beschikbaar: dit account heeft geen mailserver.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Je e-mail is overgenomen uit de eerdere Flatpak van MailCraft, die nog geïnstalleerd is. Verwijder die met: flatpak uninstall --delete-data {id}
@@ -1717,3 +1751,49 @@ month	May	mei
 	{name} couldn't be downloaded: {error}	{name} kon niet worden gedownload: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Er ging iets mis in het venster, en wat het aan het doen was, is gestopt. MailCraft gaat door; het logboek zegt waar het gebeurde.
 	Font size	Lettergrootte
+	Repeats every	Herhalen elke
+	On these days	Op deze dagen
+	Which day	Welke dag
+	Series ends	Reeks eindigt
+	After	Na
+	Pick a date	Kies een datum
+	On day {day}	Op dag {day}
+	On {month} {day}	Op {day} {month}
+	On the {nth} {weekday}	Op de {nth} {weekday}
+	On the {nth} {weekday} of {month}	Op de {nth} {weekday} van {month}
+interval	days	dagen
+interval	weeks	weken
+interval	months	maanden
+interval	years	jaar
+nth	first	eerste
+nth	second	tweede
+nth	third	derde
+nth	fourth	vierde
+nth	last	laatste
+count	occurrences	keer
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	Afbeeldingen van het web worden hier niet getoond. Ga terug naar de HTML-code zonder hier iets te wijzigen en ze blijven bewaard.
+	Messages on a light background	Berichten op een lichte achtergrond
+	In the dark theme, messages keep the light page and colours they were written in	In het donkere thema houden berichten de lichte pagina en de kleuren waarin ze geschreven zijn
+	Show messages on a light background	Berichten op een lichte achtergrond tonen
+	Show messages on the dark background	Berichten op de donkere achtergrond tonen
+	Copy picture	Afbeelding kopiëren
+	Save picture as…	Afbeelding opslaan als…
+	The picture couldn't be copied	De afbeelding kon niet worden gekopieerd
+	The picture couldn't be saved	De afbeelding kon niet worden opgeslagen
+	Only when I ask	Alleen als ik erom vraag
+	Send / Receive on the account looks; Send / Receive for all leaves it out	Verzenden/ontvangen op het account kijkt; verzenden/ontvangen voor alle accounts slaat het over
+	There's no folder to put the PDF in for the viewer	Er is geen map om de pdf in te zetten voor de viewer
+	Trust this mail server's certificate?	Het certificaat van deze mailserver vertrouwen?
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	Geen instantie die deze computer vertrouwt, staat in voor het certificaat dat {host} toont. De mailserver van een bedrijf of een thuisserver kan er zelf een maken, maar iemand tussen u en de server kan er ook een tonen. Vertrouw het alleen als degene die de server beheert deze vingerafdruk bevestigt.
+	Issued to	Uitgegeven aan
+	Issued by	Uitgegeven door
+	Valid	Geldig
+	{from} to {until}	{from} tot {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	De beheerder kan u het certificaat ook als bestand geven: Serverinstellingen › Een certificaatbestand vertrouwen…
+	Certificates	Certificaten
+	Issued by {issuer}	Uitgegeven door {issuer}
+	Trusted when asked	Vertrouwd na vraag
+	Stop trusting	Niet meer vertrouwen
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Een certificeringsinstantie van uw organisatie, of het eigen certificaat van uw mailserver (.pem, .crt, .cer)
+	Trust a certificate file…	Een certificaatbestand vertrouwen…
+	The certificate is trusted for this account	Het certificaat wordt voor dit account vertrouwd

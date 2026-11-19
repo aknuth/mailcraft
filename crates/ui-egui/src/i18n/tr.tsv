@@ -45,6 +45,7 @@
 	Close	Kapat
 	Code	Kod
 	Compact	Sıkı
+	Single line	Tek satır
 	Connect	Bağlan
 	Connecting…	Bağlanılıyor…
 	Conversations	Konuşmalar
@@ -260,6 +261,13 @@
 	Select a message first.	Önce bir ileti seçin.
 	Send	Gönder
 	Send (Ctrl+Enter)	Gönder (Ctrl+Enter)
+	Send this message?	Bu ileti gönderilsin mi?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Enter yazdığınız iletiyi gönderir.
+	Don't ask again	Bir daha sorma
+	Don't send	Gönderme
+	Ctrl+Enter in a message	İletide Ctrl+Enter
+	Ask first	Önce sor
+	Do nothing	Hiçbir şey yapma
 	Send / Receive	Gönder / Al
 	Send / Receive all folders (F9)	Tüm klasörleri gönder / al (F9)
 	Send anyway	Yine de gönder
@@ -275,6 +283,11 @@
 	Settings found: {source}	Ayarlar bulundu: {source}
 	Show a desktop notification when new mail arrives	Yeni posta geldiğinde masaüstü bildirimi göster
 	Keep MailCraft running when its window is closed	Penceresi kapatıldığında MailCraft çalışmaya devam etsin
+	Start MailCraft in the notification area	MailCraft'ı bildirim alanında başlat
+	Start MailCraft minimized	MailCraft'ı simge durumunda başlat
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	Penceresi kapatıldığındaki gibi kaldırılmışken postayı denetler ve duyurur. Bir bağlantıyı veya dosyayı açmak için başlatıldığında pencereyi açar.
+	Show the unread mail on its icon	Okunmamış postayı simgesinde göster
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	Gelen Kutularındaki okunmamış ileti sayısı, bildirim alanındaki MailCraft simgesinin köşesinde
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Bildirim alanında kalır, postayı denetler ve yeni postayı bildirir. Dosya sayfasındaki veya simgesinin menüsündeki “Çıkış” onu kapatır.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Penceresi simge durumuna küçültülür ve MailCraft postayı denetlemeyi ve yeni postayı bildirmeyi sürdürür. Dosya sayfasındaki “Çıkış” onu kapatır.
 	Open MailCraft	MailCraft’ı aç
@@ -389,6 +402,8 @@
 	Change this account's name, servers and sign-in, or its signature.	Bu hesabın adını, sunucularını ve oturum açma bilgilerini ya da imzasını değiştirin.
 	Checking with the server…	Sunucuyla denetleniyor…
 	Compact list	Sıkı liste
+	Single-line list	Tek satırlı liste
+	One line a message: the sender, the subject and the time	İleti başına tek satır: gönderen, konu ve saat
 	Don't send automatic replies	Otomatik yanıt gönderme
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	Açık oldukları sürece her gönderici günde bir yanıt alır. Posta sunucunuzda tutulurlar, bu yüzden bu bilgisayar kapalıyken de çalışırlar.
 	Empty	Boşalt
@@ -612,9 +627,16 @@
 	Remove it from the server after	Şu süreden sonra sunucudan kaldır
 	days	gün
 	Remove it from the server once it's deleted from Deleted Items	Silinmiş Öğeler'den silindiğinde sunucudan kaldır
+	A copy on the server	Sunucudaki kopya
+	None: mail is removed from the server once downloaded	Yok: posta indirildikten sonra sunucudan kaldırılır
+	Kept for {n} days	{n} gün tutulur
+	Kept for {n} days, or until deleted from Deleted Items	{n} gün ya da Silinmiş Öğeler'den silinene kadar tutulur
+	Kept until deleted from Deleted Items	Silinmiş Öğeler'den silinene kadar tutulur
+	Kept for good	Hep tutulur
 	Arrange by: {field}	Sıralama: {field}
 	By {field} ⏷	Sıralama: {field} ⏷
 	Reverse sort	Sıralamayı ters çevir
+	Show in groups	Gruplar hâlinde göster
 	Size	Boyut
 	Flag status	Bayrak durumu
 	Attachments	Ekler
@@ -656,7 +678,10 @@
 	Low importance	Düşük önem
 	Read receipt	Okundu bilgisi
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	Alıcılardan okuduklarını onaylamalarını iste (posta uygulamaları bunu yapmayabilir veya onlara sorabilir)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	Her sağlayıcıyla çalışır: SMTP ile IMAP veya POP, JMAP ya da Exchange. Parolanız bu bilgisayarın anahtarlığında tutulur ve yalnızca posta sunucunuza gönderilir.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	IMAP, POP, JMAP ve Exchange ile çalışır. Parolanız bu bilgisayarın anahtarlığında tutulur ve yalnızca posta sunucunuza gönderilir.
+	Mail stays on the server and looks the same on every device.	Postalar sunucuda kalır ve her cihazda aynı görünür.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	Postalar bu bilgisayara indirilir. Sunucu bir süre kopyasını tutabilir.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	Postalarınıza ulaşmanın daha yeni bir yolu; Fastmail gibi bazı sağlayıcılar sunar.
 	Run it now on the mail already in the Inbox	Gelen Kutusundaki mevcut postalarda şimdi çalıştır
 	Run on the mail already in the Inbox	Gelen Kutusundaki mevcut postalarda çalıştır
 	More options	Diğer seçenekler
@@ -957,6 +982,9 @@ month	May	Mayıs
 	Opened by the server for your access to it	Erişiminiz olduğu için sunucu tarafından açıldı
 	Shared mailbox {address}, opened by {email}	Paylaşılan posta kutusu {address}, {email} üzerinden açıldı
 	The outgoing server has its own user name and password	Giden sunucunun kendi kullanıcı adı ve parolası var
+	Sign in with	Oturum açma yöntemi
+	NTLM (Secure Password Authentication)	NTLM (Güvenli Parola Kimlik Doğrulaması)
+	No sign-in	Oturum açmadan
 	Its user name	Kullanıcı adı
 	Its password	Parolası
 	Password (unchanged when empty)	Parola (boşsa değişmez)
@@ -980,7 +1008,7 @@ month	May	Mayıs
 	Close anyway	Yine de kapat
 	Edit notes	Notları düzenle
 	Getting them from the server…	Sunucudan alınıyor…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	Postaları sunucuda kalır ve yalnızca MailCraft çalışırken bellekte tutulur: hiçbiri bu bilgisayara yazılmaz ve her ileti açtığınızda indirilir. Gönderdiğiniz postalar doğrudan sunucuya gider; yalnızca henüz gidemeyen postalar (çevrimdışıyken) bekler ve MailCraft önce kapanırsa çevrimdışı yapılan değişikliklerle birlikte kaybolur (size sorulur). Bir sunucudaki takvimler, kişiler ve notlar orada kalır; yalnızca MailCraft'ta tutulanlar kapandığında kaybolur.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	İletiler açtığınızda indirilir ve yalnızca bellekte tutulur: bu bilgisayara hiçbir şey yazılmaz. Çevrimdışıyken yapılan değişiklikler, gönderilmeyi bekleyen postalar ve yalnızca MailCraft'ta duran takvimler, kişiler ve notlar kapatıldığında kaybolur (önce size sorulur).
 	Mail older than what's kept here is only on the server.	Burada tutulandan daha eski postalar yalnızca sunucudadır.
 	Search the server	Sunucuda ara
 	Searching the server…	Sunucuda aranıyor…
@@ -1099,6 +1127,7 @@ month	May	Mayıs
 	Added to your calendar from {file}: {n}	{file} dosyasından takviminize eklenen: {n}
 	Added to your contacts from {file}: {n}	{file} dosyasından kişilerinize eklenen: {n}
 	Add an account first: a new message needs an account to send from.	Önce bir hesap ekleyin: yeni bir iletinin gönderileceği bir hesap gerekir.
+	{folder} isn't attached: it's a folder	{folder} eklenmez: bu bir klasör
 	Add an account first: events and people are kept with an account.	Önce bir hesap ekleyin: etkinlikler ve kişiler bir hesapla birlikte tutulur.
 	Couldn't open {file}: {error}	{file} açılamadı: {error}
 	Safety	Güvenlik önlemleri
@@ -1284,6 +1313,8 @@ month	May	Mayıs
 	Your provider's calendar server wasn't found: give its address	Sağlayıcınızın takvim sunucusu bulunamadı: adresini girin
 	Classic ribbon	Klasik şerit
 	Big buttons with their names under them, in named groups	Adlandırılmış gruplarda, adları altında yazan büyük düğmeler
+	Hide the ribbon	Şeridi gizle
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	Sekmeleri üst çubukta kalır: tek tıklama düğmelerini gösterir, çift tıklama onları açık tutar
 	New	Yeni
 	Respond	Yanıtla
 	Tags	Etiketler
@@ -1705,9 +1736,12 @@ month	May	Mayıs
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Otomatik: sunucu bildirebiliyorsa yeni posta bildirildiği anda gelir, aksi halde iki dakikada bir bakılır. Belirli bir süre seçildiğinde hesap yalnızca o zaman bakar. Gönderdikleriniz hemen gider, Gönder/Al ise hemen bakar.
 	Automatically	Otomatik
 	Every {n} minutes	Her {n} dakikada
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	Yalnızca takvimler ve kişiler, e-posta olmadan (CalDAV ve CardDAV)
+	Only calendars and contacts, with no email?	Yalnızca takvimler ve kişiler mi, e-posta olmadan?
+	Add a CalDAV and CardDAV account	CalDAV ve CardDAV hesabı ekle
 	Calendar and contacts server	Takvim ve kişi sunucusu
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Nextcloud, Baïkal, SOGo veya Radicale gibi, takvimlerinizi ve kişilerinizi e-posta olmadan tutan her CalDAV ve CardDAV sunucusu için. Parolanız bu bilgisayarın anahtarlığında tutulur ve yalnızca o sunucuya gönderilir.
+	Add calendars and contacts	Takvim ve kişi ekle
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	E-postası olmayan bir CalDAV ve CardDAV sunucusu için; örneğin Nextcloud, Baïkal, SOGo veya Radicale. Parolanız bu bilgisayarın anahtarlığında tutulur ve yalnızca o sunucuya gönderilir.
+	Add an email account instead	Bunun yerine e-posta hesabı ekle
 	Server: {url} (CalDAV and CardDAV)	Sunucu: {url} (CalDAV ve CardDAV)
 	Not available: this account has no mail server.	Kullanılamıyor: bu hesabın posta sunucusu yok.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Postanız MailCraft'ın önceki Flatpak'ından taşındı; o hâlâ yüklü. Kaldırmak için şunu çalıştırın: flatpak uninstall --delete-data {id}
@@ -1722,3 +1756,49 @@ month	May	Mayıs
 	{name} couldn't be downloaded: {error}	{name} indirilemedi: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Pencerede bir şeyler ters gitti ve yaptığı iş durduruldu. MailCraft çalışmaya devam ediyor; nerede olduğu günlükte yazıyor.
 	Font size	Yazı tipi boyutu
+	Repeats every	Tekrar aralığı: her
+	On these days	Bu günlerde
+	Which day	Hangi gün
+	Series ends	Seri biter
+	After	Toplam
+	Pick a date	Tarih seç
+	On day {day}	Ayın {day}. günü
+	On {month} {day}	{day} {month}
+	On the {nth} {weekday}	Ayın {nth} {weekday} günü
+	On the {nth} {weekday} of {month}	{month} ayının {nth} {weekday} günü
+interval	days	gün
+interval	weeks	hafta
+interval	months	ay
+interval	years	yıl
+nth	first	birinci
+nth	second	ikinci
+nth	third	üçüncü
+nth	fourth	dördüncü
+nth	last	son
+count	occurrences	kez
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	Web'deki resimleri burada gösterilmez. Burada değiştirmeden HTML koduna dönerseniz korunurlar.
+	Messages on a light background	İletiler açık arka planda
+	In the dark theme, messages keep the light page and colours they were written in	Koyu temada iletiler, yazıldıkları açık sayfayı ve renkleri korur
+	Show messages on a light background	İletileri açık arka planda göster
+	Show messages on the dark background	İletileri koyu arka planda göster
+	Copy picture	Resmi kopyala
+	Save picture as…	Resmi farklı kaydet…
+	The picture couldn't be copied	Resim kopyalanamadı
+	The picture couldn't be saved	Resim kaydedilemedi
+	Only when I ask	Yalnızca istediğimde
+	Send / Receive on the account looks; Send / Receive for all leaves it out	Hesapta Gönder/Al denetler; tümü için Gönder/Al onu atlar
+	There's no folder to put the PDF in for the viewer	PDF'yi görüntüleyici için koyacak bir klasör yok
+	Trust this mail server's certificate?	Bu posta sunucusunun sertifikasına güvenilsin mi?
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	Bu bilgisayarın güvendiği hiçbir yetkili, {host} sunucusunun gösterdiği sertifikaya kefil değil. Bir şirketin ya da evdeki bir posta sunucusu kendi sertifikasını oluşturabilir, ancak sizinle sunucu arasındaki biri de böyle bir sertifika gösterebilir. Yalnızca sunucuyu yöneten kişi bu parmak izini onaylarsa güvenin.
+	Issued to	Verildiği
+	Issued by	Veren
+	Valid	Geçerlilik
+	{from} to {until}	{from} – {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	Sunucuyu yöneten kişi sertifikayı bunun yerine dosya olarak da verebilir: Sunucu ayarları › Bir sertifika dosyasına güven…
+	Certificates	Sertifikalar
+	Issued by {issuer}	Veren: {issuer}
+	Trusted when asked	Sorulunca güvenildi
+	Stop trusting	Güvenmeyi bırak
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Kuruluşunuzun yetkilisi ya da posta sunucunuzun kendi sertifikası (.pem, .crt, .cer)
+	Trust a certificate file…	Bir sertifika dosyasına güven…
+	The certificate is trusted for this account	Bu hesap için sertifikaya güveniliyor

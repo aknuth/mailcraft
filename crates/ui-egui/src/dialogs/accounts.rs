@@ -1,11 +1,15 @@
-//! Dialogs: accounts (adding one, its settings, its password, removing it), and the rows the
-//! account dialogs share.
+//! Dialogs: accounts (adding one, its settings, its password, removing it, its other addresses,
+//! its calendars and contacts given by hand, its server's certificate), and the rows the account
+//! dialogs share.
 
 use super::*;
 
 mod adding;
+pub(super) mod addresses;
+pub(super) mod dav;
 mod editing;
 mod forms;
+pub(super) mod trust;
 
 use adding::add_account;
 use editing::edit_account;
@@ -99,7 +103,7 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
             }
             !cancel
         }
-        Dialog::EditAccount(f) => edit_account(ui, f, t, acts),
+        Dialog::EditAccount(f) => edit_account(ui, f, s, t, acts),
         Dialog::AddSharedMailbox { account, address, error } => {
             ui.set_width(420.0);
             title(ui, t, "Add a shared mailbox");
@@ -136,6 +140,50 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, t: &Tokens, acts: &
 /// A field's name, small and strong above it.
 fn field_label(ui: &mut Ui, s: &str) {
     ui.label(RichText::new(tl!(s)).strong().small());
+}
+
+/// A part of a dialog that opens and closes (`open`), its name after a chevron; closed, `note`
+/// says under it what's in it, in brief. Not a checkbox, which reads as turning something on.
+fn disclosure(ui: &mut Ui, t: &Tokens, open: &mut bool, label: &str, note: Option<&str>) {
+    let label = tl!(label);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+    widgets::named(ui, &resp, label, true, Some(*open));
+    if resp.clicked() {
+        *open = !*open;
+    }
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, t.hover_row);
+    }
+    // Laid out from the left, mirrored in a right-to-left interface.
+    let m = crate::bidi::Mirror::new(rect);
+    let icon = m.rect(egui::Rect::from_center_size(egui::pos2(rect.left() + 10.0, rect.center().y), vec2(14.0, 14.0)));
+    crate::icons::paint(ui.painter(), icon, if *open { Icon::ChevronDown } else { m.closed() }, t.dim);
+    let name = widgets::one_line(ui, label, theme::bold(13.0), t.text, rect.width() - 28.0);
+    let at = m.rect(egui::Rect::from_min_size(egui::pos2(rect.left() + 22.0, rect.center().y - name.size().y / 2.0), name.size()));
+    ui.painter().galley(at.min, name, t.text);
+    // Lined up with the name, the chevron's room left before it.
+    if let Some(note) = note.filter(|_| !*open) {
+        // From the side the text starts on (egui's `horizontal` here runs from the left even in
+        // Arabic or Hebrew), one line cut short with … past the room.
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 18.0), crate::bidi::row_from_start(egui::Align::Center), |ui| {
+            ui.add_space(22.0);
+            ui.add(egui::Label::new(RichText::new(note).color(t.faint).small()).truncate());
+        });
+    }
+}
+
+/// What's in an opened part, lined up under its name: set in from the side the text starts on.
+fn indented<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.with_layout(crate::bidi::row_from_start(egui::Align::Min), |ui| {
+        ui.add_space(22.0);
+        ui.with_layout(crate::bidi::column(), add).inner
+    })
+    .inner
+}
+
+/// A line under a heading saying what it is, faint and wrapped.
+fn about(ui: &mut Ui, t: &Tokens, s: &str) {
+    ui.add(egui::Label::new(RichText::new(s).color(t.dim).small()).wrap());
 }
 
 /// Which server a row of the account dialogs is for.
@@ -206,7 +254,7 @@ pub(super) fn online_only(ui: &mut Ui, t: &Tokens, on: &mut bool) {
 /// What online only means, said where it's chosen.
 pub(crate) fn online_only_about() -> &'static str {
     tl!(
-        "Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes."
+        "Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first)."
     )
 }
 

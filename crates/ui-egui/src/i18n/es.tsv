@@ -45,6 +45,7 @@
 	Close	Cerrar
 	Code	Código
 	Compact	Compacto
+	Single line	Una línea
 	Connect	Conectar
 	Connecting…	Conectando…
 	Conversations	Conversaciones
@@ -260,6 +261,13 @@
 	Select a message first.	Selecciona primero un mensaje.
 	Send	Enviar
 	Send (Ctrl+Enter)	Enviar (Ctrl+Entrar)
+	Send this message?	¿Enviar este mensaje?
+	Ctrl+Enter sends the message you're writing.	Ctrl+Entrar envía el mensaje que estás escribiendo.
+	Don't ask again	No volver a preguntar
+	Don't send	No enviar
+	Ctrl+Enter in a message	Ctrl+Entrar en un mensaje
+	Ask first	Preguntar antes
+	Do nothing	No hacer nada
 	Send / Receive	Enviar y recibir
 	Send / Receive all folders (F9)	Enviar y recibir todas las carpetas (F9)
 	Send anyway	Enviar de todos modos
@@ -275,6 +283,11 @@
 	Settings found: {source}	Configuración encontrada: {source}
 	Show a desktop notification when new mail arrives	Mostrar una notificación de escritorio cuando llegue correo nuevo
 	Keep MailCraft running when its window is closed	Mantener MailCraft en ejecución al cerrar su ventana
+	Start MailCraft in the notification area	Iniciar MailCraft en el área de notificación
+	Start MailCraft minimized	Iniciar MailCraft minimizado
+	It checks for mail and announces it with its window put away, as when it's closed. Started to open a link or a file, it opens the window.	Comprueba el correo y lo anuncia con la ventana guardada, como cuando se cierra. Si se inicia para abrir un enlace o un archivo, abre la ventana.
+	Show the unread mail on its icon	Mostrar el correo sin leer en su icono
+	How many unread messages the Inboxes have, in the corner of MailCraft's icon in the notification area	Cuántos mensajes sin leer tienen las bandejas de entrada, en la esquina del icono de MailCraft en el área de notificación
 	It stays in the notification area, checks for mail and announces it. Exit on the File page, or in its icon's menu, closes it.	Se queda en el área de notificación, comprueba el correo y lo anuncia. «Salir» en la página Archivo, o en el menú de su icono, lo cierra.
 	Its window is minimized, and MailCraft goes on checking for mail and announcing it. Exit on the File page closes it.	Su ventana se minimiza, y MailCraft sigue comprobando el correo y anunciándolo. «Salir» en la página Archivo lo cierra.
 	Open MailCraft	Abrir MailCraft
@@ -389,6 +402,8 @@
 	Change this account's name, servers and sign-in, or its signature.	Cambia el nombre, los servidores y el inicio de sesión de esta cuenta, o su firma.
 	Checking with the server…	Consultando al servidor…
 	Compact list	Lista compacta
+	Single-line list	Lista de una línea
+	One line a message: the sender, the subject and the time	Una línea por mensaje: el remitente, el asunto y la hora
 	Don't send automatic replies	No enviar respuestas automáticas
 	Each sender gets one reply a day while they're on. They're kept on your mail server, so they work while this computer is off.	Cada remitente recibe una respuesta al día mientras están activadas. Se guardan en tu servidor de correo, así que funcionan aunque este equipo esté apagado.
 	Empty	Vaciar
@@ -612,9 +627,16 @@
 	Remove it from the server after	Quitarla del servidor después de
 	days	días
 	Remove it from the server once it's deleted from Deleted Items	Quitarla del servidor cuando se elimine de Elementos eliminados
+	A copy on the server	Una copia en el servidor
+	None: mail is removed from the server once downloaded	Ninguna: el correo se quita del servidor al descargarlo
+	Kept for {n} days	Se conserva {n} días
+	Kept for {n} days, or until deleted from Deleted Items	Se conserva {n} días, o hasta que se elimine de Elementos eliminados
+	Kept until deleted from Deleted Items	Se conserva hasta que se elimine de Elementos eliminados
+	Kept for good	Se conserva siempre
 	Arrange by: {field}	Organizar por: {field}
 	By {field} ⏷	Por {field} ⏷
 	Reverse sort	Invertir orden
+	Show in groups	Mostrar en grupos
 	Size	Tamaño
 	Flag status	Estado de marca
 	Attachments	Datos adjuntos
@@ -656,7 +678,10 @@
 	Low importance	Importancia baja
 	Read receipt	Confirmación de lectura
 	Ask the recipients to confirm they've read it (their mail app may not, or may ask them)	Pedir a los destinatarios que confirmen que lo han leído (puede que su aplicación de correo no lo haga, o que les pregunte)
-	Works with any provider: IMAP or POP with SMTP, JMAP, or Exchange. Your password is kept in this computer's keychain and only ever sent to your mail server.	Funciona con cualquier proveedor: IMAP o POP con SMTP, JMAP o Exchange. Tu contraseña se guarda en el llavero de este equipo y solo se envía a tu servidor de correo.
+	Works with IMAP, POP, JMAP and Exchange. Your password is kept in this computer's keychain and sent only to your mail server.	Funciona con IMAP, POP, JMAP y Exchange. Tu contraseña se guarda en el llavero de este equipo y solo se envía a tu servidor de correo.
+	Mail stays on the server and looks the same on every device.	El correo se queda en el servidor y se ve igual en todos tus dispositivos.
+	Mail is downloaded to this computer. The server can keep a copy for a while.	El correo se descarga en este equipo. El servidor puede guardar una copia durante un tiempo.
+	A newer way to reach your mail, offered by some providers such as Fastmail.	Una forma más nueva de acceder a tu correo, que ofrecen algunos proveedores como Fastmail.
 	Run it now on the mail already in the Inbox	Ejecutarla ahora en el correo que ya está en la Bandeja de entrada
 	Run on the mail already in the Inbox	Ejecutar en el correo que ya está en la Bandeja de entrada
 	More options	Más opciones
@@ -957,6 +982,9 @@ month	May	mayo
 	Opened by the server for your access to it	Lo abre el servidor porque tienes acceso
 	Shared mailbox {address}, opened by {email}	Buzón compartido {address}, abierto por {email}
 	The outgoing server has its own user name and password	El servidor de salida tiene su propio nombre de usuario y contraseña
+	Sign in with	Iniciar sesión con
+	NTLM (Secure Password Authentication)	NTLM (autenticación segura de contraseña)
+	No sign-in	Sin iniciar sesión
 	Its user name	Su nombre de usuario
 	Its password	Su contraseña
 	Password (unchanged when empty)	Contraseña (sin cambios si está vacía)
@@ -980,7 +1008,7 @@ month	May	mayo
 	Close anyway	Cerrar de todos modos
 	Edit notes	Editar notas
 	Getting them from the server…	Obteniéndolos del servidor…
-	Its mail stays on the server and is held in memory only while MailCraft runs: none of it is written to this computer, and each message downloads when you open it. Mail you send goes straight to the server; only mail that can't go yet (while offline) waits, and it's lost with changes made offline if MailCraft closes first (you're asked). Calendars, contacts and notes on a server stay there; those kept only in MailCraft are lost when it closes.	Su correo permanece en el servidor y solo se mantiene en memoria mientras MailCraft está abierto: no se escribe nada en este equipo, y cada mensaje se descarga al abrirlo. El correo que envías va directamente al servidor; solo espera el que aún no puede enviarse (sin conexión), y se pierde junto con los cambios hechos sin conexión si MailCraft se cierra antes (se te pregunta). Los calendarios, contactos y notas de un servidor permanecen allí; los guardados solo en MailCraft se pierden al cerrarlo.
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	Los mensajes se descargan al abrirlos y solo se guardan en memoria: no se escribe nada en este equipo. Los cambios hechos sin conexión, el correo pendiente de enviar y los calendarios, contactos y notas que solo están en MailCraft se pierden al cerrarlo (se te pregunta antes).
 	Mail older than what's kept here is only on the server.	El correo más antiguo que el guardado aquí solo está en el servidor.
 	Search the server	Buscar en el servidor
 	Searching the server…	Buscando en el servidor…
@@ -1099,6 +1127,7 @@ month	May	mayo
 	Added to your calendar from {file}: {n}	Añadidos a tu calendario desde {file}: {n}
 	Added to your contacts from {file}: {n}	Añadidos a tus contactos desde {file}: {n}
 	Add an account first: a new message needs an account to send from.	Añade primero una cuenta: un mensaje nuevo necesita una cuenta desde la que enviarse.
+	{folder} isn't attached: it's a folder	{folder} no se adjunta: es una carpeta
 	Add an account first: events and people are kept with an account.	Añade primero una cuenta: los eventos y las personas se guardan en una cuenta.
 	Couldn't open {file}: {error}	No se pudo abrir {file}: {error}
 	Safety	Seguridad
@@ -1284,6 +1313,8 @@ month	May	mayo
 	Your provider's calendar server wasn't found: give its address	No se encontró el servidor de calendario de su proveedor: indique su dirección
 	Classic ribbon	Cinta clásica
 	Big buttons with their names under them, in named groups	Botones grandes con su nombre debajo, en grupos con nombre
+	Hide the ribbon	Ocultar la cinta de opciones
+	Its tabs stay on the top bar: click one for its buttons, twice to keep them	Sus pestañas siguen en la barra superior: un clic muestra sus botones, un doble clic los mantiene
 	New	Nuevo
 	Respond	Responder
 	Tags	Etiquetas
@@ -1705,9 +1736,12 @@ month	May	mayo
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Automáticamente recibe el correo nuevo en cuanto el servidor lo indica, si puede hacerlo, y si no, busca cada dos minutos. Con una hora fijada, la cuenta solo busca entonces. Lo que envías sale al momento, y Enviar y recibir busca enseguida.
 	Automatically	Automáticamente
 	Every {n} minutes	Cada {n} minutos
-	Calendars and contacts only, with no email (CalDAV and CardDAV)	Solo calendarios y contactos, sin correo (CalDAV y CardDAV)
+	Only calendars and contacts, with no email?	¿Solo calendarios y contactos, sin correo?
+	Add a CalDAV and CardDAV account	Agregar una cuenta de CalDAV y CardDAV
 	Calendar and contacts server	Servidor de calendarios y contactos
-	For any CalDAV and CardDAV server that keeps your calendars and contacts, such as Nextcloud, Baïkal, SOGo or Radicale, with no email. Your password is kept in this computer's keychain and only ever sent to that server.	Para cualquier servidor CalDAV y CardDAV que guarde tus calendarios y contactos, como Nextcloud, Baïkal, SOGo o Radicale, sin correo. Tu contraseña se guarda en el llavero de este equipo y solo se envía a ese servidor.
+	Add calendars and contacts	Agregar calendarios y contactos
+	For a CalDAV and CardDAV server with no email, such as Nextcloud, Baïkal, SOGo or Radicale. Your password is kept in this computer's keychain and sent only to that server.	Para un servidor CalDAV y CardDAV sin correo, como Nextcloud, Baïkal, SOGo o Radicale. Tu contraseña se guarda en el llavero de este equipo y solo se envía a ese servidor.
+	Add an email account instead	Agregar una cuenta de correo en su lugar
 	Server: {url} (CalDAV and CardDAV)	Servidor: {url} (CalDAV y CardDAV)
 	Not available: this account has no mail server.	No disponible: esta cuenta no tiene servidor de correo.
 	Your mail came over from MailCraft's earlier Flatpak, which is still installed. To remove it, run: flatpak uninstall --delete-data {id}	Tu correo se ha traído del Flatpak anterior de MailCraft, que sigue instalado. Para quitarlo, ejecuta: flatpak uninstall --delete-data {id}
@@ -1722,3 +1756,49 @@ month	May	mayo
 	{name} couldn't be downloaded: {error}	No se pudo descargar {name}: {error}
 	Something went wrong in the window, and what it was doing was stopped. MailCraft goes on; the log says where it happened.	Algo salió mal en la ventana y se detuvo lo que estaba haciendo. MailCraft sigue funcionando; el registro indica dónde ocurrió.
 	Font size	Tamaño de fuente
+	Repeats every	Repetir cada
+	On these days	Estos días
+	Which day	Qué día
+	Series ends	La serie termina
+	After	Después de
+	Pick a date	Elegir una fecha
+	On day {day}	El día {day}
+	On {month} {day}	El {day} de {month}
+	On the {nth} {weekday}	El {nth} {weekday}
+	On the {nth} {weekday} of {month}	El {nth} {weekday} de {month}
+interval	days	días
+interval	weeks	semanas
+interval	months	meses
+interval	years	años
+nth	first	primer
+nth	second	segundo
+nth	third	tercer
+nth	fourth	cuarto
+nth	last	último
+count	occurrences	repeticiones
+	Its pictures from the web aren't shown here. Go back to HTML code without changing it here, and they're kept.	Sus imágenes de la web no se muestran aquí. Vuelva al código HTML sin cambiar nada aquí y se conservan.
+	Messages on a light background	Mensajes sobre fondo claro
+	In the dark theme, messages keep the light page and colours they were written in	Con el tema oscuro, los mensajes conservan la página clara y los colores con que se escribieron
+	Show messages on a light background	Mostrar los mensajes sobre fondo claro
+	Show messages on the dark background	Mostrar los mensajes sobre fondo oscuro
+	Copy picture	Copiar imagen
+	Save picture as…	Guardar imagen como…
+	The picture couldn't be copied	No se pudo copiar la imagen
+	The picture couldn't be saved	No se pudo guardar la imagen
+	Only when I ask	Solo cuando lo pida
+	Send / Receive on the account looks; Send / Receive for all leaves it out	Enviar/Recibir en la cuenta la consulta; Enviar/Recibir para todas la omite
+	There's no folder to put the PDF in for the viewer	No hay ninguna carpeta donde poner el PDF para el visor
+	Trust this mail server's certificate?	¿Confiar en el certificado de este servidor de correo?
+	No authority this computer trusts vouches for the certificate {host} shows. A company's or a home mail server may make its own, but someone between you and the server could show one too. Trust it only if whoever runs the server confirms this fingerprint.	Ninguna autoridad en la que confía este equipo respalda el certificado que muestra {host}. El servidor de correo de una empresa o uno doméstico puede crear el suyo propio, pero alguien entre usted y el servidor también podría mostrar uno. Confíe en él solo si quien administra el servidor confirma esta huella digital.
+	Issued to	Emitido para
+	Issued by	Emitido por
+	Valid	Válido
+	{from} to {until}	Del {from} al {until}
+	Whoever runs it may give you its certificate as a file instead: Server settings › Trust a certificate file…	Quien lo administra puede darle su certificado como archivo: Configuración del servidor › Confiar en un archivo de certificado…
+	Certificates	Certificados
+	Issued by {issuer}	Emitido por {issuer}
+	Trusted when asked	De confianza al preguntar
+	Stop trusting	Dejar de confiar
+	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Una autoridad de su organización o el certificado propio de su servidor de correo (.pem, .crt, .cer)
+	Trust a certificate file…	Confiar en un archivo de certificado…
+	The certificate is trusted for this account	El certificado es de confianza para esta cuenta

@@ -166,6 +166,22 @@ fn hostile_markup_is_survived() {
     let _ = html_layout("<table><tr><td><script>if (a < b) { document.write('<td>') }</script>z</td><td>y</td></tr></table>");
     let many = "<table><tr>".to_string() + &"<td>c</td>".repeat(5000) + "</tr></table>";
     assert!(html_layout(&many).is_empty(), "too many cells: flows as text");
+    // Content outside cells, each given a row and cell of its own (#122), as deep as it goes.
+    for stray in ["<table><div>".repeat(5000), "<table><tr>x".repeat(5000), "<table><tbody><span>y".repeat(5000)] {
+        let _ = html_layout(&stray);
+    }
+}
+
+/// Rows in a form in a table (a survey a newsletter asks to fill in): a browser shows them as the
+/// table's rows. They were looked for through the table's sections only: the table came out
+/// empty.
+#[test]
+fn rows_in_a_form_are_the_tables_rows() {
+    let b = html_layout(
+        r#"<table width="600"><form action="https://survey.example/"><tr><td>How did we do?</td><td><input type="radio"> Good</td></tr></form></table>"#,
+    );
+    let s = format!("{b:?}");
+    assert!(s.contains("How did we do?") && s.contains("Good"), "{b:?}");
 }
 
 /// A colour as CSS writes one: `#abc` is `#aabbcc`, an `rgb()` part over 255 is 255, and a hex

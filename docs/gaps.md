@@ -92,6 +92,19 @@ Test builds update themselves ([how test builds update](updates.md)). These part
   that hostile or huge mail stays quick: a copy cut there would run its paragraphs together, and
   past two dozen tables, each one nested deeper makes its text slower to read.
 
+### 8. EteSync
+
+- **Impact:** MailCraft can't sign in to an EteSync account itself. EteSync encrypts contacts,
+  calendars, tasks and notes end to end, with its own protocol (Etebase).
+- **Workaround:** Run EteSync's own bridge, `etesync-dav`, which offers the account as a calendar
+  and contacts server on this computer. In MailCraft, add an account and, under its form, click
+  **Add a CalDAV and CardDAV account**: the address `http://localhost:37358/`, the EteSync user
+  name, and the password the bridge shows (not the EteSync password). Calendars and
+  contacts sync both ways. Lists of tasks don't (MailCraft keeps its tasks on this computer), and
+  the bridge doesn't offer notes.
+- **Cause:** It needs an Etebase client of MailCraft's own: the Rust library EteSync publishes
+  brings C libraries with it (OpenSSL and libsodium), which MailCraft doesn't build with.
+
 ## Not planned
 
 These are outside MailCraft's control, or accepted as they are.
@@ -108,3 +121,10 @@ These are outside MailCraft's control, or accepted as they are.
 - **Linked files on another computer or the web.** `.pst` import and export leave them out.
 - **Repeat rules Outlook can't express.** Export writes such a series as its occurrences, up to
   2,000 of them.
+- **The system's Share menu.** Windows 11's Share window lists only apps installed as signed MSIX
+  packages, and the Mac's Share menu only apps with a signed extension; GNOME Files and COSMIC
+  Files take no menu entry from a package, and a Flatpak or an AppImage can't add one anywhere.
+  Instead: **Send to › MailCraft** in Explorer (added for whoever installs or updates MailCraft;
+  another user on the computer can copy it into their own `shell:sendto` folder), **Send with
+  MailCraft** in Dolphin, Nemo and PCManFM-Qt, and files dropped on MailCraft's Dock icon or
+  window.

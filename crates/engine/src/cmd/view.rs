@@ -15,7 +15,10 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         .params(r#"{"on"?: bool}"#),
         toggle!("view.preview", "Message preview", "View › Messages", show_preview),
         toggle!("view.compact", "Compact list", "View › Layout", compact),
+        toggle!("view.groups", "Show in groups", "View › Arrangement", groups),
+        toggle!("view.singleLine", "Single-line list", "View › Layout", single_line),
         toggle!("view.classicRibbon", "Classic ribbon", "View › Layout", classic_ribbon),
+        toggle!("view.hideRibbon", "Hide the ribbon", "View › Layout", ribbon_hidden).key("Mod+F1"),
         CommandSpec::new("view.accent", "Accent colour", "File › Options › Personalize", |s, v| {
             let given = p::req_str(v, "color")?;
             s.prefs.accent = crate::session::accent_code(given)
@@ -24,6 +27,7 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         })
         .params(r##"{"color": "teal"|"blue"|"indigo"|"violet"|"rose"|"red"|"orange"|"green"|"#rrggbb" ("" or "teal": MailCraft's own)}"##),
         toggle!("view.plainTopBar", "Plain top bar", "File › Options › Personalize", plain_top_bar),
+        toggle!("view.lightMessages", "Messages on a light background", "File › Options › General", light_messages),
         CommandSpec::new("view.dateFormat", "Dates and times", "File › Options › General", |s, v| {
             let mut style = s.prefs.date_style;
             if let Some(code) = p::str(v, "order") {
@@ -104,8 +108,22 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         toggle!("view.confirmDelete", "Ask before deleting for good", "File › Options › Mail", confirm_permanent_delete),
         toggle!("view.notifications", "Desktop notifications", "File › Options › Mail", notify),
         toggle!("view.closeToTray", "Keep MailCraft running when its window is closed", "File › Options › General", close_to_tray),
+        toggle!("view.startInTray", "Start MailCraft with its window put away", "File › Options › General", start_in_tray),
+        toggle!("view.trayUnread", "The unread count on the notification area's icon", "File › Options › General", tray_unread),
         toggle!("view.newMailWindow", "New messages in their own window", "File › Options › Mail", new_mail_window),
         toggle!("view.replyWindow", "Replies and forwards in their own window", "File › Options › Mail", reply_window),
+        CommandSpec::new("options.ctrlEnter", "What Ctrl+Enter does in a message", "File › Options › Mail", |s, v| {
+            if let Some(does) = p::str(v, "does") {
+                s.prefs.ctrl_enter = match does {
+                    "ask" => crate::CtrlEnter::Ask,
+                    "send" => crate::CtrlEnter::Send,
+                    "nothing" => crate::CtrlEnter::Nothing,
+                    other => return Err(CmdError::Params(format!("`{other}`: Ctrl+Enter asks, sends or does nothing"))),
+                };
+            }
+            Ok(json!({"does": s.prefs.ctrl_enter}))
+        })
+        .params(r#"{"does"?: "ask"|"send"|"nothing"}"#),
         toggle!("calendar.tentativeInvites", "Invitations into the calendar as tentative", "File › Options › Calendar", tentative_invites),
         CommandSpec::new("options.answeredInvites", "After answering a meeting invitation", "File › Options › Mail", |s, v| {
             if let Some(after) = p::str(v, "after") {
@@ -214,6 +232,16 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         .params(r#"{"account": string, "on"?: bool (default: the other way; keep none of its mail on this computer, only in memory while MailCraft runs)}"#),
         CommandSpec::new("account.checkEvery", "Check for new mail every", "File › Options › Mail", |s, v| {
             let id = p::req_str(v, "account")?;
+            // Only when asked (issue #104).
+            if p::bool(v, "byHand") == Some(true) {
+                let mut c = s.config_of(id)?;
+                if !c.has_server() {
+                    return Err(CmdError::Params("that account has no server to look at".into()));
+                }
+                (c.check_every, c.check_by_hand) = (None, true);
+                s.update_account(c, None)?;
+                return Ok(json!({"account": id, "byHand": true}));
+            }
             let minutes = p::u64(v, "minutes").ok_or_else(|| CmdError::Params("`minutes` is required (0: automatically)".into()))?;
             let minutes = u32::try_from(minutes).ok().filter(|m| *m <= mailcraft_model::MAX_CHECK_MINUTES);
             let Some(minutes) = minutes else {
@@ -223,11 +251,11 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             if !c.has_server() {
                 return Err(CmdError::Params("that account has no server to look at".into()));
             }
-            c.check_every = (minutes > 0).then_some(minutes);
+            (c.check_every, c.check_by_hand) = ((minutes > 0).then_some(minutes), false);
             s.update_account(c, None)?;
             Ok(json!({"account": id, "minutes": minutes}))
         })
-        .params(r#"{"account": string, "minutes": number (0: as soon as the server says, or else every two minutes; up to a day)}"#),
+        .params(r#"{"account": string, "minutes": number (0: as soon as the server says, or else every two minutes; up to a day) | "byHand": true (only when asked: Send / Receive on the account)}"#),
         CommandSpec::new("note.arrange", "Arrange notes", "Notes › Arrange by", |s, v| {
             s.prefs.notes_order = match p::req_str(v, "by")? {
                 "modified" => crate::session::NotesOrder::Modified,

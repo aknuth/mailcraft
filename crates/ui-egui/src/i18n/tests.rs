@@ -32,7 +32,7 @@ pub(crate) fn interface_strings() -> BTreeSet<String> {
     // and the catalogs' own code left out.
     let sources = ui_sources();
     // (prefix, which string literals after it are interface text)
-    let prefixes: [(&str, &[usize]); 21] = [
+    let prefixes: [(&str, &[usize]); 22] = [
         ("tl!(", &[0]),
         ("tf!(", &[0]),
         ("tool_button(ui, Icon::", &[0]),
@@ -53,6 +53,7 @@ pub(crate) fn interface_strings() -> BTreeSet<String> {
         ("heading(ui, ", &[0]),
         ("group(ui, ", &[0]),
         ("check(ui, s.prefs.", &[0]),
+        ("disclosure(ui, t, ", &[0]),
         // Labels in tables of buttons drawn in a loop: `(Icon::Send, "Sent To", "to:")`.
         ("(Icon::", &[0]),
     ];
@@ -463,6 +464,9 @@ fn tags_templates_and_dates() {
     assert_eq!(lang_from_tag("tr").map(Lang::code), Some("tr"));
     assert_eq!(lang_from_tag("tr-TR").map(Lang::code), Some("tr"));
     assert_eq!(lang_from_tag("tr_TR.UTF-8").map(Lang::code), Some("tr"));
+    assert_eq!(lang_from_tag("sk").map(Lang::code), Some("sk"));
+    assert_eq!(lang_from_tag("sk-SK").map(Lang::code), Some("sk"));
+    assert_eq!(lang_from_tag("sk_SK.UTF-8").map(Lang::code), Some("sk"));
     assert_eq!(lang_from_tag("de-AT").map(Lang::code), Some("de"));
     assert_eq!(lang_from_tag("C"), Some(Lang::EN));
     assert_eq!(lang_from_tag("xx"), None);
@@ -582,7 +586,7 @@ fn a_tour_in_the_pseudo_language_only_draws_known_strings() {
 fn the_language_list_reads_in_order() {
     let names: Vec<&str> = Lang::for_picker().iter().map(|l| l.name()).collect();
     assert_eq!(names.len(), LANGUAGES.len());
-    let latin = ["English", "Deutsch", "Español", "Français", "Italiano", "Nederlands", "Português (Brasil)", "Türkçe"];
+    let latin = ["English", "Deutsch", "Español", "Français", "Italiano", "Nederlands", "Português (Brasil)", "Slovenčina", "Türkçe"];
     assert_eq!(names.get(..latin.len()), Some(&latin[..]), "{names:?}");
     assert!(names.iter().skip(latin.len()).all(|n| !n.is_ascii()), "{names:?}");
 }

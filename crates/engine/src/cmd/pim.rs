@@ -129,10 +129,13 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("event.update", "Edit event", "Calendar › Event", |s, v| {
             let uid = p::req_str(v, "uid")?.to_string();
             let current = s.find_event(&uid).map(|(_, e)| e.event.clone()).ok_or_else(|| CmdError::Params(format!("no event `{uid}`")))?;
+            let before = current.sequence;
             let e = event_from(s, v, current)?;
             let r = s.update_event(&uid, |x| *x = e)?;
-            // The user's own meeting: the guests hear of the change.
+            // The user's own meeting: the guests hear of a change that's theirs to know, a new
+            // version of it (not one saved unchanged, or of the user's own reminder, issue #102).
             if let Some((account, stored)) = s.find_event(&uid).map(|(a, e)| (a.to_string(), e.event.clone()))
+                && stored.sequence != before
                 && organized_by_me(s, &stored)
             {
                 let route = s.meeting_route(&account, &uid);
@@ -329,7 +332,16 @@ pub(super) fn event_from(s: &Session, v: &Value, mut e: mailcraft_model::ical::C
     if let Some((t, all_day)) = when("start")? {
         e.start = t;
         e.all_day = p::bool(v, "allDay").unwrap_or(all_day);
-        e.end = t.saturating_add(length.max(if e.all_day { 86_400 } else { 3600 }));
+        // Moved, it keeps its length (a half-hour meeting became an hour long); a new one, with
+        // none yet, is an hour long, or a day.
+        let length = if e.all_day {
+            length.max(86_400)
+        } else if length > 0 {
+            length
+        } else {
+            3600
+        };
+        e.end = t.saturating_add(length);
     } else if let Some(a) = p::bool(v, "allDay") {
         e.all_day = a;
     }
@@ -377,6 +389,9 @@ pub(super) fn event_from(s: &Session, v: &Value, mut e: mailcraft_model::ical::C
         Some(Value::Null) => mailcraft_model::ical::set_reminder(&mut e, None),
         Some(Value::String(x)) if matches!(x.trim(), "" | "none") => mailcraft_model::ical::set_reminder(&mut e, None),
         Some(x) => match x.as_i64().or_else(|| x.as_str().and_then(|t| t.trim().parse().ok())) {
+            // The same as it has: left as it is (written again, it moved in the event's lines,
+            // and an event saved unchanged was a change, issue #102).
+            Some(m) if mailcraft_model::ical::reminder_minutes(&e) == Some(m) => {}
             Some(m) if (0..=mailcraft_model::ical::REMINDER_MAX_MINUTES).contains(&m) => mailcraft_model::ical::set_reminder(&mut e, Some(m)),
             _ => return Err(CmdError::Params("`reminder` is minutes before it starts (0 to four weeks) or none".into())),
         },
@@ -397,7 +412,11 @@ pub(super) fn event_from(s: &Session, v: &Value, mut e: mailcraft_model::ical::C
     match repeat_param(v)? {
         // No repeat: none of a file's added dates either.
         Some(None) => (e.rrule, e.rdates) = (None, Vec::new()),
-        Some(rule) => e.rrule = rule,
+        Some(rule) => {
+            e.rrule = rule;
+            // A last day (the form's "Until"): the end of that day where the event is (issue #103).
+            mailcraft_model::ical::until_where_it_is(&mut e);
+        }
         None => {}
     }
     super::meetings::apply(s, v, &mut e)?;
