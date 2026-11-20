@@ -38,6 +38,10 @@ pub(super) fn add_account(ui: &mut Ui, f: &mut AccountForm, s: &Session, t: &Tok
     if let Some(p) = browser_note(ui, f, t, consumer, provider) {
         submit_signed_in(f, p, acts);
     }
+    // A Google address signing in with a password: an app password, before it's refused.
+    if f.kind.imap_or_pop() && mailcraft_engine::model::google_mail(&f.email, &f.imap_host) {
+        super::google_app_password(ui, t, acts, false);
+    }
     ui.add_space(8.0);
     if !s.jmap_only {
         let summary = servers_named(f);
@@ -156,11 +160,19 @@ fn server_settings(ui: &mut Ui, f: &mut AccountForm, s: &Session, t: &Tokens, ac
         // Five kinds: a list to pick from, on one row, rather than a block of choices.
         ui.horizontal(|ui| {
             field_label(ui, "Mail server");
-            egui::ComboBox::from_id_salt("account-kind").width(220.0).selected_text(kind_name(f.kind)).show_ui(ui, |ui| {
-                for k in [AccountKind::Imap, AccountKind::Pop, AccountKind::Jmap, AccountKind::Graph, AccountKind::Ews] {
-                    ui.selectable_value(&mut f.kind, k, kind_name(k));
-                }
-            });
+            let kinds = [AccountKind::Imap, AccountKind::Pop, AccountKind::Jmap, AccountKind::Graph, AccountKind::Ews];
+            let r = egui::ComboBox::from_id_salt("account-kind")
+                .width(220.0)
+                .selected_text(kind_name(f.kind))
+                .show_ui(ui, |ui| {
+                    for k in kinds {
+                        ui.selectable_value(&mut f.kind, k, kind_name(k));
+                    }
+                })
+                .response
+                // Its name beside it is painted small, not handed on.
+                .accessible_name(tl!("Mail server"));
+            crate::drop_down::keys(ui, &r, &mut f.kind, &kinds);
         });
         // POP just chosen: its server named after the IMAP one, unless one is in.
         if f.kind == AccountKind::Pop && was != AccountKind::Pop && f.pop_host.is_empty() {

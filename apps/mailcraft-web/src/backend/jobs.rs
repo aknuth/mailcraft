@@ -74,13 +74,29 @@ pub(super) async fn job(sh: &Rcs, id: &str, j: Job) {
         }
         Job::GetVacation { .. } => vacation(sh, id, None).await,
         Job::SetVacation { vacation: v, .. } => vacation(sh, id, Some(v)).await,
-        // Nothing to do in the browser: no Outbox (sending needs the server), no CalDAV.
-        Job::FlushOutbox { .. } | Job::SyncDav { .. } => {}
+        // Nothing to do in the browser: no Outbox (sending needs the server), no CalDAV, and no
+        // Send / Receive to stop (its JMAP accounts sync on their own).
+        Job::FlushOutbox { .. } | Job::SyncDav { .. } | Job::CancelTransfers { .. } => {}
         // The browser's accounts are JMAP ones, with no organisation directory (issue #9).
         Job::SearchDirectory { query, .. } => {
             emit(sh, Event::Directory { account: id.to_string(), query, people: Vec::new(), error: Some(NO_DIRECTORY.into()), consent: false })
         }
         Job::AllowDirectory { account } => emit(sh, Event::DirectoryAllowed { account: account.id, error: Some(NO_DIRECTORY.into()) }),
+        // Rules on a server are an Exchange mailbox's (issue #139): the browser's accounts are JMAP.
+        Job::GetServerRules { .. } | Job::SetServerRules { .. } => emit(
+            sh,
+            Event::ServerRules { account: id.to_string(), rules: None, error: Some("only an Exchange account keeps rules on its server".into()) },
+        ),
+        // Colleagues' free/busy times are Exchange's (issue #140), as their calendars shared for
+        // those alone: answered, each person's why.
+        Job::FreeBusy { people, from, to, .. } => {
+            let why = "only an Exchange account can show its colleagues' free/busy time";
+            let answers = people
+                .into_iter()
+                .map(|email| mailcraft_engine::model::pim::free_busy::FreeBusyAnswer { email, error: Some(why.into()), ..Default::default() })
+                .collect();
+            emit(sh, Event::FreeBusy { account: id.to_string(), from, to, answers })
+        }
         // Mail past what's kept (issue #4).
         Job::SearchServer { folders, query, search, .. } => search_server(sh, id, &folders, query, search).await,
         Job::MoreMail { folder, more, .. } => {
@@ -137,6 +153,7 @@ pub(super) async fn job(sh: &Rcs, id: &str, j: Job) {
         | Job::StopImport { .. }
         | Job::KeepImport { .. }
         | Job::ExportPst { .. }
+        | Job::ArchivePst { .. }
         | Job::DataFileHealth { .. }
         | Job::CompactDataFile { .. }
         | Job::CancelCompact { .. }

@@ -7,11 +7,19 @@ use crate::session::Toward;
 pub(super) fn commands() -> Vec<CommandSpec> {
     vec![
         // Send / Receive
-        CommandSpec::new("mail.sync", "Send / Receive all folders", "Send / Receive", |s, v| Ok(json!({"accounts": s.sync_all(p::str(v, "account"))})))
-            .key("F9")
+        CommandSpec::new("mail.sync", "Send / Receive all folders", "Send / Receive", |s, v| {
+            let accounts = s.sync_all(p::str(v, "account"));
+            // Its progress shown, as Outlook shows it, unless the user said not to.
+            s.send_receive.show_asked = s.prefs.open_send_receive && s.send_receive.open().next().is_some();
+            Ok(json!({"accounts": accounts}))
+        })
+        .key("F9")
             .params(r#"{"account"?: string (that account's only, also one that looks only when asked; else all but those)}"#)
             .when(can_connect),
         CommandSpec::new("folder.sync", "Update folder", "Send / Receive", sync_folder).key("Shift+F9").when(can_connect),
+        CommandSpec::new("mail.cancelSync", "Cancel all", "Send / Receive", |s, v| s.cancel_transfers(p::str(v, "account")))
+            .params(r#"{"account"?: string (that account's Send / Receive only, Cancel Task; else every account's)}"#),
+        toggle!("mail.openSyncProgress", "Open progress on Send / Receive", "Send / Receive", open_send_receive),
         CommandSpec::new("edit.undo", "Undo", "Quick access", |s, _| s.undo_last())
             .key("Mod+Z")
             .when(|s| if s.undo.is_empty() { Some("nothing to undo") } else { None }),
@@ -35,6 +43,21 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         })
         .params(r#"{"key"?: string (one message, even one held back to be sent later; else all that are due)}"#)
         .when(|s| if s.outbox.is_empty() { Some("the Outbox is empty") } else { None }),
+        // Undo Send (issue #135): a message sent, still waiting, back into the form.
+        CommandSpec::new("outbox.undoSend", "Undo Send", "Outbox", |s, v| s.undo_send(p::u64(v, "id")))
+            .params(r#"{"id"?: number (a message held to be undone; else the newest)}"#),
+        CommandSpec::new("options.undoSend", "Wait before sending, to undo Send", "File › Options › Mail", |s, v| {
+            if let Some(n) = v.get("seconds") {
+                let n = n.as_u64().filter(|n| *n <= u64::from(crate::session::UNDO_SEND_MAX));
+                let n = n.ok_or_else(|| CmdError::Params(format!("`seconds`: 0 to {}", crate::session::UNDO_SEND_MAX)))?;
+                s.prefs.undo_send_secs = u32::try_from(n).unwrap_or(0);
+            }
+            Ok(json!({"seconds": s.prefs.undo_send_secs}))
+        })
+        .params(r#"{"seconds"?: 0-60 (0: sent at once)}"#),
+        CommandSpec::new("options.startIn", "Start in", "File › Options › Mail", start_in).params(
+            r#"{"open"?: "firstInbox"|"allInboxes"|"last"|"folder" (what opens at the start), "account"?: string, "folder"?: string (the folder, for "folder")}"#,
+        ),
         CommandSpec::new("outbox.edit", "Edit queued message", "Outbox", |s, v| {
             let k = parse_key(v).or_else(|| s.reading.as_ref().map(|r| r.key.clone())).ok_or_else(|| CmdError::Params("`key` is required".into()))?;
             s.edit_outbox(&k)
@@ -59,6 +82,35 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         })
         .params(r#"{"folder": string, "parent"?: string (empty or absent: top level), "account"?: string}"#)
         .when(has_account),
+        CommandSpec::new("folder.order", "Put folder in place", "Folder pane (dragged)", |s, v| {
+            let account = account_param(s, v)?;
+            let folder = p::req_str(v, "folder")?.to_string();
+            match (p::str(v, "before"), p::str(v, "after")) {
+                (Some(t), _) => s.order_folder(&account, &folder, t, false),
+                (None, Some(t)) => s.order_folder(&account, &folder, t, true),
+                (None, None) => Err(CmdError::Params("`before` or `after` (a folder) is required".into())),
+            }
+        })
+        .params(r#"{"folder": string, "before"?: string, "after"?: string (a folder: it goes beside it, moved into its folder first when it's in another), "account"?: string} (the folder pane's order, the user's own from then on)"#)
+        .when(has_account),
+        CommandSpec::new("folder.moveUp", "Move up", "Folder pane › folder menu", |s, v| {
+            let account = account_param(s, v)?;
+            s.reorder_folder(&account, p::req_str(v, "folder")?, -1)
+        })
+        .params(r#"{"folder": string, "account"?: string}"#)
+        .when(has_account),
+        CommandSpec::new("folder.moveDown", "Move down", "Folder pane › folder menu", |s, v| {
+            let account = account_param(s, v)?;
+            s.reorder_folder(&account, p::req_str(v, "folder")?, 1)
+        })
+        .params(r#"{"folder": string, "account"?: string}"#)
+        .when(has_account),
+        CommandSpec::new("folder.sortAZ", "Sort folders A to Z", "Folder pane › account menu", |s, v| {
+            let account = account_param(s, v)?;
+            s.folders_a_to_z(&account)
+        })
+        .params(r#"{"account"?: string} (its folders back in A to Z order)"#)
+        .when(has_account),
         CommandSpec::new("folder.delete", "Delete folder", "Folder › Actions", |s, v| {
             let account = account_param(s, v)?;
             s.delete_folder(&account, p::req_str(v, "folder")?, p::bool(v, "permanent").unwrap_or(false))
@@ -74,6 +126,11 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("list.open", "Open message", "Message list", open_message).leaves_body().params(r#"{"key": "account:validity:uid:folder"}"#),
         CommandSpec::new("list.select", "Select", "Message list", select).leaves_body().params(r#"{"key": string, "add"?: bool}"#),
         CommandSpec::new("list.selectAll", "Select all", "Message list", select_all).leaves_body().key("Mod+A"),
+        // Issue #189: a heading folded away, or its mail shown again, as Outlook's groups.
+        CommandSpec::new("list.foldGroup", "Collapse this group", "Message list (a heading)", |s, v| s.fold_group(p::req_str(v, "heading")?, p::bool(v, "folded")))
+            .params(r#"{"heading": string (as the list shows it: "Today", a sender's name…), "folded"?: bool (default: the other way)}"#),
+        CommandSpec::new("list.collapseAll", "Collapse all groups", "Message list (a heading)", |s, _| s.fold_all(true)),
+        CommandSpec::new("list.expandAll", "Expand all groups", "Message list (a heading)", |s, _| s.fold_all(false)),
         CommandSpec::new("list.selectRange", "Select to here", "Message list (Shift+click)", |s, v| {
             let k = key_param(s, v)?;
             s.select_range(&k, p::bool(v, "add").unwrap_or(false))
@@ -108,6 +165,8 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("message.read", "Read message", "Reading pane", read_message).params(r#"{"key"?: string}"#),
         CommandSpec::new("message.popOut", "Open in new window", "Message list › Open", |s, v| {
             let k = match parse_key(v) {
+                // One of the user's own replies the open conversation shows from Sent Items (#148).
+                Some(k) if s.reading.as_ref().is_some_and(|r| r.aside.iter().any(|m| m.key == k)) => k,
                 Some(_) => key_param(s, v)?,
                 None => s
                     .focus
@@ -235,6 +294,18 @@ pub(super) fn commands() -> Vec<CommandSpec> {
 }
 
 pub(super) fn sync_folder(s: &mut Session, _: &Value) -> CmdResult {
+    // In Calendar, People, Tasks or Notes, what they show is read again, as Outlook's Update
+    // Folder does there (issue #142): the mail folder still chosen behind them was.
+    if s.module != crate::Module::Mail {
+        let accounts: Vec<String> = s.accounts.iter().filter(|a| a.config.has_server()).map(|a| a.config.id.clone()).collect();
+        for account in &accounts {
+            let job = mailcraft_model::Job::SyncDav { account: account.clone() };
+            if !s.jobs.contains(&job) {
+                s.push_job(job);
+            }
+        }
+        return Ok(json!({"accounts": accounts.len()}));
+    }
     let mut n = 0;
     let folders: Vec<(String, String)> = match &s.view {
         View::Folder { account, folder } => vec![(account.clone(), folder.clone())],
@@ -258,6 +329,28 @@ pub(super) fn open_folder(s: &mut Session, v: &Value) -> CmdResult {
     }
     s.open_view(View::Folder { account, folder });
     Ok(json!({"messages": s.list.len()}))
+}
+
+/// What opens at the start (issue #172): set when `open` is given, and said.
+fn start_in(s: &mut Session, v: &Value) -> CmdResult {
+    use crate::session::StartIn;
+    if let Some(open) = p::str(v, "open") {
+        s.prefs.start_in = match open {
+            "firstInbox" => StartIn::FirstInbox,
+            "allInboxes" => StartIn::AllInboxes,
+            "last" => StartIn::Last,
+            "folder" => {
+                let account = p::req_str(v, "account")?.to_string();
+                let folder = p::req_str(v, "folder")?.to_string();
+                if s.folder(&account, &folder).is_none() {
+                    return Err(CmdError::Params(format!("no folder `{folder}` in account `{account}`")));
+                }
+                StartIn::Folder { account, folder }
+            }
+            other => return Err(CmdError::Params(format!("`open`: firstInbox, allInboxes, last or folder, not `{other}`"))),
+        };
+    }
+    serde_json::to_value(&s.prefs.start_in).map_err(|e| CmdError::Failed(e.to_string()))
 }
 
 pub(super) fn unified(s: &mut Session, v: &Value) -> CmdResult {

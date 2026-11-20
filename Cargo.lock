@@ -322,7 +322,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
  "wl-clipboard-rs",
  "x11rb 0.13.2",
 ]
@@ -1481,6 +1481,27 @@ version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=600fc71614b316d8c2c7bd793c62f228a5b2e5b6#600fc71614b316d8c2c7bd793c62f228a5b2e5b6"
 
 [[package]]
+name = "craft-font-catalog"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=600fc71614b316d8c2c7bd793c62f228a5b2e5b6#600fc71614b316d8c2c7bd793c62f228a5b2e5b6"
+dependencies = [
+ "skrifa 0.47.0",
+ "thiserror 2.0.21",
+ "windows-registry 0.6.1",
+]
+
+[[package]]
+name = "craft-proof"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=600fc71614b316d8c2c7bd793c62f228a5b2e5b6#600fc71614b316d8c2c7bd793c62f228a5b2e5b6"
+dependencies = [
+ "log",
+ "miniz_oxide 0.9.1",
+ "toml 1.1.8+spec-1.1.0",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "crc24"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,7 +2004,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2510,7 +2531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4248,9 +4269,9 @@ dependencies = [
 
 [[package]]
 name = "lettre"
-version = "0.11.23"
+version = "0.11.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
+checksum = "f294f3d7cdb313e578acef7d7727d4e8d897e0fcd0d6d58c19959cec95073f19"
 dependencies = [
  "base64 0.23.1",
  "email_address",
@@ -4382,10 +4403,11 @@ dependencies = [
 
 [[package]]
 name = "mailcraft"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "arboard",
  "chrono",
+ "craft-font-catalog",
  "dispatch2",
  "drag",
  "eframe",
@@ -4408,6 +4430,7 @@ dependencies = [
  "raw-window-handle",
  "rfd",
  "serde_json",
+ "skrifa 0.44.0",
  "tray-icon",
  "uds_windows",
  "windows-registry 0.100.0",
@@ -4423,7 +4446,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-cli"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "chrono",
  "iana-time-zone",
@@ -4434,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-engine"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "aes-gcm",
  "der 0.8.3",
@@ -4458,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-html"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
@@ -4473,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-jmap"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "log",
  "mailcraft-mime",
@@ -4486,7 +4509,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-keys"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "core-foundation 0.10.1",
  "cryptoki",
@@ -4504,7 +4527,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-mime"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "encodify",
  "flate2",
@@ -4520,7 +4543,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-model"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4533,7 +4556,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-net"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "cfb",
  "craft-docpath",
@@ -4572,7 +4595,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-pgp"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "mailcraft-model",
  "pgp",
@@ -4583,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-print"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "image",
  "miniz_oxide 0.9.1",
@@ -4592,14 +4615,14 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-pst"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "mailcraft-smime"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",
@@ -4629,7 +4652,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-store"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "craft-atomic",
  "dirs",
@@ -4646,9 +4669,10 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-ui-egui"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "accesskit_consumer",
+ "craft-proof",
  "egui",
  "hayro",
  "image",
@@ -4665,7 +4689,7 @@ dependencies = [
 
 [[package]]
 name = "mailcraft-web"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "eframe",
  "egui",
@@ -5585,7 +5609,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5889,9 +5913,9 @@ dependencies = [
 
 [[package]]
 name = "pgp"
-version = "0.21.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae70f4d9325a391db30d115d6191a7bb67cec856aa0bba131290f0c4e09a532a"
+checksum = "c7275cbf21850789239e1be05d9a887e6bba6aa8085a81be09ca021c8379baef"
 dependencies = [
  "aead",
  "aes 0.8.4",
@@ -6769,6 +6793,17 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5a0cf4bb6cbce4c29756270d189a5e400ac05e91192161d83a0bcb6e68492e8"
+dependencies = [
+ "bytemuck",
+ "font-types",
+ "once_cell",
+]
+
+[[package]]
+name = "read-fonts"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdaa4fffe9ff3ca2c353fa9729792805b9b3e324695ff5a081f860612e81b330"
@@ -7060,7 +7095,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7585,6 +7620,16 @@ checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
 dependencies = [
  "bytemuck",
  "read-fonts 0.41.0",
+]
+
+[[package]]
+name = "skrifa"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "526e654b303ff4ad73a5a40b25de2b3ce3d039c5e3b6da5f89ae6e57004cb40f"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.44.0",
 ]
 
 [[package]]
@@ -8194,10 +8239,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8638,6 +8683,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-properties"
@@ -9085,9 +9139,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.11"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -9309,7 +9363,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10019,7 +10073,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "icu_normalizer",
  "png",

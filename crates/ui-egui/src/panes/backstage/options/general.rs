@@ -57,22 +57,34 @@ pub(super) fn general(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
         // Issue #46: dates as the user writes them (each choice shown as today's date), and the
         // clock, as Windows' region settings offer them to Outlook.
         let style = s.prefs.date_style;
-        setting(ui, &t, false, tl!("Dates"), Some(tl!("In the message list, the reading pane and the header of a reply")), |ui| {
-            let (y, m, d) = mailcraft_engine::model::dates::civil_from_days(mailcraft_engine::model::dates::today(&s.clock));
-            egui::ComboBox::from_id_salt("date-order")
-                .width(160.0)
-                .selected_text(style.order.day(y, m, d))
-                .show_ui(ui, |ui| {
-                    for o in mailcraft_engine::model::dates::DateOrder::ALL {
-                        if ui.selectable_label(style.order == o, o.day(y, m, d)).clicked() {
-                            acts.push(Action::Run("view.dateFormat", json!({"order": o.code()})));
+        setting(
+            ui,
+            &t,
+            false,
+            tl!("Dates"),
+            Some(tl!("In the message list, the reading pane, the header of a reply, and the event and task forms")),
+            |ui| {
+                let (y, m, d) = mailcraft_engine::model::dates::civil_from_days(mailcraft_engine::model::dates::today(&s.clock));
+                let r = egui::ComboBox::from_id_salt("date-order")
+                    .width(160.0)
+                    .selected_text(style.order.day(y, m, d))
+                    .show_ui(ui, |ui| {
+                        for o in mailcraft_engine::model::dates::DateOrder::ALL {
+                            if ui.selectable_label(style.order == o, o.day(y, m, d)).clicked() {
+                                acts.push(Action::Run("view.dateFormat", json!({"order": o.code()})));
+                            }
                         }
-                    }
-                })
-                .response
-                // The setting's name is beside it in the row, which doesn't hand it on.
-                .accessible_name(tl!("Dates"));
-        });
+                    })
+                    .response
+                    // The setting's name is beside it in the row, which doesn't hand it on.
+                    .accessible_name(tl!("Dates"));
+                let mut order = style.order;
+                crate::drop_down::keys(ui, &r, &mut order, &mailcraft_engine::model::dates::DateOrder::ALL);
+                if order != style.order {
+                    acts.push(Action::Run("view.dateFormat", json!({"order": order.code()})));
+                }
+            },
+        );
         setting(ui, &t, false, tl!("Time"), None, |ui| {
             let options = [tl!("24-hour"), tl!("12-hour")];
             if let Some(i) = widgets::segmented(ui, &t, "clock", &options, usize::from(style.hours12)) {
@@ -128,7 +140,7 @@ pub(super) fn general(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
         setting(ui, &t, false, tl!("Language"), None, |ui| {
             let language = st.language.as_str();
             let current = crate::i18n::Lang::from_code(language).map_or_else(|| tl!("Same as the system").to_string(), |l| l.name().to_string());
-            egui::ComboBox::from_id_salt("language")
+            let r = egui::ComboBox::from_id_salt("language")
                 .width(200.0)
                 .selected_text(current)
                 .show_ui(ui, |ui| {
@@ -143,6 +155,12 @@ pub(super) fn general(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<Act
                 })
                 .response
                 .accessible_name(tl!("Language"));
+            let codes: Vec<&str> = std::iter::once(crate::i18n::AUTO).chain(crate::i18n::Lang::for_picker().into_iter().map(|l| l.code())).collect();
+            let mut at = language;
+            crate::drop_down::keys(ui, &r, &mut at, &codes);
+            if at != language {
+                acts.push(Action::SetLanguage(at.into()));
+            }
         });
     });
 }
@@ -182,6 +200,20 @@ pub(super) fn data_files(s: &Session, st: &UiState, ui: &mut Ui, acts: &mut Vec<
                     }
                 });
             }
+            // AutoArchive (issue #180), as Outlook's AutoArchive Settings; its file suggested
+            // beside the data files, as Outlook's archive.pst is in Outlook Files.
+            let every = s.prefs.auto_archive.every_days;
+            let about = if every == 0 {
+                tl!("Off: old mail stays where it is until you clean it up.").to_string()
+            } else {
+                tf!("Every {days} days, old mail is archived by each folder's settings.", days = every)
+            };
+            setting(ui, &t, false, tl!("AutoArchive"), Some(&about), |ui| {
+                if ui.button(tl!("AutoArchive settings…")).clicked() {
+                    let suggested = dir.join("archive.pst").display().to_string();
+                    acts.push(Action::Dialog(Dialog::AutoArchive(Box::new(crate::dialogs::AutoArchiveForm::new(s, &suggested)))));
+                }
+            });
             // Compacted as MailCraft closes: off unless chosen (it's done when MailCraft is
             // left alone, or by hand, either way).
             let compact = Switch {

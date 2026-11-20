@@ -144,7 +144,27 @@ fn sign_in_to(conn: &mut SmtpConnection, hello: &ClientId, sign_in: &SignIn<'_>,
     if sign_in.oauth {
         return conn.auth(&[Mechanism::Xoauth2], &credentials).map(drop).map_err(failed);
     }
-    let offered = offered_sign_ins(conn, hello).map_err(failed)?;
+    // What the connection's `EHLO` named that lettre speaks. Asked again only for what it doesn't
+    // (NTLM): IONOS's servers refuse a second `EHLO` in a session ("503 Bad sequence of
+    // commands", issue #165), and every message was refused. One refused counts as no more.
+    let info = conn.server_info();
+    let known: Vec<String> = [(Mechanism::Plain, "PLAIN"), (Mechanism::Login, "LOGIN"), (Mechanism::Xoauth2, "XOAUTH2")]
+        .into_iter()
+        .filter(|(m, _)| info.supports_auth_mechanism(*m))
+        .map(|(_, name)| name.to_string())
+        .collect();
+    let password_known = known.iter().any(|m| m == "PLAIN" || m == "LOGIN");
+    let offered = if password_known && sign_in.method != SignInMethod::Ntlm {
+        known
+    } else {
+        match offered_sign_ins(conn, hello) {
+            Ok(all) => all,
+            Err(e) => {
+                log::info!("the outgoing server refused EHLO asked again ({e}): what it named first is used");
+                known
+            }
+        }
+    };
     let has = |m: &str| offered.iter().any(|o| o == m);
     let password = has("PLAIN") || has("LOGIN");
     let names = || if offered.is_empty() { "none".to_string() } else { offered.join(", ") };
@@ -242,7 +262,15 @@ fn hand_over(conn: &mut SmtpConnection, envelope: &Envelope, raw: &[u8], recipie
         }
         options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
     }
-    conn.command(Mail::new(envelope.from().cloned(), options)).map_err(failed)?;
+    // Turned away at MAIL, it's the sender the server refuses: said, with the address. "550 Invalid
+    // Sender" alone hid an account's mistyped address (Outlook, with the right one, sent).
+    conn.command(Mail::new(envelope.from().cloned(), options)).map_err(|e| match failed(e) {
+        NetError::Smtp(msg) => match envelope.from() {
+            Some(from) => NetError::Smtp(format!("the server refused the sender, {from}: {msg}")),
+            None => NetError::Smtp(msg),
+        },
+        other => other,
+    })?;
     for to in envelope.to() {
         conn.command(Rcpt::new(to.clone(), Vec::new())).map_err(failed)?;
     }
@@ -328,6 +356,11 @@ fn refusal(code: u16, msg: &str, recipients: &[String]) -> NetError {
     let says = |status: &str| msg.split(|c: char| c.is_whitespace() || ":()".contains(c)).any(|token| token == status);
     let sign_in_code = matches!(code, 530 | 534 | 535 | 538);
     if sign_in_code || says("5.7.8") || says("5.7.9") {
+        // Gmail's "534-5.7.9 Application-specific password required": said plainly (issue #164).
+        if mailcraft_model::google_wants_app_password(msg) {
+            log::info!("the outgoing server refused the sign-in: {msg}");
+            return NetError::Auth(mailcraft_model::GOOGLE_APP_PASSWORD_NEEDED.into());
+        }
         return NetError::Auth(msg.to_string());
     }
     let lower = msg.to_ascii_lowercase();
@@ -455,6 +488,12 @@ pub(crate) mod tests {
             assert!(matches!(e, NetError::Auth(_)), "{code} {text}: {e:?}");
             assert!(e.is_retryable(), "{code}: kept in the Outbox");
         }
+        // Gmail asking for an app password (issue #164): said plainly, not in Google's words.
+        let e = class(
+            534,
+            "5.7.9 Application-specific password required. For more information, go to 5.7.9 https://support.google.com/mail/?p=InvalidSecondFactor",
+        );
+        assert!(matches!(&e, NetError::Auth(m) if m == mailcraft_model::GOOGLE_APP_PASSWORD_NEEDED), "{e:?}");
         // The message refused for good.
         for (code, text) in [
             (553, "5.7.1 sender not owned by authenticated user"),
@@ -511,6 +550,23 @@ pub(crate) mod tests {
         let message = b"Subject: refused\r\n\r\nnot delivered\r\n";
         let e = send(&server, "z@x.example", "pw", "z@x.example", &["a@y.example".into()], message).unwrap_err();
         assert!(matches!(e, NetError::Smtp(_)), "{e:?}");
+    }
+
+    /// A sender turned away is said with its address: a mistyped one shows where it's wrong
+    /// ("550 Invalid Sender" alone, as a tester's server put it, said nothing of which).
+    #[test]
+    fn a_refused_sender_is_named() {
+        let port = scripted(|command| match command.split(' ').next().unwrap_or_default() {
+            "EHLO" => "250-scripted.test\r\n250 AUTH PLAIN LOGIN\r\n",
+            "AUTH" => "235 2.7.0 welcome\r\n",
+            "MAIL" => "550 Invalid Sender  - Please Contact with your mail service provider\r\n",
+            "QUIT" => "221 2.0.0 closing\r\n",
+            _ => "250 2.0.0 fine\r\n",
+        });
+        let server = ServerConfig { security: Security::None, port, host: "127.0.0.1".into() };
+        let e = send(&server, "zoe@studio.example", "pw", "zoe@stuido.example", &["a@y.example".into()], b"Subject: s\r\n\r\nx\r\n").unwrap_err();
+        let NetError::Smtp(said) = e else { panic!("{e:?}") };
+        assert!(said.starts_with("the server refused the sender, zoe@stuido.example: ") && said.contains("Invalid Sender"), "{said}");
     }
 
     /// The server takes the whole message and the connection drops before it answers: the

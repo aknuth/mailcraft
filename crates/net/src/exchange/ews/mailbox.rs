@@ -6,16 +6,23 @@ impl Client {
     /// The account's mail folders, with their roles and counts.
     pub fn mailboxes(&self) -> Result<Vec<Mailbox>> {
         let roles = SPECIAL;
-        let hidden = ["msgfolderroot", "outbox", "conversationhistory", "syncissues"];
+        let hidden = ["msgfolderroot", "outbox"];
         let ids: String = roles.iter().map(|(n, _)| *n).chain(hidden).map(|n| format!("<t:DistinguishedFolderId Id=\"{n}\"/>")).collect();
         let doc = self.call(&format!(
             "<m:GetFolder><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape><m:FolderIds>{ids}</m:FolderIds></m:GetFolder>"
         ))?;
         // One answer per asked-for folder, in order; missing ones are errors.
         let found = folder_ids(&doc);
-        let role_of: HashMap<String, FolderRole> = roles.iter().zip(&found).filter_map(|((_, r), id)| Some((id.clone()?, *r))).collect();
+        let mut role_of: HashMap<String, FolderRole> = roles.iter().zip(&found).filter_map(|((_, r), id)| Some((id.clone()?, *r))).collect();
         let root = found.get(roles.len()).cloned().flatten();
-        let skip: Vec<String> = found.iter().skip(roles.len() + 1).flatten().cloned().collect();
+        let mut skip: Vec<String> = found.iter().skip(roles.len() + 1).flatten().cloned().collect();
+        for (name, id) in self.newer_ids("") {
+            if name == "archive" {
+                role_of.entry(id).or_insert(FolderRole::Archive);
+            } else {
+                skip.push(id);
+            }
+        }
 
         let mut out = self.mail_folders("<t:DistinguishedFolderId Id=\"msgfolderroot\"/>", &skip, MAX_FOLDERS)?;
         for m in &mut out {
@@ -54,6 +61,41 @@ impl Client {
         }
         *self.shared_open.borrow_mut() = open;
         Ok(out)
+    }
+
+    /// The ids of [`NEWER`]'s folders in the account's mailbox, or in another's (`mb`, the
+    /// `Mailbox` element naming it), by name: asked for together, and one by one when the server
+    /// refuses that, as Exchange 2010's schema does (#149). One the server refuses alone isn't
+    /// asked again on this connection; one it hasn't (no Archive folder made yet) is left out.
+    pub(super) fn newer_ids(&self, mb: &str) -> Vec<(&'static str, String)> {
+        let ask = |names: &[&'static str]| -> Result<Vec<(&'static str, String)>> {
+            let ids: String = names.iter().map(|n| format!("<t:DistinguishedFolderId Id=\"{n}\">{mb}</t:DistinguishedFolderId>")).collect();
+            let doc = self.call(&format!(
+                "<m:GetFolder><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape><m:FolderIds>{ids}</m:FolderIds></m:GetFolder>"
+            ))?;
+            Ok(names.iter().zip(folder_ids(&doc)).filter_map(|(n, id)| Some((*n, id?))).collect())
+        };
+        let names: Vec<&'static str> = NEWER.into_iter().filter(|n| !self.unknown_ids.borrow().contains(n)).collect();
+        if names.is_empty() {
+            return Vec::new();
+        }
+        match ask(&names) {
+            Ok(found) => return found,
+            Err(e) => log::info!("the folders Exchange 2013 brought, asked one by one: {e}"),
+        }
+        let mut found = Vec::new();
+        for n in names {
+            match ask(&[n]) {
+                Ok(f) => found.extend(f),
+                // Refused by what it is: not asked again. A connection lost isn't that.
+                Err(e @ (NetError::Protocol(_) | NetError::No(_) | NetError::Bad(_))) => {
+                    log::info!("the server doesn't know the {n} folder: {e}");
+                    self.unknown_ids.borrow_mut().push(n);
+                }
+                Err(e) => log::info!("the {n} folder: {e}"),
+            }
+        }
+        found
     }
 
     /// The mail folders anywhere under a mailbox's root (`root`, the folder id element naming
@@ -169,6 +211,52 @@ impl Client {
             .filter_map(|it| Some(it.child("ItemId")?.attr("Id")?.to_string()))
             .take(limit)
             .collect())
+    }
+
+    /// Mark every message in the folder `folder` read (issue #197): at once with
+    /// `MarkAllItemsAsRead`, which Exchange 2013 brought; on a server without it (Exchange
+    /// 2010), its unread ones found and marked a page at a time, as a message is marked. At once,
+    /// no read receipts are sent, as Outlook sends none for a folder marked read.
+    pub(super) fn mark_read(&self, folder: &str) -> Result<()> {
+        let all = self.call_2013(&format!(
+            "<m:MarkAllItemsAsRead><m:ReadFlag>true</m:ReadFlag><m:SuppressReadReceipts>true</m:SuppressReadReceipts>\
+             <m:FolderIds><t:FolderId Id=\"{}\"/></m:FolderIds></m:MarkAllItemsAsRead>",
+            esc(folder)
+        ));
+        match all.and_then(|doc| messages(&doc).into_iter().try_for_each(check_message)) {
+            Ok(()) => return Ok(()),
+            // Refused for what it is: asked the older way. A connection lost isn't that.
+            Err(e @ (NetError::Protocol(_) | NetError::No(_) | NetError::Bad(_))) => {
+                log::info!("the folder marked read a page at a time: {e}");
+            }
+            Err(e) => return Err(e),
+        }
+        let unread = WordQuery { unread: Some(true), ..WordQuery::default() };
+        for _ in 0..1000 {
+            let ids = self.find(folder, &unread, 500)?;
+            if ids.is_empty() {
+                return Ok(());
+            }
+            for chunk in ids.chunks(BATCH) {
+                let changes: String = chunk
+                    .iter()
+                    .map(|id| {
+                        format!(
+                            "<t:ItemChange><t:ItemId Id=\"{}\"/><t:Updates><t:SetItemField><t:FieldURI FieldURI=\"message:IsRead\"/>\
+                             <t:Message><t:IsRead>true</t:IsRead></t:Message></t:SetItemField></t:Updates></t:ItemChange>",
+                            esc(id)
+                        )
+                    })
+                    .collect();
+                self.call_all(&format!(
+                    // Without `SuppressReadReceipts`: Exchange 2013 brought that too, and 2010's
+                    // schema refuses it.
+                    "<m:UpdateItem MessageDisposition=\"SaveOnly\" ConflictResolution=\"AlwaysOverwrite\">\
+                     <m:ItemChanges>{changes}</m:ItemChanges></m:UpdateItem>"
+                ))?;
+            }
+        }
+        Err(NetError::No("the folder's mail didn't all get marked read".into()))
     }
 
     /// Of these messages, those still in a folder, with their flags.

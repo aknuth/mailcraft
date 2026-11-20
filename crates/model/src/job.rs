@@ -16,15 +16,17 @@ mod keys;
 mod op;
 pub mod progress;
 mod status;
+mod transfer;
 mod vacation;
 pub mod work;
 pub use compact::*;
 pub use eta::Eta;
 pub use import::*;
 pub use keys::{HeldKey, Revocation};
-pub use op::Op;
+pub use op::{FollowUpDay, Op};
 pub use progress::Work;
 pub use status::{FailureKind, LOCAL_CERTIFICATE, REMOTE_CERTIFICATE, SyncStatus, UntrustedCertificate};
+pub use transfer::{Transfer, TransferKind, TransferState};
 pub use vacation::{Vacation, is_day};
 
 /// A password in transit. Its `Debug` form is redacted so it never reaches a log.
@@ -127,6 +129,10 @@ pub enum Job {
     KeepDraft { account: String, raw: Vec<u8>, folder: String, replaces: Option<MessageKey> },
     /// Try to send what waits in the Outbox now.
     FlushOutbox { account: String },
+    /// Stop the account's Send / Receive where it can be stopped (between two messages, or two
+    /// folders): what came before stays. Empty: every account's (Cancel All). Answered by
+    /// [`Event::Transfer`]s that say so.
+    CancelTransfers { account: String },
     /// Download a picture a message links to (only after the user asked to see pictures).
     FetchUrl { url: String },
     /// Read a calendar subscribed to by its link (issue #7), unless it's unchanged since the
@@ -146,12 +152,21 @@ pub enum Job {
     GetVacation { account: String },
     /// Change them.
     SetVacation { account: String, vacation: Vacation },
+    /// Read the mailbox's Inbox rules on its server (Exchange's, issue #139); answered by
+    /// [`Event::ServerRules`].
+    GetServerRules { account: String },
+    /// Change them, then read them again; `drop_outlook_list`: remove Outlook's own copy of the
+    /// rules, which the server won't change them beside.
+    SetServerRules { account: String, ops: Vec<crate::organize::ServerRuleOp>, drop_outlook_list: bool },
     /// Sync the account's calendars and address books with its CalDAV / CardDAV server (changes
     /// made here first).
     SyncDav { account: String },
     /// Look people up in the account's organisation directory (Exchange's Global Address List,
     /// issue #9), asked of the server each time; answered by [`Event::Directory`].
     SearchDirectory { account: String, query: String },
+    /// Ask the server when these people's calendars are taken, between `from` and `to` (issue
+    /// #140, Exchange's availability service); answered by [`Event::FreeBusy`].
+    FreeBusy { account: String, people: Vec<String>, from: i64, to: i64 },
     /// Ask the user, in the browser, to let an Exchange Online account search its organisation's
     /// directory (issue #9: a sign-in of its own, for the directory's permissions alone); answered
     /// by [`Event::DirectoryAllowed`].
@@ -203,6 +218,20 @@ pub enum Job {
         account: String,
         path: String,
         name: String,
+        #[serde(default)]
+        follow_up: crate::organize::FollowUpDays,
+    },
+    /// Write the account's mail received before `before` (Unix seconds), in `folders` and the
+    /// folders under them (all of them when empty; `only`, those alone, issue #180), to the data
+    /// file at `path`, in folders of the same names. Answered by [`Event::Archived`], naming the
+    /// messages the file has now.
+    ArchivePst {
+        account: String,
+        path: String,
+        folders: Vec<String>,
+        #[serde(default)]
+        only: bool,
+        before: i64,
         #[serde(default)]
         follow_up: crate::organize::FollowUpDays,
     },
@@ -328,10 +357,14 @@ impl Job {
             | Job::SaveDraft { account, .. }
             | Job::KeepDraft { account, .. }
             | Job::FlushOutbox { account }
+            | Job::CancelTransfers { account }
             | Job::GetVacation { account }
             | Job::SetVacation { account, .. }
+            | Job::GetServerRules { account }
+            | Job::SetServerRules { account, .. }
             | Job::SyncDav { account }
             | Job::SearchDirectory { account, .. }
+            | Job::FreeBusy { account, .. }
             | Job::FetchCalendar { account, .. }
             | Job::ImportPst { account, .. }
             | Job::FileMessages { account, .. }
@@ -343,6 +376,7 @@ impl Job {
             | Job::Index { account, .. }
             | Job::StopIndex { account }
             | Job::ExportPst { account, .. }
+            | Job::ArchivePst { account, .. }
             | Job::DataFileHealth { account }
             | Job::CompactDataFile { account, .. }
             | Job::CancelCompact { account } => account,
@@ -489,12 +523,27 @@ pub enum Event {
         used: u64,
         limit: u64,
     },
+    /// The mailbox's Inbox rules as its server has them; `None` with an error when it has none
+    /// to give (or they couldn't be read); with both when a change failed and they were read
+    /// again.
+    ServerRules {
+        account: String,
+        rules: Option<crate::organize::ServerRules>,
+        error: Option<String>,
+    },
     /// The account's automatic replies as the server has them; `None` with an error when it
     /// offers none (or they couldn't be read or changed).
     Vacation {
         account: String,
         vacation: Option<Vacation>,
         error: Option<String>,
+    },
+    /// People's free/busy times between `from` and `to`, each with why when it has none.
+    FreeBusy {
+        account: String,
+        from: i64,
+        to: i64,
+        answers: Vec<crate::pim::free_busy::FreeBusyAnswer>,
     },
     /// A CalDAV / CardDAV sync's result, to merge.
     DavSynced {
@@ -628,6 +677,28 @@ pub enum Event {
         done: bool,
         error: Option<String>,
     },
+    /// How archiving to a data file is going ([`Job::ArchivePst`]). Done, `archived` are the
+    /// messages the file has now (written, or there already in the same folder), which may leave
+    /// the mailbox; `skipped`, old ones not on this computer, which stay.
+    Archived {
+        account: String,
+        path: String,
+        messages: usize,
+        #[serde(default)]
+        archived: Vec<MessageKey>,
+        #[serde(default)]
+        skipped: usize,
+        #[serde(default)]
+        folders_skipped: usize,
+        done: bool,
+        error: Option<String>,
+    },
+    /// How an account's sending or receiving is going, as Send / Receive shows it (the newest of
+    /// its kind replaces the ones before).
+    Transfer {
+        account: String,
+        transfer: Transfer,
+    },
     /// Something the user should see in the status bar.
     Notice {
         account: String,
@@ -712,85 +783,4 @@ pub enum Event {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn secrets_never_print() {
-        let j = Job::Start { account: AccountConfig::default(), password: Some(Secret("hunter2".into())) };
-        assert!(!format!("{j:?}").contains("hunter2"));
-        let e = Event::Decrypted { key: MessageKey::default(), content: Some(Private(b"the plan".to_vec())), authenticated: true, error: None };
-        assert!(!format!("{e:?}").contains("the plan"), "what decrypted mail says never prints");
-        let j = Job::Pgp {
-            account: AccountConfig::default(),
-            work: PgpWork::Import { file: Private(b"-----BEGIN PGP PRIVATE KEY BLOCK-----".to_vec()), passphrase: Secret("hunter2".into()) },
-        };
-        let shown = format!("{j:?}");
-        assert!(!shown.contains("hunter2") && !shown.contains("45, 45"), "neither the passphrase nor the key file: {shown}");
-    }
-
-    #[test]
-    fn jobs_serialize_tagged() {
-        let j = Job::SyncFolder { account: "a1".into(), folder: "INBOX".into() };
-        let v = serde_json::to_value(&j).unwrap();
-        assert_eq!(v["job"], "syncFolder");
-        assert_eq!(serde_json::from_value::<Job>(v).unwrap(), j);
-        assert_eq!(j.account(), "a1");
-        let j = Job::Index { account: "a1".into(), folders: vec!["INBOX".into()] };
-        assert_eq!((serde_json::from_str::<Job>(&serde_json::to_string(&j).unwrap()).unwrap(), j.account()), (j.clone(), "a1"));
-        assert_eq!(Job::StopIndex { account: "a1".into() }.account(), "a1");
-        let e =
-            Event::Indexed { account: "a1".into(), work: Work { done: 1, total: 2, ..Work::default() }, generation: 3, failed: 0, finished: false };
-        assert_eq!(serde_json::from_str::<Event>(&serde_json::to_string(&e).unwrap()).unwrap(), e);
-    }
-
-    #[test]
-    fn import_events_read_what_earlier_versions_wrote() {
-        // As an earlier version sent them: no report, no `resume`.
-        let old = r#"{"event":"imported","account":"a1","messages":3,"skipped":1,"done":true,"error":null}"#;
-        let e: Event = serde_json::from_str(old).unwrap();
-        assert_eq!(e, Event::Imported { account: "a1".into(), messages: 3, skipped: 1, done: true, error: None, report: None });
-        assert_eq!(serde_json::to_value(&e).unwrap(), serde_json::from_str::<serde_json::Value>(old).unwrap(), "written as it was");
-        let j: Job = serde_json::from_str(r#"{"job":"importPst","account":"a1","path":"a.pst"}"#).unwrap();
-        assert_eq!(j, Job::ImportPst { account: "a1".into(), path: "a.pst".into(), resume: false });
-
-        // And the new ones round trip.
-        let mut report = ImportReport { messages: 3, runs: 1, ..Default::default() };
-        report.skip(SkipReason::AttachmentTooBig, 2);
-        let e = Event::Imported { account: "a1".into(), messages: 3, skipped: 1, done: true, error: None, report: Some(Box::new(report)) };
-        assert_eq!(serde_json::from_str::<Event>(&serde_json::to_string(&e).unwrap()).unwrap(), e);
-        let progress = ImportProgress { phase: ImportPhase::Importing, work: Work { done: 1, total: 9, ..Default::default() }, ..Default::default() };
-        let e = Event::ImportProgress { account: "a1".into(), progress };
-        assert_eq!(serde_json::from_str::<Event>(&serde_json::to_string(&e).unwrap()).unwrap(), e);
-        let folders = vec![PlannedFolder { path: "Projects/2024".into(), name: "2024".into(), items: 7 }];
-        let e = Event::ImportPlanned { account: "a1".into(), folders };
-        assert_eq!(serde_json::from_str::<Event>(&serde_json::to_string(&e).unwrap()).unwrap(), e);
-        let j = Job::StopImport { account: "a1".into(), how: StopHow::Discard };
-        assert_eq!((serde_json::from_str::<Job>(&serde_json::to_string(&j).unwrap()).unwrap(), j.account()), (j.clone(), "a1"));
-        assert_eq!(Job::InspectDataFile { path: "a.pst".into() }.account(), "");
-        let e = Event::ImportKept { account: "a1".into(), error: Some("full".into()) };
-        assert_eq!(serde_json::from_str::<Event>(&serde_json::to_string(&e).unwrap()).unwrap(), e);
-        let j = Job::KeepImport { account: "a1".into() };
-        assert_eq!((serde_json::from_str::<Job>(&serde_json::to_string(&j).unwrap()).unwrap(), j.account()), (j.clone(), "a1"));
-    }
-
-    #[test]
-    fn compaction_jobs_and_events_round_trip() {
-        for j in [
-            Job::DataFileHealth { account: "a1".into() },
-            Job::CompactDataFile { account: "a1".into(), mode: CompactMode::Manual },
-            Job::CancelCompact { account: "a1".into() },
-        ] {
-            assert_eq!((serde_json::from_str::<Job>(&serde_json::to_string(&j).unwrap()).unwrap(), j.account()), (j.clone(), "a1"));
-        }
-        let health = DataFileHealth { file_bytes: 9, raw_fraction: 0.25, ..DataFileHealth::default() };
-        let report = CompactReport { mode: CompactMode::Close, before: 9, after: 4, compacted: true, ..CompactReport::default() };
-        for e in [
-            Event::DataFileHealth { account: "a1".into(), health: Some(Box::new(health)), error: None },
-            Event::Compacting { account: "a1".into(), phase: CompactPhase::Exclusive, work: Work::default(), exclusive_s: Some(12) },
-            Event::Compacted { account: "a1".into(), report: Box::new(report) },
-        ] {
-            assert_eq!(serde_json::from_str::<Event>(&serde_json::to_string(&e).unwrap()).unwrap(), e);
-        }
-    }
-}
+mod tests;

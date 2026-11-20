@@ -122,8 +122,13 @@ impl Worker {
             Job::FileMessages { folder, paths, .. } => self.file_messages(folder, paths),
             Job::FileCopies { folder, mail, moved, .. } => self.file_copies(folder, mail, moved),
             Job::FlushOutbox { .. } => self.flush_outbox(),
-            Job::SyncDav { .. } => self.sync_dav(),
+            // The pool raises the account's flag itself, whatever its thread is doing.
+            Job::CancelTransfers { .. } => {}
+            Job::SyncDav { .. } => self.sync_dav(None),
             Job::SearchDirectory { query, .. } => self.search_directory(query),
+            Job::GetServerRules { .. } => self.server_rules(None),
+            Job::SetServerRules { ops, drop_outlook_list, .. } => self.server_rules(Some((ops, drop_outlook_list))),
+            Job::FreeBusy { people, from, to, .. } => self.free_busy(people, from, to),
             // Only a JMAP server keeps the addresses its mail is sent from where a mail
             // program can ask for them.
             Job::FindIdentities { .. } => {
@@ -170,6 +175,7 @@ impl Worker {
             | Job::Index { .. }
             | Job::StopIndex { .. }
             | Job::ExportPst { .. }
+            | Job::ArchivePst { .. }
             | Job::DataFileHealth { .. }
             | Job::CompactDataFile { .. }
             | Job::CancelCompact { .. }
@@ -283,7 +289,7 @@ impl Worker {
         });
         for op in waiting {
             let touches = match &op {
-                Op::EmptyFolder { path: p } => p == path,
+                o if o.whole_folder().is_some() => o.whole_folder() == Some(path),
                 o if o.is_folder_op() => false,
                 o => o.keys().iter().any(|k| k.folder == path),
             };
@@ -326,8 +332,8 @@ impl Worker {
                             destinations.push(to.clone());
                         }
                         Op::CreateFolder { .. } | Op::DeleteFolder { .. } => relist = true,
-                        Op::EmptyFolder { path } => destinations.push(path.clone()),
-                        Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::Expunge { .. } => {}
+                        Op::EmptyFolder { path } | Op::MarkFolderRead { path } => destinations.push(path.clone()),
+                        Op::SetFlag { .. } | Op::SetFollowUp { .. } | Op::SetReminder { .. } | Op::SetKeyword { .. } | Op::Expunge { .. } => {}
                     }
                     if let Err(e) = self.store.op_made(&self.acc.id, &mut waiting) {
                         self.notice(e.to_string());
@@ -398,5 +404,5 @@ impl Worker {
 
 /// Whether a change names a folder by its path (one a listing may not know yet).
 fn op_names_folder(op: &Op) -> bool {
-    op.is_folder_op() || matches!(op, Op::Move { .. } | Op::EmptyFolder { .. })
+    op.is_folder_op() || matches!(op, Op::Move { .. } | Op::EmptyFolder { .. } | Op::MarkFolderRead { .. })
 }

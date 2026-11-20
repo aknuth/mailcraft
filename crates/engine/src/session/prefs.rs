@@ -49,6 +49,52 @@ pub enum CtrlEnter {
     Nothing,
 }
 
+/// What opens at the start (issue #172): the first account's Inbox (Outlook's first mailbox), All
+/// Inboxes, the folder open when MailCraft last closed, or a folder chosen.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "open")]
+pub enum StartIn {
+    #[default]
+    FirstInbox,
+    AllInboxes,
+    Last,
+    #[serde(rename_all = "camelCase")]
+    Folder {
+        account: String,
+        folder: String,
+    },
+}
+
+/// How tightly the folder pane's rows sit (View › Folder density, issue #184): each step a
+/// smaller text, a shorter row and less indent a level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FolderDensity {
+    /// As it always was: room to read.
+    #[default]
+    Spacious,
+    Medium,
+    /// About as many folders as Outlook for Mac shows in the same height.
+    Compact,
+}
+
+impl FolderDensity {
+    pub const ALL: [FolderDensity; 3] = [FolderDensity::Spacious, FolderDensity::Medium, FolderDensity::Compact];
+
+    /// As `view.folderDensity` takes it.
+    pub fn code(self) -> &'static str {
+        match self {
+            FolderDensity::Spacious => "spacious",
+            FolderDensity::Medium => "medium",
+            FolderDensity::Compact => "compact",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<FolderDensity> {
+        FolderDensity::ALL.into_iter().find(|d| d.code() == code)
+    }
+}
+
 /// Settings the user changes from the View tab (saved by the app).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -71,6 +117,11 @@ pub struct Prefs {
     pub calendars_side_by_side: bool,
     /// Months shown one under another in the calendar's side pane (1 to 6).
     pub calendar_months: u8,
+    /// The days and hours worked (issue #185): the work week shows those days, and the day and
+    /// week views shade the hours outside.
+    pub work_time: mailcraft_model::pim::work_hours::WorkPeriod,
+    /// How long a time free for everyone is looked for (issue #186), in minutes.
+    pub free_time_minutes: u16,
     /// The address book Select Names opens with (Outlook's "Show this address list first"):
     /// `all` (everyone written to or heard from, and contacts), `people` (every contact), or
     /// one address book (`book:<account>:<book id>`).
@@ -86,6 +137,16 @@ pub struct Prefs {
     pub show_preview: bool,
     /// Tighter rows.
     pub compact: bool,
+    /// How tightly the folder pane's rows sit (issue #184).
+    pub folder_density: FolderDensity,
+    /// Folders in an order of the user's own, by account: their paths in that order (issue
+    /// #183). An account without one has them A to Z.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub folder_order: BTreeMap<String, Vec<String>>,
+    /// The message list's headings folded away (issue #189), by the folder they're in: each
+    /// folder's, by arrangement and heading.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub folded_groups: BTreeMap<String, BTreeSet<String>>,
     /// The list under headings, as it's arranged (Today, Yesterday…; a sender's name): off, its
     /// messages follow one another with nothing between.
     pub groups: bool,
@@ -97,6 +158,9 @@ pub struct Prefs {
     /// The ribbon's buttons hidden, its tabs kept on the top bar: one clicked shows its buttons
     /// until a click elsewhere.
     pub ribbon_hidden: bool,
+    /// Send / Receive asked for (F9) opens its progress window. Off unless asked for, as
+    /// Outlook's: the status bar says how it goes, and opens the window when clicked.
+    pub open_send_receive: bool,
     /// The accent colour (issue #8): empty for MailCraft's teal, a named one ([`ACCENTS`]), or
     /// any colour as `#rrggbb`. The window adjusts it to read well in light and dark.
     pub accent: String,
@@ -116,6 +180,20 @@ pub struct Prefs {
     pub confirm_permanent_delete: bool,
     /// Desktop notifications for new mail in an Inbox.
     pub notify: bool,
+    /// With the Focused Inbox on, new mail in Other is announced too (issue #199): off, only
+    /// Focused mail is, as Outlook does.
+    pub notify_other: bool,
+    /// Check spelling as you type (issue #174): misspelled words underlined in the message
+    /// editor, as Outlook does (on unless turned off).
+    pub spelling: bool,
+    /// The words added to the dictionary (Add to dictionary), taken as spelled right in every
+    /// language.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty", deserialize_with = "checked_words")]
+    pub dictionary: BTreeSet<String>,
+    /// The typeface new messages, replies and forwards are written in (issue #166), as Outlook's
+    /// "New mail messages" font; `None`: MailCraft's own.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "checked_font")]
+    pub compose_font: Option<String>,
     /// Closing the window leaves MailCraft running in the notification area, where the app
     /// has one (issue #67): mail is still checked and announced.
     pub close_to_tray: bool,
@@ -152,6 +230,13 @@ pub struct Prefs {
     pub reply_window: bool,
     /// What Ctrl+Enter does in a message being written.
     pub ctrl_enter: CtrlEnter,
+    /// Seconds a message sent waits in the Outbox, to be undone (issue #135); 0: none.
+    pub undo_send_secs: u32,
+    /// What opens at the start (issue #172).
+    pub start_in: StartIn,
+    /// The folder open last (All Inboxes or an account's), for [`StartIn::Last`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_open: Option<StartIn>,
     /// The folder pane shows Favorites at its top (issue #11: it could only be collapsed).
     pub show_favorites: bool,
     /// Meeting invitations go into the calendar as tentative when they arrive, before they're
@@ -199,6 +284,11 @@ pub struct Prefs {
     /// keyword; the day goes into an Outlook data file with it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "checked_days")]
     pub follow_up_done: BTreeMap<String, i64>,
+    /// When flagged messages remind (Follow Up › Add Reminder…): Message-ID → Unix seconds. IMAP
+    /// has nowhere for it, so it's kept here as the days are; Exchange and Microsoft 365 keep it
+    /// on the message.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "checked_reminders")]
+    pub mail_reminders: BTreeMap<String, i64>,
     /// The imports' due-day notes taken into `follow_up`, by account: each note's fingerprint
     /// ([`Session::imported_follow_up_at_start`]). Saved with `follow_up`, it says at the next
     /// start that the note's days are kept here, so the note can go.
@@ -214,6 +304,8 @@ pub struct Prefs {
     /// no longer than closing waits for (File › Options › Data files; off unless chosen: it's
     /// done when MailCraft is left alone, or by hand, either way).
     pub compact_on_close: bool,
+    /// AutoArchive (issue #180): when it runs, and what it does with each folder's old mail.
+    pub auto_archive: AutoArchive,
     /// Search Folders: saved searches shown as folders ([`search_folders`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub search_folders: Vec<search_folders::SearchFolder>,
@@ -308,16 +400,22 @@ impl Default for Prefs {
             hidden_calendars: BTreeSet::new(),
             calendars_side_by_side: false,
             calendar_months: 1,
+            work_time: mailcraft_model::pim::work_hours::WorkPeriod::default(),
+            free_time_minutes: 30,
             address_book: "all".into(),
             keep_messages: 1000,
             keep_offline: 40,
             read_after_secs: 0,
             show_preview: true,
             compact: false,
+            folder_density: FolderDensity::Spacious,
+            folder_order: BTreeMap::new(),
+            folded_groups: BTreeMap::new(),
             groups: true,
             single_line: false,
             classic_ribbon: false,
             ribbon_hidden: false,
+            open_send_receive: false,
             accent: String::new(),
             plain_top_bar: false,
             light_messages: false,
@@ -325,8 +423,15 @@ impl Default for Prefs {
             date_style: mailcraft_model::dates::DateStyle::default(),
             confirm_permanent_delete: true,
             ctrl_enter: CtrlEnter::Ask,
+            undo_send_secs: 0,
+            start_in: StartIn::FirstInbox,
+            last_open: None,
             favorites: None,
             notify: true,
+            notify_other: false,
+            spelling: true,
+            dictionary: BTreeSet::new(),
+            compose_font: None,
             close_to_tray: false,
             start_in_tray: false,
             tray_unread: true,
@@ -350,11 +455,13 @@ impl Default for Prefs {
             ignored: IgnoredIds::default(),
             follow_up: BTreeMap::new(),
             follow_up_done: BTreeMap::new(),
+            mail_reminders: BTreeMap::new(),
             follow_up_taken: BTreeMap::new(),
             reminders: BTreeMap::new(),
             search_folders: Vec::new(),
             animations: true,
             compact_on_close: false,
+            auto_archive: AutoArchive::default(),
             search_scope: SearchScope::Mailbox,
             recent_searches: Vec::new(),
             keep_photo_location: false,
@@ -420,6 +527,40 @@ fn checked_days<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<Strin
     let mut kept = BTreeMap::new();
     mailcraft_model::organize::merge_follow_up(&mut kept, read);
     Ok(kept)
+}
+
+/// Flags' reminders read from disk: only times on the days a follow-up may have, by a key that
+/// may be a follow-up's ([`merge_reminders`](mailcraft_model::organize::merge_reminders)).
+fn checked_reminders<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, i64>, D::Error> {
+    let read = <BTreeMap<String, i64> as serde::Deserialize>::deserialize(d)?;
+    let mut kept = BTreeMap::new();
+    mailcraft_model::organize::merge_reminders(&mut kept, read);
+    Ok(kept)
+}
+
+/// The most words the dictionary keeps, and the longest word.
+pub const DICTIONARY_MAX: usize = 10_000;
+pub const DICTIONARY_WORD_MAX: usize = 100;
+
+/// A word as the dictionary keeps it, when it's one: trimmed, one word (no space or control
+/// character), at most [`DICTIONARY_WORD_MAX`] characters.
+pub fn dictionary_word(w: &str) -> Option<String> {
+    let w = w.trim();
+    let ok = !w.is_empty() && w.chars().count() <= DICTIONARY_WORD_MAX && !w.chars().any(|c| c.is_whitespace() || c.is_control());
+    ok.then(|| w.to_string())
+}
+
+/// The font for new messages read from disk: only a name a style can carry
+/// ([`mime::rich::font_name`]).
+fn checked_font<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let read = <Option<String> as serde::Deserialize>::deserialize(d)?;
+    Ok(read.as_deref().and_then(mailcraft_mime::rich::font_name))
+}
+
+/// The dictionary's words read from disk: only what are words, up to [`DICTIONARY_MAX`].
+fn checked_words<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeSet<String>, D::Error> {
+    let read = <Vec<String> as serde::Deserialize>::deserialize(d)?;
+    Ok(read.iter().filter_map(|w| dictionary_word(w)).take(DICTIONARY_MAX).collect())
 }
 
 /// An accent as it's kept: a name from [`ACCENTS`] or `#rrggbb` (lower case); `""` for

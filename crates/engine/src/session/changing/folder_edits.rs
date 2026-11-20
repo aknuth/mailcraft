@@ -2,9 +2,6 @@
 
 use std::collections::VecDeque;
 
-use mailcraft_model::FOLLOW_UP_COMPLETE;
-use mailcraft_model::organize::MAX_FOLLOW_UP;
-
 use super::*;
 
 impl Session {
@@ -404,10 +401,7 @@ impl Session {
         let current = flag.get(&first.flags);
         let on = on.unwrap_or(!current);
         if flag == Flag::Flagged {
-            let was = self.follow_up_days_of(&sel);
-            let undo = self.set_flagged(&sel, on);
-            self.remember_follow_up(undo, was);
-            return Ok(serde_json::json!({ "on": on, "count": sel.len() }));
+            return self.flag_messages(&sel, on);
         }
         self.mark_selection(&sel, on, |m| flag.get(&m.flags), |keys, on| Op::SetFlag { keys, flag, on });
         Ok(serde_json::json!({ "on": on, "count": sel.len() }))
@@ -430,151 +424,6 @@ impl Session {
         for (a, keys) in keys_by_account(sel.iter().map(|m| m.key.clone())) {
             self.apply_op(&a, op(keys, on));
         }
-    }
-
-    /// Flag `sel` (or clear the flag): one marked complete no longer is, a fresh flag has no due
-    /// day, and a cleared one neither. The changes that put the flags back, by account.
-    ///
-    /// A server that keeps one status for both (Microsoft Graph's flag) gets the
-    /// [`FOLLOW_UP_COMPLETE`] keyword taken off before the flag is set, and put on after it.
-    fn set_flagged(&mut self, sel: &[SharedSummary], on: bool) -> Vec<(String, Vec<Op>)> {
-        let by_account = keys_by_account(sel.iter().map(|m| m.key.clone()));
-        let changed = keys_by_account(sel.iter().filter(|m| m.flags.flagged != on).map(|m| m.key.clone()));
-        // Carrying the keyword: complete, or flagged again elsewhere with it left behind.
-        let completed = keys_by_account(sel.iter().filter(|m| m.flags.has(FOLLOW_UP_COMPLETE)).map(|m| m.key.clone()));
-        for (a, keys) in &completed {
-            self.apply_op(a, Op::SetKeyword { keys: keys.clone(), keyword: FOLLOW_UP_COMPLETE.into(), on: false });
-        }
-        for (a, keys) in by_account {
-            self.apply_op(&a, Op::SetFlag { keys, flag: Flag::Flagged, on });
-        }
-        for m in sel {
-            let id = m.follow_up_id();
-            // Unflagged: no longer due. Flagged again once complete: a fresh flag, not the one
-            // completed (one still flagged keeps its day).
-            if !on || m.flags.follow_up_complete() {
-                self.prefs.follow_up.remove(&id);
-            }
-            self.prefs.follow_up_done.remove(&id);
-        }
-        let mut undo: BTreeMap<String, Vec<Op>> = BTreeMap::new();
-        for (a, keys) in changed {
-            undo.entry(a).or_default().push(Op::SetFlag { keys, flag: Flag::Flagged, on: !on });
-        }
-        for (a, keys) in completed {
-            undo.entry(a).or_default().push(Op::SetKeyword { keys, keyword: FOLLOW_UP_COMPLETE.into(), on: true });
-        }
-        undo.into_iter().collect()
-    }
-
-    /// Each of `sel`'s due and done days as they are, for Undo to put back.
-    fn follow_up_days_of<S: std::borrow::Borrow<Summary>>(&self, sel: &[S]) -> Vec<(String, Option<i64>, Option<i64>)> {
-        sel.iter()
-            .map(|m| {
-                let id = m.borrow().follow_up_id();
-                let (due, done) = (self.prefs.follow_up.get(&id).copied(), self.prefs.follow_up_done.get(&id).copied());
-                (id, due, done)
-            })
-            .collect()
-    }
-
-    /// Remember a change to follow-ups for Undo, when it changed anything: `ops` put the flags
-    /// back, `was` the days.
-    fn remember_follow_up(&mut self, ops: Vec<(String, Vec<Op>)>, was: Vec<(String, Option<i64>, Option<i64>)>) {
-        let days_changed =
-            was.iter().any(|(id, due, done)| self.prefs.follow_up.get(id).copied() != *due || self.prefs.follow_up_done.get(id).copied() != *done);
-        if ops.iter().any(|(_, o)| !o.is_empty()) || days_changed {
-            self.remember(Undo::FollowUp { ops, days: was });
-        }
-    }
-
-    /// Flag the selection for follow-up by a day (`None`: no date), or (`complete`) mark it
-    /// done ([`Self::complete_selection`]).
-    pub fn follow_up_selection(&mut self, due: Option<i64>, complete: bool) -> CmdResult {
-        if complete {
-            return self.complete_selection();
-        }
-        let sel = self.selected_shared();
-        if sel.is_empty() {
-            return Err(CmdError::Disabled("no message selected".into()));
-        }
-        let was = self.follow_up_days_of(&sel);
-        let undo = self.set_flagged(&sel, true);
-        for m in &sel {
-            let id = m.follow_up_id();
-            match due {
-                Some(d) if self.prefs.follow_up.len() < MAX_FOLLOW_UP || self.prefs.follow_up.contains_key(&id) => {
-                    self.prefs.follow_up.insert(id, d);
-                }
-                _ => {
-                    self.prefs.follow_up.remove(&id);
-                }
-            }
-        }
-        self.remember_follow_up(undo, was);
-        Ok(serde_json::json!({ "flagged": true, "due": due.map(mailcraft_model::dates::day_string), "count": sel.len() }))
-    }
-
-    /// Mark the selection's follow-up complete (Mark Complete): unflagged, with the
-    /// [`FOLLOW_UP_COMPLETE`] keyword, and the day it was done kept (as Outlook keeps it). Its
-    /// due day stays; Undo puts the flag and both days back as they were, in one step.
-    pub fn complete_selection(&mut self) -> CmdResult {
-        let sel = self.selected_shared();
-        self.complete_messages(sel)
-    }
-
-    /// [`Session::complete_selection`] for these messages, wherever they are (the To-Do Bar's
-    /// are in any folder).
-    pub(crate) fn complete_messages<S: std::borrow::Borrow<Summary>>(&mut self, sel: Vec<S>) -> CmdResult {
-        let sel: Vec<&Summary> = sel.iter().map(std::borrow::Borrow::borrow).collect();
-        if sel.is_empty() {
-            return Err(CmdError::Disabled("no message selected".into()));
-        }
-        let was = self.follow_up_days_of(&sel);
-        let today = mailcraft_model::dates::today(&self.clock);
-        let flagged = keys_by_account(sel.iter().filter(|m| m.flags.flagged).map(|m| m.key.clone()));
-        let marked = keys_by_account(sel.iter().filter(|m| !m.flags.has(FOLLOW_UP_COMPLETE)).map(|m| m.key.clone()));
-        for m in &sel {
-            // Done today, unless it was already done (marked complete again).
-            let id = m.follow_up_id();
-            if !(m.flags.follow_up_complete() && self.prefs.follow_up_done.contains_key(&id))
-                && (self.prefs.follow_up_done.len() < MAX_FOLLOW_UP || self.prefs.follow_up_done.contains_key(&id))
-            {
-                self.prefs.follow_up_done.insert(id, today);
-            }
-        }
-        // Undo: the keyword off before the flag goes back on (see `set_flagged`).
-        let mut undo: BTreeMap<String, Vec<Op>> = BTreeMap::new();
-        for (a, keys) in &marked {
-            undo.entry(a.clone()).or_default().push(Op::SetKeyword { keys: keys.clone(), keyword: FOLLOW_UP_COMPLETE.into(), on: false });
-        }
-        for (a, keys) in &flagged {
-            undo.entry(a.clone()).or_default().push(Op::SetFlag { keys: keys.clone(), flag: Flag::Flagged, on: true });
-        }
-        for (a, keys) in flagged {
-            self.apply_op(&a, Op::SetFlag { keys, flag: Flag::Flagged, on: false });
-        }
-        for (a, keys) in marked {
-            self.apply_op(&a, Op::SetKeyword { keys, keyword: FOLLOW_UP_COMPLETE.into(), on: true });
-        }
-        self.remember_follow_up(undo.into_iter().collect(), was);
-        Ok(serde_json::json!({ "flagged": false, "complete": true, "count": sel.len() }))
-    }
-
-    /// When a flagged message is due, if a day was given.
-    pub fn follow_up_due(&self, m: &Summary) -> Option<i64> {
-        if !m.flags.flagged {
-            return None;
-        }
-        self.prefs.follow_up.get(&m.follow_up_id()).copied()
-    }
-
-    /// When a message's follow-up was marked complete, if it was and the day is known.
-    pub fn follow_up_done(&self, m: &Summary) -> Option<i64> {
-        if !m.flags.follow_up_complete() {
-            return None;
-        }
-        self.prefs.follow_up_done.get(&m.follow_up_id()).copied()
     }
 
     pub(crate) fn remember(&mut self, u: Undo) {
@@ -602,10 +451,7 @@ impl Session {
                         self.apply_op(&account, op);
                     }
                 }
-                for (id, due, done) in days {
-                    put_day(&mut self.prefs.follow_up, id.clone(), due);
-                    put_day(&mut self.prefs.follow_up_done, id, done);
-                }
+                self.follow_up_back(days);
                 Ok(serde_json::json!({ "undone": "changes" }))
             }
             Undo::Move { moves } => {
@@ -671,19 +517,6 @@ impl Session {
             self.apply_op(account, Op::Move { keys, to: from });
         }
         Ok(n)
-    }
-}
-
-/// A day put back as it was (`None`: none), within [`MAX_FOLLOW_UP`].
-fn put_day(days: &mut BTreeMap<String, i64>, id: String, day: Option<i64>) {
-    match day {
-        Some(d) if days.len() < MAX_FOLLOW_UP || days.contains_key(&id) => {
-            days.insert(id, d);
-        }
-        Some(_) => {}
-        None => {
-            days.remove(&id);
-        }
     }
 }
 

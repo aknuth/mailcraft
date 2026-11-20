@@ -1,5 +1,6 @@
-//! The Reminders window: calendar reminders that have come due (Outlook's own window lists them
-//! the same way), each to dismiss, snooze or open; and a desktop notification when one comes.
+//! The Reminders window: calendar, task and flagged mail reminders that have come due (Outlook's
+//! own window lists them the same way), each to dismiss, snooze or open; and a desktop
+//! notification when one comes.
 
 use egui::{RichText, Ui, vec2};
 use mailcraft_engine::model::dates;
@@ -146,10 +147,13 @@ pub fn show(ctx: &egui::Context, st: &mut State, s: &Session, t: &Tokens, acts: 
                         if widgets::accent_button(ui, crate::icons::Icon::Close, "Dismiss", t, true).clicked() {
                             acts.push(Action::Run("reminders.dismiss", json!({ "key": r.key })));
                         }
-                        if ui.button(tl!("Open Item")).clicked()
-                            && let Some(d) = if r.task { Dialog::open_task(s, &r.uid) } else { Dialog::open_event(s, &r.uid, r.occurrence) }
-                        {
-                            acts.push(Action::Dialog(d));
+                        if ui.button(tl!("Open Item")).clicked() {
+                            if let Some(key) = &r.message {
+                                // A flagged message, in a window of its own.
+                                acts.push(Action::Run("todo.open", json!({ "key": key.to_id() })));
+                            } else if let Some(d) = if r.task { Dialog::open_task(s, &r.uid) } else { Dialog::open_event(s, &r.uid, r.occurrence) } {
+                                acts.push(Action::Dialog(d));
+                            }
                         }
                     }
                 });
@@ -157,7 +161,7 @@ pub fn show(ctx: &egui::Context, st: &mut State, s: &Session, t: &Tokens, acts: 
             ui.add_space(4.0);
             let again = ui.label(RichText::new(tl!("Click Snooze to be reminded again in:")).color(t.dim).small());
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("reminder-snooze")
+                let r = egui::ComboBox::from_id_salt("reminder-snooze")
                     .width(200.0)
                     .selected_text(snooze_label(snooze))
                     .show_ui(ui, |ui| {
@@ -167,6 +171,7 @@ pub fn show(ctx: &egui::Context, st: &mut State, s: &Session, t: &Tokens, acts: 
                     })
                     .response
                     .labelled_by(again.id);
+                crate::drop_down::keys(ui, &r, &mut st.snooze, &SNOOZES.map(Some));
                 if let Some(r) = &picked
                     && ui.button(tl!("Snooze")).clicked()
                 {

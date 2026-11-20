@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use super::*;
 
 mod folder_edits;
+mod follow_up;
 pub(crate) use folder_edits::keys_by_account;
 
 /// The most moves into an Inbox or Junk remembered ([`MovedIn`]) before the oldest are
@@ -80,11 +81,13 @@ impl Session {
         let op = match op {
             Op::SetFlag { keys, flag, on } => Op::SetFlag { keys: keys.into_iter().filter(|k| k.folder != OUTBOX).collect(), flag, on },
             Op::SetKeyword { keys, keyword, on } => Op::SetKeyword { keys: keys.into_iter().filter(|k| k.folder != OUTBOX).collect(), keyword, on },
+            Op::SetFollowUp { keys, due } => Op::SetFollowUp { keys: keys.into_iter().filter(|k| k.folder != OUTBOX).collect(), due },
+            Op::SetReminder { keys, at } => Op::SetReminder { keys: keys.into_iter().filter(|k| k.folder != OUTBOX).collect(), at },
             Op::Move { keys, to } => Op::Move { keys: keys.into_iter().filter(|k| k.folder != OUTBOX).collect(), to },
             Op::Expunge { keys } => Op::Expunge { keys: keys.into_iter().filter(|k| k.folder != OUTBOX).collect() },
             other => other,
         };
-        if !op.is_folder_op() && !matches!(op, Op::EmptyFolder { .. }) && op.keys().is_empty() {
+        if !op.is_folder_op() && op.whole_folder().is_none() && op.keys().is_empty() {
             return Ok(());
         }
         let local = self.account(account).is_none_or(AccountState::is_local);
@@ -150,7 +153,14 @@ impl Session {
                 }
             }
             Op::EmptyFolder { path } => self.search_folder_changed(account, path),
-            Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::CreateFolder { .. } | Op::RenameFolder { .. } | Op::DeleteFolder { .. } => {}
+            Op::MarkFolderRead { .. }
+            | Op::SetFlag { .. }
+            | Op::SetFollowUp { .. }
+            | Op::SetReminder { .. }
+            | Op::SetKeyword { .. }
+            | Op::CreateFolder { .. }
+            | Op::RenameFolder { .. }
+            | Op::DeleteFolder { .. } => {}
         }
         if op.is_folder_op() {
             self.apply_folder_op_memory(account, op);
@@ -167,6 +177,20 @@ impl Session {
             self.selection.retain(|k| !(k.account == account && &k.folder == path));
             if self.reading.as_ref().is_some_and(|r| r.key.account == account && &r.key.folder == path) {
                 self.reading = None;
+            }
+            return;
+        }
+        // The folder's mail kept here is marked with `SetFlag`; this is the rest, on the server
+        // (issue #197): its count goes, and anything kept still unread is read.
+        if let Op::MarkFolderRead { path } = op {
+            self.mail_changed();
+            if let Some(st) = self.cache.get_mut(&(account.to_string(), path.clone())) {
+                for m in st.messages.iter_mut().filter(|m| !m.flags.seen) {
+                    SharedSummary::make_mut(m).flags.seen = true;
+                }
+            }
+            if let Some(f) = self.account_mut(account).and_then(|a| a.folders.iter_mut().find(|f| &f.path == path)) {
+                f.unread = 0;
             }
             return;
         }
@@ -198,6 +222,17 @@ impl Session {
                         SharedSummary::make_mut(m).flags.set_keyword(keyword, *on);
                     }
                 }
+                Op::SetFollowUp { due, .. } => {
+                    let day = due.map(|d| d.day);
+                    for m in st.messages.iter_mut().filter(|m| mine.contains(&m.key.uid) && m.flags.follow_up_due != day) {
+                        SharedSummary::make_mut(m).flags.follow_up_due = day;
+                    }
+                }
+                Op::SetReminder { at, .. } => {
+                    for m in st.messages.iter_mut().filter(|m| mine.contains(&m.key.uid) && m.flags.reminder != *at) {
+                        SharedSummary::make_mut(m).flags.reminder = *at;
+                    }
+                }
                 Op::Move { to, .. } if to == f => {}
                 Op::Move { .. } | Op::Expunge { .. } => {
                     let unread = st.messages.iter().filter(|m| mine.contains(&m.key.uid) && !m.flags.seen).count();
@@ -206,7 +241,7 @@ impl Session {
                     st.messages.retain(|m| !mine.contains(&m.key.uid));
                     *gone.entry(f.clone()).or_default() += u32::try_from(before - st.messages.len()).unwrap_or(u32::MAX);
                 }
-                Op::CreateFolder { .. } | Op::RenameFolder { .. } | Op::DeleteFolder { .. } | Op::EmptyFolder { .. } => {}
+                Op::CreateFolder { .. } | Op::RenameFolder { .. } | Op::DeleteFolder { .. } | Op::EmptyFolder { .. } | Op::MarkFolderRead { .. } => {}
             }
         }
         if let Some(a) = self.account_mut(account) {
@@ -231,7 +266,7 @@ impl Session {
         let mut touched: Vec<String> = op.keys().iter().map(|k| k.folder.clone()).collect();
         match op {
             Op::Move { to, .. } => touched.push(to.clone()),
-            Op::EmptyFolder { path } => touched.push(path.clone()),
+            Op::EmptyFolder { path } | Op::MarkFolderRead { path } => touched.push(path.clone()),
             _ => {}
         }
         touched.sort();
@@ -240,7 +275,7 @@ impl Session {
         // flags they have now are handed to the store's thread for marks with the folders'
         // counts, written there in one commit (`store/src/marking.rs`): not in the window's frame.
         // One not in memory is changed on disk.
-        if matches!(op, Op::SetFlag { .. } | Op::SetKeyword { .. })
+        if matches!(op, Op::SetFlag { .. } | Op::SetFollowUp { .. } | Op::SetReminder { .. } | Op::SetKeyword { .. })
             && touched.iter().all(|f| self.cache.contains_key(&(account.to_string(), f.clone())))
         {
             let counts = self.count_local(account, Some(&touched));
@@ -315,7 +350,7 @@ impl Session {
         // flag or category changes nothing it keeps.
         if op.is_folder_op() {
             self.want_index(account, None);
-        } else if !matches!(op, Op::SetFlag { .. } | Op::SetKeyword { .. }) {
+        } else if !matches!(op, Op::SetFlag { .. } | Op::SetFollowUp { .. } | Op::SetReminder { .. } | Op::SetKeyword { .. }) {
             for f in &touched {
                 self.want_index(account, Some(f));
             }
@@ -391,7 +426,14 @@ impl Session {
                     }
                 }
                 Op::DeleteFolder { path } => a.folders.retain(|f| !mailcraft_model::is_within(&f.path, path, f.delimiter.or(delimiter))),
-                Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::Move { .. } | Op::Expunge { .. } | Op::EmptyFolder { .. } => {}
+                Op::SetFlag { .. }
+                | Op::SetFollowUp { .. }
+                | Op::SetReminder { .. }
+                | Op::SetKeyword { .. }
+                | Op::Move { .. }
+                | Op::Expunge { .. }
+                | Op::EmptyFolder { .. }
+                | Op::MarkFolderRead { .. } => {}
             }
             sort_folders(&mut a.folders);
         }
@@ -413,12 +455,24 @@ impl Session {
                     }
                 }
                 self.organizing_follows_folder(account, from, to, delimiter);
+                // Its place in the user's order too (issue #183).
+                self.order_follows_folder(account, from, Some(to), delimiter);
+                self.folds_follow_folder(account, from, Some(to), delimiter);
+                // A folder's own AutoArchive setting goes with it (issue #180).
+                for f in self.prefs.auto_archive.folders.iter_mut().filter(|f| f.account == account) {
+                    if let Some(new) = mailcraft_model::rebase_path(&f.folder, from, to, delimiter) {
+                        f.folder = new;
+                    }
+                }
             }
             Op::DeleteFolder { path } => {
                 self.cache.retain(|(acc, f), _| acc != account || !mailcraft_model::is_within(f, path, delimiter));
                 if let Some(favs) = self.prefs.favorites.as_mut() {
                     favs.retain(|f| f.account != account || !mailcraft_model::is_within(&f.folder, path, delimiter));
                 }
+                self.prefs.auto_archive.folders.retain(|f| f.account != account || !mailcraft_model::is_within(&f.folder, path, delimiter));
+                self.order_follows_folder(account, path, None, delimiter);
+                self.folds_follow_folder(account, path, None, delimiter);
                 if matches!(&self.view, View::Folder { account: va, folder } if va == account && mailcraft_model::is_within(folder, path, delimiter))
                 {
                     self.view = self.default_view();
@@ -427,7 +481,14 @@ impl Session {
                     self.focus = None;
                 }
             }
-            Op::SetFlag { .. } | Op::SetKeyword { .. } | Op::Move { .. } | Op::Expunge { .. } | Op::EmptyFolder { .. } => {}
+            Op::SetFlag { .. }
+            | Op::SetFollowUp { .. }
+            | Op::SetReminder { .. }
+            | Op::SetKeyword { .. }
+            | Op::Move { .. }
+            | Op::Expunge { .. }
+            | Op::EmptyFolder { .. }
+            | Op::MarkFolderRead { .. } => {}
         }
         self.search_folders_changed(account);
     }

@@ -57,6 +57,8 @@ struct Handle {
     no_password: Arc<AtomicBool>,
     /// The main connection is at work: a message opened meanwhile goes to the second one.
     busy: Arc<AtomicBool>,
+    /// Its Send / Receive asked to stop (Cancel All, Cancel Task), shared by both connections.
+    cancel: Arc<AtomicBool>,
     /// The main connection's way to the second one, emptied when the account stops: otherwise
     /// each would keep the other's queue open, and neither thread would end.
     quick_link: QuickLink,
@@ -74,7 +76,8 @@ impl Handle {
     fn of(w: &Worker, tx: Sender<Job>) -> Handle {
         let quick_link = w.quick.clone();
         let quick = quick_link.lock().ok().and_then(|q| q.clone());
-        Handle { tx, quick, no_password: w.no_password.clone(), busy: w.busy.clone(), quick_link, stop: w.stop.clone(), waits: w.waits.clone() }
+        let (no_password, busy, cancel) = (w.no_password.clone(), w.busy.clone(), w.cancel.clone());
+        Handle { tx, quick, no_password, busy, cancel, quick_link, stop: w.stop.clone(), waits: w.waits.clone() }
     }
 }
 
@@ -389,6 +392,21 @@ const MAX_PICTURE: usize = 8 << 20;
 const FULL_SYNC_EVERY: Duration = Duration::from_secs(15 * 60);
 const IDLE_FOR: Duration = Duration::from_secs(10 * 60);
 const POLL_EVERY: Duration = Duration::from_secs(120);
+
+/// Accounts whose test looks for new mail this often instead of [`POLL_EVERY`] (the full sync
+/// left at its quarter of an hour: what the looks bring is theirs alone), by account id.
+#[cfg(test)]
+pub(crate) static POLL_FOR: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
+
+/// How often an account that isn't told of new mail looks for it.
+fn poll_every(account: &str) -> Duration {
+    #[cfg(test)]
+    if let Some(d) = POLL_FOR.lock().ok().and_then(|p| p.iter().find(|(a, _)| a == account).map(|(_, d)| *d)) {
+        return d;
+    }
+    let _ = account;
+    POLL_EVERY
+}
 /// When Sent Items is read again after Graph or Exchange took a message (its copy is filed a
 /// moment later), and once more in case that was too soon.
 const SENT_SOON: Duration = Duration::from_secs(3);
@@ -451,6 +469,9 @@ struct Worker {
     whole_only: Arc<std::sync::Mutex<std::collections::HashSet<mailcraft_model::MessageKey>>>,
     /// Set while the main connection works rather than waits ([`Worker::working`]).
     busy: Arc<AtomicBool>,
+    /// Its Send / Receive asked to stop, shared with the pool and the other connection
+    /// (`account/transfers.rs`): cleared once the main one waits again, or asked to begin anew.
+    cancel: Arc<AtomicBool>,
     /// How many waits to connect again after a connection failed it began, shared with the
     /// pool: counted, not timed (the tests ask).
     waits: Arc<AtomicUsize>,
@@ -480,6 +501,13 @@ struct Worker {
     /// Folders to look at again soon: Graph and Exchange file a sent message's copy a moment
     /// after taking it, so Sent Items is read again then rather than at the next poll.
     soon: Vec<(Instant, String)>,
+    /// Exchange: the subscription saying which folders changed between full syncs (issue #145),
+    /// and when one was last refused (asked for again a full sync's time on).
+    ews_watch: Option<crate::ews::Watch>,
+    watch_refused: Option<Instant>,
+    /// An Exchange account's calendars and contacts are being read, a step at a time: a Send /
+    /// Receive between two steps reads the mail, not them again.
+    in_pim: bool,
     /// Folders asked to keep more than the setting (Show more on the server, issue #4): how
     /// many of each (`windows.json` with the account).
     windows: HashMap<String, usize>,
@@ -543,6 +571,7 @@ impl Worker {
         q.main = Some(main);
         q.given_back = self.given_back.clone();
         q.whole_only = self.whole_only.clone();
+        q.cancel = self.cancel.clone();
         q
     }
 
@@ -596,6 +625,7 @@ impl Worker {
             dav_looked: false,
             whole_only: Arc::default(),
             busy: Arc::default(),
+            cancel: Arc::default(),
             waits: Arc::default(),
             backoff: FIRST_BACKOFF,
             next_attempt: Instant::now(),
@@ -612,6 +642,9 @@ impl Worker {
             no_push: false,
             pushed: false,
             soon: Vec::new(),
+            ews_watch: None,
+            watch_refused: None,
+            in_pim: false,
             search,
             dav_digest: None,
             dav_said: None,

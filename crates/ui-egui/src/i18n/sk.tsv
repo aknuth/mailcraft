@@ -16,19 +16,19 @@
 	Add an email account	Pridať e-mailové konto
 	Added to new messages, replies and forwards.	Pridá sa do nových správ, odpovedí a preposlaní.
 	All	Všetko
-	All Inboxes	Všetky doručené
-	All Sent	Všetky odoslané
+	All Inboxes	Všetka doručená pošta
+	All Sent	Všetka odoslaná pošta
 	All caught up: nothing in this folder.	Všetko vybavené: v tomto priečinku nič nie je.
 	All folders	Všetky priečinky
 	Always show from {sender}	Vždy zobrazovať od odosielateľa {sender}
-	Apr	Apr
+	Apr	apr
 	Archive	Archivovať
 	Archive (Backspace)	Archivovať (Backspace)
 	Ask before deleting for good	Pred trvalým odstránením sa opýtať
 	At the top of {account}	Na začiatok konta {account}
 	Attach file	Priložiť súbor
 	Audio	Zvuk
-	Aug	Aug
+	Aug	aug
 	B	T
 	Bcc	Skrytá kópia
 	Bold (Ctrl+B)	Tučné (Ctrl+B)
@@ -53,7 +53,7 @@
 	Create rule…	Vytvoriť pravidlo…
 	Dark	Tmavý
 	Date	Dátum
-	Dec	Dec
+	Dec	dec
 	Delete	Odstrániť
 	Delete (Del)	Odstrániť (Del)
 	Delete folder…	Odstrániť priečinok…
@@ -73,9 +73,9 @@
 	Edit rule	Upraviť pravidlo
 	Email address	E-mailová adresa
 	Enter the password for {email}.	Zadajte heslo pre {email}.
-	Enter the password for {email}, which signs in as {user}.	Zadajte heslo pre {email}, ktoré sa prihlasuje ako {user}.
+	Enter the password for {email}, which signs in as {user}.	Zadajte heslo pre {email} (prihlasuje sa ako {user}).
 	Favorites	Obľúbené
-	Feb	Feb
+	Feb	feb
 	File	Súbor
 	Flag	Označiť príznakom
 	Flag / Unflag (Insert)	Označiť / zrušiť príznak (Insert)
@@ -87,7 +87,7 @@
 	Folder name	Názov priečinka
 	Forward	Preposlať
 	Forward (Ctrl+F)	Preposlať (Ctrl+F)
-	Fri	Pi
+	Fri	pi
 	Friday	piatok
 	From	Od
 	From contains	Odosielateľ obsahuje
@@ -108,13 +108,13 @@
 	Is a newsletter or list mail	Je bulletin alebo pošta z mailing listu
 	Italic (Ctrl+I)	Kurzíva (Ctrl+I)
 	Items: {n}	Položky: {n}
-	Jan	Jan
-	Jul	Júl
-	Jun	Jún
+	Jan	jan
+	Jul	júl
+	Jun	jún
 	Junk Email	Nevyžiadaná pošta
 	Language	Jazyk
 	Dates	Dátumy
-	In the message list, the reading pane and the header of a reply	V zozname správ, na table na čítanie a v hlavičke odpovede
+	In the message list, the reading pane, the header of a reply, and the event and task forms	V zozname správ, na table na čítanie, v hlavičke odpovede a vo formulároch udalostí a úloh
 	Time	Čas
 	24-hour	24-hodinový
 	12-hour	12-hodinový
@@ -128,24 +128,24 @@
 	Link	Odkaz
 	Link (Ctrl+K)	Odkaz (Ctrl+K)
 	Links like {link} aren't opened	Odkazy ako {link} sa neotvárajú
-	Local-first: mail is cached on this computer for fast offline search. Passwords stay in the system keychain.	Najprv lokálne: pošta sa ukladá na tomto počítači pre rýchle vyhľadávanie aj offline. Heslá zostávajú v systémovej kľúčenke.
+	Local-first: mail is cached on this computer for fast offline search. Passwords stay in the system keychain.	Pošta je u vás: ukladá sa na tomto počítači, takže sa v nej rýchlo hľadá aj offline. Heslá zostávajú v systémovej kľúčenke.
 	Looking up the server settings…	Zisťujú sa nastavenia servera…
 	Mail from {sender}	Pošta od odosielateľa {sender}
 	MailCraft	MailCraft
 	MailCraft {version} · an ArtCraft app · MIT OR Apache-2.0	MailCraft {version} · aplikácia ArtCraft · MIT OR Apache-2.0
 	Mailing list: unsubscribe at {address}	Mailing list: odhlásenie na adrese {address}
-	Mar	Mar
+	Mar	mar
 	Mark all as read	Označiť všetko ako prečítané
 	Mark as read	Označiť ako prečítané
 	Mark as unread	Označiť ako neprečítané
 	Mark read	Prečítané
 	Mark unread	Neprečítané
-	May	Máj
+	May	máj
 	Message preview	Ukážka správy
 	Message sent	Správa bola odoslaná
 	Messages waiting to be sent	Správy čakajúce na odoslanie
 	Messages without a subject are easy to overlook.	Správy bez predmetu sa ľahko prehliadnu.
-	Mon	Po
+	Mon	po
 	Monday	pondelok
 	{time} AM	{time} AM
 	{time} PM	{time} PM
@@ -183,9 +183,9 @@
 	Not junk	Nie je nevyžiadaná
 	Not sent: {error}	Neodoslané: {error}
 	Nothing matches this filter.	Tomuto filtru nič nezodpovedá.
-	Nov	Nov
+	Nov	nov
 	Numbered list	Číslovaný zoznam
-	Oct	Okt
+	Oct	okt
 	Off	Vypnuté
 	Offline	Offline
 	Older	Staršie
@@ -239,7 +239,7 @@
 	Same as the system	Podľa systému
 	Sample mailbox (offline)	Ukážková schránka (offline)
 	Sample mailbox, kept on this computer only	Ukážková schránka, uložená len na tomto počítači
-	Sat	So
+	Sat	so
 	Saturday	sobota
 	Save	Uložiť
 	Save all…	Uložiť všetko…
@@ -277,7 +277,7 @@
 	Sender, recipients or subject contain	Odosielateľ, príjemcovia alebo predmet obsahujú
 	Sending…	Odosiela sa…
 	Sent Items	Odoslaná pošta
-	Sep	Sep
+	Sep	sep
 	Server settings	Nastavenia servera
 	Servers: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})	Servery: {imap} (IMAP {imap_port}), {smtp} (SMTP {smtp_port})
 	Settings found: {source}	Nájdené nastavenia: {source}
@@ -308,7 +308,7 @@
 	Strikethrough	Prečiarknuté
 	Subject	Predmet
 	Subject contains	Predmet obsahuje
-	Sun	Ne
+	Sun	ne
 	Sunday	nedeľa
 	Switch to dark mode	Prepnúť na tmavý režim
 	Switch to light mode	Prepnúť na svetlý režim
@@ -328,7 +328,7 @@
 	This message will be deleted for good. This can't be undone.	Táto správa sa natrvalo odstráni. Túto akciu nemožno vrátiť späť.
 	This weekend	Tento víkend
 	Three weeks ago	Pred tromi týždňami
-	Thu	Št
+	Thu	št
 	Thursday	štvrtok
 	To	Komu
 	To do	Úlohy
@@ -337,7 +337,7 @@
 	Today	Dnes
 	Tomorrow	Zajtra
 	Try again	Skúsiť znova
-	Tue	Ut
+	Tue	ut
 	Tuesday	utorok
 	Two weeks ago	Pred dvomi týždňami
 	Unflag	Zrušiť príznak
@@ -354,7 +354,7 @@
 	View	Zobraziť
 	Waiting in the Outbox. Last try: {error}	Čaká v priečinku Pošta na odoslanie. Posledný pokus: {error}
 	Waiting in the Outbox: it will be sent when you're back online.	Čaká v priečinku Pošta na odoslanie: odošle sa, keď budete znova online.
-	Wed	St
+	Wed	st
 	Wednesday	streda
 	Welcome to MailCraft	Vitajte v MailCrafte
 	When mail	Keď pošta
@@ -398,7 +398,7 @@
 	Free and open source · MIT OR Apache-2.0	Bezplatný a open source · MIT OR Apache-2.0
 	Automatic replies	Automatické odpovede
 	Back	Späť
-	Built in the open from the email standards: no code, icons or assets from other mail apps.	Vytvorený otvorene podľa e-mailových štandardov: žiadny kód, ikony ani prvky z iných poštových aplikácií.
+	Built in the open from the email standards: no code, icons or assets from other mail apps.	Vyvíjaný verejne, len podľa e-mailových štandardov: nepoužíva kód, ikony ani iné prvky z iných poštových aplikácií.
 	Change this account's name, servers and sign-in, or its signature.	Zmena názvu tohto konta, serverov a prihlásenia alebo jeho podpisu.
 	Checking with the server…	Overuje sa na serveri…
 	Compact list	Kompaktný zoznam
@@ -629,8 +629,8 @@
 	Remove it from the server once it's deleted from Deleted Items	Odstrániť ju zo servera po odstránení z priečinka Odstránené položky
 	A copy on the server	Kópia na serveri
 	None: mail is removed from the server once downloaded	Žiadna: pošta sa po stiahnutí odstráni zo servera
-	Kept for {n} days	Ponecháva sa {n} dní
-	Kept for {n} days, or until deleted from Deleted Items	Ponecháva sa {n} dní alebo do odstránenia z priečinka Odstránené položky
+	Kept for {n} days	Ponecháva sa {n} d.
+	Kept for {n} days, or until deleted from Deleted Items	Ponecháva sa {n} d. alebo do odstránenia z priečinka Odstránené položky
 	Kept until deleted from Deleted Items	Ponecháva sa do odstránenia z priečinka Odstránené položky
 	Kept for good	Ponecháva sa natrvalo
 	Arrange by: {field}	Usporiadať podľa: {field}
@@ -733,7 +733,7 @@
 	Send right away	Odoslať hneď
 	Sends {when}	Odošle sa {when}
 	Set	Nastaviť
-	Where replies go instead of to you	Kam idú odpovede namiesto vás
+	Where replies go instead of to you	Odpovede presmerovať na adresu
 	In 1 hour	O 1 hodinu
 	Tomorrow morning	Zajtra ráno
 	Monday morning	V pondelok ráno
@@ -845,7 +845,7 @@
 	Mail kept on this computer	Pošta uložená na tomto počítači
 	Of each folder, keep	Z každého priečinka uchovať
 	Download in full for reading offline	Stiahnuť celé na čítanie offline
-	New mail always comes in. Older mail past these stays on the server; the rest of each message is downloaded when it's opened.	Nová pošta príde vždy. Staršia pošta nad tento rozsah zostáva na serveri; zvyšok každej správy sa stiahne pri jej otvorení.
+	New mail always comes in. Older mail past these stays on the server; the rest of each message is downloaded when it's opened.	Nová pošta príde vždy. Staršia pošta mimo tohto rozsahu zostáva na serveri; zvyšok každej správy sa stiahne pri jej otvorení.
 	the newest 1,000	najnovších 1 000
 	the newest 40	najnovších 40
 	all	všetko
@@ -1008,7 +1008,7 @@ month	May	máj
 	Close anyway	Napriek tomu zavrieť
 	Edit notes	Upraviť poznámky
 	Getting them from the server…	Získavajú sa zo servera…
-	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	Správy sa stiahnu až pri otvorení a držia sa len v pamäti: nič sa nezapisuje na tento počítač. Zmeny urobené offline, pošta čakajúca na odoslanie a kalendáre, kontakty a poznámky uchovávané len v MailCrafte sa po jeho zatvorení stratia (najprv sa vás spýta).
+	Messages download when you open them and are held in memory only: nothing is written to this computer. Changes made while offline, mail still waiting to be sent, and calendars, contacts and notes kept only in MailCraft are lost when it closes (you're asked first).	Správy sa stiahnu až pri otvorení a držia sa len v pamäti: nič sa nezapisuje na tento počítač. Zmeny urobené offline, pošta čakajúca na odoslanie a kalendáre, kontakty a poznámky uchovávané len v MailCrafte sa po jeho zatvorení stratia (najprv sa vás opýta).
 	Mail older than what's kept here is only on the server.	Pošta staršia ako tá, ktorá je uložená tu, je len na serveri.
 	Search the server	Hľadať na serveri
 	Searching the server…	Hľadá sa na serveri…
@@ -1029,7 +1029,7 @@ month	May	máj
 	1 hour	1 hodina
 	{n} hours	{n} h
 	1 day	1 deň
-	{n} days	{n} d
+	{n} days	{n} d.
 	1 week	1 týždeň
 	{n} weeks	{n} týž.
 	0 minutes before start	0 minút pred začiatkom
@@ -1043,7 +1043,7 @@ month	May	máj
 	Now	Teraz
 	In {n} minutes	O {n} min
 	In {n} hours	O {n} h
-	In {n} days	O {n} d
+	In {n} days	O {n} d.
 	Junk	Nevyžiadaná
 	Junk options	Možnosti nevyžiadanej pošty
 	Junk Email options…	Možnosti nevyžiadanej pošty…
@@ -1249,7 +1249,7 @@ month	May	máj
 	A certificate this computer already has, its key staying where it is	Certifikát, ktorý už tento počítač má; jeho kľúč zostáva tam, kde je
 	Look in Windows	Hľadať vo Windows
 	The certificates for email in your Keychain. The key stays there; macOS may ask before it's used.	Certifikáty pre e-mail vo vašej Kľúčenke. Kľúč tam zostáva; macOS sa môže pred jeho použitím opýtať.
-	The certificates for email in your Windows certificate store (Personal). The key stays in Windows; it may ask before it's used.	Certifikáty pre e-mail v úložisku certifikátov Windows (Osobné). Kľúč zostáva vo Windows; pred jeho použitím sa môžu opýtať.
+	The certificates for email in your Windows certificate store (Personal). The key stays in Windows; it may ask before it's used.	Certifikáty pre e-mail v úložisku certifikátov Windows (Osobné). Kľúč zostáva vo Windows; pred jeho použitím sa môže opýtať.
 	Use a certificate from Windows	Použiť certifikát z Windows
 	Use a certificate from the Keychain	Použiť certifikát z Kľúčenky
 	Use one from Windows…	Použiť certifikát z Windows…
@@ -1730,7 +1730,7 @@ month	May	máj
 	Checking for new mail	Kontrola novej pošty
 	Automatically gets new mail as soon as the server says there's some, where a server can, and otherwise looks every two minutes. With a set time, an account looks only then. Mail you send goes at once, and Send / Receive looks right away.	Automaticky prijíma novú poštu hneď, ako server oznámi, že nejaká je, ak to server dokáže; inak sa pozrie každé dve minúty. Pri nastavenom čase sa konto pozrie len vtedy. Odosielaná pošta odchádza okamžite a Odoslať / prijať sa pozrie hneď.
 	Automatically	Automaticky
-	Every {n} minutes	Každých {n} min
+	Every {n} minutes	Raz za {n} min
 	Only calendars and contacts, with no email?	Len kalendáre a kontakty, bez e-mailu?
 	Add a CalDAV and CardDAV account	Pridať konto CalDAV a CardDAV
 	Calendar and contacts server	Server kalendára a kontaktov
@@ -1797,6 +1797,163 @@ count	occurrences	opakovaní
 	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Autorita, ktorú prevádzkuje vaša organizácia, alebo vlastný certifikát vášho poštového servera (.pem, .crt, .cer)
 	Trust a certificate file…	Dôverovať súboru certifikátu…
 	The certificate is trusted for this account	Certifikát je pre toto konto dôveryhodný
+	Send / Receive failed	Odosielanie a prijímanie zlyhalo
+	Sending: {n} of {total}	Odosiela sa: {n} z {total}
+	Downloading: {n} of {total} ({done} of {all})	Sťahuje sa: {n} z {total} ({done} z {all})
+	Downloading: {n} of {total}	Sťahuje sa: {n} z {total}
+	Updating {folder} ({n} of {total})	Aktualizuje sa {folder} ({n} z {total})
+	Checking for new mail…	Kontroluje sa nová pošta…
+	{account}: sending	{account}: odosielanie
+	{account}: receiving	{account}: prijímanie
+	Waiting	Čaká sa
+	Failed	Zlyhalo
+	Stopped	Zastavené
+	{done} of {total}	{done} z {total}
+	Under way	Prebieha
+	Messages: {n} ({size})	Správy: {n} ({size})
+	Folders: {n}	Priečinky: {n}
+	Send / Receive progress	Priebeh odosielania a prijímania
+	Nothing has been sent or received yet	Zatiaľ sa nič neodoslalo ani neprijalo
+	{done} of {all} done	Hotovo: {done} z {all}
+	Cancel all	Zrušiť všetko
+	Open this window when Send / Receive starts	Otvoriť toto okno pri spustení odosielania a prijímania
+	{task} failed: {error}	{task} zlyhalo: {error}
+	Show progress	Zobraziť priebeh
+	How each account's sending and receiving goes	Ako prebieha odosielanie a prijímanie v jednotlivých kontách
+	Stop sending and receiving	Zastaviť odosielanie a prijímanie
+	Sending	Odosielanie
+	Receiving	Prijímanie
+	On the server: {account}	Na serveri: {account}
+	The server runs these on new mail, even while MailCraft is closed.	Server ich používa na novú poštu, aj keď je MailCraft zatvorený.
+	Reading the rules on the server…	Čítajú sa pravidlá na serveri…
+	Outlook keeps its own copy of these rules. Changing them here removes it, with Outlook's rules that are turned off or run only on its computer.	Outlook si uchováva vlastnú kópiu týchto pravidiel. Ak ich zmeníte tu, táto kópia sa odstráni spolu s pravidlami Outlooku, ktoré sú vypnuté alebo bežia len na jeho počítači.
+	Change them here anyway	Napriek tomu zmeniť tu
+	New rule on the server…	Nové pravidlo na serveri…
+	Made in another program: it can be turned on or off, moved or deleted here	Vytvorené v inom programe: tu ho možno zapnúť alebo vypnúť, presunúť alebo odstrániť
+	The server can't run this rule as it is	Server nemôže toto pravidlo spustiť v tejto podobe
+	Undo Send	Zrušiť odoslanie
+	A message you send waits this long in the Outbox, with Undo, before it goes.	Odoslaná správa čaká takto dlho v priečinku Pošta na odoslanie, s možnosťou Zrušiť, kým odíde.
+	Sending · {n} s	Odosiela sa · {n} s
+	Sending {count} messages · {n} s	Odosielajú sa správy ({count}) · {n} s
+	Undo	Zrušiť
+	free/busy	voľno/obsadené
+	Asking for its free/busy time…	Zisťuje sa voľno/obsadené…
+	Shared for its free/busy time alone	Zdieľaný iba pre voľno/obsadené
+	Its free/busy time couldn't be had: {error}	Údaje voľno/obsadené sa nepodarilo získať: {error}
+	Schedule	Plán
+	All together	Všetci spolu
+	Tick a calendar to show it here	Začiarknite kalendár, aby sa tu zobrazil
+	Nothing on this day	V tento deň nič
+	Group name	Názov skupiny
+	Design team	Tím dizajnu
+	New calendar group	Nová skupina kalendárov
+	Add ->	Pridať ->
+	Shown: click to hide them	Zobrazené: kliknutím ich skryjete
+	Hidden: click to show them	Skryté: kliknutím ich zobrazíte
+	Delete calendar group	Odstrániť skupinu kalendárov
+	New calendar group…	Nová skupina kalendárov…
+	Pick from the address book…	Vybrať z adresára…
+	Google doesn't let mail apps sign in with your Google password while 2-Step Verification is on. Make an app password at https://myaccount.google.com/apppasswords and enter it here instead.	Google nedovolí poštovým aplikáciám prihlásiť sa vaším heslom Google, kým je zapnuté dvojstupňové overenie. Vytvorte si heslo aplikácie na https://myaccount.google.com/apppasswords a zadajte ho sem namiesto neho.
+	With 2-Step Verification on, Google takes an app password here, not your Google password.	So zapnutým dvojstupňovým overením tu Google prijíma heslo aplikácie, nie vaše heslo Google.
+	Make an app password	Vytvoriť heslo aplikácie
+	Custom…	Vlastné…
+	Start in	Spustiť v
+	What opens when MailCraft starts	Čo sa otvorí pri spustení MailCraftu
+	The first account's Inbox	Doručená pošta prvého konta
+	The folder open last	Naposledy otvorený priečinok
+	Add reminder…	Pridať pripomienku…
+	No suggestions	Žiadne návrhy
+	Ignore all	Ignorovať všetko
+	Add to dictionary	Pridať do slovníka
+	Check spelling as you type	Kontrolovať pravopis počas písania
+	Misspelled words are underlined in red. Right-click one for suggestions.	Nesprávne napísané slová sú podčiarknuté červenou. Kliknutím pravým tlačidlom na slovo zobrazíte návrhy.
+	There's no spelling dictionary for {language} on this computer.	V tomto počítači nie je pravopisný slovník pre jazyk {language}.
+	Bold on	Tučné zapnuté
+	Bold off	Tučné vypnuté
+	Italic on	Kurzíva zapnutá
+	Italic off	Kurzíva vypnutá
+	Underline on	Podčiarknutie zapnuté
+	Underline off	Podčiarknutie vypnuté
+	{name}: on	{name}: zapnuté
+	{name}: off	{name}: vypnuté
+	Font	Písmo
+	Default font	Predvolené písmo
+	Font for new messages	Písmo nových správ
+	New messages, replies and forwards are written in it. Text you set a font on keeps its own.	Nové správy, odpovede a preposlané správy sa píšu týmto písmom. Text, ktorému nastavíte písmo, si ponechá svoje.
+	Clean up old items	Vyčistiť staré položky
+	Clean up old items…	Vyčistiť staré položky…
+	Move old mail to an archive file on this computer, out of the mailbox.	Presunúť starú poštu z poštovej schránky do archívneho súboru na tomto počítači.
+	Old mail goes into an Outlook data file on this computer, into folders of the same names, and is then deleted from the mailbox, which gets its space back. The file shows in the folder list, where its mail can be read, searched and moved back.	Stará pošta sa presunie do údajového súboru Outlooku na tomto počítači, do priečinkov s rovnakými názvami, a potom sa odstráni z poštovej schránky, ktorá tak získa späť miesto. Súbor sa zobrazí v zozname priečinkov, kde sa jeho pošta dá čítať, prehľadávať a presúvať späť.
+	Archive this folder and the folders in it	Archivovať tento priečinok a priečinky v ňom
+	Archive mail received before	Archivovať poštu prijatú pred
+	Archive file	Archívny súbor
+	That's not a date.	To nie je dátum.
+	Archive mail older than	Archivovať poštu staršiu ako
+	Move old mail to this file	Presunúť starú poštu do tohto súboru
+	Delete old mail for good	Natrvalo odstrániť starú poštu
+	AutoArchive	Automatická archivácia
+	Every so many days, each folder's old mail is archived to a data file on this computer, or deleted, by the folder's own settings (in its Properties) or these.	Každých niekoľko dní sa stará pošta každého priečinka archivuje do údajového súboru na tomto počítači alebo sa odstráni, podľa vlastných nastavení priečinka (v jeho vlastnostiach) alebo podľa týchto.
+	Run AutoArchive every	Spúšťať automatickú archiváciu každých
+	Ask before AutoArchive runs	Pred automatickou archiváciou sa opýtať
+	Show the archive file in the folder list	Zobraziť archívny súbor v zozname priečinkov
+	For folders without settings of their own	Pre priečinky bez vlastných nastavení
+	Apply these settings to all folders now	Použiť tieto nastavenia na všetky priečinky teraz
+	Folders with settings of their own follow these instead.	Priečinky s vlastnými nastaveniami sa namiesto nich budú riadiť týmito.
+	It's been {days} days: archive old mail now, as AutoArchive is set to?	Uplynulo {days} dní: archivovať starú poštu teraz, ako je nastavená automatická archivácia?
+	Archive now	Archivovať teraz
+	Off: old mail stays where it is until you clean it up.	Vypnuté: stará pošta zostane, kde je, kým ju neupracete.
+	Every {days} days, old mail is archived by each folder's settings.	Každých {days} dní sa stará pošta archivuje podľa nastavení každého priečinka.
+	AutoArchive settings…	Nastavenia automatickej archivácie…
+	Don't archive this folder	Tento priečinok nearchivovať
+	Archive it by the default settings	Archivovať podľa predvolených nastavení
+	Archive it by these settings	Archivovať podľa týchto nastavení
+	weeks	(týždne)
+	months	(mesiace)
+	Folder density	Hustota priečinkov
+	How tightly the folder pane's folders sit	Ako tesne sú priečinky na table priečinkov
+	Spacious	Voľne
+	Medium	Stredne
+	Sort folders A to Z	Zoradiť priečinky od A po Z
+	Work days	Pracovné dni
+	The work week shows these days	Pracovný týždeň zobrazuje tieto dni
+	Work hours	Pracovný čas
+	The calendar shades the hours outside them	Kalendár vytieňuje hodiny mimo neho
+	Start time	Čas začiatku
+	End time	Čas konca
+	Meeting length	Dĺžka schôdze
+	How long a time free for everyone is looked for	Ako dlho má trvať čas, keď majú všetci voľno
+	Previous free time	Predchádzajúci voľný čas
+	Next free time	Ďalší voľný čas
+	The time before when everyone shown is free, within work hours	Predchádzajúci čas, keď majú všetci zobrazení voľno, v pracovnom čase
+	The next time when everyone shown is free, within work hours	Ďalší čas, keď majú všetci zobrazení voľno, v pracovnom čase
+	Free for everyone	Všetci majú voľno
+	Free for everyone: click to make a meeting with them	Všetci majú voľno: kliknutím vytvoríte schôdzu s nimi
+	No time when everyone is free in the next six weeks	V nasledujúcich šiestich týždňoch nie je čas, keď majú všetci voľno
+	No time when everyone is free as far as their free/busy times reach: Next looks further once they come	Kam siahajú ich údaje o dostupnosti, nie je čas, keď majú všetci voľno: Ďalší bude hľadať ďalej, keď prídu
+	No earlier time when everyone is free	Nie je skorší čas, keď majú všetci voľno
+	No earlier time when everyone is free as far as their free/busy times reach: Previous looks further once they come	Kam siahajú ich údaje o dostupnosti, nie je skorší čas, keď majú všetci voľno: Predchádzajúci bude hľadať ďalej, keď prídu
+	Their free/busy times haven't come yet: try again in a moment	Ich údaje o dostupnosti ešte neprišli: skúste to o chvíľu znova
+	Some people's free/busy times can't be had: they count as free	Údaje o dostupnosti niektorých ľudí nie je možné získať: počítajú sa ako voľní
+	Collapse this group	Zbaliť túto skupinu
+	Expand this group	Rozbaliť túto skupinu
+	Collapse all groups	Zbaliť všetky skupiny
+	Expand all groups	Rozbaliť všetky skupiny
+	Show this group's mail	Zobraziť poštu tejto skupiny
+	Hide this group's mail	Skryť poštu tejto skupiny
+	{heading} ({count}), folded	{heading} ({count}), zbalená
+	Clashes with {event} on your calendar	Prekrýva sa s {event} vo vašom kalendári
+	Clashes with {n} events on your calendar	Prekrýva sa s udalosťami vo vašom kalendári: {n}
+	In {n} min	O {n} min
+	Line between the appointments and the tasks	Čiara medzi stretnutiami a úlohami
+	Mark all in {folder} as read	Označiť všetko v priečinku {folder} ako prečítané
+	Mark all shown as read	Označiť všetko zobrazené ako prečítané
+	More ways to mark mail read	Ďalšie spôsoby, ako označiť poštu ako prečítanú
+	Nothing else on your calendar then	V tom čase nič iné vo vašom kalendári nie je
+	Right after {event} on your calendar	Hneď po {event} vo vašom kalendári
+	Right before {event} on your calendar	Hneď pred {event} vo vašom kalendári
+	{h} h	{h} h
+	Notify of mail in Other too	Upozorňovať aj na poštu v priečinku Ostatné
+	Off, only mail that goes to Focused is announced	Ak je vypnuté, upozorňuje sa len na poštu, ktorá ide do Prioritné
 	The update is downloaded and checked. Restart MailCraft now to install it, or it installs when you close MailCraft.	Aktualizácia je stiahnutá a overená. Reštartujte MailCraft teraz, aby sa nainštalovala, alebo sa nainštaluje, keď MailCraft zatvoríte.
 	Contacts at {url}	Kontakty na {url}
 	Printer	Tlačiareň

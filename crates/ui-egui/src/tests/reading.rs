@@ -4,10 +4,13 @@ use super::*;
 
 mod attachments;
 mod blitz;
+mod conversation_sent;
 mod links;
 mod people;
+mod pinned_header;
 mod plain_text;
 mod reactions;
+mod search_marks;
 
 #[test]
 fn renders_every_state_without_panicking() {

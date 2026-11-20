@@ -35,6 +35,15 @@ impl Data {
             list.retain(|i| crate::fake_graph::words_match(&q.text, &i.raw));
         }
         if let Some(r) = op.child("Restriction") {
+            // When it came (issue #179): its time as Exchange writes it compares as text.
+            for (kind, keep) in [("IsGreaterThanOrEqualTo", true), ("IsLessThan", false)] {
+                let mut those = Vec::new();
+                r.all(kind, &mut those);
+                for cond in those {
+                    let at = cond.find("Constant").and_then(|c| c.attr("Value")).unwrap_or("").to_string();
+                    list.retain(|i| (i.received.as_str() >= at.as_str()) == keep);
+                }
+            }
             let mut all = Vec::new();
             r.all("IsEqualTo", &mut all);
             for cond in all {
@@ -58,11 +67,7 @@ impl Data {
                     "<t:Message><t:ItemId Id=\"{}\" ChangeKey=\"ck\"/><t:IsRead>{}</t:IsRead>{}</t:Message>",
                     i.id,
                     i.read,
-                    if i.flagged {
-                        "<t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/><t:Value>2</t:Value></t:ExtendedProperty>"
-                    } else {
-                        ""
-                    }
+                    super::follow_up_xml(i)
                 )
             })
             .collect();
@@ -109,14 +114,20 @@ impl Data {
             match self.items.iter().find(|i| i.id == id) {
                 Some(i) if self.unrouted(&i.folder) => out.push(err("ErrorItemNotFound")),
                 Some(i) if mime && self.unreadable.contains(&i.id) => out.push(err("ErrorInternalServerError")),
-                Some(i) => out.push(ok(format!("<m:Items>{}</m:Items>", self.item_xml(i, mime)))),
+                Some(i) => {
+                    let mut x = self.item_xml(i, mime);
+                    if asks_for(op, "item:Body") {
+                        x = x.replace("</t:Message>", &format!("{}</t:Message>", body_and_files(&i.raw)));
+                    }
+                    out.push(ok(format!("<m:Items>{x}</m:Items>")));
+                }
                 None => out.push(err("ErrorItemNotFound")),
             }
         }
         out
     }
 
-    /// `CreateItem`: a calendar, contacts or notes item kept as made; a message from its MIME
+    /// `CreateItem`: a calendar, contacts, notes or tasks item kept as made; a message from its MIME
     /// source, saved (a draft) or sent and saved.
     pub(super) fn create_item(&mut self, op: &El) -> Vec<String> {
         let send = op.attr("MessageDisposition") == Some("SendAndSaveCopy");
@@ -128,7 +139,7 @@ impl Data {
                 out.push(err(if self.unrouted(&folder) { "ErrorFolderNotFound" } else { "ErrorAccessDenied" }));
                 continue;
             }
-            if m.name == "CalendarItem" || m.name == "Contact" || sticky {
+            if m.name == "CalendarItem" || m.name == "Contact" || m.name == "Task" || sticky {
                 let id = self.id("P");
                 out.push(ok(format!("<m:Items><t:{0}><t:ItemId Id=\"{id}\" ChangeKey=\"ck\"/></t:{0}></m:Items>", m.name)));
                 self.pim.push(PimItem { id, folder: folder.clone(), el: m });
@@ -152,6 +163,11 @@ impl Data {
                 flagged: false,
                 draft,
                 received: "2026-10-15T12:00:00Z".into(),
+                complete: false,
+                due: None,
+                reminder_set: false,
+                reminder_signal: None,
+                reminder_time: None,
             });
             out.push(ok(if send { String::new() } else { format!("<m:Items><t:Message><t:ItemId Id=\"{id}\"/></t:Message></m:Items>") }));
         }
@@ -189,8 +205,22 @@ impl Data {
                 if let Some(r) = u.find("IsRead") {
                     it.read = r.text == "true";
                 }
-                if u.find("ExtendedFieldURI").and_then(|e| e.attr("PropertyTag")) == Some("0x1090") {
-                    it.flagged = u.name == "SetItemField";
+                let uri = u.find("ExtendedFieldURI");
+                if uri.and_then(|e| e.attr("PropertyTag")) == Some("0x1090") {
+                    // 2 flagged, 1 complete; taken off, neither.
+                    let value = u.find("Value").map(|v| v.text.trim().to_string());
+                    let set = u.name == "SetItemField";
+                    it.flagged = set && value.as_deref() != Some("1");
+                    it.complete = set && value.as_deref() == Some("1");
+                }
+                // A follow-up's due day (`PidLidTaskDueDate`), and its reminder's properties.
+                let value = if u.name == "SetItemField" { u.find("Value").map(|v| v.text.trim().to_string()) } else { None };
+                match uri.and_then(|e| e.attr("PropertyId")) {
+                    Some("33029") => it.due = value,
+                    Some("34051") => it.reminder_set = value.as_deref() == Some("true"),
+                    Some("34144") => it.reminder_signal = value,
+                    Some("34050") => it.reminder_time = value,
+                    _ => {}
                 }
             }
             out.push(ok(String::new()));
@@ -239,4 +269,33 @@ impl Data {
         }
         out
     }
+}
+
+/// Whether an operation asks for the field `uri`.
+fn asks_for(op: &El, uri: &str) -> bool {
+    let mut fields = Vec::new();
+    op.all("FieldURI", &mut fields);
+    fields.iter().any(|f| f.attr("FieldURI") == Some(uri))
+}
+
+/// A message's body and the list of its files, without their bytes, as Exchange gives them when
+/// asked for (`item:Body`, `item:Attachments`): what its text first is made of (issue #24).
+fn body_and_files(raw: &[u8]) -> String {
+    let Some(p) = mailcraft_mime::parse(raw) else { return String::new() };
+    let mut x = format!("<t:Body BodyType=\"Text\">{}</t:Body>", esc(&p.text));
+    if !p.attachments.is_empty() {
+        x.push_str("<t:Attachments>");
+        for a in &p.attachments {
+            let id = a.content_id.as_deref().map(|c| format!("<t:ContentId>{}</t:ContentId>", esc(c))).unwrap_or_default();
+            x.push_str(&format!(
+                "<t:FileAttachment><t:Name>{}</t:Name><t:ContentType>{}</t:ContentType>{id}<t:Size>{}</t:Size><t:IsInline>{}</t:IsInline></t:FileAttachment>",
+                esc(&a.name),
+                esc(&a.mime),
+                a.size,
+                a.inline
+            ));
+        }
+        x.push_str("</t:Attachments>");
+    }
+    x
 }

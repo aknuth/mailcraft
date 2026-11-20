@@ -29,7 +29,7 @@ fn the_bars_parts_and_width_are_kept() {
     let mut s = sample_session("todo-bar");
     assert!(!s.prefs.todo_bar.shown(), "off until asked for");
     let r = s.run("view.todoBar", &json!({})).unwrap();
-    assert_eq!(r, json!({"calendar": true, "appointments": true, "tasks": true, "width": 260}));
+    assert_eq!(r, json!({"calendar": true, "appointments": true, "tasks": true, "width": 260, "split": 50}));
     // A part closed on its own (its ✕), another turned the other way.
     s.run("view.todoBar", &json!({"part": "appointments", "on": false})).unwrap();
     s.run("view.todoBar", &json!({"part": "tasks"})).unwrap();
@@ -42,6 +42,12 @@ fn the_bars_parts_and_width_are_kept() {
     let bar = s.prefs.todo_bar;
     assert_eq!((bar.calendar, bar.appointments, bar.tasks), (true, false, false));
     assert!(s.run("view.todoBar", &json!({"part": "sideways"})).is_err());
+    // Where the line between the appointments and the tasks is (issue #196), within what it
+    // can be; the parts stay as they are.
+    assert_eq!(s.run("view.todoBar", &json!({"split": 70})).unwrap()["split"], 70);
+    assert_eq!(s.run("view.todoBar", &json!({"split": 2})).unwrap()["split"], 15);
+    let bar = s.prefs.todo_bar;
+    assert_eq!((bar.calendar, bar.appointments, bar.tasks, bar.split), (true, false, false, 15));
     // Kept from one start to the next; settings from before it have it off.
     let kept: Prefs = serde_json::from_value(serde_json::to_value(&s.prefs).unwrap()).unwrap();
     assert_eq!(kept.todo_bar, s.prefs.todo_bar);
@@ -194,4 +200,57 @@ fn flagging_a_big_folder_for_the_bar_takes() {
         .collect();
     took.sort();
     println!("MEASURE the bar told of 20,000 flagged: median {:?}, best {:?}", took[2], took[0]);
+}
+
+/// Issue #163: flagged mail is listed without its reply or forward prefix, as Outlook's task list
+/// shows it, its `[tag]` kept; a subject that's all prefix stays as it is.
+#[test]
+fn flagged_replies_are_listed_without_their_prefix() {
+    let mut s = sample_session("todo-prefixes");
+    for subject in ["RE: [Ticket#4] Printer jam", "FW: Fwd: Budget", "Re:"] {
+        let key = next_key(&s, "sample", "INBOX");
+        let flags = mailcraft_model::Flags { flagged: true, ..Default::default() };
+        file_in(&mut s, mailcraft_model::Summary { key, subject: subject.into(), flags, ..Default::default() }, None);
+    }
+    read_all(&mut s);
+    let titles: Vec<String> = mail(&s.todo_items()).into_iter().map(|(t, ..)| t).collect();
+    for want in ["[Ticket#4] Printer jam", "Budget", "Re:"] {
+        assert!(titles.iter().any(|t| t == want), "{want}: {titles:?}");
+    }
+    assert!(!titles.iter().any(|t| t.starts_with("RE:") || t.starts_with("FW:")), "{titles:?}");
+}
+
+/// Issue #160: the To-Do Bar's menu on flagged mail in a folder that isn't on screen (nothing
+/// selected): Follow Up by another day, a day of its own, no date, Mark Complete and Clear Flag,
+/// each undone by Undo; what isn't on the bar, refused.
+#[test]
+fn flagged_mail_is_followed_up_from_the_bar_wherever_it_is() {
+    let mut s = sample_session("todo-flag");
+    read_all(&mut s);
+    let elsewhere = mail(&s.todo_items()).into_iter().find(|(_, _, k)| !k.ends_with(":INBOX")).map(|(.., k)| k).expect("flagged elsewhere");
+    s.selection.clear();
+    let group = |s: &Session| mail(&s.todo_items()).into_iter().find(|(.., k)| *k == elsewhere).map(|(_, g, _)| g);
+    for (due, want) in [("tomorrow", TodoGroup::Tomorrow), ("nextWeek", TodoGroup::NextWeek), ("none", TodoGroup::NoDate)] {
+        s.run("todo.flag", &json!({"key": elsewhere, "due": due})).unwrap();
+        assert_eq!(group(&s), Some(want), "{due}");
+    }
+    // A day of its own (Custom…).
+    let later = mailcraft_model::dates::today(&s.clock) + 40;
+    s.run("todo.flag", &json!({"key": elsewhere, "due": mailcraft_model::dates::day_string(later)})).unwrap();
+    let item = s.todo_items().into_iter().find(|i| matches!(&i.what, TodoWhat::Mail { key } if key.to_id() == elsewhere)).unwrap();
+    assert_eq!((item.due, item.group), (Some(later), TodoGroup::Later));
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(group(&s), Some(TodoGroup::NoDate), "Undo: no date again");
+    // Mark Complete, and Clear Flag: off the bar; Undo puts it back.
+    for p in [json!({"key": elsewhere, "complete": true}), json!({"key": elsewhere})] {
+        s.run("todo.flag", &p).unwrap();
+        assert_eq!(group(&s), None, "{p}");
+        s.run("edit.undo", &json!({})).unwrap();
+        read_all(&mut s);
+        assert_eq!(group(&s), Some(TodoGroup::NoDate), "{p}: back");
+    }
+    assert!(s.selection.is_empty(), "the selection left as it was");
+    for (key, due) in [("", "today"), ("sample:1:999999:INBOX", "today"), (elsewhere.as_str(), "someday")] {
+        assert!(s.run("todo.flag", &json!({"key": key, "due": due})).is_err(), "{key} {due}");
+    }
 }

@@ -28,6 +28,8 @@ pub struct TaskForm {
     pub reminder_time: String,
     /// Times are shown on a 12-hour clock (File › Options).
     pub hours12: bool,
+    /// Days are shown and typed in this order (File › Options › Dates, issue #162).
+    pub dates: dates::DateOrder,
     pub repeat: Repeat,
     pub categories: Vec<String>,
     pub all_categories: Vec<(String, u8)>,
@@ -70,6 +72,7 @@ impl TaskForm {
             accounts,
             due: day_text(due),
             hours12: s.clock.style.hours12,
+            dates: s.clock.style.order,
             all_categories: all_categories(s, &[]),
             ..Default::default()
         }
@@ -96,6 +99,7 @@ impl TaskForm {
             reminder_date,
             reminder_time,
             hours12: s.clock.style.hours12,
+            dates: s.clock.style.order,
             repeat: Repeat::from_rrule(t.rrule.as_deref()),
             categories: t.categories.clone(),
             all_categories: all_categories(s, &t.categories),
@@ -158,7 +162,7 @@ pub(super) fn category_chips(ui: &mut Ui, t: &Tokens, all: &[(String, u8)], chos
 /// A drop-down of a form, `width` wide, `name`d for a screen reader (its row's name is painted).
 fn choice<T: PartialEq + Copy>(ui: &mut Ui, id: &str, name: &str, width: f32, value: &mut T, options: &[T], label: impl Fn(T) -> &'static str) {
     ui.allocate_ui_with_layout(vec2(width, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        egui::ComboBox::from_id_salt(id)
+        let r = egui::ComboBox::from_id_salt(id)
             .width(width - 6.0)
             .selected_text(tl!(label(*value)))
             .show_ui(ui, |ui| {
@@ -168,6 +172,7 @@ fn choice<T: PartialEq + Copy>(ui: &mut Ui, id: &str, name: &str, width: f32, va
             })
             .response
             .accessible_name(name);
+        crate::drop_down::keys(ui, &r, value, options);
     });
 }
 
@@ -176,10 +181,10 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
     form_header(ui, t, Ok(Icon::Task), if f.uid.is_some() { "Task" } else { "New task" });
     title_field(ui, &mut f.title);
     form_row(ui, t, true, Some(Icon::Calendar), "Start date", |ui| {
-        field(ui, &mut f.start, tl!("None"), 120.0);
+        date_pick::date_field(ui, t, "task-start", &mut f.start, f.dates, Some(tl!("None")));
     });
     form_row(ui, t, true, Some(Icon::Flag), "Due date", |ui| {
-        field(ui, &mut f.due, tl!("None"), 120.0);
+        date_pick::date_field(ui, t, "task-due", &mut f.due, f.dates, Some(tl!("None")));
     });
     let before = f.status;
     form_row(ui, t, true, Some(Icon::Task), "Status", |ui| {
@@ -218,7 +223,7 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
             if f.reminder_date.trim().is_empty() {
                 f.reminder_date = f.due.trim().to_string();
             }
-            field(ui, &mut f.reminder_date, "YYYY-MM-DD", 120.0);
+            date_pick::date_field(ui, t, "task-reminder", &mut f.reminder_date, f.dates, None);
             time_field(ui, &mut f.reminder_time, 9, f.hours12);
         }
     });
@@ -232,7 +237,7 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
         let name = f.accounts.get(f.account).map(|a| a.1.clone()).unwrap_or_default();
         form_row(ui, t, true, Some(Icon::Person), "Account", |ui| {
             ui.allocate_ui_with_layout(vec2(260.0, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                egui::ComboBox::from_id_salt("task-account")
+                let r = egui::ComboBox::from_id_salt("task-account")
                     .width(254.0)
                     .selected_text(name)
                     .show_ui(ui, |ui| {
@@ -242,6 +247,8 @@ pub fn task(ui: &mut Ui, f: &mut TaskForm, t: &Tokens, acts: &mut Vec<Action>) -
                     })
                     .response
                     .accessible_name(tl!("Account"));
+                let all: Vec<usize> = (0..f.accounts.len()).collect();
+                crate::drop_down::keys(ui, &r, &mut f.account, &all);
             });
         });
     }

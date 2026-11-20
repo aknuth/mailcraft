@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::ical::CalEvent;
 use crate::vcard::Card;
 
+pub mod free_busy;
 pub mod ical;
 pub mod vcard;
+pub mod work_hours;
 
 mod kept_file;
 mod task;
@@ -39,6 +41,10 @@ pub struct CalendarInfo {
     /// (issue #30). New events and invitations don't go there by themselves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub foreign: bool,
+    /// A colleague's who shares only their free/busy time (issue #140): what it holds is their
+    /// busy times, asked of the server as they're shown, never kept here nor changed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub free_busy: bool,
 }
 
 impl CalendarInfo {
@@ -106,6 +112,14 @@ pub fn shared_calendar_id(email: &str) -> String {
 /// Whose calendar a shared calendar's id is (`shared:<address>`).
 pub fn shared_calendar_owner(id: &str) -> Option<&str> {
     id.strip_prefix(SHARED).filter(|e| !e.is_empty())
+}
+
+/// A calendar group: its name, and the people in it by their addresses (lower-case), in the order
+/// added.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarGroup {
+    pub name: String,
+    pub members: Vec<String>,
 }
 
 /// A calendar subscribed to by its link (an iCal or `webcal://` address, issue #7), as Outlook's
@@ -251,13 +265,17 @@ pub struct Pim {
     /// Outlook's Open Calendar › From Address Book: read from Exchange with the rest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared: Vec<String>,
+    /// Calendar groups (issue #140), as Outlook's: people whose calendars (in `shared`) are shown
+    /// and hidden together, under the group's name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<CalendarGroup>,
     /// Calendars subscribed to by their links (issue #7), each with its entry in `calendars`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscribed: Vec<WebCalendar>,
     /// Notes (Outlook's Notes): the server's (Exchange) and those kept here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<StoredNote>,
-    /// Tasks (Outlook's Tasks), kept on this computer.
+    /// Tasks (Outlook's Tasks): the server's (Exchange) and those kept here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<StoredTask>,
     /// Where the server keeps the user's calendars and address books (found once); empty when
@@ -396,6 +414,12 @@ pub struct DavSync {
     pub notes: Option<Vec<StoredNote>>,
     #[serde(default)]
     pub pushed_notes: Vec<StoredNote>,
+    /// The server's tasks (Exchange's Tasks folder, issue #161), read in full (`None`: it keeps
+    /// none, so tasks stay on this computer), and the tasks stored there this time.
+    #[serde(default)]
+    pub tasks: Option<Vec<StoredTask>>,
+    #[serde(default)]
+    pub pushed_tasks: Vec<StoredTask>,
     /// Deletions done (by href).
     pub deleted: Vec<String>,
     /// What couldn't be stored or deleted (tried again next time).

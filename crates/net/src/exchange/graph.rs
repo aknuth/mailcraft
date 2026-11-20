@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use mailcraft_mime as mime;
-use mailcraft_model::{Flag, Flags, Folder, FolderRole, MessageKey, Op, Summary};
+use mailcraft_model::{Flags, Folder, FolderRole, MessageKey, Op, Summary};
 use mailcraft_store::Store;
 use serde_json::{Value, json};
 
@@ -275,7 +275,11 @@ impl Client {
     fn newest(&self, folder: &str, window: usize) -> Result<(Vec<Value>, (u32, u32))> {
         let page = window.clamp(1, 1000);
         let mut entries = self.all(
-            &format!("/me/mailFolders/{}/messages?$top={page}&$orderby=receivedDateTime%20desc&$select={LIST_FIELDS}", seg(folder)),
+            &format!(
+                "/me/mailFolders/{}/messages?$top={page}&$orderby=receivedDateTime%20desc&$select={LIST_FIELDS}&{}",
+                seg(folder),
+                reminder_expand()
+            ),
             window.min(100_000),
         )?;
         entries.retain(|m| m["id"].is_string());
@@ -286,8 +290,10 @@ impl Client {
 
     /// Of these messages, those still in a folder, with their flags (through `$batch`).
     fn still_in(&self, folder: &str, ids: &[String]) -> Result<Vec<(String, Flags)>> {
-        let reqs: Vec<(&str, String, Option<Value>)> =
-            ids.iter().map(|id| ("GET", format!("/me/messages/{}?$select=id,isRead,isDraft,flag,parentFolderId", seg(id)), None)).collect();
+        let reqs: Vec<(&str, String, Option<Value>)> = ids
+            .iter()
+            .map(|id| ("GET", format!("/me/messages/{}?$select=id,isRead,isDraft,flag,parentFolderId&{}", seg(id), reminder_expand()), None))
+            .collect();
         Ok(self
             .batch(&reqs)?
             .into_iter()
@@ -299,7 +305,7 @@ impl Client {
     /// Messages' details, for the list.
     fn headers(&self, ids: &[String]) -> Result<Vec<Value>> {
         let reqs: Vec<(&str, String, Option<Value>)> =
-            ids.iter().map(|id| ("GET", format!("/me/messages/{}?$select={HEADER_FIELDS}", seg(id)), None)).collect();
+            ids.iter().map(|id| ("GET", format!("/me/messages/{}?$select={HEADER_FIELDS}&{}", seg(id), reminder_expand()), None)).collect();
         Ok(self.batch(&reqs)?.into_iter().filter(|(s, _)| *s == 200).map(|(_, b)| b).collect())
     }
 
@@ -403,37 +409,23 @@ impl Client {
         }
         Err(NetError::No("the folder didn't empty".into()))
     }
-}
 
-/// A message's flags as the model knows them.
-fn flags(m: &Value) -> Flags {
-    let mut names: Vec<&str> = Vec::new();
-    if m.get("isRead").and_then(Value::as_bool) == Some(true) {
-        names.push("\\Seen");
-    }
-    if m.get("isDraft").and_then(Value::as_bool) == Some(true) {
-        names.push("\\Draft");
-    }
-    match m.get("flag").and_then(|f| f.get("flagStatus")).and_then(Value::as_str) {
-        Some("flagged") => names.push("\\Flagged"),
-        // Marked complete: Graph keeps one status for both.
-        Some("complete") => names.push(mailcraft_model::FOLLOW_UP_COMPLETE),
-        _ => {}
-    }
-    Flags::from_imap(names)
-}
-
-/// The change a flag or follow-up op makes to a message on the server (`None`: nothing Graph
-/// keeps). Graph's one `flagStatus` holds both the flag and the follow-up marked complete: the
-/// engine sends the keyword taken off before the flag is set, and put on after it.
-fn flag_patch(op: &Op) -> Option<Value> {
-    match op {
-        Op::SetFlag { flag: Flag::Seen, on, .. } => Some(json!({"isRead": on})),
-        Op::SetFlag { flag: Flag::Flagged, on, .. } => Some(json!({"flag": {"flagStatus": if *on { "flagged" } else { "notFlagged" }}})),
-        Op::SetKeyword { keyword, on, .. } if keyword.eq_ignore_ascii_case(mailcraft_model::FOLLOW_UP_COMPLETE) => {
-            Some(json!({"flag": {"flagStatus": if *on { "complete" } else { "notFlagged" }}}))
+    /// Mark every message in a folder read, a page of the unread ones at a time (issue #197:
+    /// Graph has nothing for a whole folder).
+    fn mark_read(&self, folder: &str) -> Result<()> {
+        for _ in 0..1000 {
+            let ids = self.all(&format!("/me/mailFolders/{}/messages?$filter=isRead%20eq%20false&$top=100&$select=id", seg(folder)), 100)?;
+            let reqs: Vec<(&str, String, Option<Value>)> = ids
+                .iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                .map(|id| ("PATCH", format!("/me/messages/{}", seg(id)), Some(json!({"isRead": true}))))
+                .collect();
+            if reqs.is_empty() {
+                return Ok(());
+            }
+            self.batch_ok(&reqs)?;
         }
-        _ => None,
+        Err(NetError::No("the folder's mail didn't all get marked read".into()))
     }
 }
 
@@ -591,6 +583,13 @@ pub fn find_on_server(
         if let Some(a) = query.attachment {
             f.push(format!("hasAttachments eq {a}"));
         }
+        // When it came, as the list has it (issue #179).
+        if let Some(t) = query.after {
+            f.push(format!("receivedDateTime ge {}", mailcraft_model::dates::utc_stamp(t)));
+        }
+        if let Some(t) = query.before {
+            f.push(format!("receivedDateTime lt {}", mailcraft_model::dates::utc_stamp(t)));
+        }
         format!("$filter={}", http::pct(&f.join(" and ")))
     } else {
         format!("$search={}", http::pct(&format!("\"{}\"", query.text.replace('"', "\\\""))))
@@ -627,11 +626,13 @@ pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
         c.batch_ok(&reqs)
     };
     match op {
-        Op::SetFlag { keys, .. } | Op::SetKeyword { keys, .. } => match flag_patch(op) {
-            Some(patch) => patch_all(keys, patch),
-            // Answered and forwarded are Exchange's to set; categories stay on this computer.
-            None => Ok(()),
-        },
+        Op::SetFlag { keys, .. } | Op::SetFollowUp { keys, .. } | Op::SetReminder { keys, .. } | Op::SetKeyword { keys, .. } => {
+            match flag_patch(op) {
+                Some(patch) => patch_all(keys, patch),
+                // Answered and forwarded are Exchange's to set; categories stay on this computer.
+                None => Ok(()),
+            }
+        }
         Op::Move { keys, to } => {
             let dest = st.mailbox(to)?.to_string();
             let reqs: Vec<(&str, String, Option<Value>)> = ids(keys)
@@ -669,6 +670,7 @@ pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
             c.send_raw("DELETE", &format!("/me/mailFolders/{}", seg(&id)), "application/json", Vec::new()).map(|_| ())
         }
         Op::EmptyFolder { path } => c.empty(st.mailbox(path)?),
+        Op::MarkFolderRead { path } => c.mark_read(st.mailbox(path)?),
     }
 }
 
@@ -686,7 +688,10 @@ pub fn send(c: &Client, raw: &[u8], recipients: &[String]) -> Result<()> {
     }
 }
 
+mod availability;
 mod directory;
+mod flags;
+use flags::{flag_patch, flags, reminder_expand};
 mod sync;
 pub use sync::{sync_folder, sync_folder_as};
 mod text_first;
@@ -718,22 +723,6 @@ mod tests {
         let f = flags(&json!({"flag": {"flagStatus": "complete", "completedDateTime": {"dateTime": "2026-10-30T00:00:00", "timeZone": "UTC"}}}));
         assert!(!f.flagged && f.follow_up_complete(), "{f:?}");
         assert!(!flags(&json!({"flag": {"flagStatus": "notFlagged"}})).has(mailcraft_model::FOLLOW_UP_COMPLETE));
-    }
-
-    /// Mark Complete, its Undo and a flag set again reach Graph's one flag status in the order
-    /// the engine sends them; other keywords (categories) stay on this computer.
-    #[test]
-    fn follow_up_changes_as_graph_keeps_them() {
-        let keys = vec![MessageKey::default()];
-        let status = |op: Op| flag_patch(&op).and_then(|p| p["flag"]["flagStatus"].as_str().map(str::to_string));
-        let flag = |on| Op::SetFlag { keys: keys.clone(), flag: Flag::Flagged, on };
-        let complete = |on| Op::SetKeyword { keys: keys.clone(), keyword: mailcraft_model::FOLLOW_UP_COMPLETE.into(), on };
-        // Mark Complete: the flag off, then complete.
-        assert_eq!([status(flag(false)), status(complete(true))], [Some("notFlagged".into()), Some("complete".into())]);
-        // Its Undo, or flagged again: the keyword off, then the flag on.
-        assert_eq!([status(complete(false)), status(flag(true))], [Some("notFlagged".into()), Some("flagged".into())]);
-        assert_eq!(flag_patch(&Op::SetKeyword { keys: keys.clone(), keyword: "work".into(), on: true }), None);
-        assert_eq!(flag_patch(&Op::SetFlag { keys, flag: Flag::Seen, on: true }), Some(json!({"isRead": true})));
     }
 
     #[test]

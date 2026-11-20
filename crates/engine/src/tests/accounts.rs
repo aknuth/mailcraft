@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod archiving;
+mod auto_archive;
 mod beside;
 mod calendar_only;
 mod compacting;
@@ -9,6 +11,7 @@ mod data_files;
 mod half_done;
 mod importing;
 mod reconnecting;
+mod send_receive;
 mod sign_in;
 mod trusting;
 mod which_account;
@@ -211,6 +214,10 @@ fn remote_accounts_go_through_jobs_and_events() {
     // Status and password prompts.
     s.apply(Event::Status { account: id.clone(), status: SyncStatus::NeedsPassword { error: "bad".into() } });
     assert!(s.notices.last().unwrap().text.contains("needs its password"));
+    // Google asking for an app password (issue #164): its fixed words alone, to be translated.
+    let google = mailcraft_model::GOOGLE_APP_PASSWORD_NEEDED;
+    s.apply(Event::Status { account: id.clone(), status: SyncStatus::NeedsPassword { error: google.into() } });
+    assert_eq!(s.notices.last().unwrap().text, google);
     s.run("account.setPassword", &json!({"account": id, "password": "new"})).unwrap();
     assert!(matches!(s.take_jobs().as_slice(), [Job::Start { password: Some(_), .. }]));
     assert_eq!(s.run("mail.sync", &json!({})).unwrap()["accounts"], 1);

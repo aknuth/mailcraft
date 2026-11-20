@@ -4,38 +4,57 @@
 
 use super::*;
 
+/// Which of the header is drawn: all of it, scrolling with the text; or, as Outlook keeps it at
+/// the top of the pane while the text scrolls (issue #151), the part that stays (the subject,
+/// who it's from and to, the bars about it, what can be done with it) or the part that scrolls
+/// (the conversation, reactions, an invitation's card: each can be tall).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Part {
+    All,
+    Pinned,
+    Scrolled,
+}
+
 /// The header, against the right in a right-to-left interface, its rows from there (the message
 /// itself goes the way its own text does).
-pub(super) fn header(s: &Session, st: &mut UiState, ui: &mut Ui, o: &Open<'_>, acts: &mut Vec<Action>) {
+pub(super) fn header(s: &Session, st: &mut UiState, ui: &mut Ui, o: &Open<'_>, part: Part, acts: &mut Vec<Action>) {
     let t = st.tokens;
     let r = o.r;
-    ui.with_layout(crate::bidi::column(), |ui| {
-        subject_line(s, &t, ui, o, acts);
-        ui.add_space(10.0);
-
-        // Conversation.
-        if r.thread.len() > 1 && !o.in_window {
-            thread_list(s, &t, ui, &r.thread, &r.key, acts);
+    let conversation = |ui: &mut Ui, acts: &mut Vec<Action>| {
+        if r.thread.len().max(1) + r.aside.len() > 1 && !o.in_window {
+            thread_list(s, &t, ui, &r.thread, &r.aside, &r.key, acts);
             ui.add_space(10.0);
         }
-
-        sender_card(s, &t, ui, o, acts);
-        ui.add_space(8.0);
-        follow_up_line(s, &t, ui, o.summary);
-        if let Some(w) = &r.warning {
-            sender_warning(&t, ui, w);
+    };
+    ui.with_layout(crate::bidi::column(), |ui| {
+        if part == Part::Scrolled {
+            conversation(ui, acts);
+        } else {
+            subject_line(s, &t, ui, o, acts);
+            ui.add_space(10.0);
+            if part == Part::All {
+                conversation(ui, acts);
+            }
+            sender_card(s, &t, ui, o, acts);
+            ui.add_space(8.0);
+            follow_up_line(s, &t, ui, o.summary);
+            if let Some(w) = &r.warning {
+                sender_warning(&t, ui, w);
+            }
+            if let Some(sec) = &r.security {
+                security::security_bar(s, &t, ui, sec);
+            }
+            if let Some(name) = s.opened_file_name(&r.key) {
+                opened_file_bar(&t, ui, name);
+            }
+            action_bar(s, st, ui, o, acts);
+            ui.add_space(12.0);
         }
-        if let Some(sec) = &r.security {
-            security::security_bar(s, &t, ui, sec);
-        }
-        if let Some(name) = s.opened_file_name(&r.key) {
-            opened_file_bar(&t, ui, name);
-        }
-        action_bar(s, st, ui, o, acts);
-        ui.add_space(12.0);
-        reactions::reactions_row(s, &t, ui, &r.key, acts);
-        if !o.in_window {
-            invite_card(s, st, ui, &r.key, acts);
+        if part != Part::Pinned {
+            reactions::reactions_row(s, &t, ui, &r.key, acts);
+            if !o.in_window {
+                invite_card(s, st, ui, &r.key, acts);
+            }
         }
     });
 }
@@ -45,7 +64,7 @@ fn subject_line(s: &Session, t: &Tokens, ui: &mut Ui, o: &Open<'_>, acts: &mut V
     // Subject.
     ui.horizontal_wrapped(|ui| {
         let subject = if o.p.subject.is_empty() { tl!("(no subject)") } else { o.p.subject.as_str() };
-        subject_heading(ui, subject, t);
+        subject_heading(ui, subject, t, &subject_marks(s, subject));
         if o.summary.is_some_and(|m| m.flags.flagged) {
             let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
             icons::paint(ui.painter(), ir, Icon::Flag, t.flag);
@@ -205,7 +224,9 @@ fn follow_up_line(s: &Session, t: &Tokens, ui: &mut Ui, summary: Option<&Summary
 /// isn't waiting: it isn't tried again as it is (it read as one whose last try failed).
 fn outbox_says(item: &mailcraft_engine::store::OutboxItem, s: &Session) -> String {
     match item.error.as_deref() {
-        Some(e) if item.refused => tf!("Not sent: {error}", error = widgets::shorten(e, 140)),
+        // MailCraft's own reason whole (it ends in where to go), a server's words shortened.
+        Some(e) if item.refused => tf!("Not sent: {error}", error = crate::i18n::fixed_reason(e).unwrap_or_else(|| widgets::shorten(e, 140))),
+        Some(e) if crate::i18n::fixed_reason(e).is_some() => tf!("Waiting in the Outbox. Last try: {error}", error = crate::i18n::error(e)),
         Some(e) if e != "offline" => tf!("Waiting in the Outbox. Last try: {error}", error = widgets::shorten(e, 140)),
         _ if item.not_before > s.clock.now => {
             tf!("Held in the Outbox: it will be sent {when}.", when = crate::i18n::date(&dates::full_time(item.not_before, &s.clock)))

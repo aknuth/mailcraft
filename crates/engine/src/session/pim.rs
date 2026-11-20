@@ -15,17 +15,26 @@ pub mod directory;
 pub use directory::Directory;
 mod find;
 pub use find::{EVENT_HITS_MAX, EventHit, EventWhen};
+mod free_busy;
+mod free_time;
+pub use free_time::FREE_LENGTHS;
+#[cfg(test)]
+pub(crate) use free_time::{NONE_YET, UNKNOWN_FREE};
+mod groups;
+pub use free_busy::{FreeBusyKept, FreeBusyState};
 pub mod invite;
 mod local;
 pub use local::LocalEvents;
+mod moving;
 mod reminders;
 mod series;
 mod sync;
 mod tasks;
 pub use tasks::{ListedTask, TASKS_CALENDAR, TaskRef, TasksOrder};
 mod todo;
-pub use todo::{TODO_BAR_WIDTH, TodoBar, TodoGroup, TodoItem, TodoMail, TodoWhat};
+pub use todo::{TODO_BAR_SPLIT, TODO_BAR_WIDTH, TodoBar, TodoGroup, TodoItem, TodoMail, TodoWhat};
 pub mod web;
+mod work_time;
 
 /// The part of the app on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +60,9 @@ pub enum CalMode {
     #[default]
     Week,
     Month,
+    /// A day's hours across, a row for each calendar shown (Outlook's Schedule view, issue
+    /// #141): when several people are free together.
+    Schedule,
 }
 
 /// A reminder whose time has come (File › Reminders, as Outlook's Reminders window lists them).
@@ -70,6 +82,9 @@ pub struct DueReminder {
     pub due: i64,
     /// A task's reminder ([`Session::task_reminders`]): `uid` is the task's.
     pub task: bool,
+    /// A flagged message's reminder (gap 9): the message (one of its copies), its follow-up id
+    /// the `uid`.
+    pub message: Option<MessageKey>,
 }
 
 /// One occurrence of an event, ready to draw. Times are Unix seconds; all-day events start at
@@ -100,6 +115,9 @@ pub struct AgendaItem {
     pub show_as: ical::ShowAs,
     /// A task due that day ([`Session::task_items`]), not an event: `uid` is the task's.
     pub task: bool,
+    /// A time a colleague's calendar shared for its free/busy time alone has taken (issue
+    /// #140): its subject only when they share that, and nothing to open.
+    pub busy_only: bool,
 }
 
 /// A person in an address book, borrowed from it: a card can carry its picture and files
@@ -178,14 +196,19 @@ impl Session {
         self.cal_day.unwrap_or_else(|| mailcraft_model::dates::today(&self.clock))
     }
 
-    /// The local days on screen: a day, the work week (Monday to Friday), the week (Monday first)
-    /// or the weeks of the month.
+    /// The local days on screen: a day (the Schedule view's too), the work week (from its first
+    /// worked day to its last, issue #185: `cal_day_list` has those alone), the week (Monday
+    /// first) or the weeks of the month.
     pub fn cal_days(&self) -> (i64, i64) {
         let d = self.cal_day();
         let monday = |x: i64| x - i64::from(weekday_index(x));
         match self.cal_mode {
-            CalMode::Day => (d, d + 1),
-            CalMode::WorkWeek => (monday(d), monday(d) + 5),
+            CalMode::Day | CalMode::Schedule => (d, d + 1),
+            CalMode::WorkWeek => match self.work_week_days()[..] {
+                [first, .., last] => (first, last + 1),
+                [only] => (only, only + 1),
+                [] => (monday(d), monday(d) + 5),
+            },
             CalMode::Week => (monday(d), monday(d) + 7),
             CalMode::Month => {
                 let (y, m, _) = civil_from_days(d);
@@ -213,8 +236,13 @@ impl Session {
             None => {}
         }
         let step = step.clamp(-1200, 1200);
+        // Moved by hand (not the view changed): a time found free is looked for from the days
+        // shown again.
+        if date.is_some() || step != 0 {
+            self.free_slot = None;
+        }
         d = match self.cal_mode {
-            CalMode::Day => d + step,
+            CalMode::Day | CalMode::Schedule => d + step,
             CalMode::WorkWeek | CalMode::Week => d + 7 * step,
             CalMode::Month => {
                 let (y, m, day) = civil_from_days(d);
@@ -258,13 +286,22 @@ impl Session {
     /// The occurrences overlapping `[from, to)`, by start, from every calendar that's shown.
     /// (Each with its calendar's colour: [`Session::calendar_color`].)
     pub fn agenda(&self, from: i64, to: i64) -> Vec<AgendaItem> {
+        let mut out = self.agenda_where(from, to, |account, cal| self.calendar_shown(account, &cal.id));
+        self.free_busy_items(from, to, &mut out);
+        out.sort_by(|a, b| (b.all_day, a.start, &a.summary).cmp(&(a.all_day, b.start, &b.summary)));
+        out
+    }
+
+    /// The events between `from` and `to` of the calendars `keep` takes (an account's id, the
+    /// calendar), unsorted.
+    pub(super) fn agenda_where(&self, from: i64, to: i64, keep: impl Fn(&str, &mailcraft_model::pim::CalendarInfo) -> bool) -> Vec<AgendaItem> {
         // Every address of the accounts' (their others too: an invitation to one needs its
         // answer like any).
         let mine = self.my_addresses();
         let mut out = Vec::new();
         for (account, p) in &self.pim {
             let Some(acc) = self.account(account) else { continue };
-            for cal in p.calendars.iter().filter(|c| self.calendar_shown(account, &c.id)) {
+            for cal in p.calendars.iter().filter(|c| keep(account, c)) {
                 // Borrowed, not copied: this runs each frame the calendar is drawn, and an
                 // imported event can carry files.
                 let events: Vec<&CalEvent> = p.events.iter().filter(|e| e.calendar == cal.id).map(|e| &e.event).collect();
@@ -295,11 +332,11 @@ impl Session {
                         privacy,
                         show_as,
                         task: false,
+                        busy_only: false,
                     });
                 }
             }
         }
-        out.sort_by(|a, b| (b.all_day, a.start, &a.summary).cmp(&(a.all_day, b.start, &b.summary)));
         out
     }
 
@@ -550,18 +587,7 @@ impl Session {
     /// Open someone else's calendar from an Exchange account (Outlook's Open Calendar › From
     /// Address Book): read with the account's own, read-only, once the server shows it.
     pub fn open_shared_calendar(&mut self, account: Option<&str>, email: &str) -> CmdResult {
-        let account = match account {
-            Some(a) => self.account_or_shown(Some(a))?,
-            None => self
-                .accounts
-                .iter()
-                .find(|a| a.config.graph.is_some() || a.config.ews.is_some())
-                .map(|a| a.config.id.clone())
-                .ok_or_else(|| CmdError::Disabled("other people's calendars open from an Exchange account".into()))?,
-        };
-        if !self.account(&account).is_some_and(|a| a.config.graph.is_some() || a.config.ews.is_some()) {
-            return Err(CmdError::Params("other people's calendars open from an Exchange account".into()));
-        }
+        let account = self.exchange_account(account)?;
         let email = email.trim().to_ascii_lowercase();
         let ok =
             mailcraft_model::addr::parse_list(&email).is_ok_and(|l| l.len() == 1 && l.first().is_some_and(|a| a.email.eq_ignore_ascii_case(&email)));
@@ -591,6 +617,11 @@ impl Session {
         let Some(account) = account else { return Err(CmdError::Params(format!("no calendar of {email} is open"))) };
         let p = self.pim_mut(&account);
         p.shared.retain(|e| *e != email);
+        // Out of its groups too (issue #140); a group left with no one goes.
+        for g in &mut p.groups {
+            g.members.retain(|e| *e != email);
+        }
+        p.groups.retain(|g| !g.members.is_empty());
         p.calendars.retain(|c| c.id != id);
         p.events.retain(|e| e.calendar != id);
         self.after_pim_change(&account, false);

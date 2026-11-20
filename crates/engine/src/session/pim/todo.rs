@@ -13,12 +13,18 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
+mod flag_reminders;
+
 /// Flagged messages kept of one folder, at most (the newest).
 const FLAGGED_PER_FOLDER: usize = 500;
 /// The bar's width, at least and at most.
 pub const TODO_BAR_WIDTH: std::ops::RangeInclusive<u16> = 200..=480;
+/// The appointments' share of the height under the month when the tasks are under them, in
+/// percent, at least and at most (issue #196): each part keeps a few rows.
+pub const TODO_BAR_SPLIT: std::ops::RangeInclusive<u8> = 15..=85;
 
-/// The To-Do Bar's settings: its parts, each shown or not, and its width.
+/// The To-Do Bar's settings: its parts, each shown or not, its width, and where the line between
+/// the appointments and the tasks is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TodoBar {
@@ -29,11 +35,14 @@ pub struct TodoBar {
     /// Tasks and flagged mail, by when they're due.
     pub tasks: bool,
     pub width: u16,
+    /// The appointments' share of the room under the month, in percent ([`TODO_BAR_SPLIT`]),
+    /// when the tasks are under them; the tasks have the rest (issue #196).
+    pub split: u8,
 }
 
 impl Default for TodoBar {
     fn default() -> Self {
-        TodoBar { calendar: false, appointments: false, tasks: false, width: 260 }
+        TodoBar { calendar: false, appointments: false, tasks: false, width: 260, split: 50 }
     }
 }
 
@@ -127,6 +136,7 @@ impl Session {
         if !self.todo.begun {
             return;
         }
+        self.todo_follow_up_op(op);
         let gone: &[MessageKey] = match op {
             Op::SetFlag { keys, flag: Flag::Flagged, on: false } | Op::Move { keys, .. } | Op::Expunge { keys } => keys,
             Op::SetFlag { keys, flag: Flag::Flagged, on: true } => {
@@ -181,12 +191,19 @@ impl Session {
             }
         }
         let Some(next) = self.todo.stale.pop_first() else { return false };
+        // A folder's flagged mail with a reminder in it, read or gone (gap 9): the Reminders
+        // window works its list out again at once, not at its next look.
+        let reminds = |s: &Session, list: &[SharedSummary]| list.iter().any(|m| s.message_reminder(m).is_some());
+        let had = self.todo.read.get(&next).is_some_and(|l| reminds(self, l));
         let known = self.account(&next.0).is_some_and(|a| a.folders.iter().any(|f| f.path == next.1));
         let flagged: Vec<SharedSummary> = match self.store.as_ref().filter(|_| known).map(|s| s.load_folder(&next.0, &next.1)) {
             Some(Ok(st)) => st.messages.into_iter().filter(|m| m.flags.flagged).take(FLAGGED_PER_FOLDER).collect(),
             // A folder with nothing kept, or gone: nothing flagged in it.
             _ => Vec::new(),
         };
+        if had || reminds(self, &flagged) {
+            self.pim_revision = self.pim_revision.wrapping_add(1);
+        }
         if flagged.is_empty() {
             self.todo.read.remove(&next);
         } else {
@@ -197,7 +214,12 @@ impl Session {
 
     /// The flagged message of the task list with this key.
     pub fn todo_message(&self, key: &MessageKey) -> Option<&Summary> {
-        self.todo.read.get(&(key.account.clone(), key.folder.clone()))?.iter().find(|m| &m.key == key).map(|m| &**m)
+        self.todo_shared(key).map(|m| &**m)
+    }
+
+    /// [`Session::todo_message`], shared.
+    pub(crate) fn todo_shared(&self, key: &MessageKey) -> Option<&SharedSummary> {
+        self.todo.read.get(&(key.account.clone(), key.folder.clone()))?.iter().find(|m| &m.key == key)
     }
 
     /// The To-Do Bar's task list: tasks not done and flagged mail, the soonest due first (those
@@ -220,7 +242,11 @@ impl Session {
             }
             for m in list {
                 let due = self.follow_up_due(m);
-                out.push(TodoItem { what: TodoWhat::Mail { key: m.key.clone() }, title: m.subject.clone(), due, group: TodoGroup::of(due, today) });
+                // Without its `RE:` / `FW:`, as Outlook's task list shows a reply or forward
+                // flagged (issue #163); its `[tags]` kept. One that's all prefix stays as it is.
+                let bare = mailcraft_model::thread::without_prefixes(&m.subject);
+                let title = if bare.trim().is_empty() { m.subject.clone() } else { bare };
+                out.push(TodoItem { what: TodoWhat::Mail { key: m.key.clone() }, title, due, group: TodoGroup::of(due, today) });
             }
         }
         out.sort_by_cached_key(|i| (i.group, i.due, i.title.to_lowercase()));

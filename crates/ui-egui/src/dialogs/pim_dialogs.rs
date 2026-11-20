@@ -11,14 +11,16 @@ use crate::{Action, widgets};
 
 mod contact;
 mod date_pick;
+pub(crate) mod follow_up;
 mod online_meeting;
 mod pattern;
-#[cfg(test)]
+pub(crate) use date_pick::date_field;
 pub(crate) use pattern::form_day as pattern_day;
 mod repeat;
 mod showing;
 mod task;
 pub use contact::{ContactForm, contact};
+pub use follow_up::{FollowUpForm, follow_up};
 pub use online_meeting::MeetingState;
 #[cfg(test)]
 pub(crate) use online_meeting::{add as online_meeting_add, remove as online_meeting_remove};
@@ -89,6 +91,8 @@ pub struct EventForm {
     pub all_day: bool,
     /// Its times are shown on a 12-hour clock (File › Options).
     pub hours12: bool,
+    /// Its days are shown and typed in this order (File › Options › Dates, issue #162).
+    pub dates: dates::DateOrder,
     pub repeat: Repeat,
     /// How it repeats, when the form can show the rule (issue #103): sent in place of `repeat`.
     pub pattern: Option<mailcraft_engine::model::ical::Pattern>,
@@ -183,6 +187,7 @@ impl EventForm {
             end_date: local_date(start + 3600, s),
             end: local_time(start + 3600, s),
             hours12: s.clock.style.hours12,
+            dates: s.clock.style.order,
             can_invite: true,
             all_categories: all_categories(s, &[]),
             // As Outlook sets a new appointment's reminder.
@@ -190,6 +195,26 @@ impl EventForm {
             meeting: MeetingState::new(s, None),
             ..Default::default()
         }
+    }
+
+    /// A new event from `from` to `to` with `guests` invited, in `calendar` (account, id) when
+    /// it can take one, else in that account's default: the Schedule view's (issue #141), for a
+    /// time chosen across people's calendars.
+    pub fn between(s: &Session, (from, to): (i64, i64), calendar: Option<(&str, &str)>, guests: &[String]) -> EventForm {
+        let mut f = EventForm::new(s, Some(from));
+        let to = to.max(from.saturating_add(60));
+        f.end_date = local_date(to, s);
+        f.end = local_time(to, s);
+        if let Some((account, id)) = calendar {
+            let default = s.pim.get(account).and_then(|p| p.default_calendar()).map(|c| c.id.clone());
+            let at = |want: &str| f.calendars.iter().position(|(a, c, _)| a == account && c == want);
+            if let Some(i) = at(id).or_else(|| default.as_deref().and_then(at)) {
+                f.calendar = i;
+            }
+        }
+        let guests: Vec<mailcraft_engine::model::EmailAddress> = guests.iter().map(|e| mailcraft_engine::model::EmailAddress::new("", e)).collect();
+        f.guests = mailcraft_engine::model::addr::format_list(&guests);
+        f
     }
 
     /// An existing event, opened at one of its occurrences.
@@ -225,6 +250,7 @@ impl EventForm {
             end: local_time(end, s),
             all_day: e.all_day,
             hours12: s.clock.style.hours12,
+            dates: s.clock.style.order,
             reminder: mailcraft_engine::model::ical::reminder_minutes(e),
             privacy: mailcraft_engine::model::ical::privacy(e),
             show_as: mailcraft_engine::model::ical::show_as(e),
@@ -483,14 +509,14 @@ pub fn event(ui: &mut Ui, f: &mut EventForm, t: &Tokens, acts: &mut Vec<Action>)
         title_field(ui, &mut f.summary);
         let start_before = typed_moment(&f.date, &f.start, f.all_day);
         form_row(ui, t, true, Some(Icon::Clock), "Starts", |ui| {
-            date_pick::date_field(ui, t, "event-start", &mut f.date);
+            date_pick::date_field(ui, t, "event-start", &mut f.date, f.dates, None);
             if !f.all_day {
                 time_field(ui, &mut f.start, 9, f.hours12);
             }
         });
         end_follows_start(f, start_before);
         form_row(ui, t, true, None, "Ends", |ui| {
-            date_pick::date_field(ui, t, "event-end", &mut f.end_date);
+            date_pick::date_field(ui, t, "event-end", &mut f.end_date, f.dates, None);
             if !f.all_day {
                 time_field(ui, &mut f.end, 10, f.hours12);
             }
@@ -509,16 +535,17 @@ pub fn event(ui: &mut Ui, f: &mut EventForm, t: &Tokens, acts: &mut Vec<Action>)
                 if !choices.contains(&f.reminder) {
                     choices.push(f.reminder);
                 }
-                egui::ComboBox::from_id_salt("event-reminder")
+                let r = egui::ComboBox::from_id_salt("event-reminder")
                     .width(194.0)
                     .selected_text(reminder_label(f.reminder))
                     .show_ui(ui, |ui| {
-                        for c in choices {
+                        for c in choices.iter().copied() {
                             ui.selectable_value(&mut f.reminder, c, reminder_label(c));
                         }
                     })
                     .response
                     .accessible_name(tl!("Reminder"));
+                crate::drop_down::keys(ui, &r, &mut f.reminder, &choices);
             });
         });
         showing::show_as_row(ui, t, f);
@@ -540,7 +567,7 @@ pub fn event(ui: &mut Ui, f: &mut EventForm, t: &Tokens, acts: &mut Vec<Action>)
             let name = f.calendars.get(f.calendar).map(|c| c.2.clone()).unwrap_or_default();
             form_row(ui, t, true, Some(Icon::Calendar), "Calendar", |ui| {
                 ui.allocate_ui_with_layout(vec2(260.0, FIELD_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("event-calendar")
+                    let r = egui::ComboBox::from_id_salt("event-calendar")
                         .width(254.0)
                         .selected_text(name)
                         .show_ui(ui, |ui| {
@@ -550,6 +577,8 @@ pub fn event(ui: &mut Ui, f: &mut EventForm, t: &Tokens, acts: &mut Vec<Action>)
                         })
                         .response
                         .accessible_name(tl!("Calendar"));
+                    let all: Vec<usize> = (0..f.calendars.len()).collect();
+                    crate::drop_down::keys(ui, &r, &mut f.calendar, &all);
                 });
             });
         }

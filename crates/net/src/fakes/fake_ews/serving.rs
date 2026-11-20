@@ -261,6 +261,12 @@ fn operation(shared: &Arc<Mutex<Data>>, doc: &El, routed: String, anchor: String
             "<soap:Envelope><soap:Body><soap:Fault><faultstring>no operation</faultstring></soap:Fault></soap:Body></soap:Envelope>".into(),
         );
     };
+    // As Exchange: a time zone whose two changes fall on the same day is refused whole (issue #140).
+    if op.name == "GetUserAvailabilityRequest" && super::availability::zone_refused(&op) {
+        let fault = "<soap:Envelope><soap:Body><soap:Fault><faultcode>a:ErrorTimeZone</faultcode>\
+                     <faultstring>The specified time zone isn't valid.</faultstring></soap:Fault></soap:Body></soap:Envelope>";
+        return (500, fault.into());
+    }
     // A slow server: listing a mail folder waits while the test holds it (without holding up
     // the others); a minute at most, so a test that never lets go fails rather than hangs.
     let hold = {
@@ -275,6 +281,14 @@ fn operation(shared: &Arc<Mutex<Data>>, doc: &El, routed: String, anchor: String
         }
         shared.lock().unwrap().held -= 1;
     }
+    // A big calendar: listing it takes a while (the server not held meanwhile).
+    let slow = {
+        let d = shared.lock().unwrap();
+        d.pim_slow.filter(|_| op.name == "FindItem" && d.pim_folder(op.child("ParentFolderIds").and_then(|p| p.kids.first())))
+    };
+    if let Some(wait) = slow {
+        std::thread::sleep(wait);
+    }
     let mut d = shared.lock().unwrap();
     d.calls.push(op.name.clone());
     let version = doc.find("RequestServerVersion").and_then(|v| v.attr("Version")).unwrap_or_default().to_string();
@@ -283,6 +297,27 @@ fn operation(shared: &Arc<Mutex<Data>>, doc: &El, routed: String, anchor: String
         let fault = "<soap:Envelope><soap:Body><soap:Fault><faultcode>a:ErrorInvalidServerVersion</faultcode>\
                      <faultstring>The specified server version is invalid.</faultstring></soap:Fault></soap:Body></soap:Envelope>";
         return (500, fault.into());
+    }
+    // As Exchange: a field its schema doesn't know refuses the request whole (issue #191).
+    if let Some(field) = super::schema::unknown_field(&op, &d.refused_fields) {
+        if d.field_refusals.len() < 1000 {
+            d.field_refusals.push(field);
+        }
+        drop(d);
+        let fault = "<soap:Envelope><soap:Body><soap:Fault><faultcode>a:ErrorInvalidRequest</faultcode>\
+                     <faultstring>The request is invalid.</faultstring></soap:Fault></soap:Body></soap:Envelope>";
+        return (500, fault.into());
+    }
+    if let Some(id) = newer_id(&op).filter(|_| d.exchange_2010) {
+        d.schema_refusals += 1;
+        drop(d);
+        let fault = format!(
+            "<soap:Envelope><soap:Body><soap:Fault><faultcode>a:ErrorSchemaValidation</faultcode>\
+             <faultstring>The request failed schema validation: The 'Id' attribute is invalid - The value '{id}' is invalid \
+             according to its datatype 'http://schemas.microsoft.com/exchange/services/2006/types:DistinguishedFolderIdNameType' \
+             - The Enumeration constraint failed.</faultstring></soap:Fault></soap:Body></soap:Envelope>"
+        );
+        return (500, fault);
     }
     d.routed = routed;
     if !anchor.is_empty() && d.anchors.len() < 1000 {
@@ -293,10 +328,18 @@ fn operation(shared: &Arc<Mutex<Data>>, doc: &El, routed: String, anchor: String
     (200, envelope(&name, &parts))
 }
 
+/// The first distinguished folder an operation names that Exchange 2010 doesn't know.
+fn newer_id(op: &El) -> Option<String> {
+    let mut ids = Vec::new();
+    op.all("DistinguishedFolderId", &mut ids);
+    ids.iter().filter_map(|f| f.attr("Id")).find(|id| ["archive", "conversationhistory", "syncissues"].contains(id)).map(str::to_string)
+}
+
 /// An operation's response element in its envelope: its response messages (each named for the
 /// operation), or, for automatic replies and reminders, its parts as they are.
 fn envelope(name: &str, parts: &[String]) -> String {
-    let reminders = name.starts_with("GetReminders") || name.starts_with("PerformReminderAction");
+    // Answers whose result and response code are on the answer itself, not in response messages.
+    let reminders = ["GetReminders", "PerformReminderAction", "GetInboxRules", "UpdateInboxRules"].iter().any(|n| name.starts_with(n));
     let class = if !reminders {
         String::new()
     } else if parts.concat().contains(">NoError<") {
@@ -304,7 +347,7 @@ fn envelope(name: &str, parts: &[String]) -> String {
     } else {
         " ResponseClass=\"Error\"".to_string()
     };
-    let inner = if name.starts_with("GetUserOof") || name.starts_with("SetUserOof") || reminders {
+    let inner = if name.starts_with("GetUserOof") || name.starts_with("SetUserOof") || name.starts_with("GetUserAvailability") || reminders {
         parts.concat()
     } else {
         let tag = name.trim_end_matches("Response").to_string() + "ResponseMessage";

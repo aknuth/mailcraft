@@ -200,6 +200,11 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::r
                 ui.add_space(4.0);
                 ui.label(RichText::new(e.as_str()).color(t.danger).small());
             }
+            // Outlook's From Address Book: picked from the address book, the organisation's
+            // directory among them (issue #140).
+            if ui.link(RichText::new(tl!("Pick from the address book…")).small()).clicked() {
+                acts.push(Action::Dialog(Dialog::names_for(NamesFor::Calendars, email)));
+            }
             let ready = email.contains('@');
             let (ok, cancel) = buttons(ui, t, "Open", ready);
             if (ok || enter) && ready {
@@ -242,6 +247,7 @@ pub(super) fn draw(ui: &mut Ui, d: &mut Dialog, s: &Session, pics: &mut crate::r
         }
         Dialog::Event(f) => crate::pim_dialogs::event(ui, f, t, acts),
         Dialog::Task(f) => crate::pim_dialogs::task(ui, f, t, acts),
+        Dialog::FollowUp(f) => crate::pim_dialogs::follow_up(ui, f, t, acts),
         Dialog::Contact(f) => crate::pim_dialogs::contact(ui, f, t, acts),
         // Every other kind is shown by its own group (`body`).
         _ => true,

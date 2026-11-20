@@ -114,7 +114,7 @@
 	Junk Email	Ongewenste e-mail
 	Language	Taal
 	Dates	Datums
-	In the message list, the reading pane and the header of a reply	In de berichtenlijst, het leesvenster en de kop van een antwoord
+	In the message list, the reading pane, the header of a reply, and the event and task forms	In de berichtenlijst, het leesvenster, de kop van een antwoord en de formulieren voor afspraken en taken
 	Time	Tijd
 	24-hour	24-uurs
 	12-hour	12-uurs
@@ -1797,3 +1797,160 @@ count	occurrences	keer
 	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Een certificeringsinstantie van uw organisatie, of het eigen certificaat van uw mailserver (.pem, .crt, .cer)
 	Trust a certificate file…	Een certificaatbestand vertrouwen…
 	The certificate is trusted for this account	Het certificaat wordt voor dit account vertrouwd
+	Send / Receive failed	Verzenden/ontvangen mislukt
+	Sending: {n} of {total}	Verzenden: {n} van {total}
+	Downloading: {n} of {total} ({done} of {all})	Downloaden: {n} van {total} ({done} van {all})
+	Downloading: {n} of {total}	Downloaden: {n} van {total}
+	Updating {folder} ({n} of {total})	{folder} bijwerken ({n} van {total})
+	Checking for new mail…	Nieuwe e-mail ophalen…
+	{account}: sending	{account}: verzenden
+	{account}: receiving	{account}: ontvangen
+	Waiting	Wachten
+	Failed	Mislukt
+	Stopped	Gestopt
+	{done} of {total}	{done} van {total}
+	Under way	Bezig
+	Messages: {n} ({size})	Berichten: {n} ({size})
+	Folders: {n}	Mappen: {n}
+	Send / Receive progress	Voortgang verzenden/ontvangen
+	Nothing has been sent or received yet	Er is nog niets verzonden of ontvangen
+	{done} of {all} done	{done} van {all} gereed
+	Cancel all	Alles annuleren
+	Open this window when Send / Receive starts	Dit venster openen wanneer verzenden/ontvangen begint
+	{task} failed: {error}	{task} mislukt: {error}
+	Show progress	Voortgang weergeven
+	How each account's sending and receiving goes	Hoe het verzenden en ontvangen per account verloopt
+	Stop sending and receiving	Verzenden en ontvangen stoppen
+	Sending	Verzenden
+	Receiving	Ontvangen
+	On the server: {account}	Op de server: {account}
+	The server runs these on new mail, even while MailCraft is closed.	De server past deze toe op nieuwe e-mail, ook als MailCraft gesloten is.
+	Reading the rules on the server…	Regels op de server lezen…
+	Outlook keeps its own copy of these rules. Changing them here removes it, with Outlook's rules that are turned off or run only on its computer.	Outlook bewaart een eigen kopie van deze regels. Als u ze hier wijzigt, wordt die kopie verwijderd, met de Outlook-regels die uitgeschakeld zijn of alleen op die computer worden uitgevoerd.
+	Change them here anyway	Toch hier wijzigen
+	New rule on the server…	Nieuwe regel op de server…
+	Made in another program: it can be turned on or off, moved or deleted here	Gemaakt in een ander programma: hier kan deze aan- of uitgezet, verplaatst of verwijderd worden
+	The server can't run this rule as it is	De server kan deze regel zo niet uitvoeren
+	Undo Send	Verzenden ongedaan maken
+	A message you send waits this long in the Outbox, with Undo, before it goes.	Een verzonden bericht wacht zo lang in Postvak UIT, met Ongedaan maken, voordat het vertrekt.
+	Sending · {n} s	Verzenden · {n} s
+	Sending {count} messages · {n} s	{count} berichten verzenden · {n} s
+	Undo	Ongedaan maken
+	free/busy	beschikbaarheid
+	Asking for its free/busy time…	Beschikbaarheid opvragen…
+	Shared for its free/busy time alone	Alleen gedeeld voor beschikbaarheid
+	Its free/busy time couldn't be had: {error}	De beschikbaarheid kon niet worden opgehaald: {error}
+	Schedule	Planning
+	All together	Allemaal samen
+	Tick a calendar to show it here	Vink een agenda aan om die hier te zien
+	Nothing on this day	Niets op deze dag
+	Group name	Groepsnaam
+	Design team	Ontwerpteam
+	New calendar group	Nieuwe agendagroep
+	Add ->	Toevoegen ->
+	Shown: click to hide them	Zichtbaar: klik om ze te verbergen
+	Hidden: click to show them	Verborgen: klik om ze te tonen
+	Delete calendar group	Agendagroep verwijderen
+	New calendar group…	Nieuwe agendagroep…
+	Pick from the address book…	Kiezen uit het adresboek…
+	Google doesn't let mail apps sign in with your Google password while 2-Step Verification is on. Make an app password at https://myaccount.google.com/apppasswords and enter it here instead.	Google laat e-mailapps niet inloggen met je Google-wachtwoord zolang verificatie in twee stappen aan staat. Maak een app-wachtwoord op https://myaccount.google.com/apppasswords en voer dat hier in.
+	With 2-Step Verification on, Google takes an app password here, not your Google password.	Met verificatie in twee stappen aan neemt Google hier een app-wachtwoord aan, niet je Google-wachtwoord.
+	Make an app password	Een app-wachtwoord maken
+	Custom…	Aangepast…
+	Start in	Starten in
+	What opens when MailCraft starts	Wat er opent wanneer MailCraft start
+	The first account's Inbox	Postvak IN van het eerste account
+	The folder open last	De laatst geopende map
+	Add reminder…	Herinnering toevoegen…
+	No suggestions	Geen suggesties
+	Ignore all	Alles negeren
+	Add to dictionary	Toevoegen aan woordenlijst
+	Check spelling as you type	Spelling controleren tijdens het typen
+	Misspelled words are underlined in red. Right-click one for suggestions.	Verkeerd gespelde woorden worden rood onderstreept. Klik er met de rechtermuisknop op voor suggesties.
+	There's no spelling dictionary for {language} on this computer.	Er is op deze computer geen spellingwoordenlijst voor {language}.
+	Bold on	Vet aan
+	Bold off	Vet uit
+	Italic on	Cursief aan
+	Italic off	Cursief uit
+	Underline on	Onderstrepen aan
+	Underline off	Onderstrepen uit
+	{name}: on	{name}: aan
+	{name}: off	{name}: uit
+	Font	Lettertype
+	Default font	Standaardlettertype
+	Font for new messages	Lettertype voor nieuwe berichten
+	New messages, replies and forwards are written in it. Text you set a font on keeps its own.	Nieuwe berichten, antwoorden en doorgestuurde berichten worden erin geschreven. Tekst waarvoor u een lettertype instelt, houdt zijn eigen lettertype.
+	Clean up old items	Oude items opruimen
+	Clean up old items…	Oude items opruimen…
+	Move old mail to an archive file on this computer, out of the mailbox.	Oude mail uit het postvak naar een archiefbestand op deze computer verplaatsen.
+	Old mail goes into an Outlook data file on this computer, into folders of the same names, and is then deleted from the mailbox, which gets its space back. The file shows in the folder list, where its mail can be read, searched and moved back.	Oude mail gaat naar een Outlook-gegevensbestand op deze computer, in mappen met dezelfde namen, en wordt daarna uit het postvak verwijderd, dat zo weer ruimte krijgt. Het bestand staat in de mappenlijst, waar de mail gelezen, doorzocht en teruggezet kan worden.
+	Archive this folder and the folders in it	Deze map en de mappen erin archiveren
+	Archive mail received before	Mail archiveren die is ontvangen vóór
+	Archive file	Archiefbestand
+	That's not a date.	Dat is geen datum.
+	Archive mail older than	Mail archiveren die ouder is dan
+	Move old mail to this file	Oude mail naar dit bestand verplaatsen
+	Delete old mail for good	Oude mail definitief verwijderen
+	AutoArchive	AutoArchiveren
+	Every so many days, each folder's old mail is archived to a data file on this computer, or deleted, by the folder's own settings (in its Properties) or these.	Om de zoveel dagen wordt de oude mail van elke map gearchiveerd in een gegevensbestand op deze computer, of verwijderd, volgens de eigen instellingen van de map (in de eigenschappen) of deze.
+	Run AutoArchive every	AutoArchiveren uitvoeren elke
+	Ask before AutoArchive runs	Vragen voordat AutoArchiveren wordt uitgevoerd
+	Show the archive file in the folder list	Het archiefbestand in de mappenlijst tonen
+	For folders without settings of their own	Voor mappen zonder eigen instellingen
+	Apply these settings to all folders now	Deze instellingen nu op alle mappen toepassen
+	Folders with settings of their own follow these instead.	Mappen met eigen instellingen volgen dan deze.
+	It's been {days} days: archive old mail now, as AutoArchive is set to?	Er zijn {days} dagen voorbij: oude mail nu archiveren, zoals AutoArchiveren is ingesteld?
+	Archive now	Nu archiveren
+	Off: old mail stays where it is until you clean it up.	Uit: oude mail blijft waar die is tot u opruimt.
+	Every {days} days, old mail is archived by each folder's settings.	Elke {days} dagen wordt oude mail gearchiveerd volgens de instellingen van elke map.
+	AutoArchive settings…	Instellingen voor AutoArchiveren…
+	Don't archive this folder	Deze map niet archiveren
+	Archive it by the default settings	Archiveren volgens de standaardinstellingen
+	Archive it by these settings	Archiveren volgens deze instellingen
+	weeks	weken
+	months	maanden
+	Folder density	Mapdichtheid
+	How tightly the folder pane's folders sit	Hoe dicht de mappen in het mappenvenster op elkaar staan
+	Spacious	Ruim
+	Medium	Gemiddeld
+	Sort folders A to Z	Mappen sorteren van A tot Z
+	Work days	Werkdagen
+	The work week shows these days	De werkweek toont deze dagen
+	Work hours	Werktijden
+	The calendar shades the hours outside them	De agenda kleurt de uren daarbuiten grijs
+	Start time	Begintijd
+	End time	Eindtijd
+	Meeting length	Duur van de vergadering
+	How long a time free for everyone is looked for	Hoe lang een tijd moet zijn waarop iedereen vrij is
+	Previous free time	Vorige vrije tijd
+	Next free time	Volgende vrije tijd
+	The time before when everyone shown is free, within work hours	De vorige tijd waarop iedereen die getoond wordt vrij is, binnen werktijden
+	The next time when everyone shown is free, within work hours	De volgende tijd waarop iedereen die getoond wordt vrij is, binnen werktijden
+	Free for everyone	Iedereen vrij
+	Free for everyone: click to make a meeting with them	Iedereen vrij: klik om een vergadering met hen te maken
+	No time when everyone is free in the next six weeks	Geen tijd waarop iedereen vrij is in de komende zes weken
+	No time when everyone is free as far as their free/busy times reach: Next looks further once they come	Geen tijd waarop iedereen vrij is zover hun beschikbaarheid reikt: Volgende zoekt verder zodra die er is
+	No earlier time when everyone is free	Geen eerdere tijd waarop iedereen vrij is
+	No earlier time when everyone is free as far as their free/busy times reach: Previous looks further once they come	Geen eerdere tijd waarop iedereen vrij is zover hun beschikbaarheid reikt: Vorige zoekt verder zodra die er is
+	Their free/busy times haven't come yet: try again in a moment	Hun beschikbaarheid is er nog niet: probeer het zo nog eens
+	Some people's free/busy times can't be had: they count as free	De beschikbaarheid van sommige mensen is niet op te halen: zij tellen als vrij
+	Collapse this group	Deze groep samenvouwen
+	Expand this group	Deze groep uitvouwen
+	Collapse all groups	Alle groepen samenvouwen
+	Expand all groups	Alle groepen uitvouwen
+	Show this group's mail	De e-mail van deze groep tonen
+	Hide this group's mail	De e-mail van deze groep verbergen
+	{heading} ({count}), folded	{heading} ({count}), samengevouwen
+	Clashes with {event} on your calendar	Overlapt met {event} in je agenda
+	Clashes with {n} events on your calendar	Overlapt met {n} afspraken in je agenda
+	In {n} min	Over {n} min
+	Line between the appointments and the tasks	Lijn tussen de afspraken en de taken
+	Mark all in {folder} as read	Alles in {folder} als gelezen markeren
+	Mark all shown as read	Alles wat getoond wordt als gelezen markeren
+	More ways to mark mail read	Meer manieren om e-mail als gelezen te markeren
+	Nothing else on your calendar then	Verder niets in je agenda op dat moment
+	Right after {event} on your calendar	Direct na {event} in je agenda
+	Right before {event} on your calendar	Direct voor {event} in je agenda
+	{h} h	{h} u
+	Notify of mail in Other too	Ook melden bij e-mail in Overige
+	Off, only mail that goes to Focused is announced	Uit: alleen e-mail die naar Prioriteit gaat, wordt gemeld

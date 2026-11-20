@@ -114,7 +114,7 @@
 	Junk Email	Junk-E-Mail
 	Language	Sprache
 	Dates	Datum
-	In the message list, the reading pane and the header of a reply	In der Nachrichtenliste, im Lesebereich und im Kopf einer Antwort
+	In the message list, the reading pane, the header of a reply, and the event and task forms	In der Nachrichtenliste, im Lesebereich, im Kopf einer Antwort und in den Termin- und Aufgabenformularen
 	Time	Uhrzeit
 	24-hour	24 Stunden
 	12-hour	12 Stunden
@@ -1802,3 +1802,160 @@ count	occurrences	Terminen
 	An authority your organisation runs, or your mail server's own certificate (.pem, .crt, .cer)	Eine Zertifizierungsstelle Ihrer Organisation oder das eigene Zertifikat Ihres Mailservers (.pem, .crt, .cer)
 	Trust a certificate file…	Einer Zertifikatsdatei vertrauen…
 	The certificate is trusted for this account	Dem Zertifikat wird für dieses Konto vertraut
+	Send / Receive failed	Senden/Empfangen fehlgeschlagen
+	Sending: {n} of {total}	Senden: {n} von {total}
+	Downloading: {n} of {total} ({done} of {all})	Herunterladen: {n} von {total} ({done} von {all})
+	Downloading: {n} of {total}	Herunterladen: {n} von {total}
+	Updating {folder} ({n} of {total})	{folder} wird aktualisiert ({n} von {total})
+	Checking for new mail…	Neue E-Mails werden abgerufen…
+	{account}: sending	{account}: Senden
+	{account}: receiving	{account}: Empfangen
+	Waiting	Wartet
+	Failed	Fehlgeschlagen
+	Stopped	Angehalten
+	{done} of {total}	{done} von {total}
+	Under way	Läuft
+	Messages: {n} ({size})	Nachrichten: {n} ({size})
+	Folders: {n}	Ordner: {n}
+	Send / Receive progress	Fortschritt beim Senden/Empfangen
+	Nothing has been sent or received yet	Noch nichts gesendet oder empfangen
+	{done} of {all} done	{done} von {all} erledigt
+	Cancel all	Alle abbrechen
+	Open this window when Send / Receive starts	Dieses Fenster beim Senden/Empfangen öffnen
+	{task} failed: {error}	{task} fehlgeschlagen: {error}
+	Show progress	Fortschritt anzeigen
+	How each account's sending and receiving goes	Wie das Senden und Empfangen jedes Kontos vorangeht
+	Stop sending and receiving	Senden und Empfangen anhalten
+	Sending	Senden
+	Receiving	Empfangen
+	On the server: {account}	Auf dem Server: {account}
+	The server runs these on new mail, even while MailCraft is closed.	Der Server wendet sie auf neue E-Mails an, auch wenn MailCraft geschlossen ist.
+	Reading the rules on the server…	Regeln werden vom Server gelesen…
+	Outlook keeps its own copy of these rules. Changing them here removes it, with Outlook's rules that are turned off or run only on its computer.	Outlook hat eine eigene Kopie dieser Regeln. Wenn Sie sie hier ändern, wird diese Kopie entfernt, mit den Outlook-Regeln, die ausgeschaltet sind oder nur auf dessen Computer laufen.
+	Change them here anyway	Trotzdem hier ändern
+	New rule on the server…	Neue Regel auf dem Server…
+	Made in another program: it can be turned on or off, moved or deleted here	In einem anderen Programm erstellt: Sie kann hier ein- oder ausgeschaltet, verschoben oder gelöscht werden
+	The server can't run this rule as it is	Der Server kann diese Regel so nicht ausführen
+	Undo Send	Senden rückgängig machen
+	A message you send waits this long in the Outbox, with Undo, before it goes.	Eine gesendete Nachricht wartet so lange im Postausgang, mit „Rückgängig“, bevor sie verschickt wird.
+	Sending · {n} s	Wird gesendet · {n} s
+	Sending {count} messages · {n} s	{count} Nachrichten werden gesendet · {n} s
+	Undo	Rückgängig
+	free/busy	Frei/Gebucht
+	Asking for its free/busy time…	Frei/Gebucht-Zeiten werden abgefragt…
+	Shared for its free/busy time alone	Nur mit Frei/Gebucht-Zeiten freigegeben
+	Its free/busy time couldn't be had: {error}	Die Frei/Gebucht-Zeiten konnten nicht abgerufen werden: {error}
+	Schedule	Zeitplan
+	All together	Alle zusammen
+	Tick a calendar to show it here	Haken Sie einen Kalender an, um ihn hier zu sehen
+	Nothing on this day	An diesem Tag steht nichts an
+	Group name	Gruppenname
+	Design team	Designteam
+	New calendar group	Neue Kalendergruppe
+	Add ->	Hinzufügen ->
+	Shown: click to hide them	Angezeigt: Klicken, um sie auszublenden
+	Hidden: click to show them	Ausgeblendet: Klicken, um sie anzuzeigen
+	Delete calendar group	Kalendergruppe löschen
+	New calendar group…	Neue Kalendergruppe…
+	Pick from the address book…	Aus dem Adressbuch wählen…
+	Google doesn't let mail apps sign in with your Google password while 2-Step Verification is on. Make an app password at https://myaccount.google.com/apppasswords and enter it here instead.	Google lässt Mail-Apps nicht mit Ihrem Google-Passwort anmelden, solange die Bestätigung in zwei Schritten aktiviert ist. Erstellen Sie unter https://myaccount.google.com/apppasswords ein App-Passwort und geben Sie es stattdessen hier ein.
+	With 2-Step Verification on, Google takes an app password here, not your Google password.	Mit aktivierter Bestätigung in zwei Schritten nimmt Google hier ein App-Passwort an, nicht Ihr Google-Passwort.
+	Make an app password	App-Passwort erstellen
+	Custom…	Benutzerdefiniert…
+	Start in	Starten in
+	What opens when MailCraft starts	Was beim Start von MailCraft geöffnet wird
+	The first account's Inbox	Posteingang des ersten Kontos
+	The folder open last	Zuletzt geöffneter Ordner
+	Add reminder…	Erinnerung hinzufügen…
+	No suggestions	Keine Vorschläge
+	Ignore all	Alle ignorieren
+	Add to dictionary	Zum Wörterbuch hinzufügen
+	Check spelling as you type	Rechtschreibung während der Eingabe prüfen
+	Misspelled words are underlined in red. Right-click one for suggestions.	Falsch geschriebene Wörter werden rot unterstrichen. Mit einem Rechtsklick darauf erhalten Sie Vorschläge.
+	There's no spelling dictionary for {language} on this computer.	Auf diesem Computer gibt es kein Rechtschreibwörterbuch für {language}.
+	Bold on	Fett ein
+	Bold off	Fett aus
+	Italic on	Kursiv ein
+	Italic off	Kursiv aus
+	Underline on	Unterstrichen ein
+	Underline off	Unterstrichen aus
+	{name}: on	{name}: ein
+	{name}: off	{name}: aus
+	Font	Schriftart
+	Default font	Standardschriftart
+	Font for new messages	Schriftart für neue Nachrichten
+	New messages, replies and forwards are written in it. Text you set a font on keeps its own.	Neue Nachrichten, Antworten und Weiterleitungen werden darin geschrieben. Text, für den Sie eine Schriftart festlegen, behält seine eigene.
+	Clean up old items	Alte Elemente aufräumen
+	Clean up old items…	Alte Elemente aufräumen…
+	Move old mail to an archive file on this computer, out of the mailbox.	Alte E-Mails aus dem Postfach in eine Archivdatei auf diesem Computer verschieben.
+	Old mail goes into an Outlook data file on this computer, into folders of the same names, and is then deleted from the mailbox, which gets its space back. The file shows in the folder list, where its mail can be read, searched and moved back.	Alte E-Mails kommen in eine Outlook-Datendatei auf diesem Computer, in Ordner mit denselben Namen, und werden dann aus dem Postfach gelöscht, das so wieder Platz bekommt. Die Datei erscheint in der Ordnerliste, wo ihre E-Mails gelesen, durchsucht und zurückverschoben werden können.
+	Archive this folder and the folders in it	Diesen Ordner und die Ordner darin archivieren
+	Archive mail received before	E-Mails archivieren, die empfangen wurden vor dem
+	Archive file	Archivdatei
+	That's not a date.	Das ist kein Datum.
+	Archive mail older than	E-Mails archivieren, die älter sind als
+	Move old mail to this file	Alte E-Mails in diese Datei verschieben
+	Delete old mail for good	Alte E-Mails endgültig löschen
+	AutoArchive	AutoArchivierung
+	Every so many days, each folder's old mail is archived to a data file on this computer, or deleted, by the folder's own settings (in its Properties) or these.	Alle paar Tage werden die alten E-Mails jedes Ordners in eine Datendatei auf diesem Computer archiviert oder gelöscht, nach den eigenen Einstellungen des Ordners (in seinen Eigenschaften) oder nach diesen.
+	Run AutoArchive every	AutoArchivierung ausführen alle
+	Ask before AutoArchive runs	Vor der AutoArchivierung fragen
+	Show the archive file in the folder list	Die Archivdatei in der Ordnerliste anzeigen
+	For folders without settings of their own	Für Ordner ohne eigene Einstellungen
+	Apply these settings to all folders now	Diese Einstellungen jetzt auf alle Ordner anwenden
+	Folders with settings of their own follow these instead.	Ordner mit eigenen Einstellungen folgen stattdessen diesen.
+	It's been {days} days: archive old mail now, as AutoArchive is set to?	{days} Tage sind vergangen: alte E-Mails jetzt archivieren, wie die AutoArchivierung eingestellt ist?
+	Archive now	Jetzt archivieren
+	Off: old mail stays where it is until you clean it up.	Aus: Alte E-Mails bleiben, wo sie sind, bis Sie aufräumen.
+	Every {days} days, old mail is archived by each folder's settings.	Alle {days} Tage werden alte E-Mails nach den Einstellungen jedes Ordners archiviert.
+	AutoArchive settings…	Einstellungen für AutoArchivierung…
+	Don't archive this folder	Diesen Ordner nicht archivieren
+	Archive it by the default settings	Nach den Standardeinstellungen archivieren
+	Archive it by these settings	Nach diesen Einstellungen archivieren
+	weeks	Wochen
+	months	Monate
+	Folder density	Ordnerdichte
+	How tightly the folder pane's folders sit	Wie eng die Ordner im Ordnerbereich stehen
+	Spacious	Großzügig
+	Medium	Mittel
+	Sort folders A to Z	Ordner von A bis Z sortieren
+	Work days	Arbeitstage
+	The work week shows these days	Die Arbeitswoche zeigt diese Tage
+	Work hours	Arbeitszeit
+	The calendar shades the hours outside them	Der Kalender hinterlegt die Stunden außerhalb grau
+	Start time	Beginn
+	End time	Ende
+	Meeting length	Besprechungsdauer
+	How long a time free for everyone is looked for	Wie lange eine Zeit gesucht wird, in der alle frei sind
+	Previous free time	Vorherige freie Zeit
+	Next free time	Nächste freie Zeit
+	The time before when everyone shown is free, within work hours	Die vorherige Zeit, in der alle Angezeigten frei sind, innerhalb der Arbeitszeit
+	The next time when everyone shown is free, within work hours	Die nächste Zeit, in der alle Angezeigten frei sind, innerhalb der Arbeitszeit
+	Free for everyone	Alle frei
+	Free for everyone: click to make a meeting with them	Alle frei: klicken, um eine Besprechung mit ihnen anzulegen
+	No time when everyone is free in the next six weeks	In den nächsten sechs Wochen ist keine Zeit, in der alle frei sind
+	No time when everyone is free as far as their free/busy times reach: Next looks further once they come	Keine Zeit, in der alle frei sind, soweit ihre Frei/Gebucht-Zeiten reichen: „Weiter“ sucht weiter, sobald sie da sind
+	No earlier time when everyone is free	Keine frühere Zeit, in der alle frei sind
+	No earlier time when everyone is free as far as their free/busy times reach: Previous looks further once they come	Keine frühere Zeit, in der alle frei sind, soweit ihre Frei/Gebucht-Zeiten reichen: „Zurück“ sucht weiter, sobald sie da sind
+	Their free/busy times haven't come yet: try again in a moment	Ihre Frei/Gebucht-Zeiten sind noch nicht da: gleich noch einmal versuchen
+	Some people's free/busy times can't be had: they count as free	Die Frei/Gebucht-Zeiten einiger Personen sind nicht zu bekommen: sie gelten als frei
+	Collapse this group	Diese Gruppe reduzieren
+	Expand this group	Diese Gruppe erweitern
+	Collapse all groups	Alle Gruppen reduzieren
+	Expand all groups	Alle Gruppen erweitern
+	Show this group's mail	E-Mails dieser Gruppe anzeigen
+	Hide this group's mail	E-Mails dieser Gruppe ausblenden
+	{heading} ({count}), folded	{heading} ({count}), reduziert
+	Clashes with {event} on your calendar	Überschneidet sich mit {event} in Ihrem Kalender
+	Clashes with {n} events on your calendar	Überschneidet sich mit {n} Terminen in Ihrem Kalender
+	In {n} min	In {n} Min.
+	Line between the appointments and the tasks	Linie zwischen Terminen und Aufgaben
+	Mark all in {folder} as read	Alles in {folder} als gelesen markieren
+	Mark all shown as read	Alles Angezeigte als gelesen markieren
+	More ways to mark mail read	Weitere Möglichkeiten, E-Mails als gelesen zu markieren
+	Nothing else on your calendar then	Sonst nichts in Ihrem Kalender zu dieser Zeit
+	Right after {event} on your calendar	Direkt nach {event} in Ihrem Kalender
+	Right before {event} on your calendar	Direkt vor {event} in Ihrem Kalender
+	{h} h	{h} Std.
+	Notify of mail in Other too	Auch bei E-Mails in „Sonstige“ benachrichtigen
+	Off, only mail that goes to Focused is announced	Aus: Nur E-Mails, die in „Relevant“ landen, werden gemeldet

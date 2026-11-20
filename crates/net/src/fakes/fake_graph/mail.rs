@@ -108,6 +108,15 @@ impl Data {
                     "flag/flagStatus eq 'flagged'" => list.retain(|m| m.flagged),
                     "flag/flagStatus ne 'flagged'" => list.retain(|m| !m.flagged),
                     "hasAttachments eq true" => list.clear(),
+                    // When it came (issue #179): its time as Graph writes it compares as text.
+                    c if c.starts_with("receivedDateTime ge ") => {
+                        let at = c.trim_start_matches("receivedDateTime ge ");
+                        list.retain(|m| m.received.as_str() >= at);
+                    }
+                    c if c.starts_with("receivedDateTime lt ") => {
+                        let at = c.trim_start_matches("receivedDateTime lt ");
+                        list.retain(|m| m.received.as_str() < at);
+                    }
                     _ => {}
                 }
             }
@@ -164,6 +173,15 @@ impl Data {
                     }
                     if let Some(f) = input["flag"]["flagStatus"].as_str() {
                         m.flagged = f == "flagged";
+                        m.complete = f == "complete";
+                    }
+                    if let Some(due) = input["flag"].get("dueDateTime") {
+                        m.due = due["dateTime"].as_str().map(str::to_string);
+                    }
+                    for p in input["singleValueExtendedProperties"].as_array().into_iter().flatten() {
+                        let (Some(id), Some(value)) = (p["id"].as_str(), p["value"].as_str()) else { continue };
+                        m.props.retain(|(i, _)| !i.eq_ignore_ascii_case(id));
+                        m.props.push((id.to_string(), value.to_string()));
                     }
                     ok(json!({ "id": id }))
                 }

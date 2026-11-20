@@ -118,6 +118,25 @@ fn person(m: &El) -> Option<Attendee> {
     email.contains('@').then(|| Attendee { email, name: text(mb, "Name"), partstat: String::new(), rsvp: false })
 }
 
+/// The answer the mailbox's owner (`me`) gave a meeting, from the appointment's own
+/// `MyResponseType`, put on their place among its guests, as Outlook shows it. That place keeps
+/// the answer the invitation came with ("Unknown", or tentative) and isn't changed when the owner
+/// answers: some accepted series showed as tentative or not answered (#144).
+fn own_answer(event: &mut CalEvent, it: &El, me: &str) {
+    let partstat = match it.text_of("MyResponseType") {
+        Some("Accept") => "ACCEPTED",
+        Some("Tentative") => "TENTATIVE",
+        Some("Decline") => "DECLINED",
+        _ => return,
+    };
+    if me.is_empty() {
+        return;
+    }
+    if let Some(a) = event.attendees.iter_mut().find(|a| a.email.eq_ignore_ascii_case(me)) {
+        a.partstat = partstat.to_string();
+    }
+}
+
 /// An appointment as an event (occurrences and changed instances are left to their series).
 pub fn event_of(it: &El) -> Option<CalEvent> {
     if matches!(it.text_of("CalendarItemType"), Some("Occurrence" | "Exception")) {
@@ -476,10 +495,12 @@ fn id_and_key(id: Option<&El>) -> (String, String) {
     (attr("Id"), attr("ChangeKey"))
 }
 
-/// The events among a calendar's items, as kept in `calendar`.
-fn stored_events(items: Vec<El>, calendar: &str) -> impl Iterator<Item = StoredEvent> + '_ {
+/// The events among a calendar's items, as kept in `calendar`; `me`, the address of the mailbox
+/// it's in (empty for a public folder's), whose answers to meetings the items say.
+fn stored_events<'a>(items: Vec<El>, calendar: &'a str, me: &'a str) -> impl Iterator<Item = StoredEvent> + 'a {
     items.into_iter().filter_map(move |it| {
-        let event = event_of(&it)?;
+        let mut event = event_of(&it)?;
+        own_answer(&mut event, &it, me);
         let (href, etag) = id_and_key(it.child("ItemId"));
         Some(StoredEvent { calendar: calendar.to_string(), href, etag, event, dirty: false })
     })
@@ -536,36 +557,17 @@ fn item_may_change(it: &El) -> bool {
     it.child("EffectiveRights").and_then(|r| r.child("Modify")).is_some_and(|m| m.text.trim().eq_ignore_ascii_case("true"))
 }
 
-/// Send what changed here, then read the calendar and contacts again.
-pub fn sync(c: &Client, pim: &Pim, now: i64) -> Result<DavSync> {
-    let mut out = DavSync { caldav_home: Some("ews".into()), carddav_home: Some("ews".into()), checked: now, ..Default::default() };
-    push_deletions(c, pim, &mut out);
-    push_events(c, pim, &mut out);
-    // Reminders dismissed or snoozed here (issue #40).
-    reminders::answer_all(c, pim, &mut out);
-    push_cards(c, pim, &mut out);
-    // Then the folders, read again. One the server refuses keeps what was read of it before,
-    // and doesn't hold up the others (issue #9: the address books stayed as they were whenever
-    // the calendar failed). A server that can't be reached stops the pass, so nothing read
-    // before is dropped for want of an answer.
-    let mut calendars = vec![read_calendar(c, &mut out)?];
-    read_shared_calendars(c, pim, &mut out, &mut calendars);
-    let mut books = vec![read_contacts(c, &mut out)?];
-    read_public(c, &mut out, &mut calendars, &mut books);
-    out.calendars = Some(calendars);
-    out.books = Some(books);
-    // Notes (Outlook's sticky notes): what changed here goes up, then the folder is read again.
-    push_notes(c, pim, &mut out);
-    read_notes(c, &mut out);
-    mailcraft_model::pim::separate_shared_uids(&mut out.events);
-    Ok(out)
-}
-
+mod pass;
+pub use pass::Pass;
+#[cfg(test)]
+pub use pass::sync;
 mod pushing;
 mod reading;
 mod reminders;
+mod tasks;
 use pushing::{push_cards, push_deletions, push_events, push_notes};
-use reading::{read_calendar, read_contacts, read_notes, read_public, read_shared_calendars};
+use reading::{read_calendar, read_contacts, read_notes, read_public, read_shared_calendar};
+use tasks::{TASK_FIELDS, push_tasks, read_tasks};
 
 #[cfg(test)]
 mod tests;

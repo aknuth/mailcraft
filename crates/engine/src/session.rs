@@ -29,12 +29,15 @@ mod organize;
 mod prefs;
 mod searching;
 mod security;
+mod send_receive;
+mod updates;
 mod writing;
 #[cfg(test)]
 pub(crate) use accounts::REMOVE_BACKSTOP;
+pub(crate) use accounts::RuleChange;
 pub(crate) use accounts::data_file_path;
+pub use accounts::{AgeUnit, ArchiveRule, AutoArchive, Compacting, Compaction, FolderArchive, IDLE_AFTER_S};
 pub use accounts::{Changes, ImportState, Imports, TrustedCertificate};
-pub use accounts::{Compacting, Compaction, IDLE_AFTER_S};
 use changing::Batch;
 use changing::keys_by_account;
 #[cfg(test)]
@@ -47,15 +50,20 @@ pub use security::{
     CardSearch, KeySource, KnownCert, KnownKey, Lock, PGP_DOC, PgpSettings, Reach, RevocationCheck, SMIME_DOC, Scheme, Seal, Security, SignedBy,
     SmimeSettings,
 };
-pub use writing::{Compose, Drafted, Quote, Reactions, SendBlock, SendCheck, signature_parts};
+pub use send_receive::{SendReceive, TransferRow};
+pub use updates::{UpdateCheck, newer_release};
+pub use writing::{Compose, Drafted, Quote, Reactions, SendBlock, SendCheck, UNDO_SEND_MAX, UndoHold, signature_parts};
 // The message list's arrangement and rows, named here as before.
 #[cfg(test)]
 pub(crate) use mailboxes::arrange_list;
 pub use mailboxes::{ARRANGE_HEADINGS, Arrange, ListFilter, Row};
 // Organizing mail's own parts, named here as before.
 pub use opening::SenderMarks;
-pub use organize::{junk, quick_steps, search_folders};
-pub use prefs::{ACCENTS, CtrlEnter, NotesOrder, Prefs, ReadInPane, ReadingPane, SenderAddresses, accent_code, accent_rgb};
+pub use organize::{junk, quick_steps, search_folders, server_rules};
+pub use prefs::{
+    ACCENTS, CtrlEnter, DICTIONARY_MAX, FolderDensity, NotesOrder, Prefs, ReadInPane, ReadingPane, SenderAddresses, StartIn, accent_code, accent_rgb,
+    dictionary_word,
+};
 pub mod pim;
 pub use pim::invite;
 
@@ -69,6 +77,8 @@ pub struct AccountState {
     pub quota: Option<(u64, u64)>,
     /// The automatic replies as last read from the server.
     pub vacation: VacationState,
+    /// Its Inbox rules on the server (Exchange's), as last read.
+    pub server_rules: server_rules::ServerRulesState,
 }
 
 /// What is known of an account's automatic replies.
@@ -96,50 +106,6 @@ impl AccountState {
     /// An Outlook data file opened here (its "address" is the file's name).
     pub fn is_data_file(&self) -> bool {
         self.is_local() && !addr::is_valid_email(&self.config.email)
-    }
-}
-
-/// File › About › Check for updates.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum UpdateCheck {
-    #[default]
-    NotAsked,
-    Checking,
-    /// This is the newest (the newest release's tag, when there is one).
-    UpToDate(String),
-    /// A newer one is out.
-    Available(mailcraft_model::job::Release),
-    Failed(String),
-}
-
-/// The newest release `releases` has for a build of `version` made from commit `build_sha`:
-/// `Some` when it's newer. A newer version is. Of one version, its release (`v0.19.0`) comes after
-/// its test builds (`v0.19.0-test.15`), and a later test build after an earlier one: newer when
-/// this build is one of those (known by its commit). With `stable_only` (a build of a release),
-/// test builds aren't offered at all. A build made from no release (a developer's), ahead or the
-/// same, is up to date.
-pub fn newer_release<'a>(
-    version: &str,
-    build_sha: Option<&str>,
-    releases: &'a [mailcraft_model::job::Release],
-    stable_only: bool,
-) -> Option<&'a mailcraft_model::job::Release> {
-    let parse = |v: &str| -> Option<(u32, u32, u32)> {
-        let mut p = v.split('.').map(|n| n.parse::<u32>().ok());
-        Some((p.next()??, p.next()??, p.next()??))
-    };
-    // A version's release after its test builds, the later test build after the earlier.
-    let rank = |r: &mailcraft_model::job::Release| parse(&r.version).map(|v| (v, !r.pre, r.build));
-    let current = parse(version)?;
-    let newest = releases.iter().filter(|r| !(stable_only && r.pre)).filter_map(|r| rank(r).map(|k| (k, r))).max_by_key(|(k, _)| *k)?;
-    match newest.0.0.cmp(&current) {
-        std::cmp::Ordering::Greater => Some(newest.1),
-        std::cmp::Ordering::Less => None,
-        std::cmp::Ordering::Equal => {
-            let sha = build_sha.map(str::trim).filter(|s| s.len() >= 7)?;
-            let mine = releases.iter().find(|r| !r.commit.is_empty() && (r.commit.starts_with(sha) || sha.starts_with(&r.commit)))?;
-            rank(mine).is_some_and(|k| k < newest.0).then_some(newest.1)
-        }
     }
 }
 
@@ -188,10 +154,20 @@ pub enum Undo {
     Move { moves: Vec<(String, String, Vec<(String, String)>)> },
     /// Flags or keywords changed: the changes that put them back, by account.
     Ops { ops: Vec<(String, Vec<Op>)> },
-    /// Follow-ups changed (flagged, cleared, marked complete): the flag and keyword changes that
-    /// put them back, by account, and each message's due and done days as they were, by its
-    /// follow-up id.
-    FollowUp { ops: Vec<(String, Vec<Op>)>, days: Vec<(String, Option<i64>, Option<i64>)> },
+    /// Follow-ups changed (flagged, cleared, marked complete, a reminder given): the flag,
+    /// keyword and reminder changes that put them back, by account, and each message's due and
+    /// done days and reminder as MailCraft kept them.
+    FollowUp { ops: Vec<(String, Vec<Op>)>, days: Vec<FollowUpWas> },
+}
+
+/// A message's follow-up as MailCraft kept it, for Undo: by its follow-up id, its due and done
+/// days and when it reminded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FollowUpWas {
+    pub id: String,
+    pub due: Option<i64>,
+    pub done: Option<i64>,
+    pub reminder: Option<i64>,
 }
 
 /// Changes Undo remembers.
@@ -229,6 +205,9 @@ pub struct Reading {
     pub error: Option<String>,
     /// The other messages of its conversation in this list, oldest first.
     pub thread: Vec<MessageKey>,
+    /// The user's own messages of its conversation in Sent Items (issue #148), not in this list:
+    /// shown in its conversation, oldest first, and opened in a window of their own.
+    pub aside: Vec<SharedSummary>,
     /// Who it says it's from doesn't add up: a lookalike of a domain the user deals with, or
     /// another address shown in the sender's name.
     pub warning: Option<mailcraft_model::lookalike::SenderWarning>,
@@ -343,6 +322,10 @@ pub struct Session {
     pub outbox: Vec<(String, OutboxItem)>,
     /// Held-back Outbox messages already asked to be sent when their time came.
     flushed: BTreeSet<u64>,
+    /// Each account's Sent folder by Message-ID, for its replies in conversations.
+    pub(crate) sent_indexes: HashMap<String, mailboxes::SentIndex>,
+    /// Messages sent that wait in the Outbox to be undone (Undo Send), as they were written.
+    pub(crate) undo_holds: Vec<writing::UndoHold>,
     pub(crate) jobs: Vec<Job>,
     pub(crate) cache: HashMap<(String, String), FolderState>,
     /// The cached folders, the least recently used first.
@@ -406,6 +389,10 @@ pub struct Session {
     pub(crate) moved_at: i64,
     /// Mail moved or copied into a folder on this computer, waiting for its source (issue #82).
     pub(crate) transfers: Vec<mailboxes::Transfer>,
+    /// Old mail being archived to a data file (issue #179), one at a time.
+    pub(crate) archiving: Option<accounts::Archiving>,
+    /// AutoArchive's groups still to archive, and its question (issue #180).
+    pub(crate) auto_archiving: accounts::AutoArchiving,
     /// Mail that arrived and may hold an invitation, waiting for its body (issue #20).
     pub(crate) arrived_invites: Vec<MessageKey>,
     /// Answered invitations to put out of the way once the server has the answer (issue #101).
@@ -450,6 +437,8 @@ pub struct Session {
     pub(crate) pim_unread: HashSet<String>,
     /// The flagged mail of every folder, for the To-Do Bar's task list.
     pub(crate) todo: pim::TodoMail,
+    /// Colleagues' free/busy times, asked for while the calendar shows them (issue #140).
+    pub(crate) free_busy: pim::FreeBusyKept,
     /// The documents (`rules.json`, `snoozes.json`, `pending-marks.json`) that couldn't be read
     /// at start: never saved over with what's shown or kept in their place.
     pub(crate) docs_unread: HashSet<&'static str>,
@@ -458,6 +447,8 @@ pub struct Session {
     pub cal_mode: pim::CalMode,
     /// The local day the calendar shows (`None`: today).
     pub cal_day: Option<i64>,
+    /// The time last found free for everyone shown (issue #186), marked in the calendar.
+    pub(crate) free_slot: Option<(i64, i64)>,
     /// Search: the one running (or done and shown), and what it keeps between searches.
     search_state: searching::SearchState,
     /// How many times a message was shown in the reading pane ([`Session::messages_shown`]).
@@ -467,6 +458,8 @@ pub struct Session {
     /// Data files imported into accounts: running, waiting on the user, or done (`imports.json`).
     /// While one is read, its account's folders' search words wait for the end.
     importing: Imports,
+    /// Send / Receive: each POP or IMAP account's sending and receiving, as it last went.
+    pub send_receive: SendReceive,
     /// The search indexes kept up in the background.
     indexing: searching::Indexing,
     /// Data files made smaller: how each is doing, and the compactions running.
@@ -534,6 +527,8 @@ impl Session {
             pim_revision: 0,
             outbox: Vec::new(),
             flushed: BTreeSet::new(),
+            sent_indexes: HashMap::new(),
+            undo_holds: Vec::new(),
             jobs: Vec::new(),
             cache: HashMap::new(),
             cache_order: Vec::new(),
@@ -564,6 +559,8 @@ impl Session {
             moved_in: changing::MovedIn::default(),
             moved_at: 0,
             transfers: Vec::new(),
+            archiving: None,
+            auto_archiving: Default::default(),
             arrived_invites: Vec::new(),
             tidy_waiting: Vec::new(),
             new_mail: Vec::new(),
@@ -587,14 +584,17 @@ impl Session {
             pim: HashMap::new(),
             pim_unread: HashSet::new(),
             todo: pim::TodoMail::default(),
+            free_busy: Default::default(),
             docs_unread: HashSet::new(),
             module: pim::Module::Mail,
             cal_mode: pim::CalMode::Week,
             cal_day: None,
+            free_slot: None,
             search_state: Default::default(),
             shown: 0,
             body: Default::default(),
             importing: Imports::default(),
+            send_receive: SendReceive::default(),
             indexing: Default::default(),
             compaction: Compaction::default(),
             read_due: None,

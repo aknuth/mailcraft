@@ -26,6 +26,11 @@ impl Pool {
         let Some(job) = self.held_for_compaction(job) else { return };
         if let Job::SearchServer { search, .. } = &job {
             self.search.store(*search, Ordering::Relaxed);
+            // After the changes made before it, as the server has them: those reach the account's
+            // thread through the pool's thread for changes, and a search sent straight there went
+            // first (issue #179: an archive's next round found again the mail just archived,
+            // not yet deleted on the server).
+            self.edits.flush();
         }
         match job {
             Job::FetchUrl { url } => self.fetch_url(url),
@@ -64,8 +69,12 @@ impl Pool {
                 self.submit(if keep { Job::KeepDraft { account, raw, folder, replaces } } else { Job::SaveDraft { account, raw, folder, replaces } });
             }
             Job::ExportPst { account, path, name, follow_up } => self.export_pst(account, path, name, follow_up),
+            Job::ArchivePst { account, path, folders, only, before, follow_up } => {
+                self.archive_pst(account, path, crate::pst_export::Pick { folders, only, before }, follow_up)
+            }
             Job::SetSync { messages, offline } => self.set_sync(messages, offline),
             Job::WorkOffline { on } => self.work_offline(on),
+            Job::CancelTransfers { account } => self.cancel_transfers(&account),
             Job::Start { account, password } if self.offline => self.start_when_online(account, password),
             // Looking only when asked (issue #104): not signed in until something is (one set so
             // while it ran stops looking now).
@@ -104,10 +113,27 @@ impl Pool {
                 self.edits.send(&self.store, &self.sink, account, op, wake);
             }
             other => {
+                // Asked to send or receive anew: a stop asked before isn't this one's.
+                if matches!(other, Job::SyncAll { .. } | Job::FlushOutbox { .. } | Job::Send { .. })
+                    && let Some(h) = self.workers.get(other.account())
+                {
+                    h.cancel.store(false, Ordering::Relaxed);
+                }
                 self.start_when_asked(&other);
                 if let Some(job) = self.offline_answer(other) {
                     self.route_to_worker(job);
                 }
+            }
+        }
+    }
+
+    /// Stop `account`'s Send / Receive (empty: every account's) where it can be stopped: its
+    /// threads see the flag between two messages or two folders. Only one at work: a flag raised
+    /// on a thread that waits would stop the next look it makes by itself.
+    fn cancel_transfers(&mut self, account: &str) {
+        for (id, h) in &self.workers {
+            if (account.is_empty() || id == account) && h.busy.load(Ordering::Relaxed) {
+                h.cancel.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -166,6 +192,16 @@ impl Pool {
             }
             Job::GetVacation { account } | Job::SetVacation { account, .. } if mail_offline => {
                 self.sink.emit(Event::Vacation { account, vacation: None, error: Some(OFFLINE.into()) });
+            }
+            Job::GetServerRules { account } | Job::SetServerRules { account, .. } if mail_offline => {
+                self.sink.emit(Event::ServerRules { account, rules: None, error: Some(OFFLINE.into()) });
+            }
+            Job::FreeBusy { account, people, from, to } if mail_offline => {
+                let answers = people
+                    .into_iter()
+                    .map(|email| mailcraft_model::pim::free_busy::FreeBusyAnswer { email, error: Some(OFFLINE.into()), ..Default::default() })
+                    .collect();
+                self.sink.emit(Event::FreeBusy { account, from, to, answers });
             }
             job => return Some(job),
         }
@@ -294,6 +330,7 @@ impl Pool {
         let needs_server = match job {
             Job::SyncAll { .. } | Job::SyncFolder { .. } | Job::Send { .. } | Job::FlushOutbox { .. } | Job::MoreMail { .. } => true,
             Job::SearchServer { .. } | Job::SearchDirectory { .. } | Job::GetVacation { .. } | Job::SetVacation { .. } => true,
+            Job::GetServerRules { .. } | Job::SetServerRules { .. } | Job::FreeBusy { .. } => true,
             Job::FindIdentities { .. } => true,
             Job::FetchBody { key } => self.store.read_body(key).is_none(),
             _ => false,

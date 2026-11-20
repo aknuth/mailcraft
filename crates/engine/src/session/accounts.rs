@@ -2,9 +2,15 @@
 
 use super::*;
 
+mod archiving;
+mod auto_archive;
 mod importing;
 mod mailbox_settings;
 mod trusting;
+pub(in crate::session) use archiving::ArchiveReport;
+pub(crate) use archiving::Archiving;
+pub(crate) use auto_archive::RuleChange;
+pub use auto_archive::{AgeUnit, ArchiveRule, AutoArchive, AutoArchiving, FolderArchive};
 #[cfg(test)]
 pub(crate) use importing::REMOVE_BACKSTOP;
 pub(crate) use importing::data_file_path;
@@ -70,7 +76,14 @@ impl Session {
                     }
                 }
                 sort_folders(&mut folders);
-                self.accounts.push(AccountState { config, folders, status: SyncStatus::Offline, quota: None, vacation: VacationState::Unknown });
+                self.accounts.push(AccountState {
+                    config,
+                    folders,
+                    status: SyncStatus::Offline,
+                    quota: None,
+                    vacation: VacationState::Unknown,
+                    server_rules: Default::default(),
+                });
             }
         }
         let mut local = Vec::new();
@@ -140,6 +153,7 @@ impl Session {
             status: SyncStatus::Connecting,
             quota: None,
             vacation: VacationState::Unknown,
+            server_rules: Default::default(),
         });
         self.save_accounts();
         self.move_to_sending_account();
@@ -203,7 +217,11 @@ impl Session {
         let name = if a.config.name.trim().is_empty() { a.config.email.clone() } else { a.config.name.clone() };
         // When flagged messages are due, and when completed ones were done, which only this
         // computer keeps, go into the file too.
-        let follow_up = mailcraft_model::organize::FollowUpDays { due: self.prefs.follow_up.clone(), done: self.prefs.follow_up_done.clone() };
+        let follow_up = mailcraft_model::organize::FollowUpDays {
+            due: self.prefs.follow_up.clone(),
+            done: self.prefs.follow_up_done.clone(),
+            reminder: self.prefs.mail_reminders.clone(),
+        };
         self.jobs.push(Job::ExportPst { account: account.to_string(), path: path.to_string(), name, follow_up });
         Ok(serde_json::json!({ "account": account, "exporting": true }))
     }
@@ -337,6 +355,7 @@ impl Session {
         };
         self.accounts.retain(|a| a.config.id != id);
         self.forget_transfers(id);
+        self.forget_archiving(id);
         self.cache.retain(|(a, _), _| a != id);
         // Its messages held for their drafts go with it: kept as MailCraft closes, they'd be
         // written into a removed account's folder, and sent up by a later one of the same id.
@@ -345,6 +364,7 @@ impl Session {
         self.search_folders_changed(id);
         self.importing.running.remove(id);
         self.importing.keeping.remove(id);
+        self.forget_transfers_of(id);
         if leaves != Leaves::ForImport && self.importing.sources.remove(id).is_some() {
             self.save_imports();
         }
@@ -516,6 +536,8 @@ impl Session {
         if by_account.is_empty() {
             return Err(CmdError::Disabled("no account here has its mail on a server".into()));
         }
+        // The servers search one thing at a time: an archive's search stops for this one.
+        self.archive_search_cut();
         self.searches = self.searches.wrapping_add(1).max(1);
         let id = self.searches;
         let sent = self.server_query(&q);
@@ -685,6 +707,7 @@ impl Session {
         for id in &ids {
             self.jobs.push(Job::SyncAll { account: id.clone() });
         }
+        self.transfers_asked(&ids);
         ids.len()
     }
 }

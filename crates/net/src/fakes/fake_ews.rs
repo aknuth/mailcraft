@@ -58,6 +58,15 @@ pub struct It {
     pub raw: Vec<u8>,
     pub read: bool,
     pub flagged: bool,
+    /// Its follow-up marked complete (`PidTagFlagStatus` 1).
+    pub complete: bool,
+    /// The day its follow-up is due (`PidLidTaskDueDate`), as written.
+    pub due: Option<String>,
+    /// Its flag's reminder: set (`PidLidReminderSet`), and its signal time and time
+    /// (`PidLidReminderSignalTime`, `PidLidReminderTime`), as written.
+    pub reminder_set: bool,
+    pub reminder_signal: Option<String>,
+    pub reminder_time: Option<String>,
     pub draft: bool,
     pub received: String,
 }
@@ -145,6 +154,45 @@ pub struct Data {
     pub lower_case_schemes: bool,
     /// Its reminders (issue #40).
     pub reminders: reminders::Reminders,
+    /// Exchange 2010's schema (#149): a request naming a distinguished folder it doesn't know
+    /// (`archive`, `conversationhistory`, `syncissues`: 2013 brought them) fails validation as a
+    /// whole (HTTP 500).
+    pub exchange_2010: bool,
+    /// Requests refused so ([`Data::exchange_2010`]).
+    pub schema_refusals: usize,
+    /// Fields its schema doesn't know besides those none does (`schema.rs`): a request naming
+    /// one is refused whole, as one naming a field no Exchange knows is (issue #191).
+    pub refused_fields: Vec<String>,
+    /// Requests refused for a field (`schema.rs`), by the field.
+    pub field_refusals: Vec<String>,
+    /// The mailbox's limits, in KB (where it can't send, can't receive, and is warned), said on
+    /// its root folder, with every folder's size; `None`: neither said (issue #143).
+    pub quota_kb: Option<[i64; 3]>,
+    /// The mailbox's Inbox rules (each a `Rule` element as the server keeps it; issue #139).
+    pub rules: Vec<El>,
+    /// Outlook's own copy of the rules is beside them: they're not changed until it's removed.
+    pub outlook_rules: bool,
+    /// Changes to the rules taken.
+    pub rule_updates: usize,
+    /// People's times taken, as the availability service gives them (issue #140).
+    pub free_busy: Vec<availability::FakeBusy>,
+    /// People who don't share their free/busy times with the account.
+    pub free_busy_refused: Vec<String>,
+    /// Someone's `WorkingHours`, as the service writes it beside their times (issue #185).
+    pub working_hours: Vec<(String, String)>,
+    /// The free/busy times asked for, in order.
+    pub availability_asks: Vec<availability::AvailabilityAsk>,
+    /// Pull subscriptions to the mailbox's folders (issue #145).
+    pub subscriptions: Vec<watching::FakeSub>,
+    /// A subscription to every folder at once is refused (Exchange 2010 before its first
+    /// service pack): one naming the folders is taken.
+    pub subscribe_all_refused: bool,
+    /// The folders a `GetEvents` answer says at most, the rest said as more (`None`: all).
+    pub events_per_answer: Option<usize>,
+    /// `GetEvents` asked.
+    pub get_events_asked: usize,
+    /// Listing a calendar's or address book's items takes this long (a big shared calendar).
+    pub pim_slow: Option<std::time::Duration>,
     /// What came to it and went out, for a test's wait to tell where it stopped
     /// ([`Data::where_it_stopped`]).
     traffic: serving::Traffic,
@@ -192,6 +240,23 @@ impl Default for Data {
             open: false,
             lower_case_schemes: false,
             reminders: Default::default(),
+            exchange_2010: false,
+            schema_refusals: 0,
+            refused_fields: Vec::new(),
+            field_refusals: Vec::new(),
+            quota_kb: None,
+            rules: Vec::new(),
+            outlook_rules: false,
+            rule_updates: 0,
+            free_busy: Vec::new(),
+            free_busy_refused: Vec::new(),
+            working_hours: Vec::new(),
+            availability_asks: Vec::new(),
+            subscriptions: Vec::new(),
+            subscribe_all_refused: false,
+            events_per_answer: None,
+            get_events_asked: 0,
+            pim_slow: None,
             traffic: Default::default(),
             next: 0,
         };
@@ -280,6 +345,11 @@ impl Data {
             flagged: false,
             draft: false,
             received: received.into(),
+            complete: false,
+            due: None,
+            reminder_set: false,
+            reminder_signal: None,
+            reminder_time: None,
         });
         id
     }
@@ -321,6 +391,20 @@ impl Data {
                 "<t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"0x6698\" PropertyType=\"Binary\"/><t:Value>{}</t:Value></t:ExtendedProperty>",
                 mailcraft_model::base64::encode(format!("{PF_GUID}\0").as_bytes())
             ));
+        }
+        // Its size, and the mailbox's limits on its root, as Exchange says them when asked.
+        if let Some(limits) = self.quota_kb {
+            let size: usize = self.items.iter().filter(|i| i.folder == f.id).map(|i| i.raw.len()).sum();
+            extended.push_str(&format!(
+                "<t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"0xe08\" PropertyType=\"Long\"/><t:Value>{size}</t:Value></t:ExtendedProperty>"
+            ));
+            if f.known.as_deref() == Some("msgfolderroot") {
+                for (tag, kb) in ["0x666e", "0x666a", "0x3ff5"].into_iter().zip(limits) {
+                    extended.push_str(&format!(
+                        "<t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"{tag}\" PropertyType=\"Integer\"/><t:Value>{kb}</t:Value></t:ExtendedProperty>"
+                    ));
+                }
+            }
         }
         if self.flagged_hidden.contains(&f.id) {
             extended.push_str(
@@ -374,21 +458,29 @@ impl Data {
             x.push_str(&format!("<t:MimeContent CharacterSet=\"UTF-8\">{}</t:MimeContent>", mailcraft_model::base64::encode(&it.raw)));
         }
         x.push_str(&format!(
-            "<t:Subject>{}</t:Subject><t:DateTimeReceived>{}</t:DateTimeReceived><t:Size>{}</t:Size><t:HasAttachments>false</t:HasAttachments>",
+            "<t:Subject>{}</t:Subject><t:DateTimeReceived>{}</t:DateTimeReceived><t:Size>{}</t:Size><t:HasAttachments>{}</t:HasAttachments>",
             esc(&p.subject),
             it.received,
-            it.raw.len()
+            it.raw.len(),
+            // As Exchange: files shown in the text don't count.
+            p.attachments.iter().any(|a| !a.inline)
         ));
-        if it.flagged {
-            x.push_str(&ext("0x1090", 2));
-        }
+        x.push_str(&follow_up_xml(it));
         x.push_str(&ext("0x0E07", if it.draft { 8 } else { 1 }));
         x.push_str(&format!("<t:ToRecipients>{}</t:ToRecipients>", p.to.iter().map(mb).collect::<String>()));
         if !p.cc.is_empty() {
             x.push_str(&format!("<t:CcRecipients>{}</t:CcRecipients>", p.cc.iter().map(mb).collect::<String>()));
         }
         x.push_str(&format!("<t:From>{}</t:From>", mb(&p.from)));
-        x.push_str(&format!("<t:InternetMessageId>&lt;{}&gt;</t:InternetMessageId><t:IsRead>{}</t:IsRead></t:Message>", esc(&p.message_id), it.read));
+        x.push_str(&format!("<t:InternetMessageId>&lt;{}&gt;</t:InternetMessageId>", esc(&p.message_id)));
+        if !p.in_reply_to.is_empty() {
+            x.push_str(&format!("<t:InReplyTo>&lt;{}&gt;</t:InReplyTo>", esc(&p.in_reply_to)));
+        }
+        if !p.references.is_empty() {
+            let refs: Vec<String> = p.references.iter().map(|r| format!("&lt;{}&gt;", esc(r))).collect();
+            x.push_str(&format!("<t:References>{}</t:References>", refs.join(" ")));
+        }
+        x.push_str(&format!("<t:IsRead>{}</t:IsRead></t:Message>", it.read));
         x
     }
 
@@ -422,6 +514,10 @@ impl Data {
         let out = match op.name.as_str() {
             "GetFolder" => self.get_folder(op),
             "GetReminders" | "PerformReminderAction" => vec![self.reminders_answer(op)],
+            "GetInboxRules" => vec![self.inbox_rules_answer()],
+            "UpdateInboxRules" => vec![self.update_inbox_rules(op)],
+            "Subscribe" => vec![self.subscribe(op)],
+            "GetEvents" => vec![self.get_events(op)],
             // The directory: every name or address with a word starting with the search, up to
             // 100, as Exchange's ambiguous name resolution; several are a warning.
             "ResolveNames" if op.attr("SearchScope") == Some("ActiveDirectory") => vec![self.directory_answer(op)],
@@ -438,8 +534,10 @@ impl Data {
             "UpdateFolder" => self.update_folder(op),
             "DeleteFolder" => self.delete_folder(op),
             "EmptyFolder" => self.empty_folder(op),
+            "MarkAllItemsAsRead" => self.mark_all_read(op),
             "GetUserOofSettingsRequest" => return ("GetUserOofSettingsResponse".into(), vec![self.oof_answer()]),
             "SetUserOofSettingsRequest" => return ("SetUserOofSettingsResponse".into(), vec![self.set_oof(op)]),
+            "GetUserAvailabilityRequest" => return ("GetUserAvailabilityResponse".into(), vec![self.availability(op)]),
             other => vec![err(&format!("ErrorInvalidOperation:{other}"))],
         };
         (format!("{}Response", op.name), out)
@@ -479,12 +577,54 @@ fn xml(e: &El) -> String {
     format!("<t:{0}{attrs}>{1}{inner}</t:{0}>", e.name, esc(&e.text))
 }
 
+mod availability;
 mod directory;
 mod folders;
 mod items;
 mod oof;
 mod refusing;
 mod reminders;
+mod rules;
+mod schema;
 mod serving;
 #[cfg(test)]
 mod tests;
+mod watching;
+
+/// A message's flag status, the day its follow-up is due and its reminder, as Exchange gives
+/// them (naming the property sets it knows).
+fn follow_up_xml(it: &It) -> String {
+    let status = if it.flagged {
+        Some(2)
+    } else if it.complete {
+        Some(1)
+    } else {
+        None
+    };
+    let mut x = status
+        .map(|v| {
+            format!(
+                "<t:ExtendedProperty><t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/><t:Value>{v}</t:Value></t:ExtendedProperty>"
+            )
+        })
+        .unwrap_or_default();
+    if let Some(d) = &it.due {
+        x.push_str(&format!(
+            "<t:ExtendedProperty><t:ExtendedFieldURI DistinguishedPropertySetId=\"Task\" PropertyId=\"33029\" PropertyType=\"SystemTime\"/><t:Value>{d}</t:Value></t:ExtendedProperty>"
+        ));
+    }
+    let common = |id: &str, kind: &str, v: &str| {
+        format!(
+            "<t:ExtendedProperty><t:ExtendedFieldURI DistinguishedPropertySetId=\"Common\" PropertyId=\"{id}\" PropertyType=\"{kind}\"/><t:Value>{v}</t:Value></t:ExtendedProperty>"
+        )
+    };
+    if it.reminder_set || it.reminder_signal.is_some() || it.reminder_time.is_some() {
+        x.push_str(&common("34051", "Boolean", if it.reminder_set { "true" } else { "false" }));
+    }
+    for (id, v) in [("34144", &it.reminder_signal), ("34050", &it.reminder_time)] {
+        if let Some(v) = v {
+            x.push_str(&common(id, "SystemTime", v));
+        }
+    }
+    x
+}

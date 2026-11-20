@@ -103,8 +103,10 @@ impl MailApp {
                             Module::Tasks => (&mut self.ui.tasks_query, tl!("Search tasks")),
                             _ => (&mut self.ui.notes_query, tl!("Search notes")),
                         };
+                        // An id of its own, as the mail's (issue #158): the bar's tabs before it change.
                         let resp = ui.add(
                             egui::TextEdit::singleline(query)
+                                .id(egui::Id::unique(("mailcraft-module-search", module as u8)))
                                 .hint_text(hint)
                                 .frame(egui::Frame::NONE)
                                 .align(if i18n::current().rtl() { egui::Align2::RIGHT_CENTER } else { egui::Align2::LEFT_CENTER })
@@ -165,15 +167,21 @@ impl MailApp {
         let mut again: Option<String> = None;
         let mut restart = false;
         let mut details = self.ui.import_details.clone();
+        let mut send_receive = std::mem::take(&mut self.ui.send_receive);
         let mut acts = Vec::new();
         ui.with_layout(bidi::row_from_start(Align::Center), |ui| {
             item_counts(ui, s, people_items, t);
             // A test build's next version: how far it's downloaded, then restart into it.
             restart = self.update_status(ui);
             background_segment(ui, s, &self.ui.compact, t, &mut details, &mut acts);
-            ui.with_layout(bidi::row_from_end(Align::Center), |ui| accounts_status(ui, s, t, &mut again));
+            ui.with_layout(bidi::row_from_end(Align::Center), |ui| {
+                // Send / Receive under way is said where the accounts' status is, in its place.
+                let busy = super::send_receive::status_segment(ui, s, &t, &mut send_receive);
+                accounts_status(ui, s, t, &mut again, busy);
+            });
         });
         self.ui.import_details = details;
+        self.ui.send_receive = send_receive;
         for a in acts {
             self.act(a);
         }
@@ -185,6 +193,42 @@ impl MailApp {
         }
     }
 
+    /// While a message sent waits in the Outbox to be undone (issue #135): how long it has, and
+    /// Undo, at the bottom of the window; several at once, how many, the newest undone.
+    pub(crate) fn undo_bar(&mut self, ctx: &egui::Context) {
+        let now = self.session.clock.now;
+        let holds: Vec<(u64, i64)> = self.session.undo_holds().map(|h| (h.id, h.until)).collect();
+        let Some(&(newest, until)) = holds.last() else { return };
+        // Each second, as it counts down, and as it goes.
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        let t = self.ui.tokens;
+        let left = until.saturating_sub(now).max(1);
+        let text =
+            if holds.len() > 1 { tf!("Sending {count} messages · {n} s", count = holds.len(), n = left) } else { tf!("Sending · {n} s", n = left) };
+        let mut undo = false;
+        egui::Area::new(egui::Id::unique("undo-send")).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -40.0)).order(egui::Order::Foreground).show(
+            ctx,
+            |ui| {
+                egui::Frame::new()
+                    .fill(t.surface)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .corner_radius(8)
+                    .shadow(ui.visuals().popup_shadow)
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(text).color(t.text));
+                            ui.add_space(12.0);
+                            undo = ui.button(RichText::new(tl!("Undo")).strong().color(t.accent)).clicked();
+                        });
+                    });
+            },
+        );
+        if undo {
+            self.act(Action::Run("outbox.undoSend", json!({"id": newest})));
+        }
+    }
+
     pub(crate) fn toasts(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         if self.session.notices.len() < self.ui.seen_notices {
@@ -192,6 +236,9 @@ impl MailApp {
         }
         if let Some(n) = self.session.notices.get(self.ui.seen_notices..).and_then(|v| v.last()) {
             self.ui.toast = Some((n.text.clone(), n.error, now));
+            // Said to a screen reader too, as it comes (issue #175): the notice is in a corner
+            // the keyboard never goes to. A failure is said at once.
+            crate::a11y::announce(ctx, i18n::notice(&n.text), n.error);
         }
         self.ui.seen_notices = self.session.notices.len();
         let Some((text, error, at)) = self.ui.toast.clone() else { return };
@@ -234,7 +281,7 @@ impl MailApp {
                     .show(ui, |ui| {
                         ui.set_max_width(420.0);
                         // Notices from the engine are English; the ones with a fixed text have a translation.
-                        ui.label(RichText::new(tl!(&text)).color(if error { Color32::WHITE } else { t.surface }));
+                        ui.label(RichText::new(i18n::notice(&text)).color(if error { Color32::WHITE } else { t.surface }));
                     });
             });
     }
@@ -292,10 +339,11 @@ fn dot(ui: &mut Ui, color: egui::Color32) {
 
 /// The accounts, at the bar's end. One account: its own status. Several: one status for them
 /// all (a line per account didn't fit), with each on hover; only those that need you stand
-/// out. `again`: the account whose link was clicked, to sign in again.
-fn accounts_status(ui: &mut Ui, s: &Session, t: Tokens, again: &mut Option<String>) {
+/// out. `again`: the account whose link was clicked, to sign in again. `busy`: Send / Receive
+/// is said in their status's place, so only those that need you are.
+fn accounts_status(ui: &mut Ui, s: &Session, t: Tokens, again: &mut Option<String>, busy: bool) {
     if s.accounts.len() <= 1 {
-        for a in &s.accounts {
+        for a in s.accounts.iter().filter(|a| !busy || needs_you(a)) {
             let (color, text) = account_status(s, &t, a);
             // "Password needed" is a link: click it to enter the password again.
             if needs_you(a) {
@@ -312,7 +360,9 @@ fn accounts_status(ui: &mut Ui, s: &Session, t: Tokens, again: &mut Option<Strin
     // Each account's line, made once for the hover of them all and for those waiting.
     let lines: Vec<String> =
         s.accounts.iter().map(|a| tf!("{account}: {status}", account = a.config.email, status = account_status(s, &t, a).1)).collect();
-    all_accounts(ui, s, t, &lines);
+    if !busy {
+        all_accounts(ui, s, t, &lines);
+    }
     waiting_accounts(ui, s, t, &lines, again);
 }
 
@@ -404,7 +454,7 @@ pub(crate) fn background_work(s: &Session, compact: &super::compacting::CompactU
 pub(crate) fn why(a: &mailcraft_engine::AccountState) -> String {
     match &a.status {
         SyncStatus::Error { error, .. } | SyncStatus::NeedsPassword { error } if !error.is_empty() => {
-            format!("{}\n{}", a.config.email, tl!(error))
+            format!("{}\n{}", a.config.email, i18n::error(error))
         }
         _ => a.config.email.clone(),
     }

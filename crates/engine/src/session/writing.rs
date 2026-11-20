@@ -12,12 +12,14 @@ mod reactions;
 mod reopen;
 mod sending;
 mod signatures;
+mod undo_send;
 pub use drafts::Drafted;
 pub(crate) use drafts::DraftedMemo;
 pub use quote::Quote;
 pub use reactions::Reactions;
 pub use sending::SendBlock;
 pub use signatures::signature_parts;
+pub use undo_send::{UNDO_SEND_MAX, UndoHold};
 
 /// From this many people (counted as [`SendCheck::Exposed`] says), sending to all of them in To
 /// and Cc asks first.
@@ -90,6 +92,10 @@ pub struct Compose {
     /// Send as plain text only (lists written out, the rest of the formatting dropped).
     #[serde(default)]
     pub plain: bool,
+    /// The typeface its text is in where none is set on it (issue #166): the font chosen for new
+    /// messages when it was begun. Sent as HTML for it, even with nothing else formatted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
     /// The pictures placed in the text (each where a [`mime::rich::PICTURE`] stands).
     #[serde(default)]
     pub inline: Vec<mime::InlinePicture>,
@@ -210,10 +216,10 @@ impl Compose {
         let used = mime::rich::pictures(&self.body, &styles);
         let pictures: Vec<mime::InlinePicture> = self.inline.iter().filter(|p| used.contains(&p.cid)).cloned().collect();
         let text = mime::rich::to_text(&self.body, &styles);
-        if self.plain || (styles.is_plain() && pictures.is_empty()) {
+        if self.plain || (styles.is_plain() && pictures.is_empty() && self.font.is_none()) {
             (text, None, Vec::new())
         } else {
-            (text, Some(mime::rich::to_html(&self.body, &styles)), pictures)
+            (text, Some(mime::rich::to_html_in(&self.body, &styles, self.font.as_deref())), pictures)
         }
     }
 
@@ -239,11 +245,11 @@ impl Compose {
         let (before, before_styles) = mime::rich::slice(&self.body, &styles, 0..start + "-- ".len());
         let (after, after_styles) = mime::rich::slice(&self.body, &styles, end..self.body.chars().count());
         let (code_html, code_pictures) = mime::signature_code_parts(code, &self.signature_code_tag());
-        let mut out = mime::rich::to_html(&before, &before_styles);
+        let mut out = mime::rich::to_html_in(&before, &before_styles, self.font.as_deref());
         // Marked, so a saved draft opened again has the code back as it was.
         out.push_str(&format!("<div class=\"{}\">{code_html}</div>", mime::SIGNATURE_CLASS));
         if !after.trim().is_empty() {
-            out.push_str(&mime::rich::to_html(&after, &after_styles));
+            out.push_str(&mime::rich::to_html_in(&after, &after_styles, self.font.as_deref()));
         }
         let mut used = mime::rich::pictures(&before, &before_styles);
         used.extend(mime::rich::pictures(&after, &after_styles));
@@ -378,7 +384,8 @@ impl Session {
         let sig = self.signature_for(&account, &from, false);
         let id = self.fresh_id();
         let window = self.prefs.new_mail_window;
-        self.open_compose(Compose { id, account, from, window, ..Default::default() });
+        let font = self.prefs.compose_font.clone();
+        self.open_compose(Compose { id, account, from, window, font, ..Default::default() });
         self.put_signature(sig.as_ref(), None)?;
         self.compose.as_mut().ok_or_else(|| CmdError::Failed("compose".into()))
     }
@@ -475,6 +482,7 @@ impl Session {
             scheme,
             window: self.prefs.reply_window,
             quote,
+            font: self.prefs.compose_font.clone(),
             ..Default::default()
         });
         self.style_signature(signature.as_ref());
@@ -523,6 +531,7 @@ impl Session {
             encrypt: encrypted,
             scheme,
             window: self.prefs.reply_window,
+            font: self.prefs.compose_font.clone(),
             ..Default::default()
         };
         c.set_text(String::new());
@@ -701,8 +710,10 @@ impl Session {
         self.can_send(&c.account)?;
         let local = self.account(&c.account).is_some_and(AccountState::is_local);
         let sent_folder = self.account(&c.account).and_then(|a| a.folder(FolderRole::Sent)).map(|f| f.path.clone());
-        // Delay Delivery: into the Outbox, sent once it's time (the app has to be running then).
-        if let Some(at) = c.send_after.filter(|at| *at > self.clock.now && !local) {
+        // Delay Delivery, or Undo Send's wait: into the Outbox, sent once it's time (the app has
+        // to be running then).
+        let undo = self.undo_hold_until(c, local);
+        if let Some(at) = c.send_after.filter(|at| *at > self.clock.now && !local).or(undo) {
             let item = OutboxItem {
                 id: c.id,
                 from,
@@ -717,6 +728,12 @@ impl Session {
             let store = self.store.as_ref().ok_or_else(|| CmdError::Failed("there is nowhere to keep it".into()))?;
             store.outbox_add(&c.account, &item, &raw).map_err(|e| CmdError::Failed(format!("the Outbox couldn't keep it: {e}")))?;
             self.after_outbox_change();
+            if undo.is_some() {
+                // Said by the window's Undo bar while it waits, not as a notice.
+                self.hold_for_undo(c, at);
+                self.finish_sent(c, false, String::new());
+                return Ok(serde_json::json!({ "queued": c.id, "sendAfter": at, "undo": true }));
+            }
             self.finish_sent(c, false, format!("It will be sent {}", mailcraft_model::dates::full_time(at, &self.clock)));
             return Ok(serde_json::json!({ "queued": c.id, "sendAfter": at }));
         }
@@ -766,6 +783,8 @@ impl Session {
         }
         self.composes.retain(|x| x.id != c.id);
         self.sent_away.retain(|x| x.id != c.id);
-        self.notice(said, false);
+        if !said.is_empty() {
+            self.notice(said, false);
+        }
     }
 }

@@ -32,12 +32,35 @@ impl Session {
         });
     }
 
+    /// What opens at the start, as File › Options › Start in says (issue #172), when it's still
+    /// there: the first account's Inbox otherwise (a folder since deleted, an account removed).
+    pub fn start_view(&self) -> View {
+        let place = match &self.prefs.start_in {
+            StartIn::Last => self.prefs.last_open.as_ref(),
+            other => Some(other),
+        };
+        let view = match place {
+            Some(StartIn::AllInboxes) if !self.accounts.is_empty() => Some(View::Unified { role: FolderRole::Inbox }),
+            Some(StartIn::Folder { account, folder }) if self.folder(account, folder).is_some() => {
+                Some(View::Folder { account: account.clone(), folder: folder.clone() })
+            }
+            _ => None,
+        };
+        view.unwrap_or_else(|| self.default_view())
+    }
+
     /// What drops of message files on folders did, since last asked.
     pub fn take_filed(&mut self) -> Vec<Filed> {
         std::mem::take(&mut self.filed)
     }
 
     pub fn open_view(&mut self, view: View) {
+        // Kept for File › Options › Start in › The folder open last (issue #172).
+        match &view {
+            View::Folder { account, folder } => self.prefs.last_open = Some(StartIn::Folder { account: account.clone(), folder: folder.clone() }),
+            View::Unified { role: FolderRole::Inbox } => self.prefs.last_open = Some(StartIn::AllInboxes),
+            _ => {}
+        }
         self.view = view;
         self.search = None;
         self.drop_search();
@@ -107,7 +130,8 @@ impl Session {
         self.focus = Some(key.clone());
         self.anchor = Some(key.clone());
         let thread = self.thread_of(key);
-        self.reading = Some(Reading { key: key.clone(), parsed: None, error: None, thread, warning: None, security: None, text_first: false });
+        let aside = self.sent_aside(key, &thread);
+        self.reading = Some(Reading { key: key.clone(), parsed: None, error: None, thread, aside, warning: None, security: None, text_first: false });
         if self.body.defer {
             // Read and parsed on another thread: the pane waits for it.
             self.defer_read(key);
@@ -118,7 +142,10 @@ impl Session {
             }
         }
         let unread = key.folder != OUTBOX && self.summary(key).is_some_and(|m| !m.flags.seen);
-        if mark && unread && self.prefs.mark_read_on_open {
+        // With the reading pane off, a chosen message isn't shown at all: only opening it in its
+        // own window reads it (#146, mail passed over with the arrow keys was marked read).
+        let shown = self.prefs.reading_pane != ReadingPane::Off;
+        if mark && unread && shown && self.prefs.mark_read_on_open {
             match (self.prefs.read_in_pane, self.prefs.read_after_secs) {
                 (ReadInPane::Shown, 0) => self.mark_seen(key),
                 (ReadInPane::Shown, secs) => self.read_due = Some((key.clone(), self.clock.now.saturating_add(i64::from(secs.min(3600))))),
@@ -143,7 +170,16 @@ impl Session {
                 self.windows.remove(0);
             }
             let cached = self.body_raw(key);
-            let mut w = Reading { key: key.clone(), parsed: None, error: None, thread: Vec::new(), warning: None, security: None, text_first: false };
+            let mut w = Reading {
+                key: key.clone(),
+                parsed: None,
+                error: None,
+                thread: Vec::new(),
+                aside: Vec::new(),
+                warning: None,
+                security: None,
+                text_first: false,
+            };
             match cached {
                 Some(raw) => {
                     let (shown, security) = self.unwrap(key, &raw);

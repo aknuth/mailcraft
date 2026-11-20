@@ -4,12 +4,14 @@
 use super::*;
 
 mod files;
+mod fonts;
 mod form;
 mod names;
 mod quote;
 mod sending;
 mod signatures;
 mod suggest;
+mod undo_send;
 
 #[test]
 fn recipient_boxes_suggest_people() {

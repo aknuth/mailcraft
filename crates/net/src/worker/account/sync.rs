@@ -1,8 +1,11 @@
-//! An account's worker: syncing folders, searching the server, calendars and contacts, and waiting for new mail.
+//! An account's worker: syncing folders, calendars and contacts (`calendars.rs`), searching the
+//! server (`searching.rs`), and waiting for new mail.
 
 use super::*;
 
 mod calendars;
+mod searching;
+mod watching;
 
 // Run once, on this thread, as [`Worker::publish_folders`] is about to write the folder list: a
 // test's way to come between deciding to write it and writing it.
@@ -27,6 +30,8 @@ impl Worker {
     /// Wait for new mail: IDLE on the Inbox when the server supports it, else poll.
     pub(crate) fn wait_for_mail(&mut self, rx: &Receiver<Job>) {
         self.working(false);
+        // Whatever was asked to stop has stopped.
+        self.cancel.store(false, Ordering::Relaxed);
         // Looking only when asked (issue #104): once it's been quiet a while, signed out until
         // it's asked again, not kept awake for good.
         if self.acc.check_by_hand {
@@ -55,17 +60,14 @@ impl Worker {
         let idle = matches!(&self.conn, Some(Conn::Imap(c)) if c.has("IDLE"));
         if !idle || inbox.is_none() {
             let next_soon = self.soon.iter().map(|(at, _)| *at).min();
-            let wait = next_soon.map_or(POLL_EVERY, |at| at.saturating_duration_since(Instant::now()).min(POLL_EVERY));
+            let poll = poll_every(&self.acc.id);
+            let wait = next_soon.map_or(poll, |at| at.saturating_duration_since(Instant::now()).min(poll));
             let Some(got) = self.recv_unless_set_aside(rx, wait) else { return };
             match got {
                 Ok(j) => push_job(&mut self.queue, j),
                 Err(RecvTimeoutError::Disconnected) => self.closed = true,
                 Err(RecvTimeoutError::Timeout) if next_soon.is_some_and(|at| at <= Instant::now()) => self.sync_soon_folders(),
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(f) = inbox {
-                        self.sync_one(&f);
-                    }
-                }
+                Err(RecvTimeoutError::Timeout) => self.look_for_mail(),
             }
             return;
         }
@@ -167,10 +169,7 @@ impl Worker {
                 if self.dropped_while_quiet(Instant::now()) {
                     return;
                 }
-                if let Some(f) = self.inbox() {
-                    self.sync_one(&f);
-                }
-                self.looked = Some(Instant::now());
+                self.look_for_mail();
             }
         }
     }
@@ -370,6 +369,9 @@ impl Worker {
         if !self.relist() {
             return;
         }
+        // Exchange: told from now on which folders change, for the looks between full syncs (a
+        // change during this one is read again at the next look, which costs little).
+        self.watch_from_now();
         let paths: Vec<String> = self.folders.iter().filter(|f| f.selectable).map(|f| f.path.clone()).collect();
         // Counts are said as folders are synced, once a second at most: each time writes them
         // into the account's folder list, and says all of it.
@@ -381,7 +383,18 @@ impl Worker {
         // mail, as ever.
         let mut calendars_due = self.last_full.is_none() && !self.calendars_read_before();
         let mut calendars_read = false;
+        // An IMAP account's Send / Receive: its folders, one by one (a POP account says its
+        // download as it goes, `transfers.rs`).
+        let imap = matches!(self.conn, Some(Conn::Imap(_)));
+        let mut going = Transfer { folders_total: u32::try_from(paths.len()).unwrap_or(u32::MAX), ..Transfer::working(TransferKind::Receiving) };
+        let mut pace = transfers::Pace::default();
         for path in paths {
+            if self.cancel_asked() {
+                break;
+            }
+            if imap && pace.due() {
+                self.tell_transfer(Transfer { folder: path.clone(), ..going.clone() });
+            }
             if !self.counts_unsaid.is_empty() && said.elapsed() >= COUNTS_EVERY {
                 self.say_counts();
                 said = Instant::now();
@@ -396,13 +409,15 @@ impl Worker {
             if !self.folders.iter().any(|f| f.path == path) {
                 continue;
             }
+            going.folder.clone_from(&path);
             if self.sync_counted(&path) {
                 self.counts_unsaid.push(path);
             }
-            if std::mem::take(&mut calendars_due) && !self.closed && self.conn.is_some() {
+            going.folders_done = going.folders_done.saturating_add(1);
+            if std::mem::take(&mut calendars_due) && !self.closed && self.conn.is_some() && !self.in_pim {
                 self.say_counts();
                 said = Instant::now();
-                self.calendars_and_contacts();
+                self.calendars_and_contacts(rx);
                 calendars_read = true;
             }
         }
@@ -413,6 +428,11 @@ impl Worker {
             self.serve_between_folders(rx);
         }
         self.say_counts();
+        if imap && !self.closed {
+            // Its connection lost on the way: failed, the account's status saying why.
+            let lost = self.conn.is_none().then(String::new);
+            self.transfer_ended(Transfer { folder: String::new(), ..going }, lost);
+        }
         if self.closed {
             return;
         }
@@ -430,15 +450,16 @@ impl Worker {
             log::info!("{}: synced {} folders in {:.1} s", self.acc.id, self.folders.len(), began.elapsed().as_secs_f32());
             self.status(SyncStatus::Online { at: now() });
         }
-        if self.conn.is_some() && !calendars_read {
-            self.calendars_and_contacts();
+        // Not while they're being read already: this is a Send / Receive between two of their steps.
+        if self.conn.is_some() && !calendars_read && !self.in_pim {
+            self.calendars_and_contacts(rx);
         }
     }
 
     /// The account's calendars and contacts, synced with their server now.
-    fn calendars_and_contacts(&mut self) {
+    fn calendars_and_contacts(&mut self, rx: &Receiver<Job>) {
         let began = Instant::now();
-        self.sync_dav();
+        self.sync_dav(Some(rx));
         log::info!("{}: PIM pass took {:?}", self.acc.id, began.elapsed());
     }
 
@@ -614,78 +635,6 @@ impl Worker {
         self.sink.emit(Event::Folders { account: self.id(), folders: self.folders.clone() });
     }
 
-    /// Search folders on the server (issue #4): IMAP's `SEARCH`, JMAP's `Email/query`, Graph's
-    /// `$search` and EWS's `QueryString`, the messages found brought into their folders' lists
-    /// and sent as they're found (an IMAP folder a range at a time, the others a folder at a
-    /// time). Stops between two when a newer search is asked, or none (the search box cleared).
-    pub(crate) fn search_server(&mut self, folders: &[String], query: String, search: u64) {
-        let id = self.id();
-        let (sink, wanted) = (self.sink.clone(), self.search.clone());
-        let still = move || wanted.load(Ordering::Relaxed) == search;
-        let answer = |keys, error, done| Event::ServerSearched { account: id.clone(), query: query.clone(), keys, error, done };
-        if !still() {
-            self.sink.emit(answer(Vec::new(), None, true));
-            return;
-        }
-        if self.conn.is_none() {
-            self.next_attempt = Instant::now();
-            self.connect_and_sync();
-        }
-        let store = self.store.clone();
-        let asked = ServerQuery::new(&query);
-        let asks = match self.conn.as_ref() {
-            None => {
-                self.sink.emit(answer(Vec::new(), Some("the account isn't connected".into()), true));
-                return;
-            }
-            Some(Conn::Pop) => {
-                self.sink.emit(answer(Vec::new(), Some("a POP account keeps all its mail here".into()), true));
-                return;
-            }
-            Some(c) => c.asks(&asked),
-        };
-        if !asks {
-            self.sink.emit(answer(Vec::new(), None, true));
-            return;
-        }
-        let (mut any, mut failed) = (false, None);
-        // Nothing found is kept once the account is removed (found in review: its files came back).
-        let seen = self.removals;
-        for f in folders.iter().take(200) {
-            if !still() {
-                break;
-            }
-            // What a folder finds goes out as it's found.
-            let mut sent = |keys: Vec<MessageKey>, new: usize| {
-                if new > 0 {
-                    sink.emit(Event::FolderChanged { account: id.clone(), folder: f.clone() });
-                }
-                if !keys.is_empty() {
-                    any = true;
-                    sink.emit(answer(keys, None, false));
-                }
-                still()
-            };
-            let Some(found) = self.conn.as_mut().and_then(|c| c.find_on_server(&mut self.jstate, &store, (&id, seen), f, &asked, &mut sent)) else {
-                break;
-            };
-            if let Err(e) = found {
-                log::info!("{id}/{f}: searching the server: {e}");
-                failed = Some(e.to_string());
-                // Nothing more is asked on a connection that may hold half an answer.
-                if e.is_fatal() {
-                    self.conn = None;
-                    break;
-                }
-            }
-        }
-        if !matches!(self.conn, Some(Conn::Imap(_))) {
-            self.save_jstate();
-        }
-        let error = if any { None } else { failed };
-        self.sink.emit(answer(Vec::new(), error, true));
-    }
-
     /// [`Self::sync_one`] for a folder a message was just filed in. A POP account's folders other
     /// than its Inbox are only on this computer, so reading one finds nothing new: said here, or
     /// the list on screen went without it until MailCraft started again (issue #57).
@@ -731,15 +680,7 @@ impl Worker {
                 r
             }
             // POP: the Inbox is downloaded; every other folder is here only.
-            Some(Conn::Pop) if self.folders.iter().any(|f| f.path == path && f.role == FolderRole::Inbox) => {
-                let secret = self.secret();
-                (|| {
-                    let mut c = crate::pop::open(&self.acc, &secret?)?;
-                    let r = crate::pop::fetch_new_as(&mut c, &store, &id, path, &crate::pop::Keep::of(&self.acc), now(), seen)?;
-                    let _ = c.quit();
-                    Ok(r)
-                })()
-            }
+            Some(Conn::Pop) if self.folders.iter().any(|f| f.path == path && f.role == FolderRole::Inbox) => self.receive_pop(&store, path, seen),
             Some(Conn::Pop) => crate::pop::local_counts(&store, &id, path),
             None => Err(NetError::Closed("not connected".into())),
         };
@@ -787,8 +728,10 @@ impl Worker {
         let q = match self.conn.as_mut() {
             Some(Conn::Imap(c)) => c.quota(),
             Some(Conn::Jmap(c)) => c.quota(),
+            // Exchange says it of the mailbox's folders (issue #143).
+            Some(Conn::Ews(c)) => c.quota(),
             // Graph doesn't tell a mailbox's size to the mailbox's owner.
-            Some(Conn::Graph(_) | Conn::Ews(_) | Conn::Pop) | None => return,
+            Some(Conn::Graph(_) | Conn::Pop) | None => return,
         };
         match q {
             Ok(Some((used, limit))) => self.sink.emit(Event::Quota { account: self.id(), used, limit }),

@@ -6,7 +6,7 @@ use super::*;
 impl MailApp {
     /// Preferences and theme for the app to save.
     pub fn saved_state(&self) -> Value {
-        json!({ "prefs": self.session.prefs, "dark": self.ui.dark, "language": self.ui.language, "windows": self.ui.places, "peopleView": self.ui.people_view, "peopleList": self.ui.people_list })
+        json!({ "prefs": self.session.prefs, "dark": self.ui.dark, "language": self.ui.language, "windows": self.ui.places, "peopleView": self.ui.people_view, "peopleList": self.ui.people_list, "panes": self.ui.pane_sizes })
     }
 
     /// What [`MailApp::saved_state`] saved, back. A setting another version wrote otherwise
@@ -30,6 +30,10 @@ impl MailApp {
         if let Some(pl) = read(v, "peopleList") {
             self.ui.people_list = pl;
         }
+        if let Some(sizes) = read::<crate::PaneSizes>(v, "panes") {
+            let ok = |s: Option<f32>| s.and_then(crate::PaneSizes::kept);
+            self.ui.pane_sizes = crate::PaneSizes { folders: ok(sizes.folders), list: ok(sizes.list), list_above: ok(sizes.list_above) };
+        }
         if let Some(w) = read(v, "windows") {
             self.ui.places = w;
         }
@@ -43,7 +47,9 @@ impl MailApp {
         let offline = p.work_offline;
         let keep = (p.keep_messages, p.keep_offline);
         self.session.prefs = p;
-        self.session.refresh_list();
+        // What File › Options › Start in says opens (issue #172: always the first Inbox).
+        let start = self.session.start_view();
+        self.session.open_view(start);
         // How much mail to keep, before any account connects (when it isn't the default).
         let d = mailcraft_engine::Prefs::default();
         if keep != (d.keep_messages, d.keep_offline) {

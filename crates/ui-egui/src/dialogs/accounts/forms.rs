@@ -159,12 +159,13 @@ impl SignInMethods {
 /// server's alone).
 fn method_row(ui: &mut Ui, id: &str, v: &mut SignInMethod, none: bool) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(tl!("Sign in with")).small());
-        method_combo(ui, id, v, none);
+        let l = ui.label(RichText::new(tl!("Sign in with")).small());
+        method_combo(ui, id, v, none, l.id);
     });
 }
 
-fn method_combo(ui: &mut Ui, id: &str, v: &mut SignInMethod, none: bool) {
+/// The sign-in methods, named by the label beside them (`label`).
+fn method_combo(ui: &mut Ui, id: &str, v: &mut SignInMethod, none: bool, label: egui::Id) {
     let name = |m: SignInMethod| match m {
         SignInMethod::Automatic => tl!("Automatic"),
         SignInMethod::Password => tl!("Password"),
@@ -175,11 +176,16 @@ fn method_combo(ui: &mut Ui, id: &str, v: &mut SignInMethod, none: bool) {
     if none {
         methods.push(SignInMethod::None);
     }
-    egui::ComboBox::from_id_salt(id).selected_text(name(*v)).show_ui(ui, |ui| {
-        for m in methods {
-            ui.selectable_value(v, m, name(m));
-        }
-    });
+    let r = egui::ComboBox::from_id_salt(id)
+        .selected_text(name(*v))
+        .show_ui(ui, |ui| {
+            for m in methods.iter().copied() {
+                ui.selectable_value(v, m, name(m));
+            }
+        })
+        .response
+        .labelled_by(label);
+    crate::drop_down::keys(ui, &r, v, &methods);
 }
 
 /// When a POP server's copy of downloaded mail goes: kept (for so many days, or until it's deleted
@@ -371,8 +377,17 @@ pub struct EditForm {
 }
 
 impl EditForm {
+    /// Whether the account's address can be changed here: an IMAP or POP account's, signing in
+    /// with a password (the others' is the one they sign in as).
+    pub(crate) fn address_editable(&self) -> bool {
+        self.ews.is_none() && !self.jmap && !self.oauth
+    }
+
     pub(crate) fn params(&self) -> serde_json::Value {
         let mut p = self.server_params();
+        if self.address_editable() {
+            p["email"] = json!(self.email.trim());
+        }
         if self.pop.is_none() {
             p["onlineOnly"] = json!(self.online_only);
         }

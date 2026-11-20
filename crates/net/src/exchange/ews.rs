@@ -161,6 +161,11 @@ pub struct Client {
     /// The User-Agent every request names, instead of MailCraft's (issue #9: a server that lets
     /// in only the clients it knows).
     user_agent: Option<String>,
+    /// Those of [`NEWER`] the server refused (an older Exchange's schema): not asked again.
+    unknown_ids: RefCell<Vec<&'static str>>,
+    /// The server refused a message's text first (issue #191): not asked again here, each
+    /// message coming whole.
+    text_first_refused: RefCell<bool>,
 }
 
 /// Another mailbox the account opens (Outlook's shared mailboxes): its address and name.
@@ -173,15 +178,21 @@ pub struct SharedMailbox {
 /// Most shared mailboxes an account opens.
 const MAX_SHARED: usize = 20;
 
-/// A mailbox's special folders: their distinguished ids and roles.
-const SPECIAL: [(&str, FolderRole); 6] = [
+/// A mailbox's special folders: their distinguished ids and roles. Its Archive folder is asked
+/// for apart, as one of [`NEWER`].
+const SPECIAL: [(&str, FolderRole); 5] = [
     ("inbox", FolderRole::Inbox),
     ("drafts", FolderRole::Drafts),
     ("sentitems", FolderRole::Sent),
     ("deleteditems", FolderRole::Trash),
     ("junkemail", FolderRole::Junk),
-    ("archive", FolderRole::Archive),
 ];
+
+/// Distinguished folders that Exchange 2013 and later brought: the Archive folder, and two kept
+/// out of the folder list as Outlook keeps them. Exchange 2010's schema doesn't know them, and
+/// refused a request naming any of them as a whole, the first sync with it (#149); so they're
+/// asked for apart ([`Client::newer_ids`]).
+const NEWER: [&str; 3] = ["archive", "conversationhistory", "syncissues"];
 
 /// A public folder in the tree.
 pub(crate) struct PublicFolder {
@@ -237,12 +248,16 @@ fn replica_list() -> String {
 /// Whether a property tag as an answer writes it (`0x6698`, or `26264` in decimal) is
 /// `PR_REPLICA_LIST`'s.
 fn is_replica_tag(tag: &str) -> bool {
+    tag_number(tag) == Some(REPLICA_TAG)
+}
+
+/// A property tag as an answer writes it: `0x6698`, or `26264` in decimal.
+fn tag_number(tag: &str) -> Option<u32> {
     let tag = tag.trim();
-    let n = match tag.get(..2).filter(|p| p.eq_ignore_ascii_case("0x")) {
+    match tag.get(..2).filter(|p| p.eq_ignore_ascii_case("0x")) {
         Some(_) => tag.get(2..).and_then(|h| u32::from_str_radix(h, 16).ok()),
         None => tag.parse::<u32>().ok(),
-    };
-    n == Some(REPLICA_TAG)
+    }
 }
 
 /// The mailbox GUID in a `PR_REPLICA_LIST` value (base64 of the GUID as ASCII, NUL-ended).
@@ -305,6 +320,15 @@ pub(crate) fn gone(e: &NetError) -> bool {
     matches!(e, NetError::No(m) if m.starts_with(GONE))
 }
 
+/// The code of a refusal for want of rights, kept in what it says ([`check_message`]).
+pub(crate) const DENIED: &str = "ErrorAccessDenied";
+
+/// Whether a refusal was for want of rights ([`DENIED`]): a colleague's calendar shared for its
+/// subject and place, not its items, is refused so (issue #140).
+pub(crate) fn denied(e: &NetError) -> bool {
+    matches!(e, NetError::No(m) if m.contains(DENIED))
+}
+
 /// How a refusal begins for an id the server can't read as one (EWS's and Graph's): malformed,
 /// or the other transport's. It names nothing there, and never will.
 pub(crate) const NO_SUCH_ID: &str = "not an id of this server's";
@@ -328,7 +352,9 @@ pub(crate) fn check_message(m: &El) -> Result<()> {
             Err(match code {
                 "ErrorItemNotFound" | "ErrorFolderNotFound" => NetError::No(format!("{GONE} ({text})")),
                 _ if code.starts_with(INVALID_ID) => NetError::No(format!("{NO_SUCH_ID} ({text})")),
-                // Any other (access denied, the server busy) is refused as it says.
+                // Refused for want of rights: said as the server says it, its code kept ([`denied`]).
+                DENIED if !text.contains(DENIED) => NetError::No(format!("{text} ({DENIED})")),
+                // Any other (the server busy) is refused as it says.
                 _ => NetError::No(text.to_string()),
             })
         }
@@ -385,7 +411,14 @@ impl Client {
             pf_listed: RefCell::new(None),
             shared_listed: RefCell::new(None),
             user_agent: None,
+            unknown_ids: RefCell::new(Vec::new()),
+            text_first_refused: RefCell::new(false),
         })
+    }
+
+    /// The account's own address.
+    pub(crate) fn email(&self) -> &str {
+        &self.email
     }
 
     /// The same session naming itself `agent` to the server (`None`, or nothing usable: as
@@ -429,14 +462,21 @@ fn count_of(f: &El, name: &str) -> u32 {
     f.text_of(name).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0)
 }
 
-/// The read, flag and draft state, asked for with every item.
+/// The read, flag and draft state, asked for with every item, the day a flag is due
+/// (`PidLidTaskDueDate`) and its reminder (`PidLidReminderSet`, `PidLidReminderSignalTime`,
+/// `PidLidReminderTime`): [`follow_up`].
 const FLAG_FIELDS: &str = "<t:FieldURI FieldURI=\"message:IsRead\"/>\
 <t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/>\
-<t:ExtendedFieldURI PropertyTag=\"0x0E07\" PropertyType=\"Integer\"/>";
+<t:ExtendedFieldURI PropertyTag=\"0x0E07\" PropertyType=\"Integer\"/>\
+<t:ExtendedFieldURI PropertySetId=\"00062003-0000-0000-C000-000000000046\" PropertyId=\"33029\" PropertyType=\"SystemTime\"/>\
+<t:ExtendedFieldURI PropertySetId=\"00062008-0000-0000-C000-000000000046\" PropertyId=\"34051\" PropertyType=\"Boolean\"/>\
+<t:ExtendedFieldURI PropertySetId=\"00062008-0000-0000-C000-000000000046\" PropertyId=\"34144\" PropertyType=\"SystemTime\"/>\
+<t:ExtendedFieldURI PropertySetId=\"00062008-0000-0000-C000-000000000046\" PropertyId=\"34050\" PropertyType=\"SystemTime\"/>";
 const HEADER_FIELDS: &str = "<t:FieldURI FieldURI=\"item:Subject\"/><t:FieldURI FieldURI=\"message:From\"/>\
 <t:FieldURI FieldURI=\"message:ToRecipients\"/><t:FieldURI FieldURI=\"message:CcRecipients\"/>\
 <t:FieldURI FieldURI=\"message:ReplyTo\"/><t:FieldURI FieldURI=\"item:DateTimeReceived\"/>\
 <t:FieldURI FieldURI=\"item:DateTimeSent\"/><t:FieldURI FieldURI=\"message:InternetMessageId\"/>\
+<t:FieldURI FieldURI=\"item:InReplyTo\"/><t:FieldURI FieldURI=\"message:References\"/>\
 <t:FieldURI FieldURI=\"item:HasAttachments\"/><t:FieldURI FieldURI=\"item:Size\"/>";
 
 /// An extended property's value.
@@ -448,10 +488,15 @@ fn extended(it: &El, tag: &str) -> Option<i64> {
 }
 
 fn flags(it: &El) -> Flags {
+    let status = extended(it, "0x1090");
     Flags {
         seen: it.text_of("IsRead").is_some_and(|v| v == "true"),
-        flagged: extended(it, "0x1090") == Some(2),
+        flagged: status == Some(2),
         draft: extended(it, "0x0E07").is_some_and(|f| f & 8 != 0),
+        // Marked complete in Outlook: done, not flagged.
+        keywords: if status == Some(1) { vec![mailcraft_model::FOLLOW_UP_COMPLETE.to_string()] } else { Vec::new() },
+        follow_up_due: follow_up::due_day(it),
+        reminder: follow_up::reminder(it),
         ..Default::default()
     }
 }
@@ -491,6 +536,14 @@ fn header_block(it: &El) -> Vec<u8> {
     }
     if let Some(id) = it.text_of("InternetMessageId") {
         h.push_str(&format!("Message-ID: {}\r\n", clean(id)));
+    }
+    // What it answers: a reply joins its conversation by these. They weren't asked for, and an
+    // Exchange account's replies threaded by nothing, its own from Sent Items not at all (#148).
+    for (field, name) in [("InReplyTo", "In-Reply-To"), ("References", "References")] {
+        if let Some(v) = it.text_of(field).filter(|v| !v.trim().is_empty()) {
+            let v: String = clean(v).chars().take(16 * 1024).collect();
+            h.push_str(&format!("{name}: {v}\r\n"));
+        }
     }
     h.push_str("\r\n");
     h.into_bytes()
@@ -561,7 +614,8 @@ pub fn find_on_server(
     crate::exchange::window::found(st, store, (account, seen), folder, fs, &numbers, new)
 }
 
-/// A `Restriction` for a search's read, flag and attachment conditions.
+/// A `Restriction` for a search's read, flag and attachment conditions, and when the mail came
+/// (issue #179).
 fn restriction(q: &WordQuery) -> String {
     let equal = |field: &str, value: &str| {
         format!("<t:IsEqualTo>{field}<t:FieldURIOrConstant><t:Constant Value=\"{value}\"/></t:FieldURIOrConstant></t:IsEqualTo>")
@@ -577,6 +631,14 @@ fn restriction(q: &WordQuery) -> String {
     if let Some(a) = q.attachment {
         parts.push(equal("<t:FieldURI FieldURI=\"item:HasAttachments\"/>", if a { "true" } else { "false" }));
     }
+    let received = |op: &str, t: i64| {
+        let at = mailcraft_model::dates::utc_stamp(t);
+        format!(
+            "<t:{op}><t:FieldURI FieldURI=\"item:DateTimeReceived\"/><t:FieldURIOrConstant><t:Constant Value=\"{at}\"/></t:FieldURIOrConstant></t:{op}>"
+        )
+    };
+    parts.extend(q.after.map(|t| received("IsGreaterThanOrEqualTo", t)));
+    parts.extend(q.before.map(|t| received("IsLessThan", t)));
     match parts.len() {
         0 => String::new(),
         1 => format!("<m:Restriction>{}</m:Restriction>", parts.concat()),
@@ -660,8 +722,12 @@ pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
         Op::SetFlag { keys, flag: Flag::Flagged, on: false } => {
             update(keys, "<t:DeleteItemField><t:ExtendedFieldURI PropertyTag=\"0x1090\" PropertyType=\"Integer\"/></t:DeleteItemField>")
         }
+        // A follow-up's days and reminder, or marked complete (gap 9: they stayed on this computer).
+        Op::SetFollowUp { keys, .. } | Op::SetReminder { keys, .. } | Op::SetKeyword { keys, .. } if follow_up::updates(op).is_some() => {
+            update(keys, &follow_up::updates(op).unwrap_or_default())
+        }
         // Answered and forwarded are Exchange's to set; categories stay on this computer.
-        Op::SetFlag { .. } | Op::SetKeyword { .. } => Ok(()),
+        Op::SetFlag { .. } | Op::SetFollowUp { .. } | Op::SetReminder { .. } | Op::SetKeyword { .. } => Ok(()),
         Op::Move { keys, to } => {
             let dest = st.mailbox(to)?.to_string();
             each_folder(keys, Some(to), &|chunk| {
@@ -734,6 +800,10 @@ pub fn apply_remote(c: &Client, st: &State, op: &Op) -> Result<()> {
             })
             .map(drop)
         }
+        Op::MarkFolderRead { path } => {
+            let id = st.mailbox(path)?.to_string();
+            c.in_folder(&id, || c.mark_read(&id))
+        }
     }
 }
 
@@ -751,13 +821,18 @@ pub fn send(c: &Client, raw: &[u8], recipients: &[String]) -> Result<()> {
     }
 }
 
+mod availability;
+pub use availability::{WINDOW_MAX as AVAILABILITY_WINDOW_MAX, answers_in as availability_answers};
 mod directory;
 mod discover;
+mod follow_up;
 pub use directory::DIRECTORY_MAX;
 #[cfg(test)]
 pub(crate) use directory::directory_name;
 mod mailbox;
+mod quota;
 mod requests;
+mod rules;
 #[cfg(test)]
 use discover::autodiscover_answer;
 pub use discover::{autodiscover, autodiscover_as};
@@ -765,10 +840,13 @@ use discover::{autodiscover_request, autodiscover_urls};
 pub(crate) use requests::into_messages;
 #[cfg(test)]
 use requests::scheme_token;
+pub use rules::{CHANGED_ELSEWHERE, RuleFolder, read_rules_answer, rule_written};
 mod shared;
 mod sync;
 pub use sync::{sync_folder, sync_folder_as};
 mod text_first;
+mod watch;
+pub use watch::{CHANGED_MAX as WATCH_CHANGED_MAX, Events as WatchEvents, Watch, events_in as watch_events};
 
 #[cfg(test)]
 mod tests;

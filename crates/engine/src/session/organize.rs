@@ -9,6 +9,7 @@ pub mod categories;
 pub mod junk;
 pub mod quick_steps;
 pub mod search_folders;
+pub mod server_rules;
 
 /// The folder snoozed mail waits in.
 const SNOOZED: &str = "Snoozed";
@@ -157,8 +158,12 @@ impl Session {
         self.make_texts_ahead();
         self.marks_kept();
         self.flush_due_outbox();
+        self.undo_holds_due();
         self.read_when_due();
         self.web_calendars_due();
+        self.free_busy_due();
+        self.archive_waits_due();
+        self.auto_archive_due();
         // The sender check follows contacts saved, accounts and the directory (cheap when not).
         self.keep_senders_when(false);
         self.held_invitations_due();

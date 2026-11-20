@@ -98,9 +98,11 @@ pub(super) fn commands() -> Vec<CommandSpec> {
         CommandSpec::new("mail.toggleRead", "Read / Unread", "Home › Tags", |s, _| s.flag_selection(Flag::Seen, None)).when(has_selection),
         CommandSpec::new("mail.flag", "Flag / Unflag", "Home › Tags", flag)
             .key("Insert")
-            .params(r#"{"on"?: bool, "due"?: "today"|"tomorrow"|"thisWeek"|"nextWeek"|"none"|"YYYY-MM-DD" (Follow Up: flag, due then), "complete"?: true (Mark Complete: unflag, mark it done today; flagging again or "on": false clears that)}"#)
+            .params(r#"{"on"?: bool, "due"?: "today"|"tomorrow"|"thisWeek"|"nextWeek"|"none"|"YYYY-MM-DD" (Follow Up: flag, due then), "reminder"?: "YYYY-MM-DDTHH:MM"|"none" (Add Reminder: flag, remind then; a day alone at 09:00), "complete"?: true (Mark Complete: unflag, mark it done today; flagging again or "on": false clears that)}"#)
             .when(has_selection),
-        CommandSpec::new("mail.markAllRead", "Mark all as read", "Folder", mark_all_read).when(has_account),
+        CommandSpec::new("mail.markAllRead", "Mark all as read", "Folder", mark_all_read)
+            .params(r#"{"account"?: string, "folder"?: string} (that folder, all of it; none: the folder on view, or the mail another view lists)"#)
+            .when(has_account),
         CommandSpec::new("mail.categorize", "Categorize", "Home › Tags", |s, v| s.categorize_selection(p::str(v, "category"), p::str(v, "keyword"), p::bool(v, "on")))
             .params(r#"{"category": string, "on"?: bool} | {"keyword": string (one not in the list, e.g. "$label6"), "on"?: bool}"#)
             .when(has_selection),
@@ -190,6 +192,29 @@ pub(super) fn commands() -> Vec<CommandSpec> {
             s.import_rules(&bytes, p::bool(v, "replace").unwrap_or(false))
         })
         .params(r#"{"path": string, "replace"?: bool (in place of the rules here; else added after them)}"#),
+        // The rules an Exchange mailbox keeps on its server (issue #139).
+        CommandSpec::new("rules.server", "Rules on the server", "Home › Rules", |s, v| s.load_server_rules(p::req_str(v, "account")?))
+            .params(r#"{"account": string (an Exchange account)}"#),
+        CommandSpec::new("rules.serverSave", "Save a rule on the server", "Home › Rules", |s, v| {
+            let rule = v.get("rule").cloned().ok_or_else(|| CmdError::Params("`rule` is required".into()))?;
+            let rule = serde_json::from_value(rule).map_err(|e| CmdError::Params(format!("rule: {e}")))?;
+            s.save_server_rule(p::req_str(v, "account")?, p::str(v, "id"), rule, p::bool(v, "dropOutlookList").unwrap_or(false))
+        })
+        .params(r#"{"account": string, "rule": Rule (see rules.add), "id"?: string (the server's rule to change; else a new one), "dropOutlookList"?: bool}"#),
+        CommandSpec::new("rules.serverSwitch", "Turn a rule on the server on or off", "Home › Rules", |s, v| {
+            let on = p::bool(v, "on").ok_or_else(|| CmdError::Params("`on` is required".into()))?;
+            s.switch_server_rule(p::req_str(v, "account")?, p::req_str(v, "id")?, on, p::bool(v, "dropOutlookList").unwrap_or(false))
+        })
+        .params(r#"{"account": string, "id": string, "on": bool, "dropOutlookList"?: bool}"#),
+        CommandSpec::new("rules.serverMove", "Move a rule on the server", "Home › Rules", |s, v| {
+            let up = p::bool(v, "up").ok_or_else(|| CmdError::Params("`up` is required".into()))?;
+            s.move_server_rule(p::req_str(v, "account")?, p::req_str(v, "id")?, up, p::bool(v, "dropOutlookList").unwrap_or(false))
+        })
+        .params(r#"{"account": string, "id": string, "up": bool (else down), "dropOutlookList"?: bool}"#),
+        CommandSpec::new("rules.serverDelete", "Delete a rule on the server", "Home › Rules", |s, v| {
+            s.delete_server_rule(p::req_str(v, "account")?, p::req_str(v, "id")?, p::bool(v, "dropOutlookList").unwrap_or(false))
+        })
+        .params(r#"{"account": string, "id": string, "dropOutlookList"?: bool}"#),
         CommandSpec::new("rules.run", "Run rules now", "Home › Rules", |s, v| {
             s.run_rules_now(p::u64(v, "index").and_then(|i| usize::try_from(i).ok()), p::bool(v, "inbox").unwrap_or(false))
         })
@@ -215,6 +240,18 @@ pub(super) fn delete(s: &mut Session, v: &Value) -> CmdResult {
     if s.view == View::Outbox && s.search.is_none() {
         return s.delete_outbox_selection();
     }
+    // A conversation's row stands for the whole conversation (issue #170); put back as it was
+    // if nothing is deleted, so what's done next isn't done to the rest of it too.
+    let picked = s.selection.clone();
+    s.selection = s.with_conversations(&picked);
+    let done = delete_selection(s, v);
+    if done.is_err() {
+        s.selection = picked;
+    }
+    done
+}
+
+fn delete_selection(s: &mut Session, v: &Value) -> CmdResult {
     let in_trash = s.view_role() == Some(FolderRole::Trash) && s.search.is_none();
     let all_in_trash = s
         .selected_shared()
@@ -261,29 +298,89 @@ pub(super) fn snooze(s: &mut Session, v: &Value) -> CmdResult {
     s.snooze_selection(until)
 }
 
-/// Flag or unflag; or Follow Up by a day, or Mark Complete.
+/// Flag or unflag; or Follow Up by a day, with a reminder, or Mark Complete.
 pub(super) fn flag(s: &mut Session, v: &Value) -> CmdResult {
     if p::bool(v, "complete") == Some(true) {
         return s.follow_up_selection(None, true);
     }
-    match p::str(v, "due") {
-        None => s.flag_selection(Flag::Flagged, p::bool(v, "on")),
-        Some(d) if d.eq_ignore_ascii_case("none") => s.follow_up_selection(None, false),
-        Some(d) => {
-            let day = match mailcraft_model::dates::FollowUp::from_code(d) {
-                Some(f) => f.due(&s.clock),
-                None if mailcraft_model::job::is_day(d) => {
-                    let num = |a: usize, z: usize| d.get(a..z).and_then(|x| x.parse::<u32>().ok()).unwrap_or(1);
-                    mailcraft_model::dates::days_from_civil(i64::from(num(0, 4)), num(5, 7), num(8, 10))
-                }
-                None => return Err(CmdError::Params(format!("`due`: not today, tomorrow, thisWeek, nextWeek, none or a date: `{d}`"))),
-            };
-            s.follow_up_selection(Some(day), false)
+    let reminder = follow_up_reminder(s, v)?;
+    match (p::str(v, "due"), reminder) {
+        (None, None) => s.flag_selection(Flag::Flagged, p::bool(v, "on")),
+        (due, reminder) => {
+            let day = due.map(|d| follow_up_day(s, d)).transpose()?;
+            s.follow_up_selection_with(day, reminder)
         }
     }
 }
 
-pub(super) fn mark_all_read(s: &mut Session, _: &Value) -> CmdResult {
+/// A follow-up's `reminder` as `mail.flag` takes it (gap 9): a local date and time, a day alone
+/// (at nine in its morning, as a task's), or `none`; not given, `None`.
+fn follow_up_reminder(s: &Session, v: &Value) -> Result<Option<Option<i64>>, CmdError> {
+    match v.get("reminder") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(x)) if matches!(x.trim(), "" | "none") => Ok(Some(None)),
+        Some(Value::String(x)) => match crate::session::pim::parse_local(x.trim(), &s.clock) {
+            Some((day, true)) => Ok(Some(Some(s.clock.utc(day.saturating_add(9 * 3600))))),
+            Some((at, false)) => Ok(Some(Some(at))),
+            None => Err(CmdError::Params(format!("`reminder`: not a date and time (YYYY-MM-DDTHH:MM) or none: `{x}`"))),
+        },
+        Some(_) => Err(CmdError::Params("`reminder` is a date and time (YYYY-MM-DDTHH:MM) or none".into())),
+    }
+}
+
+/// A follow-up's `due` as `mail.flag` takes it: a Follow Up choice's day, a date, or `none`.
+fn follow_up_day(s: &Session, d: &str) -> Result<Option<i64>, CmdError> {
+    if d.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    match mailcraft_model::dates::FollowUp::from_code(d) {
+        Some(f) => Ok(Some(f.due(&s.clock))),
+        None if mailcraft_model::job::is_day(d) => {
+            let num = |a: usize, z: usize| d.get(a..z).and_then(|x| x.parse::<u32>().ok()).unwrap_or(1);
+            Ok(Some(mailcraft_model::dates::days_from_civil(i64::from(num(0, 4)), num(5, 7), num(8, 10))))
+        }
+        None => Err(CmdError::Params(format!("`due`: not today, tomorrow, thisWeek, nextWeek, none or a date: `{d}`"))),
+    }
+}
+
+/// `todo.flag`: `mail.flag` for a flagged message of the To-Do Bar's task list, in whatever
+/// folder it is (issue #160: its menu gives it another day, completes it or clears its flag).
+pub(super) fn todo_flag(s: &mut Session, v: &Value) -> CmdResult {
+    let key = p::req_str(v, "key")?;
+    let key = mailcraft_model::MessageKey::from_id(key).ok_or_else(|| CmdError::Params(format!("`{key}` isn't a message")))?;
+    let m = s.todo_shared(&key).cloned().ok_or_else(|| CmdError::Params(format!("`{}` isn't flagged", key.to_id())))?;
+    if p::bool(v, "complete") == Some(true) {
+        return s.complete_messages(vec![m]);
+    }
+    let reminder = follow_up_reminder(s, v)?;
+    match (p::str(v, "due"), reminder) {
+        (None, None) => s.flag_messages(&[m], p::bool(v, "on").unwrap_or(false)),
+        (due, reminder) => {
+            let day = due.map(|d| follow_up_day(s, d)).transpose()?;
+            s.follow_up_with(&[m], day, reminder)
+        }
+    }
+}
+
+/// Mark All as Read, as Outlook's: the folder named, or the one on view, all of it (issue #197:
+/// a search's results or one tab of Focused / Other alone, and none of the mail on the server
+/// past what's kept here); another view (all Inboxes, a search folder), the mail it lists.
+pub(super) fn mark_all_read(s: &mut Session, v: &Value) -> CmdResult {
+    let named = match (p::str(v, "account"), p::str(v, "folder")) {
+        (Some(a), Some(f)) => {
+            s.folder(a, f).ok_or_else(|| CmdError::Params(format!("no folder `{f}` in `{a}`")))?;
+            Some((a.to_string(), f.to_string()))
+        }
+        (None, None) => match &s.view {
+            crate::View::Folder { account, folder } => Some((account.clone(), folder.clone())),
+            _ => None,
+        },
+        _ => return Err(CmdError::Params("`account` and `folder` name a folder together".into())),
+    };
+    if let Some((account, folder)) = named {
+        return mark_folder_read(s, &account, &folder);
+    }
     let keys: Vec<_> = s.list.iter().filter(|m| !m.flags.seen).map(|m| m.key.clone()).collect();
     let n = keys.len();
     let mut by_account: std::collections::BTreeMap<String, Vec<_>> = Default::default();
@@ -294,6 +391,22 @@ pub(super) fn mark_all_read(s: &mut Session, _: &Value) -> CmdResult {
         s.apply_op(&a, mailcraft_model::Op::SetFlag { keys, flag: Flag::Seen, on: true });
     }
     Ok(json!({"count": n}))
+}
+
+/// Every message of a folder read: those kept here as any marked read, and on a server holding
+/// unread mail past them (its count says more than are kept), the rest there at once.
+fn mark_folder_read(s: &mut Session, account: &str, folder: &str) -> CmdResult {
+    let keys: Vec<_> = s.folder_state(account, folder).messages.iter().filter(|m| !m.flags.seen).map(|m| m.key.clone()).collect();
+    let on_server = s.folder(account, folder).map_or(0, |f| f.unread as usize);
+    let remote = s.account(account).is_some_and(|a| !a.is_local() && a.config.pop.is_none());
+    let n = keys.len().max(if remote { on_server } else { 0 });
+    if !keys.is_empty() {
+        s.apply_op(account, mailcraft_model::Op::SetFlag { keys: keys.clone(), flag: Flag::Seen, on: true });
+    }
+    if remote && on_server > keys.len() {
+        s.apply_op(account, mailcraft_model::Op::MarkFolderRead { path: folder.to_string() });
+    }
+    Ok(json!({"count": n, "account": account, "folder": folder}))
 }
 
 /// A category colour from the params (an index into the palette).

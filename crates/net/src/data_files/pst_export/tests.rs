@@ -10,7 +10,7 @@ use mailcraft_pst::{
 use mailcraft_store::FolderState;
 use std::collections::BTreeMap;
 
-const NONE: &FollowUpDays = &FollowUpDays { due: BTreeMap::new(), done: BTreeMap::new() };
+const NONE: &FollowUpDays = &FollowUpDays { due: BTreeMap::new(), done: BTreeMap::new(), reminder: BTreeMap::new() };
 
 /// A big file's byte at `at`, the `n`th file's: not one repeated block, which a writer might
 /// keep once.
@@ -188,6 +188,7 @@ fn an_account_round_trips_through_a_data_file() {
     // A task with no due day goes in all the same.
     pim.tasks.push(mailcraft_model::pim::StoredTask {
         task: mailcraft_model::pim::Task { uid: "t1".into(), title: "Pack the lenses".into(), percent: 40, ..Default::default() },
+        ..Default::default()
     });
     store.save_account_doc("a1", mailcraft_model::pim::PIM_DOC, &pim).unwrap();
     let file = dir.join("Out.pst");
@@ -521,7 +522,10 @@ fn a_completed_follow_up_round_trips() {
     let due = BTreeMap::from([("done@studio.example".to_string(), 20_400), ("open@studio.example".to_string(), 20_410)]);
     let done = BTreeMap::from([("done@studio.example".to_string(), 20_390), ("open@studio.example".to_string(), 20_391)]);
     let path = dir.join("Done.pst");
-    let days = FollowUpDays { due: due.clone(), done };
+    // When the flagged one reminds (gap 9); a completed one's isn't written.
+    let at = 20_410 * 86_400 + 9 * 3600;
+    let reminder = BTreeMap::from([("done@studio.example".to_string(), at), ("open@studio.example".to_string(), at)]);
+    let days = FollowUpDays { due: due.clone(), done, reminder };
     assert_eq!(export(&store, "a1", "Done", &path, &days, &mut |_| {}).unwrap().messages, 2);
 
     let midnight = |day: i64| filetime(day * 86_400);
@@ -543,10 +547,13 @@ fn a_completed_follow_up_round_trips() {
     assert_eq!(due_back, due);
     let done_back: BTreeMap<String, i64> = back.load_account_doc("b1", FOLLOW_UP_DONE_DOC).unwrap();
     assert_eq!(done_back, BTreeMap::from([("done@studio.example".to_string(), 20_390)]), "only the completed one's");
+    let reminders_back: BTreeMap<String, i64> = back.load_account_doc("b1", mailcraft_model::organize::FOLLOW_UP_REMINDER_DOC).unwrap();
+    assert_eq!(reminders_back, BTreeMap::from([("open@studio.example".to_string(), at)]), "only the flagged one's");
     drop((store, back));
 }
 
 mod ansi;
+mod archive;
 mod big;
 mod calendar;
 mod kinds;

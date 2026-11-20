@@ -27,6 +27,7 @@ impl Session {
             | Event::PgpKeys { .. }
             | Event::PgpDecrypted { .. }) => self.apply_smime(e),
             Event::Status { account, status } => self.status_changed(account, status),
+            Event::Transfer { account, transfer } => self.transfer_went(&account, transfer),
             Event::Folders { account, folders } => self.folders_listed(account, folders),
             Event::FolderChanged { account, folder } => match self.echo_of(&account, &folder) {
                 // The echo of a flag or category changed here: the folder in memory has it already.
@@ -53,6 +54,7 @@ impl Session {
             }
             Event::DirectoryAllowed { account, error } => self.directory_allowed(&account, error),
             Event::ServerSearched { account, query, keys, error, done } => {
+                self.archive_searched(&account, &query, &keys, error.as_deref(), done);
                 if let Some(ss) = self.server_search.as_mut().filter(|ss| ss.sent == query) {
                     // What's found so far shows at once; the account is done at its last answer.
                     if done {
@@ -100,17 +102,24 @@ impl Session {
                 let left = accounts::ExportLeft { skipped, already, occurrences, replaced, folders: folders_skipped };
                 self.exported(&account, messages, left, done, error)
             }
+            Event::Archived { account, path, messages, archived, skipped, folders_skipped, done, error } => {
+                let report = accounts::ArchiveReport { messages, archived, skipped, folders: folders_skipped };
+                self.archived(&account, &path, report, done, error)
+            }
             Event::Quota { account, used, limit } => {
                 if let Some(a) = self.account_mut(&account) {
                     a.quota = Some((used, limit));
                 }
             }
             Event::Vacation { account, vacation, error } => self.vacation_read(&account, vacation, error),
+            Event::ServerRules { account, rules, error } => self.server_rules_read(&account, rules, error),
+            Event::FreeBusy { account, from, to, answers } => self.free_busy_answered(&account, from, to, answers),
             // Its text first (issue #24): shown, and nothing else until the whole message comes.
             Event::Body { key, raw } if mime::is_text_first(&raw) => self.show_body(&key, &raw),
             Event::Body { key, raw } => {
                 self.source_arrived(&key, &raw);
                 self.transfer_arrived(&key, &raw);
+                self.archive_source(&key, false);
                 // The open message's: parsed on another thread, where the window has one.
                 if !self.defer_arrived(&key, &raw) {
                     self.show_body(&key, &raw);
@@ -126,6 +135,7 @@ impl Session {
             Event::BodyFailed { key, error } => {
                 self.source_failed(&key, &error);
                 self.transfer_failed(&key, &error);
+                self.archive_source(&key, true);
                 for w in self.windows.iter_mut().filter(|w| w.key == key && w.parsed.is_none()) {
                     w.error = Some(error.clone());
                 }
@@ -222,7 +232,13 @@ impl Session {
             let why = if error.is_empty() { String::new() } else { format!(": {error}") };
             // An account that signs in in the browser has no password to ask for.
             let what = if browser { "needs you to sign in again" } else { "needs its password" };
-            self.notice(format!("{who} {what}{why}"), true);
+            // Google asking for an app password: its fixed words alone, which are translated
+            // (issue #164); the password asked for next names the account.
+            if error == mailcraft_model::GOOGLE_APP_PASSWORD_NEEDED {
+                self.notice(error.clone(), true);
+            } else {
+                self.notice(format!("{who} {what}{why}"), true);
+            }
             if !browser && self.asked_password.insert(account.clone()) {
                 self.ask_password.push(account.clone());
             }
@@ -232,6 +248,8 @@ impl Session {
         if matches!(status, SyncStatus::Online { .. }) {
             self.mark_role(&account, FolderRole::Inbox);
         }
+        // What it had under way for Send / Receive stops with it.
+        self.transfers_stopped(&account, &status);
         if let Some(a) = self.account_mut(&account) {
             a.status = status;
         }

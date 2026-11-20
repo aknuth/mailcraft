@@ -25,6 +25,7 @@ impl MailApp {
         // In a pass that draws, `ui` then leaves it be (egui gives `logic` alone the last pass's
         // input time, so a minimized window's close is always decided).
         self.ui.close_checked = Some(ctx.input(|i| i.time));
+        self.follow_minimized(ctx);
         self.decide_close(ctx);
         // What the mail servers sent is taken in and new mail announced here too: a minimized
         // window draws no frame, and mail that came meanwhile was neither shown in the title
@@ -34,9 +35,28 @@ impl MailApp {
         self.flush_jobs();
     }
 
+    /// A window MailCraft minimized itself, brought back by the user (the Dock, the taskbar): egui
+    /// is told it isn't minimized any more. egui notes a window minimized when it's told to
+    /// minimize it, and on a Mac never asks again (asking can deadlock there, egui #3494): the
+    /// window came back keeping its last frame and taking no input, as no pass drew it (issue
+    /// #169). It's back when it has the focus again, having lost it as it went.
+    fn follow_minimized(&mut self, ctx: &egui::Context) {
+        let Some(lost) = self.ui.minimized_away else { return };
+        match ctx.input(|i| i.viewport().focused) {
+            Some(false) => self.ui.minimized_away = Some(true),
+            Some(true) if lost => {
+                self.ui.minimized_away = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.request_repaint();
+            }
+            _ => {}
+        }
+    }
+
     /// The window back from the notification area (its icon clicked, MailCraft started again).
     pub fn show_window(&mut self, ctx: &egui::Context) {
         self.ui.in_tray = false;
+        self.ui.minimized_away = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -63,6 +83,7 @@ impl MailApp {
     /// area, or minimized where a hidden window couldn't be brought back.
     pub fn started_away(&mut self, hidden: bool) {
         self.ui.in_tray = hidden;
+        self.ui.minimized_away = (!hidden).then_some(false);
     }
 
     /// Whether the window is hidden, its icon in the notification area the way back to it.
@@ -74,6 +95,7 @@ impl MailApp {
     /// back (the notification area wouldn't take one), it would be out of reach.
     pub fn back_minimized(&mut self, ctx: &egui::Context) {
         self.ui.in_tray = false;
+        self.ui.minimized_away = Some(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
@@ -145,7 +167,10 @@ impl MailApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         self.ui.in_tray = true;
                     }
-                    KeptOnClose::Minimized => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    KeptOnClose::Minimized => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        self.ui.minimized_away = Some(false);
+                    }
                 }
                 return;
             }
@@ -199,7 +224,9 @@ impl MailApp {
                 // graphics lost): the messages held while their drafts were on the way to the
                 // server were chosen to be kept, and the save may never finish (#53). On this
                 // computer now, with the pool, as a minimized window draws no frame to send them.
-                if self.session.keep_held() > 0 {
+                // Messages waiting to be undone go now, rather than at the next start.
+                let released = self.session.release_undo_holds();
+                if self.session.keep_held() > 0 || released {
                     self.flush_jobs();
                 }
             }
@@ -294,6 +321,13 @@ impl MailApp {
             && self.session.open_search_folder_name().is_none()
         {
             self.ui.search_text = q.clone();
+        }
+        // A search ended some other way (a folder opened, another module, a command) takes its
+        // words out of the box (issue #187): they stayed, as if it were still on. Not while
+        // they're typed, nor before a search they're about to start; the recent searches keep
+        // them.
+        if self.session.search.is_none() && !self.ui.search_text.is_empty() && !self.ui.search_focused && self.ui.search_due.is_none() {
+            self.ui.search_text.clear();
         }
         let dark = self.ui.dark.unwrap_or_else(|| match ctx.system_theme() {
             Some(theme) => theme == egui::Theme::Dark,
@@ -426,6 +460,7 @@ impl MailApp {
     /// folders, list and reading pane (and the To-Do Bar beside the mail).
     fn panes(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = self.ui.tokens;
+        self.ui.panes.clear();
         if self.ui.backstage.is_some() {
             backstage::show(&self.session, &mut self.ui, ui, acts);
             self.ui.backstage_typing = ui.ctx().text_edit_focused();
@@ -448,12 +483,13 @@ impl MailApp {
             // keeps a width it can be read in (it was a strip a word wide).
             let mail_beside = module == Module::Mail && self.session.prefs.reading_pane == ReadingPane::Right;
             let most_nav = if mail_beside { (ui.available_width() - LIST_LEAST - READING_LEAST).clamp(170.0, 380.0) } else { 380.0 };
+            // At the size it was last dragged to (issue #171), else as it starts for everyone.
             let full = start("nav")
                 .resizable(true)
-                .default_size(if module == Module::Mail { 230.0 } else { 260.0 })
+                .default_size(self.ui.pane_sizes.folders.unwrap_or(if module == Module::Mail { 230.0 } else { 260.0 }))
                 .size_range(170.0..=most_nav)
                 .frame(egui::Frame::new().fill(t.chrome).inner_margin(Margin::symmetric(6, 8)));
-            egui::Panel::show_switched(ui, &mut expanded, strip, full, |ui, wide| {
+            let nav = egui::Panel::show_switched(ui, &mut expanded, strip, full, |ui, wide| {
                 if !wide {
                     ui.vertical_centered(|ui| {
                         let chevron = if rtl { Icon::ChevronLeft } else { Icon::ChevronRight };
@@ -468,21 +504,30 @@ impl MailApp {
                 egui::Panel::bottom("modules").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 4))).show(ui, |ui| {
                     module_switch(ui, &t, module, acts);
                 });
-                // Minimize, as Outlook's ‹ at the top of its folder pane.
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    let chevron = if rtl { Icon::ChevronRight } else { Icon::ChevronLeft };
-                    if widgets::tiny_icon_button(ui, chevron, "Minimize the folder pane", &t).clicked() {
-                        acts.push(Action::Run("view.folderPane", json!({"minimized": true})));
-                    }
-                });
+                // Minimize, as Outlook's ‹ at the top of its folder pane: in Mail at the end of
+                // the folders' first row (issue #188: a row of its own left a strip above them),
+                // elsewhere above the pane.
+                if module != Module::Mail {
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        let chevron = if rtl { Icon::ChevronRight } else { Icon::ChevronLeft };
+                        if widgets::tiny_icon_button(ui, chevron, "Minimize the folder pane", &t).clicked() {
+                            acts.push(Action::Run("view.folderPane", json!({"minimized": true})));
+                        }
+                    });
+                }
                 match module {
-                    Module::Mail => nav::show(&self.session, &t, ui, acts),
+                    Module::Mail => nav::show(&self.session, &t, ui, true, acts),
                     Module::Calendar => calendar::nav(&self.session, &mut self.ui, ui, acts),
                     Module::People => people::nav(&self.session, &mut self.ui, ui, acts),
                     Module::Tasks => tasks::nav(&self.session, &mut self.ui, ui, acts),
                     Module::Notes => notes::nav(&self.session, &mut self.ui, ui, acts),
                 }
             });
+            self.ui.panes.push((Pane::Folders, nav.response.rect));
+            // Its width kept while it's open (a slide to or from the strip settles on it).
+            if expanded && !self.session.prefs.folder_pane_minimized && nav.response.rect.width() >= 170.0 {
+                self.ui.pane_sizes.folders = PaneSizes::kept(nav.response.rect.width()).or(self.ui.pane_sizes.folders);
+            }
             // Dragged narrower than it goes: minimized, as the button does.
             if expanded == self.session.prefs.folder_pane_minimized {
                 acts.push(Action::Run("view.folderPane", json!({"minimized": !expanded})));
@@ -504,43 +549,57 @@ impl MailApp {
             };
             match (other, pane) {
                 (Some(show), _) => {
-                    egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface)).show(ui, |ui| {
+                    let main = egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface)).show(ui, |ui| {
                         show(&self.session, &mut self.ui, ui, acts);
                     });
+                    self.ui.panes.push((Pane::Reading, main.response.rect));
                 }
                 (None, pane) => match pane {
                     ReadingPane::Right => {
                         let most = (ui.available_width() - READING_LEAST).clamp(LIST_LEAST, 720.0);
-                        start("list").resizable(true).default_size(390.0).size_range(LIST_LEAST..=most).frame(list_frame).show(ui, |ui| {
-                            list::show(&self.session, &mut self.ui, ui, acts);
-                        });
-                        egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface)).show(ui, |ui| {
+                        let list = start("list")
+                            .resizable(true)
+                            .default_size(self.ui.pane_sizes.list.unwrap_or(390.0))
+                            .size_range(LIST_LEAST..=most)
+                            .frame(list_frame)
+                            .show(ui, |ui| {
+                                list::show(&self.session, &mut self.ui, ui, acts);
+                            });
+                        self.ui.pane_sizes.list = PaneSizes::kept(list.response.rect.width()).or(self.ui.pane_sizes.list);
+                        let reading = egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface)).show(ui, |ui| {
                             reading::show(&mut self.session, &mut self.ui, ui, acts);
                         });
+                        self.ui.panes.extend([(Pane::List, list.response.rect), (Pane::Reading, reading.response.rect)]);
                     }
                     ReadingPane::Bottom => {
                         // A name of its own: under "list" it took the size the list beside the
                         // pane had saved, the whole height, and the pane had no room (issue #17).
                         // The pane always keeps some.
                         let most = (ui.available_height() - 160.0).max(140.0);
-                        egui::Panel::top("list-above").resizable(true).default_size(300.0).size_range(140.0..=most).frame(list_frame).show(
-                            ui,
-                            |ui| {
+                        let above = egui::Panel::top("list-above")
+                            .resizable(true)
+                            .default_size(self.ui.pane_sizes.list_above.unwrap_or(300.0))
+                            .size_range(140.0..=most)
+                            .frame(list_frame)
+                            .show(ui, |ui| {
                                 list::show(&self.session, &mut self.ui, ui, acts);
-                            },
-                        );
-                        egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface)).show(ui, |ui| {
+                            });
+                        self.ui.pane_sizes.list_above = PaneSizes::kept(above.response.rect.height()).or(self.ui.pane_sizes.list_above);
+                        let reading = egui::CentralPanel::default().frame(egui::Frame::new().fill(t.surface)).show(ui, |ui| {
                             reading::show(&mut self.session, &mut self.ui, ui, acts);
                         });
+                        self.ui.panes.extend([(Pane::List, above.response.rect), (Pane::Reading, reading.response.rect)]);
                     }
                     ReadingPane::Off => {
-                        egui::CentralPanel::default().frame(list_frame).show(ui, |ui| {
-                            if self.session.compose.is_some() {
+                        let writing = self.session.compose.is_some();
+                        let main = egui::CentralPanel::default().frame(list_frame).show(ui, |ui| {
+                            if writing {
                                 reading::show(&mut self.session, &mut self.ui, ui, acts);
                             } else {
                                 list::show(&self.session, &mut self.ui, ui, acts);
                             }
                         });
+                        self.ui.panes.push((if writing { Pane::Reading } else { Pane::List }, main.response.rect));
                     }
                 },
             }
@@ -595,9 +654,17 @@ impl MailApp {
             super::caption::resize_zones(ui);
         }
         self.toasts(&ctx);
+        crate::a11y::said(&ctx);
+        self.undo_bar(&ctx);
+        self.send_receive_window(&ctx);
         // Calendar reminders: the window, and the desktop told of each as it comes. A message's
         // own page leaves them to the main window's (each page would tell of them again).
         if self.ui.page_message.is_none() {
+            // Flagged mail's (gap 9) are found in every folder's flagged mail, read a folder a
+            // frame as the To-Do Bar reads it, when there may be some.
+            if self.session.mail_reminders_wanted() && self.session.todo_step() {
+                ctx.request_repaint();
+            }
             for r in reminders::refresh(&mut self.ui.reminders, &self.session, false) {
                 let when = if r.all_day { String::new() } else { crate::calendar::hm(r.start, &self.session) };
                 self.services.notify(&r.summary, &if r.location.is_empty() { when } else { format!("{when} · {}", r.location) });

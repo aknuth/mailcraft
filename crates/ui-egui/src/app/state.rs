@@ -18,6 +18,29 @@ pub(crate) fn use_editor(st: &mut UiState, id: u64) {
 
 /// UI-only state. Its `Default` is a blank one: [`MailApp::new`] starts it with what the
 /// platform says and the few values that aren't their type's default.
+/// The sizes the panes were dragged to, in points (issue #171: the message list went back to its
+/// first width at every start, as did the folder pane). `None`: never dragged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneSizes {
+    /// The folder pane's width.
+    #[serde(default)]
+    pub folders: Option<f32>,
+    /// The message list's width beside the reading pane, and its height above it.
+    #[serde(default)]
+    pub list: Option<f32>,
+    #[serde(default)]
+    pub list_above: Option<f32>,
+}
+
+impl PaneSizes {
+    /// A size as kept: whole points (a size that wavers by a fraction doesn't write the settings
+    /// again), and only one that makes sense (a damaged file's isn't taken).
+    pub fn kept(size: f32) -> Option<f32> {
+        (size.is_finite() && (40.0..=10_000.0).contains(&size)).then(|| size.round())
+    }
+}
+
 #[derive(Default)]
 pub struct UiState {
     /// Where the main window, the last message window and the last compose window were.
@@ -60,6 +83,9 @@ pub struct UiState {
     pub keeps_running: Option<KeptOnClose>,
     /// The window was closed to the notification area and is hidden.
     pub(crate) in_tray: bool,
+    /// MailCraft minimized the window itself (closed to the Dock or the taskbar, or started put
+    /// away), and whether it has lost the focus since (issue #169, [`MailApp::logic`]).
+    pub(crate) minimized_away: Option<bool>,
     /// Exit was chosen (the File page's, the tray icon's): the window's close ends MailCraft
     /// rather than hiding it.
     pub(crate) quit_wanted: bool,
@@ -144,6 +170,20 @@ pub struct UiState {
     pub toast: Option<(String, bool, f64)>,
     pub(crate) seen_notices: usize,
     pub(crate) scroll_to_focus: bool,
+    /// When the list's focus last moved by the keyboard: the row it's on takes the keyboard once
+    /// it's drawn (it may be scrolled into view first), so a screen reader reads the message
+    /// reached (issue #175).
+    pub(crate) focus_row_at: Option<f64>,
+    /// The message row that had the keyboard last: the list's arrows are its, while another
+    /// control's are that control's.
+    pub(crate) row_keyboard: Option<egui::Id>,
+    /// Where the main window's panes were drawn last, for F6 (the top bar and the ribbon are
+    /// `top_bar_rect` and `ribbon_rect`); and the list's one stop for Tab, its message's row,
+    /// where F6 puts the keyboard in the list.
+    pub(crate) panes: Vec<(Pane, egui::Rect)>,
+    pub(crate) list_stop: Option<egui::Id>,
+    /// The reading pane's: the open message's text, while a screen reader reads it as a document.
+    pub(crate) reading_stop: Option<egui::Id>,
     /// A text field on the File page had the keyboard at the end of the last frame: Esc leaves it
     /// rather than the page (egui takes the focus away on Esc before the shortcuts see it).
     pub(crate) backstage_typing: bool,
@@ -198,6 +238,8 @@ pub struct UiState {
     pub(crate) han_missing: bool,
     /// Long message texts laid out by what's in view: their parts' heights, and their selection.
     pub(crate) long_text: HashMap<egui::Id, reading::LongText>,
+    /// The open message with what the search on found marked (issue #173).
+    pub(crate) marked: reading::Marked,
     /// What's selected of the message texts shown, and whether one has the keyboard.
     pub(crate) text_selection: reading::TextSelection,
     /// The app's name in the window title (`MailCraft`, or `MailCraft – Sample mailbox`).
@@ -223,8 +265,9 @@ pub struct UiState {
     /// The month the calendar's small month shows (`year * 12 + month - 1`; `None`: the day on
     /// screen's).
     pub(crate) mini_month: Option<i64>,
-    /// The day and week views have been scrolled to the working day once (each has its own scroll).
-    pub(crate) cal_scrolled: [bool; 2],
+    /// The day and week views, and the Schedule view, have been scrolled to the working day once
+    /// (each has its own scroll).
+    pub(crate) cal_scrolled: [bool; 3],
     pub(crate) people_query: String,
     /// The address book People shows (account, book id); `None`: all of them.
     pub(crate) people_book: Option<(String, String)>,
@@ -234,6 +277,8 @@ pub struct UiState {
     pub people_view: people::PeopleView,
     /// The People list's columns and sort.
     pub people_list: people::ListSettings,
+    /// The folder pane's and the message list's sizes as last dragged, kept between runs.
+    pub pane_sizes: PaneSizes,
     /// The calendar's search (issue #33): what's typed, the switches, what it found.
     pub(crate) cal_search: calendar::CalSearch,
     /// How far the calendar's month grip has been dragged since it last added or took a month.
@@ -248,19 +293,28 @@ pub struct UiState {
     /// The month the To-Do Bar's date navigator shows (months since year 0), moved by its
     /// arrows; `None`: this month.
     pub(crate) todo_month: Option<i64>,
+    /// The day picked in the To-Do Bar's month, its events listed under it (issue #154); `None`:
+    /// what's coming up.
+    pub(crate) todo_day: Option<i64>,
     /// What's typed in the To-Do Bar's "Type a new task" box.
     pub(crate) todo_new: String,
+    /// The line between the To-Do Bar's appointments and tasks while it's dragged: the
+    /// appointments' share of the height (issue #196); kept once it's let go.
+    pub(crate) todo_split: Option<f32>,
     pub(crate) task: Option<String>,
     /// The person whose card is shown (uid).
     pub(crate) person: Option<String>,
     /// What People, Tasks and Notes list, as last made (see `shown`).
     pub(crate) shown: shown::Shown,
-    /// The invitation in the open message, worked out once per message and calendar change.
-    pub(crate) invite: Option<(MessageKey, u64, Option<mailcraft_engine::Invite>)>,
+    /// The invitation in the open message, worked out once per message and calendar change, with
+    /// how it fits the user's calendar (issue #194).
+    pub(crate) invite: Option<(MessageKey, u64, Option<mailcraft_engine::Invite>, Option<mailcraft_engine::InviteDay>)>,
     /// Files to drag out of the window (the app starts the system drag).
     pub(crate) drag_out: Vec<PathBuf>,
     /// The platform can drag files out.
     pub(crate) can_drag_out: bool,
     /// The account whose import's details are shown, beside the status bar.
     pub(crate) import_details: Option<String>,
+    /// Send / Receive's progress window.
+    pub(crate) send_receive: super::chrome::send_receive::SendReceiveUi,
 }

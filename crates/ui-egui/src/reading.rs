@@ -19,6 +19,7 @@ pub(crate) mod body;
 mod compose;
 mod frame_lru;
 mod header;
+mod invite_day;
 mod long_text;
 mod people;
 mod pictures;
@@ -42,6 +43,7 @@ pub(crate) use body::WEB_PICTURES;
 #[cfg(test)]
 pub(crate) use body::picture_menu_for_tests;
 use body::*;
+pub(crate) use body::{Marked, marked_job, subject_marks, text_marks};
 pub use compose::compose_window;
 #[cfg(test)]
 pub(crate) use compose::parse_local;
@@ -120,6 +122,9 @@ pub(crate) fn plain_text_check(s: &Session, st: &UiState, ui: &mut Ui, key: &Mes
     }
 }
 
+/// The least height of a pane whose message header stays at its top while the text scrolls.
+const PINNED_PANE: f32 = 360.0;
+
 /// The open message, its parts in hand, as the pieces of the reading pane take it.
 struct Open<'a> {
     r: &'a mailcraft_engine::Reading,
@@ -148,13 +153,38 @@ fn message(s: &mut Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action
         close_attachment_view(st);
     }
     let viewing = viewing.filter(|_| st.attachment_view.is_some());
+    let locked = r.security.as_ref().is_some_and(security::still_locked);
+    // The header stays at the top while the text scrolls, as Outlook's (issue #151), in a pane
+    // with room for it: half of it at most, as it was last drawn; else all of it scrolls.
+    let head_id = egui::Id::unique(("reading-head", in_window, r.key.to_id()));
+    let head_was: f32 = ui.ctx().data(|d| d.get_temp(head_id)).unwrap_or(0.0);
+    let room = ui.available_height();
+    let pinned = r.parsed.as_ref().filter(|_| viewing.is_none() && !locked && room >= PINNED_PANE && head_was <= room / 2.0);
+    if let Some(p) = pinned {
+        let o = Open { r: &r, p, summary: summary.as_ref(), in_window };
+        let top = ui.cursor().top();
+        egui::Frame::new().inner_margin(Margin { left: 24, right: 24, top: 18, bottom: 0 }).show(ui, |ui| {
+            header::header(s, st, ui, &o, header::Part::Pinned, acts);
+            attachments_strip(s, st, ui, &o, shown_formatted(s, st, &r.key, p), acts);
+        });
+        let edge = ui.cursor().top();
+        ui.ctx().data_mut(|d| d.insert_temp(head_id, edge - top));
+        let line = ui.available_rect_before_wrap();
+        ui.painter().line_segment([egui::pos2(line.left() + 24.0, edge), egui::pos2(line.right() - 24.0, edge)], egui::Stroke::new(1.0, t.border));
+    }
     egui::ScrollArea::vertical().auto_shrink(false).id_salt(("reading", in_window, r.key.to_id(), viewing)).show(ui, |ui| {
-        egui::Frame::new().inner_margin(Margin { left: 24, right: 24, top: 18, bottom: 24 }).show(ui, |ui| {
+        let top = if pinned.is_some() { 12 } else { 18 };
+        egui::Frame::new().inner_margin(Margin { left: 24, right: 24, top, bottom: 24 }).show(ui, |ui| {
             let Some(p) = &r.parsed else {
                 not_ready(ui, &t, &r, summary.as_ref(), getting_ready, acts);
                 return;
             };
             let o = Open { r: &r, p, summary: summary.as_ref(), in_window };
+            if pinned.is_some() {
+                header::header(s, st, ui, &o, header::Part::Scrolled, acts);
+                message_text(s, st, ui, &o, shown_formatted(s, st, &r.key, p), acts);
+                return;
+            }
             // Previewing an attachment: back to the message, and what can be done with the file.
             if let Some(index) = viewing
                 && let Some(a) = p.attachments.iter().find(|a| a.index == index)
@@ -165,7 +195,7 @@ fn message(s: &mut Session, st: &mut UiState, ui: &mut Ui, acts: &mut Vec<Action
                 }
             }
             if viewing.is_none() {
-                header::header(s, st, ui, &o, acts);
+                header::header(s, st, ui, &o, header::Part::All, acts);
             }
 
             // An encrypted message not decrypted: nothing of it (its smime.p7m) is shown.
@@ -209,7 +239,7 @@ fn not_ready(ui: &mut Ui, t: &Tokens, r: &mailcraft_engine::Reading, summary: Op
         None if getting_ready => {
             if let Some(m) = summary {
                 let subject = if m.subject.is_empty() { tl!("(no subject)") } else { m.subject.as_str() };
-                subject_heading(ui, subject, t);
+                subject_heading(ui, subject, t, &[]);
                 ui.add_space(8.0);
             }
             ui.spinner();
@@ -233,7 +263,7 @@ fn attachments_strip(s: &Session, st: &mut UiState, ui: &mut Ui, o: &Open<'_>, f
     let shown: Vec<usize> = if formatted { p.images.iter().filter_map(|i| mime::picture_attachment(p, i)).collect() } else { Vec::new() };
     let in_place = |a: &mime::AttachmentInfo| shown.contains(&a.index);
     // An invitation is shown as its card above, not as a file.
-    let invitation = st.invite.as_ref().is_some_and(|(k, _, i)| k == &r.key && i.is_some()) && !o.in_window;
+    let invitation = st.invite.as_ref().is_some_and(|(k, _, i, _)| k == &r.key && i.is_some()) && !o.in_window;
     let is_invite_file = |a: &mime::AttachmentInfo| {
         invitation && (a.mime.to_ascii_lowercase().starts_with("text/calendar") || a.name.to_ascii_lowercase().ends_with(".ics"))
     };
@@ -327,6 +357,12 @@ fn message_body(s: &Session, st: &mut UiState, ui: &mut Ui, o: &Open<'_>, format
     let (r, p) = (o.r, o.p);
     // The text is selected as one, whatever it's drawn as (`text_selection`).
     text_selection::begin(st, ui, ui.scope_id().with(("message-text", r.key.to_id())), o.in_window);
+    // A search on: what it found marked (issue #173), the text drawn as formatted lines.
+    if let Some(m) = marked(s, st, &r.key, p, formatted) {
+        rich_body(s, st, ui, &r.key, &m, acts);
+        text_selection::finish(st, ui, long_text::many_lines(&m).then_some(p.text.as_str()));
+        return;
+    }
     if formatted {
         rich_body(s, st, ui, &r.key, p, acts);
     } else if p.text.len() > long_text::LONG {
@@ -431,11 +467,15 @@ fn invite_card(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey, act
     if s.reading.as_ref().is_some_and(|r| &r.key == key && r.text_first) {
         return;
     }
-    let fresh = st.invite.as_ref().is_some_and(|(k, rev, _)| k == key && *rev == s.pim_revision);
+    let fresh = st.invite.as_ref().is_some_and(|(k, rev, _, _)| k == key && *rev == s.pim_revision);
     if !fresh {
-        st.invite = Some((key.clone(), s.pim_revision, s.invite()));
+        let inv = s.invite();
+        // How a request fits the calendar: worked out with it, not each frame.
+        let day = inv.as_ref().filter(|i| i.method == "REQUEST" && i.problem.is_none()).and_then(|i| s.invite_day(&i.event));
+        st.invite = Some((key.clone(), s.pim_revision, inv, day));
     }
-    let Some(inv) = st.invite.as_ref().and_then(|(_, _, i)| i.clone()) else { return };
+    let Some(inv) = st.invite.as_ref().and_then(|(_, _, i, _)| i.clone()) else { return };
+    let day = st.invite.as_ref().and_then(|(_, _, _, d)| d.clone());
     let t = st.tokens;
     let e = &inv.event;
     egui::Frame::new().fill(t.accent_soft).corner_radius(8).inner_margin(Margin::same(12)).show(ui, |ui| {
@@ -464,6 +504,11 @@ fn invite_card(s: &Session, st: &mut UiState, ui: &mut Ui, key: &MessageKey, act
         }
         match inv.method.as_str() {
             "REQUEST" => {
+                // How it fits the calendar, and the hours around it (issue #194).
+                if let Some(day) = &day {
+                    invite_day::show(s, &t, ui, e, day, acts);
+                    ui.add_space(6.0);
+                }
                 ui.horizontal_wrapped(|ui| {
                     let current = match inv.answer.as_str() {
                         "ACCEPTED" => Some("You accepted."),
@@ -526,24 +571,44 @@ fn empty(ui: &mut Ui, t: &Tokens, msg: &str) {
     widgets::empty_state(ui, t, Icon::Read, msg);
 }
 
-fn thread_list(s: &Session, t: &Tokens, ui: &mut Ui, thread: &[MessageKey], open: &MessageKey, acts: &mut Vec<Action>) {
+/// The messages of the open one's conversation, the oldest first: those in this list, and the
+/// user's own from Sent Items (`aside`, issue #148), dimmed with their folder's name and opened
+/// in a window of their own, as Outlook shows a conversation's messages from other folders.
+fn thread_list(
+    s: &Session,
+    t: &Tokens,
+    ui: &mut Ui,
+    thread: &[MessageKey],
+    aside: &[mailcraft_engine::model::SharedSummary],
+    open: &MessageKey,
+    acts: &mut Vec<Action>,
+) {
+    let here: Vec<&Summary> =
+        if thread.is_empty() { s.summary(open).into_iter().collect() } else { thread.iter().filter_map(|k| s.summary(k)).collect() };
+    let mut rows: Vec<(&Summary, bool)> = here.into_iter().map(|m| (m, false)).chain(aside.iter().map(|m| (&**m, true))).collect();
+    rows.sort_by_key(|(m, _)| m.when());
     egui::Frame::new().fill(t.chrome).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(8).inner_margin(Margin::symmetric(10, 8)).show(
         ui,
         |ui| {
-            ui.label(RichText::new(tf!("{n} messages in this conversation", n = thread.len())).color(t.dim).small());
-            for k in thread {
-                let Some(m) = s.summary(k) else { continue };
+            ui.label(RichText::new(tf!("{n} messages in this conversation", n = rows.len())).color(t.dim).small());
+            for (m, sent) in rows {
+                let k = &m.key;
                 let current = k == open;
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
                 if current || resp.hovered() {
                     ui.painter().rect_filled(rect, 4.0, if current { t.accent_soft } else { t.hover_row });
                 }
-                let font = if !m.flags.seen { theme::bold(13.0) } else { theme::regular(13.0) };
+                let font = if !m.flags.seen && !sent { theme::bold(13.0) } else { theme::regular(13.0) };
                 let p = ui.painter_at(rect);
                 // Who, the first words and when, each in its own room: the words ran on under
-                // the time in a narrow pane, and a long name under the words.
-                let when = p.layout_no_wrap(crate::i18n::date(&dates::list_time(m.when(), &s.clock)), theme::regular(12.0), t.dim);
-                let who = widgets::one_line(ui, m.from.display(), font, t.text, 154.0);
+                // the time in a narrow pane, and a long name under the words. One from Sent
+                // Items says so before its time.
+                let folder = sent
+                    .then(|| s.account(&k.account).and_then(|a| a.folder(mailcraft_engine::model::FolderRole::Sent)).map(crate::i18n::folder))
+                    .flatten();
+                let date = crate::i18n::date(&dates::list_time(m.when(), &s.clock));
+                let when = p.layout_no_wrap(folder.map_or(date.clone(), |f| format!("{f} · {date}")), theme::regular(12.0), t.dim);
+                let who = widgets::one_line(ui, m.from.display(), font, if sent { t.dim } else { t.text }, 154.0);
                 let mid = |g: &egui::Galley| rect.center().y - g.size().y / 2.0;
                 let room = rect.width() - 170.0 - when.size().x - 20.0;
                 p.galley(egui::pos2(rect.left() + 8.0, mid(&who)), who, t.text);
@@ -552,7 +617,9 @@ fn thread_list(s: &Session, t: &Tokens, ui: &mut Ui, thread: &[MessageKey], open
                     p.galley(egui::pos2(rect.left() + 170.0, mid(&words)), words, t.dim);
                 }
                 p.galley(egui::pos2(rect.right() - 8.0 - when.size().x, mid(&when)), when, t.dim);
-                if resp.clicked() && !current {
+                if resp.clicked() && sent {
+                    acts.push(Action::Run("message.popOut", json!({"key": k.to_id()})));
+                } else if resp.clicked() && !current {
                     acts.push(Action::Open(k.clone()));
                 }
             }
